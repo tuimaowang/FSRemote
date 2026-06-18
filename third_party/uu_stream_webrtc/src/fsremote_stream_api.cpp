@@ -11,6 +11,7 @@
 
 #include "native_webrtc_runtime.h"
 #include "signaling.h"
+#include "system_audio_stream.h"
 #include "uu_codec_factory.h"
 #include "webrtc_session.h"
 
@@ -219,6 +220,13 @@ public:
         worker_ = std::thread([this, port] { run(port); });
     }
 
+    ~HostInstance() override
+    {
+        if (audio_streamer_) {
+            audio_streamer_->stop();
+        }
+    }
+
     bool isBusy() const override
     {
         return socket_.load() != 0;
@@ -288,6 +296,11 @@ private:
             }
             socket_ = socket;
             append_log("host accepted client");
+            {
+                std::string audio_error;
+                audio_streamer_ = std::make_unique<uu::HostAudioStreamer>();
+                audio_streamer_->start(49105, &audio_error);
+            }
 
             {
                 uu::SessionConfig config;
@@ -316,9 +329,16 @@ private:
             if (current) {
                 uu::close_socket(current);
             }
+            if (audio_streamer_) {
+                audio_streamer_->resetClient();
+                audio_streamer_->stop();
+                audio_streamer_.reset();
+            }
             append_log("host client socket closed");
         }
     }
+
+    std::unique_ptr<uu::HostAudioStreamer> audio_streamer_;
 };
 
 class ViewerInstance final : public StreamInstance {
@@ -336,6 +356,13 @@ public:
         , user_(user)
     {
         worker_ = std::thread([this] { run(); });
+    }
+
+    ~ViewerInstance() override
+    {
+        if (audio_player_) {
+            audio_player_->stop();
+        }
     }
 
     bool sendInput(const char* message) override
@@ -391,6 +418,11 @@ private:
         }
 
         report_status(status_callback_, user_, 20, "TCP connected");
+        {
+            std::string audio_error;
+            audio_player_ = std::make_unique<uu::ViewerAudioPlayer>();
+            audio_player_->start(host_ip_, 49105, &audio_error);
+        }
         report_status(status_callback_, user_, 30, "Initializing WebRTC");
         uu::NativeWebrtcRuntime runtime;
         if (!runtime.initialize(&error)) {
@@ -450,6 +482,7 @@ private:
     void* user_ = nullptr;
     std::mutex session_mutex_;
     uu::WebrtcSession* active_session_ = nullptr;
+    std::unique_ptr<uu::ViewerAudioPlayer> audio_player_;
 };
 
 } // namespace

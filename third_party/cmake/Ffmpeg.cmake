@@ -21,7 +21,7 @@ FetchContent_MakeAvailable(ffmpeg)
 add_library(ffmpeg INTERFACE)
 target_include_directories(ffmpeg INTERFACE "${ffmpeg_SOURCE_DIR}/include")
 target_link_directories(ffmpeg INTERFACE "${ffmpeg_SOURCE_DIR}/lib")
-target_link_libraries(ffmpeg INTERFACE avcodec avutil swscale)
+target_link_libraries(ffmpeg INTERFACE avcodec avutil swscale swresample)
 
 set(FFMPEG_BIN_DIR "${ffmpeg_SOURCE_DIR}/bin")
 

@@ -24,6 +24,7 @@ add_library(uu_stream_common STATIC
     src/parsec_vdd_session.cpp
     src/sdp_guard.cpp
     src/signaling.cpp
+    src/system_audio_stream.cpp
     src/uu_codec_factory.cpp
     src/uu_profile.cpp
     src/webrtc_session.cpp
@@ -109,6 +110,7 @@ target_link_libraries(uu_stream_common PUBLIC
     setupapi
     cfgmgr32
     user32
+    ole32
 )
 
 set(_uu_stream_ffmpeg_runtime_dlls
