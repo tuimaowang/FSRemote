@@ -1,0 +1,38 @@
+# Build output
+/build/
+/build_embedded/
+/build_embedded_clang/
+/build_stream_dll/
+/build_webrtc/
+/build_webrtc_host/
+/build_webrtc_slim/
+/dist/
+
+# CMake generated files
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/compile_commands.json
+/install_manifest.txt
+/Testing/
+
+# Temporary / local work dirs
+/tmp_svg_extract/
+/_ssh_test/
+/_ssh_test2/
+/_ssh_test_ok/
+/_vendor/
+
+# IDE / editor
+/.vs/
+/.vscode/
+/.idea/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+
+# Logs and runtime leftovers
+*.log
+*.tmp
+*.temp

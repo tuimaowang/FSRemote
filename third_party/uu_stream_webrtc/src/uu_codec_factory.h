@@ -1,0 +1,19 @@
+#pragma once
+
+#include <api/video/video_frame.h>
+#include <api/video_codecs/video_decoder_factory.h>
+#include <api/video_codecs/video_encoder_factory.h>
+
+#include <functional>
+#include <memory>
+#include <cstddef>
+#include <cstdint>
+
+namespace uu {
+
+std::unique_ptr<webrtc::VideoEncoderFactory> CreateUuVideoEncoderFactory();
+std::unique_ptr<webrtc::VideoDecoderFactory> CreateUuVideoDecoderFactory();
+void SetUuDecodedFrameHook(std::function<void(const webrtc::VideoFrame&)> hook);
+void SetUuDecodedBgraHook(std::function<void(int width, int height, const uint8_t* bgra, size_t size)> hook);
+
+} // namespace uu

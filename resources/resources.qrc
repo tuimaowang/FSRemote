@@ -1,0 +1,39 @@
+<RCC>
+    <qresource prefix="/UUGuest">
+        <file alias="resource/images/titlebar/app_icon.ico">app.ico</file>
+        <file alias="resource/images/titlebar/title_wordmark.png">uuguest/titlebar/title_wordmark.png</file>
+        <file alias="resource/images/titlebar/fs_session_logo.svg">uuguest/titlebar/fs_session_logo.svg</file>
+        <file alias="resource/images/titlebar/remote_control_center.svg">uuguest/titlebar/remote_control_center.svg</file>
+        <file alias="resource/images/titlebar/settings.svg">uuguest/titlebar/settings.svg</file>
+        <file alias="resource/images/titlebar/chevron_up.svg">uuguest/titlebar/chevron_up.svg</file>
+        <file alias="resource/images/titlebar/chevron_down.svg">uuguest/titlebar/chevron_down.svg</file>
+        <file alias="resource/images/titlebar/device_group.svg">uuguest/titlebar/device_group.svg</file>
+        <file alias="resource/images/titlebar/remote_assist_group.svg">uuguest/titlebar/remote_assist_group.svg</file>
+        <file alias="resource/images/titlebar/remote_assist_start.svg">uuguest/titlebar/remote_assist_start.svg</file>
+        <file alias="resource/images/titlebar/controlled_notice.svg">uuguest/titlebar/controlled_notice.svg</file>
+        <file alias="resource/images/titlebar/remote_badge.svg">uuguest/titlebar/remote_badge.svg</file>
+        <file alias="resource/images/titlebar/file_transfer.svg">uuguest/titlebar/file_transfer.svg</file>
+        <file alias="resource/images/titlebar/more.svg">uuguest/titlebar/more.svg</file>
+        <file alias="resource/images/titlebar/device_status_offline.svg">uuguest/titlebar/device_status_offline.svg</file>
+        <file alias="resource/images/titlebar/device_status_busy.svg">uuguest/titlebar/device_status_busy.svg</file>
+        <file alias="resource/images/titlebar/refresh.svg">uuguest/titlebar/refresh.svg</file>
+        <file alias="resource/images/titlebar/wake_power.svg">uuguest/titlebar/wake_power.svg</file>
+        <file alias="resource/images/titlebar/wake_loading_bg.png">uuguest/titlebar/wake_loading_bg.png</file>
+        <file alias="resource/images/titlebar/wake_loading_spinner.png">uuguest/titlebar/wake_loading_spinner.png</file>
+        <file alias="resource/images/titlebar/minimize.svg">uuguest/titlebar/minimize.svg</file>
+        <file alias="resource/images/titlebar/close.svg">uuguest/titlebar/close.svg</file>
+        <file alias="resource/images/titlebar/rd_minimize.svg">uuguest/titlebar/rd_minimize.svg</file>
+        <file alias="resource/images/titlebar/rd_maximize.svg">uuguest/titlebar/rd_maximize.svg</file>
+        <file alias="resource/images/titlebar/rd_close.svg">uuguest/titlebar/rd_close.svg</file>
+        <file alias="resource/images/titlebar/rd_control_center.svg">uuguest/titlebar/rd_control_center.svg</file>
+        <file alias="resource/images/desktop_bk_image.png">uuguest/desktop_bk_image.png</file>
+        <file alias="resource/images/menu/terminal.svg">uuguest/menu/terminal.svg</file>
+        <file alias="resource/images/menu/power.svg">uuguest/menu/power.svg</file>
+        <file alias="resource/images/menu/restart.svg">uuguest/menu/restart.svg</file>
+        <file alias="resource/images/menu/rename.svg">uuguest/menu/rename.svg</file>
+        <file alias="resource/images/menu/delete.svg">uuguest/menu/delete.svg</file>
+        <file alias="resource/images/settings/auto_run.svg">uuguest/settings/auto_run.svg</file>
+        <file alias="resource/images/settings/remote_wakeup.svg">uuguest/settings/remote_wakeup.svg</file>
+        <file alias="resource/images/settings/prevent_sleep.svg">uuguest/settings/prevent_sleep.svg</file>
+    </qresource>
+</RCC>
