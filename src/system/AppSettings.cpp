@@ -47,14 +47,14 @@ void AppSettings::setStatusAutoRefreshEnabled(bool enabled)
 
 int AppSettings::statusAutoRefreshIntervalSeconds()
 {
-    const int seconds = settings().value(QStringLiteral("statusAutoRefreshIntervalSeconds"), 10).toInt();
-    return seconds > 0 ? seconds : 10;
+    const int seconds = settings().value(QStringLiteral("statusAutoRefreshIntervalSeconds"), 60).toInt();
+    return seconds > 0 ? seconds : 60;
 }
 
 void AppSettings::setStatusAutoRefreshIntervalSeconds(int seconds)
 {
     QSettings appSettings = settings();
-    appSettings.setValue(QStringLiteral("statusAutoRefreshIntervalSeconds"), seconds > 0 ? seconds : 10);
+    appSettings.setValue(QStringLiteral("statusAutoRefreshIntervalSeconds"), seconds > 0 ? seconds : 60);
 }
 
 } // namespace platform

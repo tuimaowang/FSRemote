@@ -18,7 +18,6 @@
 #include <vector>
 
 class QEvent;
-class QComboBox;
 class QLineEdit;
 class QMouseEvent;
 class QPaintEvent;
@@ -85,10 +84,11 @@ private:
     void applyStatusAutoRefreshSetting(bool refreshImmediately);
     void beginDeviceGroupRename(int groupIndex); // wjy: 在分组文字原位置显示输入框，开始原地重命名。
     void finishDeviceGroupRename(bool saveText); // wjy: 回车或点击外部时结束重命名，并按规则保存或恢复。
+    void pruneHiddenDeviceSelections(); // wjy: 分组折叠后清理不可见设备的多选和拖拽状态，避免隐藏设备参与批量移动。
     void runBackgroundTask(std::function<void()> task); // wjy: 后台任务统一由 DeviceGrid 持有，关闭窗口时等待它们结束，避免 detach 线程晚于界面销毁。
 
     QString m_currentDeviceName;
-    QComboBox* m_statusRefreshIntervalCombo = nullptr;
+    QLineEdit* m_statusRefreshIntervalEdit = nullptr; // wjy: 列表自动刷新间隔输入框，只允许输入秒数数字，替代下拉框。
     QLineEdit* m_deviceIpEdit = nullptr;
     QLineEdit* m_deviceNameEdit = nullptr;
     QLineEdit* m_deviceMacEdit = nullptr;
@@ -119,7 +119,7 @@ private:
     bool m_statusAutoRefreshEnabled = false;
     bool m_statusRefreshInProgress = false;
     bool m_wakeProbeInProgress = false;
-    int m_statusAutoRefreshIntervalSeconds = 10;
+    int m_statusAutoRefreshIntervalSeconds = 60; // wjy: 自动刷新间隔默认 60 秒，和设置页数字输入框默认值保持一致。
     int m_deviceListScrollOffset = 0; // wjy: “我的设备”列表的手绘滚动偏移，设备和分组很多时用于上下滚动。
     int m_renamingDeviceGroupIndex = -1; // wjy: 当前正在重命名的分组下标，-1 表示没有分组处于编辑状态。
     // 当前右侧详情页对应的主设备

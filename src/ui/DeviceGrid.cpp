@@ -22,15 +22,14 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QComboBox>
 #include <QHostAddress>
 #include <QIcon>
+#include <QIntValidator>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
 #include <QLineEdit>
-#include <QListView>
 #include <QMenu>
 #include <QMessageBox>
 #include <QMetaObject>
@@ -1300,6 +1299,7 @@ DeviceGrid::DeviceGrid(QWidget* parent)
     setFixedSize(920, 680);
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after setFixedSize before setMouseTracking")); // wjy: 记录固定尺寸设置完成，继续判断是否崩在鼠标追踪设置。
     setMouseTracking(true);
+    setFocusPolicy(Qt::ClickFocus); // wjy: 允许手绘区域被点击后接管焦点，数字输入框点击外部时才能真正失焦并保存。
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after basic widget setup")); // wjy: 记录基础 QWidget 属性设置完成。
 
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before app settings restore")); // wjy: 恢复读取用户设置前打点，若再次异常可以确认是否来自 QSettings/注册表。
@@ -1307,7 +1307,7 @@ DeviceGrid::DeviceGrid(QWidget* parent)
     m_remoteWakeupEnabled = platform::AppSettings::remoteWakeupEnabled(); // wjy: 读取远程开机设置，恢复用户上次选择。
     m_preventSleepEnabled = platform::AppSettings::preventSleepEnabled(); // wjy: 读取防睡眠设置，后续同步应用到系统执行状态。
     m_statusAutoRefreshEnabled = platform::AppSettings::statusAutoRefreshEnabled(); // wjy: 读取设备状态自动刷新开关。
-    m_statusAutoRefreshIntervalSeconds = platform::AppSettings::statusAutoRefreshIntervalSeconds(); // wjy: 读取自动刷新间隔，非法值由 AppSettings 兜底为 10 秒。
+    m_statusAutoRefreshIntervalSeconds = platform::AppSettings::statusAutoRefreshIntervalSeconds(); // wjy: 读取自动刷新间隔，非法值由 AppSettings 兜底为 60 秒。
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before PowerManager restore")); // wjy: 应用防睡眠前打点，便于区分设置读取和系统 API 调用。
     platform::PowerManager::setPreventSleepEnabled(m_preventSleepEnabled); // wjy: 根据保存的设置恢复防睡眠，保证重启程序后行为一致。
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before loadDevices restore")); // wjy: 加载设备文件前打点，验证 devices.json 读写路径是否稳定。
@@ -1597,69 +1597,43 @@ void DeviceGrid::setupSettingsControls()
 {
     // =====wjy====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] setupSettingsControls begin")); // wjy: 进入设置控件初始化，细分 Release 偶发崩溃发生在设置页的哪一步。
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before status combo create")); // wjy: 判断是否崩在自动刷新间隔下拉框创建。
+    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before status interval edit create")); // wjy: 判断是否崩在自动刷新间隔输入框创建。
     // ===end====
-    m_statusRefreshIntervalCombo = new QComboBox(this);
+    m_statusRefreshIntervalEdit = new QLineEdit(this);
     // =====wjy====
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status combo create")); // wjy: 自动刷新间隔下拉框对象创建完成。
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before status combo popup view create")); // wjy: 判断是否崩在下拉框弹出列表视图创建。
+    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status interval edit create")); // wjy: 自动刷新间隔输入框对象创建完成。
     // ===end====
-    auto* popupView = new QListView(m_statusRefreshIntervalCombo);
-    // =====wjy====
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status combo popup view create")); // wjy: 下拉框弹出列表视图创建完成。
-    // ===end====
-    m_statusRefreshIntervalCombo->setGeometry(654, 364, 112, 32);
-    m_statusRefreshIntervalCombo->addItem(zh("5 秒"), 5);
-    m_statusRefreshIntervalCombo->addItem(zh("10 秒"), 10);
-    m_statusRefreshIntervalCombo->addItem(zh("15 秒"), 15);
-    m_statusRefreshIntervalCombo->addItem(zh("30 秒"), 30);
-    m_statusRefreshIntervalCombo->addItem(zh("60 秒"), 60);
-    m_statusRefreshIntervalCombo->setCursor(Qt::PointingHandCursor);
-    m_statusRefreshIntervalCombo->setStyleSheet(QStringLiteral(
-        "QComboBox{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;padding:0 28px 0 12px;"
+    m_statusRefreshIntervalEdit->setGeometry(654, 364, 112, 32);
+    m_statusRefreshIntervalEdit->setValidator(new QIntValidator(1, 86400, m_statusRefreshIntervalEdit)); // wjy: 只允许输入正整数秒数，避免用户输入字母或符号导致定时器间隔异常。
+    m_statusRefreshIntervalEdit->setText(QString::number(qMax(1, m_statusAutoRefreshIntervalSeconds)));
+    m_statusRefreshIntervalEdit->setAlignment(Qt::AlignCenter);
+    m_statusRefreshIntervalEdit->setPlaceholderText(QStringLiteral("60"));
+    m_statusRefreshIntervalEdit->setStyleSheet(QStringLiteral(
+        "QLineEdit{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;padding:0 10px;"
         "font-family:'Microsoft YaHei UI';font-size:14px;color:#040B18;}"
-        "QComboBox:disabled{background:#F5F7FA;border:1px solid #DDE3EA;color:#687384;}"
-        "QComboBox::drop-down{subcontrol-origin:padding;subcontrol-position:top right;width:24px;border:0;}"
-        "QComboBox::down-arrow{image:url(:/UUGuest/resource/images/titlebar/chevron_down.svg);width:12px;height:12px;}"));
+        "QLineEdit:focus{border:1px solid #3A7BFC;}"
+        "QLineEdit:disabled{background:#F5F7FA;border:1px solid #DDE3EA;color:#687384;}"));
     // =====wjy====
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status combo basic setup")); // wjy: 下拉框位置、选项、鼠标和样式设置完成。
+    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status interval edit basic setup")); // wjy: 输入框位置、校验器、初始值和样式设置完成。
+    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before status interval edit signal connect")); // wjy: 判断是否崩在输入框保存逻辑信号连接。
     // ===end====
-    popupView->setStyleSheet(QStringLiteral(
-        "QListView{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;"
-        "font-family:'Microsoft YaHei UI';font-size:14px;color:#040B18;outline:0;padding:4px 0;}"
-        "QListView::item{min-height:30px;padding:0 12px;color:#040B18;background:#FFFFFF;}"
-        "QListView::item:selected{background:#F3F7FF;color:#040B18;}"
-        "QListView::item:hover{background:#F7FAFF;color:#040B18;}"));
-    popupView->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    popupView->setTextElideMode(Qt::ElideNone);
-    // =====wjy====
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status combo popup view setup")); // wjy: 弹出列表样式和滚动策略设置完成。
-    // ===end====
-
-    for (int i = 0; i < m_statusRefreshIntervalCombo->count(); ++i) {
-        m_statusRefreshIntervalCombo->setItemData(i, QColor(QStringLiteral("#040B18")), Qt::ForegroundRole);
-        m_statusRefreshIntervalCombo->setItemData(i, QSize(0, 30), Qt::SizeHintRole);
-    }
-    // =====wjy====
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status combo item roles")); // wjy: 下拉框每个选项的颜色和高度数据设置完成。
-    // ===end====
-
-    const int initialIndex = qMax(0, m_statusRefreshIntervalCombo->findData(m_statusAutoRefreshIntervalSeconds));
-    m_statusRefreshIntervalCombo->setCurrentIndex(initialIndex);
-    // =====wjy====
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status combo current index")); // wjy: 自动刷新间隔初始选项设置完成。
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before status combo signal connect")); // wjy: 判断是否崩在下拉框 currentIndexChanged 信号连接。
-    // ===end====
-    connect(m_statusRefreshIntervalCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
-        if (index < 0) {
-            return;
+    const auto saveStatusRefreshInterval = [this] {
+        if (!m_statusRefreshIntervalEdit) {
+            return; // wjy: 防御性判空，避免关闭阶段信号触发访问已释放控件。
         }
-        m_statusAutoRefreshIntervalSeconds = m_statusRefreshIntervalCombo->itemData(index).toInt();
+        int seconds = m_statusRefreshIntervalEdit->text().trimmed().toInt();
+        if (seconds <= 0) {
+            seconds = 60; // wjy: 输入为空或非法时回到默认 60 秒。
+            m_statusRefreshIntervalEdit->setText(QString::number(seconds));
+        }
+        m_statusAutoRefreshIntervalSeconds = seconds;
         platform::AppSettings::setStatusAutoRefreshIntervalSeconds(m_statusAutoRefreshIntervalSeconds);
-        applyStatusAutoRefreshSetting(false);
-    });
+        applyStatusAutoRefreshSetting(false); // wjy: 保存后立即重启自动刷新定时器，让新的秒数马上生效。
+    };
+    connect(m_statusRefreshIntervalEdit, &QLineEdit::editingFinished, this, saveStatusRefreshInterval);
+    connect(m_statusRefreshIntervalEdit, &QLineEdit::returnPressed, this, saveStatusRefreshInterval);
     // =====wjy====
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status combo signal connect")); // wjy: 自动刷新间隔下拉框信号连接完成。
+    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status interval edit signal connect")); // wjy: 自动刷新间隔输入框信号连接完成。
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before updateSettingsControls in setup")); // wjy: 判断是否崩在首次刷新设置控件显隐状态。
     // ===end====
 
@@ -1736,12 +1710,19 @@ void DeviceGrid::refreshLocalDeviceInfo()
 
 void DeviceGrid::updateSettingsControls()
 {
-    if (!m_statusRefreshIntervalCombo) {
+    if (!m_statusRefreshIntervalEdit) {
         return;
     }
-    const bool visible = m_settingsSelected;
-    m_statusRefreshIntervalCombo->setVisible(visible);
-    m_statusRefreshIntervalCombo->setEnabled(m_statusAutoRefreshEnabled);
+// =====wjy====
+    const bool visible =
+        m_settingsSelected
+        && m_statusAutoRefreshEnabled; // wjy: 自动刷新关闭时隐藏秒数输入框；打开后才显示，避免设置页出现无效输入区域。
+    m_statusRefreshIntervalEdit->setVisible(visible);
+    m_statusRefreshIntervalEdit->setEnabled(m_statusAutoRefreshEnabled);
+    if (visible) {
+        m_statusRefreshIntervalEdit->raise(); // wjy: 输入框是 Qt 子控件，显示时提升到手绘设置页上层，避免被父控件重绘视觉上盖住。
+    }
+// ===end====
 }
 
 void DeviceGrid::applyStatusAutoRefreshSetting(bool refreshImmediately)
@@ -2973,6 +2954,82 @@ void DeviceGrid::startDeviceSwitchAnimation(int newIndex, const QString& newName
     update();
 }
 
+// =====wjy====
+void DeviceGrid::pruneHiddenDeviceSelections()
+{
+    const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 以当前展开/折叠后的可见行作为唯一可信的选择范围。
+    QSet<int> visibleDeviceIndexes; // wjy: 保存当前左侧列表里真实可见的设备下标，用来过滤隐藏设备。
+    int firstVisibleDeviceIndex = -1; // wjy: 当前主设备被隐藏时，用第一个可见设备作为详情页兜底目标。
+    int firstSelectedVisibleDeviceIndex = -1; // wjy: 如果多选里还有可见设备，优先用它作为新的主设备。
+
+    for (const DeviceListRow& row : rows) {
+        if (row.type != DeviceListRow::Type::Device
+            || row.deviceIndex < 0
+            || row.deviceIndex >= g_devices.size()) {
+            continue; // wjy: 分组行和异常下标不参与选择集合计算。
+        }
+
+        visibleDeviceIndexes.insert(row.deviceIndex); // wjy: 记录当前仍显示在左侧列表里的真实设备。
+        if (firstVisibleDeviceIndex < 0) {
+            firstVisibleDeviceIndex = row.deviceIndex; // wjy: 保留视觉顺序里的第一台可见设备作为兜底。
+        }
+        if (firstSelectedVisibleDeviceIndex < 0
+            && m_selectedDeviceIndexes.contains(row.deviceIndex)) {
+            firstSelectedVisibleDeviceIndex = row.deviceIndex; // wjy: 保留视觉顺序里的第一台仍可见已选设备。
+        }
+    }
+
+    for (auto it = m_selectedDeviceIndexes.begin(); it != m_selectedDeviceIndexes.end();) {
+        if (!visibleDeviceIndexes.contains(*it)) {
+            it = m_selectedDeviceIndexes.erase(it); // wjy: 设备被折叠隐藏后，不再保留在多选集合里。
+        } else {
+            ++it;
+        }
+    }
+
+    for (auto it = m_draggingDeviceIndexes.begin(); it != m_draggingDeviceIndexes.end();) {
+        if (!visibleDeviceIndexes.contains(*it)) {
+            it = m_draggingDeviceIndexes.erase(it); // wjy: 隐藏设备也不能留在后续批量拖拽快照里。
+        } else {
+            ++it;
+        }
+    }
+
+    if (m_selectionAnchorDeviceIndex >= 0
+        && !visibleDeviceIndexes.contains(m_selectionAnchorDeviceIndex)) {
+        m_selectionAnchorDeviceIndex = firstSelectedVisibleDeviceIndex; // wjy: Shift 锚点被折叠隐藏时，改成可见选中设备；没有则清空。
+    }
+
+    if (m_selectedDeviceIndex >= 0
+        && m_selectedDeviceIndex < g_devices.size()
+        && visibleDeviceIndexes.contains(m_selectedDeviceIndex)) {
+        return; // wjy: 右侧详情主设备仍可见时，只需要完成上面的集合清理。
+    }
+
+    const int nextDeviceIndex = firstSelectedVisibleDeviceIndex >= 0
+        ? firstSelectedVisibleDeviceIndex
+        : firstVisibleDeviceIndex; // wjy: 主设备被隐藏时，优先切到可见选中设备，否则切到第一台可见设备。
+    if (nextDeviceIndex < 0) {
+        m_selectedDeviceIndexes.clear(); // wjy: 当前没有任何可见设备时，清空左侧选择，避免隐藏设备继续高亮或被拖拽。
+        m_draggingDeviceIndexes.clear();
+        m_selectionAnchorDeviceIndex = -1;
+        return;
+    }
+
+    m_selectedDeviceIndex = nextDeviceIndex; // wjy: 将右侧详情主设备同步到仍可见的设备，避免详情指向折叠隐藏项。
+    m_previousDeviceIndex = nextDeviceIndex;
+    m_currentDeviceName = deviceDisplayName(g_devices.at(nextDeviceIndex));
+    m_previousDeviceName = m_currentDeviceName;
+    m_selectedDeviceIndexes.insert(nextDeviceIndex); // wjy: 新主设备必须在左侧多选集合里，保证视觉选中态一致。
+    if (m_selectionAnchorDeviceIndex < 0) {
+        m_selectionAnchorDeviceIndex = nextDeviceIndex; // wjy: 没有可用 Shift 锚点时，用新主设备作为下一次范围选择起点。
+    }
+    if (m_detailAnimationTimer) {
+        m_detailAnimationTimer->stop(); // wjy: 分组折叠引发的主设备兜底切换不播放详情页切换动画，避免隐藏项参与过渡。
+    }
+}
+// ===end====
+
 void DeviceGrid::setDesktopHoverActive(bool active)
 {
     if (m_desktopHovered == active) {
@@ -3036,6 +3093,13 @@ void DeviceGrid::clearBottomActionHover()
 void DeviceGrid::mousePressEvent(QMouseEvent* event)
 {
 // =====wjy====
+    if (m_statusRefreshIntervalEdit
+        && m_statusRefreshIntervalEdit->hasFocus()
+        && !m_statusRefreshIntervalEdit->geometry().contains(event->pos())) {
+        m_statusRefreshIntervalEdit->clearFocus(); // wjy: 设置页是手绘区域，点击空白/开关不会天然抢焦点，这里主动让秒数输入框失焦并触发保存。
+        setFocus(Qt::MouseFocusReason); // wjy: 父控件接管焦点，避免输入框清焦后马上继续接收键盘输入。
+    }
+
     if (m_deviceGroupNameEdit
         && m_deviceGroupNameEdit->isVisible()
         && !m_deviceGroupNameEdit->geometry().contains(event->pos())) { // wjy: 点击分组输入框外部时，提交当前名字并关闭输入框。
@@ -3186,9 +3250,18 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
                     deviceIndex)) {
 
                 // 按在已经选中的设备上：
-                // 拖动当前全部选中的设备。
-                m_draggingDeviceIndexes =
-                    m_selectedDeviceIndexes;
+                // 拖动当前可见且已选中的设备。
+                for (const DeviceListRow& selectedRow : rows) {
+                    if (selectedRow.type == DeviceListRow::Type::Device
+                        && selectedRow.deviceIndex >= 0
+                        && selectedRow.deviceIndex < g_devices.size()
+                        && m_selectedDeviceIndexes.contains(selectedRow.deviceIndex)) {
+                        m_draggingDeviceIndexes.insert(selectedRow.deviceIndex); // wjy: 只把当前可见设备写入拖拽快照，折叠隐藏的选中设备不会被批量移动。
+                    }
+                }
+                if (m_draggingDeviceIndexes.isEmpty()) {
+                    m_draggingDeviceIndexes.insert(deviceIndex); // wjy: 极端情况下可见过滤为空时，至少拖动鼠标按下的这台设备。
+                }
             } else {
                 // 按在一个没有被选中的设备上：
                 // 本次只拖动这一台，避免误移动原来的多选设备。
@@ -3574,6 +3647,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                         g_deviceGroupExpandedStates.append(true); // wjy: 防御性补齐状态数组，缺失状态默认按展开处理。
                     }
                     g_deviceGroupExpandedStates[groupIndex] = !g_deviceGroupExpandedStates.at(groupIndex); // wjy: 点击分组行时切换展开状态，从而让箭头上下倒转。
+                    pruneHiddenDeviceSelections(); // wjy: 分组折叠后立即移除隐藏设备选择，避免后续 Shift/拖拽继续带着不可见设备。
                     saveDevices(); // wjy: 保存分组展开状态，重启后箭头方向保持一致。
                     update();
                     event->accept();
@@ -3591,6 +3665,10 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                     const bool shiftPressed =
                         event->modifiers().testFlag(
                             Qt::ShiftModifier);
+                    const bool ctrlPressed =
+                        event->modifiers().testFlag(
+                            Qt::ControlModifier); // wjy: Ctrl+左键使用文件管理器式的单项加入/取消多选。
+                    int detailDeviceIndex = deviceIndex; // wjy: 默认右侧详情跟随本次点击的设备，Ctrl 取消当前项时会重新选择一个仍可见的已选设备。
 
                     if (shiftPressed
                         && m_selectionAnchorDeviceIndex >= 0) {
@@ -3658,6 +3736,31 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                             m_selectionAnchorDeviceIndex =
                                 deviceIndex;
                         }
+                    } else if (ctrlPressed) {
+                        if (m_selectedDeviceIndexes.contains(deviceIndex)
+                            && m_selectedDeviceIndexes.size() > 1) {
+                            m_selectedDeviceIndexes.remove(deviceIndex); // wjy: Ctrl 点已选设备时从多选集合里移除，行为对齐文件管理器取消选择。
+
+                            bool foundVisibleSelectedDevice = false; // wjy: 记录取消当前设备后，是否还能找到另一台可见已选设备接管详情页。
+                            for (const DeviceListRow& visibleRow : rows) {
+                                if (visibleRow.type == DeviceListRow::Type::Device
+                                    && visibleRow.deviceIndex >= 0
+                                    && visibleRow.deviceIndex < g_devices.size()
+                                    && m_selectedDeviceIndexes.contains(visibleRow.deviceIndex)) {
+                                    detailDeviceIndex = visibleRow.deviceIndex; // wjy: 被取消的是详情主设备时，切到第一台仍可见的已选设备。
+                                    foundVisibleSelectedDevice = true;
+                                    break;
+                                }
+                            }
+                            if (!foundVisibleSelectedDevice) {
+                                m_selectedDeviceIndexes.insert(deviceIndex); // wjy: 如果历史残留状态导致没有可见已选设备，就保留当前设备，避免详情指向未选中项。
+                                detailDeviceIndex = deviceIndex;
+                            }
+                        } else {
+                            m_selectedDeviceIndexes.insert(deviceIndex); // wjy: Ctrl 点未选设备时加入多选；如果只剩这一台，则保持至少一台被选中。
+                        }
+
+                        m_selectionAnchorDeviceIndex = deviceIndex; // wjy: Ctrl 点击也作为下一次 Shift 范围选择的新起点，贴近文件管理器操作习惯。
                     } else {
                         // 没有按 Shift：普通单选，
                         // 同时把这台设备设为下一次 Shift 的起点。
@@ -3680,11 +3783,11 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                     updateLocalInfoControls();
                     updateSettingsControls();
 
-                    // 最后点击的设备仍然作为右侧详情主设备。
+                    // 右侧详情跟随当前点击或 Ctrl 取消后仍可见的已选设备。
                     startDeviceSwitchAnimation(
-                        deviceIndex,
+                        detailDeviceIndex,
                         deviceDisplayName(
-                            g_devices.at(deviceIndex)));
+                            g_devices.at(detailDeviceIndex)));
 
                     event->accept();
                     return;
