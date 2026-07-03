@@ -25,7 +25,7 @@ void AppSettings::setPreventSleepEnabled(bool enabled)
 
 bool AppSettings::remoteWakeupEnabled()
 {
-    return settings().value(QStringLiteral("remoteWakeupEnabled"), false).toBool();
+    return settings().value(QStringLiteral("remoteWakeupEnabled"), true).toBool(); //允许远程控制
 }
 
 void AppSettings::setRemoteWakeupEnabled(bool enabled)
@@ -36,7 +36,7 @@ void AppSettings::setRemoteWakeupEnabled(bool enabled)
 
 bool AppSettings::statusAutoRefreshEnabled()
 {
-    return settings().value(QStringLiteral("statusAutoRefreshEnabled"), false).toBool();
+    return settings().value(QStringLiteral("statusAutoRefreshEnabled"), true).toBool();
 }
 
 void AppSettings::setStatusAutoRefreshEnabled(bool enabled)

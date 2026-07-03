@@ -26,6 +26,8 @@ QByteArray statusPayload(bool busy)
     payload.append('|');
     payload.append(loginUser.toUtf8());
     payload.append('|');
+    payload.append(localInfo.name.trimmed().toUtf8()); // wjy: 追加远端设备名，批量新增时用电脑名而不是登录账户名。
+    payload.append('|');
     payload.append(localInfo.ip.trimmed().toUtf8());
     payload.append('|');
     payload.append(localInfo.subnetMask.trimmed().toUtf8());
@@ -68,17 +70,25 @@ DeviceStatusInfo queryStatusInfo(const QString& hostIp, uint16_t port, int timeo
     if (parts.size() > 1) {
         info.terminalUser = QString::fromUtf8(parts.at(1)).trimmed();
     }
-    if (parts.size() > 2) {
-        info.localIp = QString::fromUtf8(parts.at(2)).trimmed();
-    }
-    if (parts.size() > 3) {
-        info.subnetMask = QString::fromUtf8(parts.at(3)).trimmed();
-    }
-    if (parts.size() > 4) {
-        info.broadcastIp = QString::fromUtf8(parts.at(4)).trimmed();
-    }
-    if (parts.size() > 5) {
-        info.mac = QString::fromUtf8(parts.at(5)).trimmed();
+    if (parts.size() > 6) {
+        info.deviceName = QString::fromUtf8(parts.at(2)).trimmed(); // wjy: 新协议字段，保存远端电脑名。
+        info.localIp = QString::fromUtf8(parts.at(3)).trimmed();
+        info.subnetMask = QString::fromUtf8(parts.at(4)).trimmed();
+        info.broadcastIp = QString::fromUtf8(parts.at(5)).trimmed();
+        info.mac = QString::fromUtf8(parts.at(6)).trimmed();
+    } else {
+        if (parts.size() > 2) {
+            info.localIp = QString::fromUtf8(parts.at(2)).trimmed(); // wjy: 兼容旧状态协议，旧客户端没有 deviceName 字段。
+        }
+        if (parts.size() > 3) {
+            info.subnetMask = QString::fromUtf8(parts.at(3)).trimmed();
+        }
+        if (parts.size() > 4) {
+            info.broadcastIp = QString::fromUtf8(parts.at(4)).trimmed();
+        }
+        if (parts.size() > 5) {
+            info.mac = QString::fromUtf8(parts.at(5)).trimmed();
+        }
     }
     return info;
 }

@@ -19,6 +19,7 @@ enum class DevicePresenceState {
 struct DeviceStatusInfo {
     DevicePresenceState state = DevicePresenceState::Offline;
     QString terminalUser;
+    QString deviceName;
     QString localIp;
     QString subnetMask;
     QString broadcastIp;

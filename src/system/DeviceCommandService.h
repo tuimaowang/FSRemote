@@ -28,6 +28,7 @@ class DeviceCommandService final {
 public:
     static bool send(const QString& hostIp, DeviceControlAction action, uint16_t port = 49102, int timeoutMs = 1500);
     static bool sendWakeProxy(const QString& hostIp, const QString& macAddress, QString* errorMessage = nullptr, uint16_t port = 49102, int timeoutMs = 1500);
+    static bool renameDevice(const QString& hostIp, const QString& newName, QString* errorMessage = nullptr, uint16_t port = 49102, int timeoutMs = 1500);
 };
 
 } // namespace platform

@@ -38,15 +38,15 @@ class DeviceGrid final : public QFrame {
 
 public:
     explicit DeviceGrid(QWidget* parent = nullptr);
-    ~DeviceGrid() override; // wjy: 仅用于记录 DeviceGrid 销毁时机，帮助判断后台线程是否晚于界面销毁返回。
+    ~DeviceGrid() override; // wjy: Used to record DeviceGrid destroy timing and wait background threads safely.
 
 protected:
     void paintEvent(QPaintEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
-    void mouseDoubleClickEvent(QMouseEvent* event) override; // wjy: 双击分组行时进入原地重命名。
+    void mouseDoubleClickEvent(QMouseEvent* event) override; // wjy: Double click a group row to rename in place.
     void mouseReleaseEvent(QMouseEvent* event) override;
-    void wheelEvent(QWheelEvent* event) override; // wjy: 手绘设备列表使用滚轮事件实现滚动，不额外拆子控件。
+    void wheelEvent(QWheelEvent* event) override; // wjy: The hand-painted device list handles scrolling here.
     void leaveEvent(QEvent* event) override;
 
 private:
@@ -64,7 +64,7 @@ private:
     void showDeviceMenu();
     void openCurrentDeviceTerminal();
     void openRemoteDesktopWindow();
-    void openDeviceGroupTiledWindows(int groupIndex); // wjy: 打开某个分组内所有设备的远程桌面，并按屏幕网格平铺。
+    void openDeviceGroupTiledWindows(int groupIndex); // wjy: Open all devices in one group and tile remote windows.
     void refreshLocalDeviceInfo();
     void shutdownCurrentDevice();
     void restartCurrentDevice();
@@ -82,31 +82,34 @@ private:
     void setupSettingsControls();
     void updateSettingsControls();
     void applyStatusAutoRefreshSetting(bool refreshImmediately);
-    void beginDeviceGroupRename(int groupIndex); // wjy: 在分组文字原位置显示输入框，开始原地重命名。
-    void finishDeviceGroupRename(bool saveText); // wjy: 回车或点击外部时结束重命名，并按规则保存或恢复。
-    void pruneHiddenDeviceSelections(); // wjy: 分组折叠后清理不可见设备的多选和拖拽状态，避免隐藏设备参与批量移动。
-    void runBackgroundTask(std::function<void()> task); // wjy: 后台任务统一由 DeviceGrid 持有，关闭窗口时等待它们结束，避免 detach 线程晚于界面销毁。
+    void startBatchAddDevices(); // wjy: 从设置页网段输入框启动批量扫描并追加在线设备。
+    void beginDeviceGroupRename(int groupIndex); // wjy: Show the group rename editor in place.
+    void finishDeviceGroupRename(bool saveText); // wjy: Finish group rename on Enter or focus loss.
+    void pruneHiddenDeviceSelections(); // wjy: Remove collapsed hidden devices from multi-selection state.
+    void runBackgroundTask(std::function<void()> task); // wjy: Keep background tasks joinable until DeviceGrid is destroyed.
 
     QString m_currentDeviceName;
-    QLineEdit* m_statusRefreshIntervalEdit = nullptr; // wjy: 列表自动刷新间隔输入框，只允许输入秒数数字，替代下拉框。
+    QLineEdit* m_statusRefreshIntervalEdit = nullptr; // wjy: Auto refresh interval edit.
+    QLineEdit* m_batchSubnetEdit = nullptr; // wjy: 批量新增网段输入框，支持 192.168.3.* 格式。
+    QPushButton* m_batchAddButton = nullptr; // wjy: 批量新增按钮，扫描期间禁用避免重复启动。
     QLineEdit* m_deviceIpEdit = nullptr;
     QLineEdit* m_deviceNameEdit = nullptr;
     QLineEdit* m_deviceMacEdit = nullptr;
     QLineEdit* m_deviceRemarkEdit = nullptr;
-    QLineEdit* m_deviceGroupNameEdit = nullptr; // wjy: 分组原地重命名输入框，平时隐藏，双击分组时显示。
+    QLineEdit* m_deviceGroupNameEdit = nullptr; // wjy: Group rename editor.
     QPushButton* m_saveDeviceButton = nullptr;
     QPushButton* m_cancelDeviceButton = nullptr;
     QVector<QPushButton*> m_localInfoCopyButtons;
     bool m_draggingWindow = false;
     QPoint m_dragOffset;
-    bool m_deviceDragCandidateActive = false; // wjy: 鼠标按下设备行后先作为拖拽候选，移动超过阈值才进入真正拖拽。
-    bool m_draggingDevice = false; // wjy: 当前是否正在拖拽设备；第一步只用于输出识别日志，不改变数据。
-    int m_draggingDeviceIndex = -1; // wjy: 当前拖拽候选/正在拖拽的设备下标，-1 表示没有设备被拖拽。
+    bool m_deviceDragCandidateActive = false; // wjy: Mouse-down device row is a drag candidate before crossing threshold.
+    bool m_draggingDevice = false; // wjy: True while dragging devices.
+    int m_draggingDeviceIndex = -1; // wjy: Current dragged device index, -1 means none.
 
-    // 本次真正需要批量移动的所有设备下标
+    // wjy: Device indexes that should move together in the current drag.
     QSet<int> m_draggingDeviceIndexes;
-    QPoint m_deviceDragStartPos; // wjy: 记录设备拖拽起点，用来判断鼠标移动距离是否达到拖拽阈值。
-    QPoint m_deviceDragCurrentPos; // wjy: 记录拖拽过程中的当前鼠标位置，用来绘制跟随鼠标移动的半透明设备虚影。
+    QPoint m_deviceDragStartPos; // wjy: Device drag start position.
+    QPoint m_deviceDragCurrentPos; // wjy: Current mouse position while dragging devices.
     bool m_deviceGroupExpanded = true;
     bool m_remoteAssistExpanded = true;
     bool m_remoteAssistSelected = false;
@@ -119,23 +122,24 @@ private:
     bool m_statusAutoRefreshEnabled = false;
     bool m_statusRefreshInProgress = false;
     bool m_wakeProbeInProgress = false;
-    int m_statusAutoRefreshIntervalSeconds = 60; // wjy: 自动刷新间隔默认 60 秒，和设置页数字输入框默认值保持一致。
-    int m_deviceListScrollOffset = 0; // wjy: “我的设备”列表的手绘滚动偏移，设备和分组很多时用于上下滚动。
-    int m_renamingDeviceGroupIndex = -1; // wjy: 当前正在重命名的分组下标，-1 表示没有分组处于编辑状态。
-    // 当前右侧详情页对应的主设备
+    bool m_batchAddInProgress = false; // wjy: 标记批量新增扫描是否正在后台执行。
+    int m_statusAutoRefreshIntervalSeconds = 60; // wjy: Default auto refresh interval is 60 seconds.
+    int m_deviceListScrollOffset = 0; // wjy: Scroll offset for the hand-painted device list.
+    int m_renamingDeviceGroupIndex = -1; // wjy: Current renaming group index, -1 means none.
+    // wjy: Primary device shown on the right detail page.
     int m_selectedDeviceIndex = 0;
 
-    // 左侧所有被选中的设备
+    // wjy: All selected device indexes in the left list.
     QSet<int> m_selectedDeviceIndexes;
 
-    // Shift 范围选择的起点
+    // wjy: Anchor index for Shift range selection.
     int m_selectionAnchorDeviceIndex = -1;
 
     int m_previousDeviceIndex = 0;
     QString m_previousDeviceName;
-    std::mutex m_backgroundThreadsMutex; // wjy: 保护后台线程列表，析构等待和新任务登记不能同时改 vector。
-    std::vector<std::thread> m_backgroundThreads; // wjy: 保存状态刷新/唤醒检测等后台线程，析构时 join 防止关闭阶段堆损坏。
-    bool m_shuttingDown = false; // wjy: DeviceGrid 析构开始后不再接受新的后台任务。
+    std::mutex m_backgroundThreadsMutex; // wjy: Protects background thread list.
+    std::vector<std::thread> m_backgroundThreads; // wjy: Joined in destructor to avoid late UI callbacks.
+    bool m_shuttingDown = false; // wjy: No new background tasks after destruction begins.
     QHash<QString, platform::DevicePresenceState> m_deviceStatuses;
     QTimer* m_detailAnimationTimer = nullptr;
     QTimer* m_desktopHoverTimer = nullptr;

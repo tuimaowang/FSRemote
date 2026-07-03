@@ -310,6 +310,49 @@ bool parseIpv4Address(const QString& text, quint32* outValue)
     return true;
 }
 
+bool isWildcardSubnetPattern(const QString& text)
+{
+    const QStringList parts = text.trimmed().split('.');
+    if (parts.size() != 4 || parts.at(3).trimmed() != QStringLiteral("*")) {
+        return false;
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        bool ok = false;
+        const int value = parts.at(i).trimmed().toInt(&ok);
+        if (!ok || value < 0 || value > 255) {
+            return false;
+        }
+    }
+    return true;
+}
+
+QStringList wildcardSubnetScanIps(const QString& text)
+{
+    QStringList result;
+    const QStringList parts = text.trimmed().split('.');
+    if (parts.size() != 4 || parts.at(3).trimmed() != QStringLiteral("*")) {
+        return result; // wjy: 非 192.168.3.* 格式时不生成扫描列表。
+    }
+
+    const QString prefix = QStringLiteral("%1.%2.%3.")
+        .arg(parts.at(0).trimmed())
+        .arg(parts.at(1).trimmed())
+        .arg(parts.at(2).trimmed()); // wjy: 只遍历最后一段，前三段保持用户输入的网段。
+    result.reserve(254);
+    for (int host = 1; host <= 254; ++host) {
+        result.append(prefix + QString::number(host)); // wjy: 跳过 .0 和 .255，避免扫描网络号和广播地址。
+    }
+    return result;
+}
+
+struct BatchAddResult {
+    QString name;
+    QString ip;
+    QString mac;
+    QString broadcastIp;
+};
+
 bool isSameSubnet(const QString& targetIp, const QString& candidateIp, const QString& subnetMask)
 {
     quint32 target = 0;
@@ -327,6 +370,14 @@ bool isSameSubnet(const QString& targetIp, const QString& candidateIp, const QSt
 QVector<DeviceEntry> g_devices;
 QVector<QString> g_deviceGroupNames; // wjy: 保存右键新建的分组名称，会写入 devices.json 的 groups 字段。
 QVector<bool> g_deviceGroupExpandedStates; // wjy: 保存每个分组是否展开，会和分组名称一起持久化。
+
+bool deviceIpExists(const QString& ip)
+{
+    const QString trimmedIp = ip.trimmed();
+    return g_devices.cend() != std::find_if(g_devices.cbegin(), g_devices.cend(), [&trimmedIp](const DeviceEntry& device) {
+        return device.ip.trimmed() == trimmedIp; // wjy: 按 IP 去重，避免批量扫描把已有设备再次写入 devices.json。
+    });
+}
 
 QString deviceStorePath()
 {
@@ -407,23 +458,48 @@ void loadDevices()
         : QJsonArray(); // wjy: 旧数组格式没有 groups，加载时保持分组为空。
 // ===end====
 
+    int deviceJsonIndex = -1;
     for (const QJsonValue& value : deviceArray) {
+        ++deviceJsonIndex;
         const QJsonObject object = value.toObject();
         const QString ip = object.value(QStringLiteral("ip")).toString().trimmed();
         if (ip.isEmpty()) {
+            qWarning().noquote() << QStringLiteral("[loadDevices] skip empty ip index=%1").arg(deviceJsonIndex);
             continue;
         }
+        quint32 ipValue = 0;
+        if (!parseIpv4Address(ip, &ipValue)) {
+            qWarning().noquote() << QStringLiteral("[loadDevices] skip invalid ip index=%1 ip=%2")
+                .arg(deviceJsonIndex)
+                .arg(ip);
+            continue;
+        }
+        qWarning().noquote() << QStringLiteral("[loadDevices] duplicate ip=%1 duplicated=%2")
+            .arg(ip)
+            .arg(g_devices.cend() != std::find_if(g_devices.cbegin(), g_devices.cend(), [&ip](const DeviceEntry& device) {
+                return device.ip.trimmed() == ip;
+            }));
         QString name = object.value(QStringLiteral("name")).toString().trimmed();
         if (name.isEmpty()) {
             name = ip;
         }
+        const QString mac = object.value(QStringLiteral("mac")).toString().trimmed();
+        const QString broadcastIp = object.value(QStringLiteral("broadcast_ip")).toString().trimmed();
+        const QString remark = object.value(QStringLiteral("remark")).toString();
+        const QString group = object.value(QStringLiteral("group")).toString().trimmed();
+        qWarning().noquote() << QStringLiteral("[loadDevices] append index=%1 name=%2 ip=%3 mac=%4 group=%5")
+            .arg(deviceJsonIndex)
+            .arg(name)
+            .arg(ip)
+            .arg(mac)
+            .arg(group);
         g_devices.append({
             name,
             ip,
-            object.value(QStringLiteral("mac")).toString().trimmed(),
-            object.value(QStringLiteral("broadcast_ip")).toString().trimmed(),
-            object.value(QStringLiteral("remark")).toString(),
-            object.value(QStringLiteral("group")).toString().trimmed() // wjy: 读取设备所属分组；旧 devices.json 没有 group 时会得到空字符串。
+            mac,
+            broadcastIp,
+            remark,
+            group // wjy: 读取设备所属分组；旧 devices.json 没有 group 时会得到空字符串。
         });
     }
 
@@ -1226,6 +1302,16 @@ QRect settingsAutoRefreshSwitchRect()
     return QRect(780, 368, 82, 32);
 }
 
+QRect settingsBatchSubnetInputRect()
+{
+    return QRect(596, 448, 140, 32);
+}
+
+QRect settingsBatchAddButtonRect()
+{
+    return QRect(750, 448, 96, 32);
+}
+
 void drawSettingsPage(
     QPainter& painter,
     const QFont& textFont,
@@ -1254,11 +1340,13 @@ void drawSettingsPage(
     painter.drawRoundedRect(QRectF(270.5, 120.5, 599, 143), 4, 4);
     painter.drawRoundedRect(QRectF(270.5, 268.5, 599, 71), 4, 4);
     painter.drawRoundedRect(QRectF(270.5, 344.5, 599, 71), 4, 4);
+    painter.drawRoundedRect(QRectF(270.5, 420.5, 599, 88), 4, 4);
     painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
     painter.drawLine(QPointF(270, 192.5), QPointF(870, 192.5));
 
     drawResourceIcon(painter, QRect(289, 144, 24, 24), QStringLiteral("settings/auto_run.svg"));
     drawResourceIcon(painter, QRect(289, 290, 24, 24), QStringLiteral("settings/prevent_sleep.svg"));
+    drawDeviceTileIcon(painter, 291, 450, 20);
 
     painter.setFont(textFont);
     painter.setPen(QColor(QStringLiteral("#040B18")));
@@ -1266,6 +1354,7 @@ void drawSettingsPage(
     painter.drawText(QRectF(330, 208, 210, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE5\x85\x81\xE8\xAE\xB8\xE9\x80\x9A\xE8\xBF\x87\xE8\xBF\x9C\xE7\xA8\x8B\xE5\xBC\x80\xE6\x9C\xBA\xE5\x90\xAF\xE5\x8A\xA8"));
     painter.drawText(QRectF(330, 284, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE9\x98\xB2\xE6\xAD\xA2\xE7\x94\xB5\xE8\x84\x91\xE4\xBC\x91\xE7\x9C\xA0"));
     painter.drawText(QRectF(330, 360, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE5\x88\x97\xE8\xA1\xA8\xE8\x87\xAA\xE5\x8A\xA8\xE5\x88\xB7\xE6\x96\xB0"));
+    painter.drawText(QRectF(330, 444, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QStringLiteral("批量新增设备"));
 
     QFont subFont(QStringLiteral("Microsoft YaHei UI"));
     subFont.setPixelSize(12);
@@ -1275,6 +1364,7 @@ void drawSettingsPage(
     painter.setPen(QColor(QStringLiteral("#687384")));
     painter.drawText(QRectF(330, 305, 330, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE4\xBC\x91\xE7\x9C\xA0\xE5\xB0\x86\xE5\xAF\xBC\xE8\x87\xB4\xE7\x94\xB5\xE8\x84\x91\xE6\x97\xA0\xE6\xB3\x95\xE8\xBF\x9C\xE7\xA8\x8B\xE6\x8E\xA7\xE5\x88\xB6\xEF\xBC\x88\xE5\xBC\xBA\xE7\x83\x88\xE6\x8E\xA8\xE8\x8D\x90\xE5\xBC\x80\xE5\x90\xAF\xEF\xBC\x89"));
     painter.drawText(QRectF(330, 381, 330, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE6\x8C\x89\xE9\x80\x89\xE5\xAE\x9A\xE6\x97\xB6\xE9\x97\xB4\xE5\x91\xA8\xE6\x9C\x9F\xE6\xA3\x80\xE6\xB5\x8B\xE8\xAE\xBE\xE5\xA4\x87\xE5\x9C\xA8\xE7\xBA\xBF\xE7\x8A\xB6\xE6\x80\x81"));
+    painter.drawText(QRectF(330, 465, 300, 20), Qt::AlignVCenter | Qt::AlignLeft, QStringLiteral("输入 192.168.3.* 扫描在线受控端"));
 
     painter.setFont(textFont);
     painter.setPen(QColor(QStringLiteral("#040B18")));
@@ -1304,7 +1394,12 @@ DeviceGrid::DeviceGrid(QWidget* parent)
 
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before app settings restore")); // wjy: 恢复读取用户设置前打点，若再次异常可以确认是否来自 QSettings/注册表。
     m_autoRunEnabled = platform::StartupManager::isEnabled(); // wjy: 读取当前开机自启状态，让设置页显示真实开关值。
+    if (!m_autoRunEnabled) { //永远开机自启
+        platform::StartupManager::setEnabled(true);
+        m_autoRunEnabled = true;
+    }
     m_remoteWakeupEnabled = platform::AppSettings::remoteWakeupEnabled(); // wjy: 读取远程开机设置，恢复用户上次选择。
+
     m_preventSleepEnabled = platform::AppSettings::preventSleepEnabled(); // wjy: 读取防睡眠设置，后续同步应用到系统执行状态。
     m_statusAutoRefreshEnabled = platform::AppSettings::statusAutoRefreshEnabled(); // wjy: 读取设备状态自动刷新开关。
     m_statusAutoRefreshIntervalSeconds = platform::AppSettings::statusAutoRefreshIntervalSeconds(); // wjy: 读取自动刷新间隔，非法值由 AppSettings 兜底为 60 秒。
@@ -1634,6 +1729,27 @@ void DeviceGrid::setupSettingsControls()
     connect(m_statusRefreshIntervalEdit, &QLineEdit::returnPressed, this, saveStatusRefreshInterval);
     // =====wjy====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status interval edit signal connect")); // wjy: 自动刷新间隔输入框信号连接完成。
+    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before batch add controls create")); // wjy: 开始创建批量新增真实控件，后续若异常可定位到设置页批量新增区域。
+    m_batchSubnetEdit = new QLineEdit(this);
+    m_batchSubnetEdit->setGeometry(settingsBatchSubnetInputRect());
+    m_batchSubnetEdit->setText(QStringLiteral("192.168.3.*"));
+    m_batchSubnetEdit->setPlaceholderText(QStringLiteral("192.168.3.*"));
+    m_batchSubnetEdit->setAlignment(Qt::AlignCenter);
+    m_batchSubnetEdit->setStyleSheet(QStringLiteral(
+        "QLineEdit{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;padding:0 10px;"
+        "font-family:'Microsoft YaHei UI';font-size:14px;color:#040B18;}"
+        "QLineEdit:focus{border:1px solid #3A7BFC;}"
+        "QLineEdit:disabled{background:#F5F7FA;border:1px solid #DDE3EA;color:#687384;}")); // wjy: 复用设置页数字输入框的真实控件样式，只在点击按钮时校验 192.168.3.* 格式。
+    m_batchAddButton = new QPushButton(QStringLiteral("批量新增"), this);
+    m_batchAddButton->setGeometry(settingsBatchAddButtonRect());
+    m_batchAddButton->setCursor(Qt::PointingHandCursor);
+    m_batchAddButton->setStyleSheet(QStringLiteral(
+        "QPushButton{border:0;border-radius:4px;background:#3A7BFC;"
+        "font-family:'Microsoft YaHei UI';font-size:14px;color:#FFFFFF;}"
+        "QPushButton:hover{background:#2F6FEF;}"
+        "QPushButton:disabled{background:#C9D0DA;color:#FFFFFF;}")); // wjy: 扫描期间按钮禁用，避免用户重复启动多个批量扫描任务。
+    connect(m_batchAddButton, &QPushButton::clicked, this, &DeviceGrid::startBatchAddDevices);
+    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after batch add controls create")); // wjy: 批量新增输入框和按钮创建完成。
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before updateSettingsControls in setup")); // wjy: 判断是否崩在首次刷新设置控件显隐状态。
     // ===end====
 
@@ -1722,6 +1838,20 @@ void DeviceGrid::updateSettingsControls()
     if (visible) {
         m_statusRefreshIntervalEdit->raise(); // wjy: 输入框是 Qt 子控件，显示时提升到手绘设置页上层，避免被父控件重绘视觉上盖住。
     }
+
+    if (m_batchSubnetEdit && m_batchAddButton) {
+        const bool batchVisible = m_settingsSelected; // wjy: 批量新增属于设置页功能，离开设置页时隐藏真实控件。
+        m_batchSubnetEdit->setVisible(batchVisible);
+        m_batchAddButton->setVisible(batchVisible);
+        m_batchSubnetEdit->setEnabled(batchVisible && !m_batchAddInProgress);
+        m_batchAddButton->setEnabled(batchVisible && !m_batchAddInProgress);
+        m_batchAddButton->setText(m_batchAddInProgress ? QStringLiteral("扫描中") : QStringLiteral("批量新增"));
+        if (batchVisible) {
+            m_batchSubnetEdit->raise();
+            m_batchAddButton->raise();
+        }
+    }
+
 // ===end====
 }
 
@@ -1742,6 +1872,159 @@ void DeviceGrid::applyStatusAutoRefreshSetting(bool refreshImmediately)
     }
 
     updateSettingsControls();
+}
+
+void DeviceGrid::startBatchAddDevices()
+{
+// =====wjy====
+    if (!m_batchSubnetEdit || m_batchAddInProgress) {
+        return; // wjy: 控件未创建或已有扫描正在运行时不重复启动。
+    }
+
+    const QString subnetText = m_batchSubnetEdit->text().trimmed();
+    if (!isWildcardSubnetPattern(subnetText)) {
+        qWarning().noquote() << QStringLiteral("[batch-add] invalid subnet=%1").arg(subnetText);
+        m_batchSubnetEdit->setText(QStringLiteral("192.168.3.*")); // wjy: 非法输入回到默认网段，和设置页秒数输入框的兜底思路一致。
+        m_batchSubnetEdit->selectAll();
+        m_batchSubnetEdit->setFocus(Qt::MouseFocusReason);
+        return;
+    }
+
+    const QStringList allScanIps = wildcardSubnetScanIps(subnetText);
+    QStringList scanIps;
+    scanIps.reserve(allScanIps.size());
+    for (const QString& ip : allScanIps) {
+        if (!deviceIpExists(ip)) {
+            scanIps.append(ip); // wjy: 已存在的设备不再扫描和追加，避免批量新增制造重复 IP。
+        }
+    }
+    if (scanIps.isEmpty()) {
+        qWarning().noquote() << QStringLiteral("[batch-add] no new ip to scan subnet=%1").arg(subnetText);
+        return;
+    }
+
+    m_batchAddInProgress = true;
+    updateSettingsControls();
+    qWarning().noquote() << QStringLiteral("[batch-add] scan begin subnet=%1 count=%2")
+        .arg(subnetText)
+        .arg(scanIps.size());
+
+    QPointer<DeviceGrid> self(this);
+    runBackgroundTask([self, scanIps] {
+        QVector<BatchAddResult> results;
+        std::mutex resultMutex;
+        std::atomic_int nextIndex = 0;
+        const int workerCount = std::max(1, std::min<int>(16, scanIps.size()));
+        std::vector<std::thread> workers;
+        workers.reserve(workerCount);
+
+        for (int worker = 0; worker < workerCount; ++worker) {
+            workers.emplace_back([&, worker] {
+                while (true) {
+                    const int index = nextIndex.fetch_add(1);
+                    if (index >= scanIps.size()) {
+                        break;
+                    }
+
+                    const QString ip = scanIps.at(index);
+                    const platform::DeviceStatusInfo info = platform::DeviceStatusService::query(ip, 49101, 250);
+                    if (info.state == platform::DevicePresenceState::Offline
+                        || info.state == platform::DevicePresenceState::Unknown) {
+                        continue; // wjy: 只有状态服务有响应的远端才视为可批量新增设备。
+                    }
+                    if (info.localIp.trimmed() != ip || info.mac.trimmed().isEmpty()) {
+                        qWarning().noquote() << QStringLiteral("[batch-add] skip weak match ip=%1 remoteIp=%2 mac=%3")
+                            .arg(ip)
+                            .arg(info.localIp.trimmed())
+                            .arg(info.mac.trimmed()); // wjy: 必须拿到 FSRemote 状态服务返回的本机 IP 和 MAC，避免把无效端口响应误加成设备。
+                        continue;
+                    }
+
+                    BatchAddResult result;
+                    result.ip = ip;
+                    result.name = info.deviceName.trimmed().isEmpty()
+                        ? ip
+                        : info.deviceName.trimmed(); // wjy: 设备名优先使用远端电脑名，取不到时用 IP 兜底，不再使用登录账户名。
+                    result.mac = info.mac.trimmed();
+                    result.broadcastIp = info.broadcastIp.trimmed();
+
+                    std::lock_guard lock(resultMutex);
+                    results.append(result);
+                }
+            });
+        }
+
+        for (std::thread& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+
+        if (!self) {
+            return; // wjy: 窗口关闭后不再回到 UI 线程追加设备。
+        }
+
+        QMetaObject::invokeMethod(self, [self, results = std::move(results)]() mutable {
+            if (!self) {
+                return; // wjy: queued 回调执行前窗口可能已经销毁。
+            }
+
+            DeviceGrid* grid = self.data();
+            const bool wasEmpty = g_devices.isEmpty();
+            int firstAddedIndex = -1;
+            int addedCount = 0;
+            QSet<QString> addedIps;
+            for (const BatchAddResult& result : results) {
+                const QString ip = result.ip.trimmed();
+                if (ip.isEmpty() || deviceIpExists(ip) || addedIps.contains(ip)) {
+                    continue; // wjy: UI 线程最终追加前再次去重，防止扫描期间用户手动新增同一 IP。
+                }
+
+                const QString name = result.name.trimmed().isEmpty() ? ip : result.name.trimmed();
+                g_devices.append({name, ip, result.mac.trimmed(), result.broadcastIp.trimmed(), QStringLiteral("批量增加"), {}});
+                grid->m_deviceStatuses.insert(ip, platform::DevicePresenceState::Online);
+                addedIps.insert(ip);
+                if (firstAddedIndex < 0) {
+                    firstAddedIndex = g_devices.size() - 1;
+                }
+                ++addedCount;
+            }
+
+            if (addedCount > 0) {
+                saveDevices();
+                grid->m_remoteAssistSelected = false;
+                grid->m_localInfoSelected = false;
+                grid->m_settingsSelected = false;
+                grid->m_deviceGroupExpanded = true;
+                grid->clearBottomActionHover();
+                grid->setDesktopHoverActive(false);
+                grid->m_selectedDeviceIndexes.clear();
+                grid->m_selectedDeviceIndexes.insert(firstAddedIndex);
+                grid->m_selectionAnchorDeviceIndex = firstAddedIndex;
+                if (wasEmpty) {
+                    grid->m_selectedDeviceIndex = firstAddedIndex;
+                    grid->m_previousDeviceIndex = firstAddedIndex;
+                    grid->m_currentDeviceName = deviceDisplayName(g_devices.at(firstAddedIndex));
+                    grid->m_previousDeviceName = grid->m_currentDeviceName;
+                    if (grid->m_detailAnimationTimer) {
+                        grid->m_detailAnimationTimer->stop();
+                    }
+                } else {
+                    grid->startDeviceSwitchAnimation(firstAddedIndex, deviceDisplayName(g_devices.at(firstAddedIndex)));
+                }
+            }
+
+            grid->m_batchAddInProgress = false;
+            grid->updateSettingsControls();
+            grid->updateAddDeviceControls();
+            grid->updateLocalInfoControls();
+            grid->update();
+            qWarning().noquote() << QStringLiteral("[batch-add] scan end found=%1 added=%2")
+                .arg(results.size())
+                .arg(addedCount);
+        }, Qt::QueuedConnection);
+    });
+// ===end====
 }
 
 void DeviceGrid::beginDeviceGroupRename(int groupIndex)
@@ -1960,6 +2243,7 @@ void DeviceGrid::refreshDeviceStatuses()
         writeDeviceGridStartupLog(QStringLiteral("[wjy-status] background thread start ipCount=%1").arg(ips.size())); // wjy: 后台总线程启动日志写入文件，确认是否进入线程阶段。
 // ===end====
         QHash<QString, platform::DevicePresenceState> statuses;
+        QHash<QString, QString> remoteDeviceNames; // wjy: 自动刷新时顺便记录远端真实设备名，用来同步 devices.json 的 name 字段。
         std::mutex resultMutex;
         std::atomic_int nextIndex = 0;
         const int workerCount = std::max(1, std::min<int>(8, ips.size()));
@@ -1986,16 +2270,19 @@ void DeviceGrid::refreshDeviceStatuses()
                         .arg(index)
                         .arg(ip)); // wjy: 单个 IP 探测前记录，崩溃时可定位是否卡在某台设备。
 // ===end====
-                    const platform::DevicePresenceState state = platform::DeviceStatusService::probe(ip);
+                    const platform::DeviceStatusInfo info = platform::DeviceStatusService::query(ip);
 // =====wjy====
                     writeDeviceGridStartupLog(QStringLiteral("[wjy-status] probe done worker=%1 index=%2 ip=%3 state=%4")
                         .arg(worker)
                         .arg(index)
                         .arg(ip)
-                        .arg(static_cast<int>(state))); // wjy: 单个 IP 探测后记录状态枚举值，判断 probe 是否顺利返回。
+                        .arg(static_cast<int>(info.state))); // wjy: 单个 IP 探测后记录状态枚举值，判断 query 是否顺利返回。
 // ===end====
                     std::lock_guard lock(resultMutex);
-                    statuses.insert(ip, state);
+                    statuses.insert(ip, info.state);
+                    if (!info.deviceName.trimmed().isEmpty()) {
+                        remoteDeviceNames.insert(ip, info.deviceName.trimmed()); // wjy: 只有新版远端返回了真实设备名时才参与本地 JSON 同步。
+                    }
                 }
 // =====wjy====
                 writeDeviceGridStartupLog(QStringLiteral("[wjy-status] worker end worker=%1").arg(worker)); // wjy: worker 结束日志，判断线程是否正常跑完。
@@ -2021,7 +2308,7 @@ void DeviceGrid::refreshDeviceStatuses()
 
 // =====wjy====
         writeDeviceGridStartupLog(QStringLiteral("[wjy-status] invoke ui post begin")); // wjy: 准备把后台探测结果投递回 UI 线程；如果有 begin 没有 end，说明崩在投递附近。
-        const bool invokeQueued = QMetaObject::invokeMethod(self, [self, statuses = std::move(statuses)]() mutable {
+        const bool invokeQueued = QMetaObject::invokeMethod(self, [self, statuses = std::move(statuses), remoteDeviceNames = std::move(remoteDeviceNames)]() mutable {
 // =====wjy====
             writeDeviceGridStartupLog(QStringLiteral("[wjy-status] invoke ui begin")); // wjy: 回到 UI 线程前半段日志，判断崩溃是否发生在 UI 更新阶段。
 // ===end====
@@ -2033,6 +2320,28 @@ void DeviceGrid::refreshDeviceStatuses()
             }
             DeviceGrid* grid = self.data();
             grid->m_deviceStatuses = std::move(statuses);
+            bool deviceNameChanged = false;
+            for (DeviceEntry& device : g_devices) {
+                const QString ip = device.ip.trimmed();
+                const QString remoteName = remoteDeviceNames.value(ip).trimmed();
+                if (!ip.isEmpty()
+                    && !remoteName.isEmpty()
+                    && device.name.trimmed() != remoteName) {
+                    qWarning().noquote() << QStringLiteral("[wjy-status] sync device name ip=%1 old=%2 new=%3")
+                        .arg(ip)
+                        .arg(device.name.trimmed())
+                        .arg(remoteName); // wjy: 自动刷新发现 JSON 设备名和远端真实设备名不一致，按远端设备名修正本地记录。
+                    device.name = remoteName;
+                    deviceNameChanged = true;
+                }
+            }
+            if (deviceNameChanged) {
+                saveDevices(); // wjy: 设备名同步后立即保存 devices.json，保证下次启动仍使用真实设备名。
+                if (grid->m_selectedDeviceIndex >= 0 && grid->m_selectedDeviceIndex < g_devices.size()) {
+                    grid->m_currentDeviceName = deviceDisplayName(g_devices.at(grid->m_selectedDeviceIndex));
+                    grid->m_previousDeviceName = grid->m_currentDeviceName;
+                }
+            }
             for (auto it = grid->m_poweringOnDeviceIps.begin(); it != grid->m_poweringOnDeviceIps.end();) {
                 const platform::DevicePresenceState state = grid->m_deviceStatuses.value(*it, platform::DevicePresenceState::Offline);
                 if (state != platform::DevicePresenceState::Offline) {
@@ -2333,11 +2642,27 @@ void DeviceGrid::renameCurrentDevice()
         return;
     }
 
+    const QString targetIp = g_devices.at(m_selectedDeviceIndex).ip.trimmed();
     g_devices[m_selectedDeviceIndex].name = newName;
     saveDevices();
     m_currentDeviceName = newName;
     m_previousDeviceName = newName;
     update();
+
+    if (!targetIp.isEmpty()) {
+        QPointer<DeviceGrid> self(this);
+        runBackgroundTask([self, targetIp, newName] {
+            QString errorMessage;
+            const bool renamed = platform::DeviceCommandService::renameDevice(targetIp, newName, &errorMessage);
+            qWarning().noquote() << QStringLiteral("[rename-device] remote ip=%1 renamed=%2 error=%3")
+                .arg(targetIp)
+                .arg(renamed)
+                .arg(errorMessage.trimmed()); // wjy: 本地名称先保存，远端电脑名修改结果写日志；Windows 通常需要重启后完全生效。
+            if (!self) {
+                return;
+            }
+        });
+    }
 }
 
 void DeviceGrid::deleteCurrentDevice()
@@ -2715,14 +3040,14 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                 }
 
                 const bool deviceInsideGroup = row.groupIndex >= 0; // wjy: 分组内设备稍微右移，视觉上表示它属于上方分组。
-                const int statusDotX = deviceInsideGroup ? 42 : 26; // wjy: 根部设备保持旧坐标，分组内设备整体缩进。
+                const int statusDotX = 200; // wjy: 根部设备保持旧坐标，分组内设备整体缩进。 这是原点坐标
                 const int iconX = deviceInsideGroup ? 58 : 42;
                 const int textX = deviceInsideGroup ? 90 : 74;
                 const int textWidth = deviceInsideGroup ? 96 : 116; // wjy: 缩进后收窄文字区域，避免碰到右侧角标。
 
                 painter.setPen(Qt::NoPen);
                 painter.setBrush(deviceStatusDotColor(devicePresenceForIndex(deviceIndex))); // wjy: 在线圆点按真实设备状态绘制，不受视觉行号影响。
-                painter.drawEllipse(QRectF(statusDotX, rowY + 17, 6, 6));
+                painter.drawEllipse(QRectF(statusDotX, rowY + 11, 13, 13));
                 drawDeviceTileIcon(painter, iconX, rowY + 9, 20);
 
                 painter.setFont(textFont);
@@ -2741,7 +3066,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                 }
 
                 painter.setPen(Qt::NoPen);
-                painter.setBrush(QColor(QStringLiteral("#F7FAFE"))); // wjy: 分组行使用浅背景，和普通设备行区分开。
+                painter.setBrush(QColor(QStringLiteral("#1E3A5F"))); // wjy: 分组行使用深蓝背景，和普通设备行区分开。
                 painter.drawRoundedRect(QRectF(rowRect), 5, 5);
                 drawUiIcon(
                     painter,
@@ -2749,7 +3074,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                     deviceGroupExpandedForIndex(groupIndex) ? QStringLiteral("chevron_up.svg") : QStringLiteral("chevron_down.svg")); // wjy: 根据分组展开状态绘制上箭头或下箭头。
 
                 painter.setFont(textFont);
-                painter.setPen(QColor(QStringLiteral("#111827")));
+                painter.setPen(QColor(QStringLiteral("#FFFFFF"))); //分组字体颜色
                 if (m_renamingDeviceGroupIndex != groupIndex) {
                     painter.drawText(QRectF(58, rowY + 7, 132, 22), Qt::AlignVCenter | Qt::AlignLeft, g_deviceGroupNames.at(groupIndex)); // wjy: 分组正在原地重命名时不画底层文字，避免和输入框重叠。
                 }
@@ -3098,6 +3423,12 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         && !m_statusRefreshIntervalEdit->geometry().contains(event->pos())) {
         m_statusRefreshIntervalEdit->clearFocus(); // wjy: 设置页是手绘区域，点击空白/开关不会天然抢焦点，这里主动让秒数输入框失焦并触发保存。
         setFocus(Qt::MouseFocusReason); // wjy: 父控件接管焦点，避免输入框清焦后马上继续接收键盘输入。
+    }
+    if (m_batchSubnetEdit
+        && m_batchSubnetEdit->hasFocus()
+        && !m_batchSubnetEdit->geometry().contains(event->pos())) {
+        m_batchSubnetEdit->clearFocus(); // wjy: 批量新增网段输入框点击设置页空白后主动失焦，行为和自动刷新秒数输入框一致。
+        setFocus(Qt::MouseFocusReason);
     }
 
     if (m_deviceGroupNameEdit

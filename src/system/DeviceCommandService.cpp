@@ -10,6 +10,16 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTimer>
+#include <QUrl>
+
+#include <string>
+
+#if defined(Q_OS_WIN)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace platform {
 namespace {
@@ -40,6 +50,111 @@ QByteArray wakeCommand(const QString& macAddress)
         return {};
     }
     return QByteArrayLiteral("wake_mac|") + mac.toUtf8() + QByteArrayLiteral("\n");
+}
+
+QByteArray renameDeviceCommand(const QString& newName)
+{
+    const QString name = newName.trimmed();
+    if (name.isEmpty()) {
+        return {};
+    }
+    return QByteArrayLiteral("rename_device|")
+        + QUrl::toPercentEncoding(name)
+        + QByteArrayLiteral("\n"); // wjy: 设备名可能包含中文或空格，命令协议里先做百分号编码避免分隔符冲突。
+}
+
+bool renameLocalComputer(const QString& newName, QString* errorMessage)
+{
+    const QString name = newName.trimmed();
+    if (name.isEmpty()) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("设备名为空");
+        }
+        return false;
+    }
+
+#if defined(Q_OS_WIN)
+    const std::wstring wideName = name.toStdWString();
+    if (SetComputerNameExW(ComputerNamePhysicalDnsHostname, wideName.c_str())) {
+        if (errorMessage) {
+            errorMessage->clear();
+        }
+        return true; // wjy: Windows 修改计算机名通常需要重启后完全生效，命令这里只负责写入目标系统设置。
+    }
+    if (errorMessage) {
+        *errorMessage = QStringLiteral("修改目标设备名失败，错误码 %1").arg(GetLastError());
+    }
+    return false;
+#else
+    if (errorMessage) {
+        *errorMessage = QStringLiteral("当前系统暂不支持远程修改设备名");
+    }
+    return false;
+#endif
+}
+
+bool sendCommandPayload(const QString& hostIp, const QByteArray& payload, QString* errorMessage, uint16_t port, int timeoutMs)
+{
+    if (hostIp.trimmed().isEmpty()) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("目标 IP 为空");
+        }
+        return false;
+    }
+    if (payload.isEmpty()) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("命令为空");
+        }
+        return false;
+    }
+
+    QTcpSocket socket;
+    socket.connectToHost(hostIp.trimmed(), port);
+    if (!socket.waitForConnected(timeoutMs)) {
+        if (errorMessage) {
+            *errorMessage = socket.errorString().trimmed();
+        }
+        return false;
+    }
+    if (socket.write(payload) != payload.size()) {
+        if (errorMessage) {
+            *errorMessage = socket.errorString().trimmed();
+        }
+        socket.disconnectFromHost();
+        return false;
+    }
+    if (!socket.waitForBytesWritten(timeoutMs)) {
+        if (errorMessage) {
+            *errorMessage = socket.errorString().trimmed();
+        }
+        socket.disconnectFromHost();
+        return false;
+    }
+    if (!socket.waitForReadyRead(timeoutMs)) {
+        if (errorMessage) {
+            *errorMessage = socket.errorString().trimmed();
+        }
+        socket.disconnectFromHost();
+        return false;
+    }
+
+    const QByteArray reply = socket.readAll().trimmed();
+    socket.disconnectFromHost();
+    const QList<QByteArray> parts = reply.split('|');
+    const QByteArray status = parts.value(0).trimmed().toLower();
+    if (status == "ok") {
+        if (errorMessage) {
+            errorMessage->clear();
+        }
+        return true;
+    }
+
+    if (errorMessage) {
+        *errorMessage = parts.size() > 1
+            ? QUrl::fromPercentEncoding(parts.at(1)).trimmed()
+            : QStringLiteral("远程命令执行失败");
+    }
+    return false;
 }
 
 void schedulePowerAction(DeviceControlAction action)
@@ -105,6 +220,22 @@ private:
                 if (!result.errorMessage.trimmed().isEmpty()) {
                     payload.append('|');
                     payload.append(result.errorMessage.trimmed().toUtf8());
+                }
+                payload.append('\n');
+                replyAndClose(payload);
+            }
+            return;
+        }
+        if (command == "rename_device") {
+            const QString newName = QUrl::fromPercentEncoding(parts.value(1)).trimmed();
+            QString errorMessage;
+            if (renameLocalComputer(newName, &errorMessage)) {
+                replyAndClose(QByteArrayLiteral("ok\n"));
+            } else {
+                QByteArray payload = QByteArrayLiteral("error");
+                if (!errorMessage.trimmed().isEmpty()) {
+                    payload.append('|');
+                    payload.append(QUrl::toPercentEncoding(errorMessage.trimmed()));
                 }
                 payload.append('\n');
                 replyAndClose(payload);
@@ -323,6 +454,12 @@ bool DeviceCommandService::sendWakeProxy(const QString& hostIp, const QString& m
             : QStringLiteral("同网段代理设备代发开机包失败");
     }
     return false;
+}
+
+bool DeviceCommandService::renameDevice(const QString& hostIp, const QString& newName, QString* errorMessage, uint16_t port, int timeoutMs)
+{
+    const QByteArray payload = renameDeviceCommand(newName);
+    return sendCommandPayload(hostIp, payload, errorMessage, port, timeoutMs); // wjy: 复用统一 TCP 命令发送流程，把本地重命名同步到目标机器。
 }
 
 } // namespace platform
