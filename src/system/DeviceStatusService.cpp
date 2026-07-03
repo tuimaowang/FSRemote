@@ -1,6 +1,7 @@
 #include "system/DeviceStatusService.h"
 #include "system/DeviceInfoService.h"
 #include "system/PortableOpenSshManager.h"
+#include "system/WjyDiagnosticLog.h"
 
 #include <QAbstractSocket>
 #include <QHostAddress>
@@ -9,6 +10,13 @@
 
 namespace platform {
 namespace {
+
+// =====wjy====
+void writeStatusServerLog(const QString& message)
+{
+    writeWjyDiagnosticLog(message); // wjy: 状态服务关闭阶段写入统一诊断日志，用来确认 main 返回后的析构链路。
+}
+// ===end====
 
 QByteArray statusPayload(bool busy)
 {
@@ -84,7 +92,13 @@ DeviceStatusServer::DeviceStatusServer(std::function<bool()> busyProvider)
 
 DeviceStatusServer::~DeviceStatusServer()
 {
+    // =====wjy====
+    writeStatusServerLog(QStringLiteral("[wjy-status-server] DeviceStatusServer dtor begin")); // wjy: 记录状态服务析构开始，确认命令服务析构之后是否继续走到这里。
+    // ===end====
     stop();
+    // =====wjy====
+    writeStatusServerLog(QStringLiteral("[wjy-status-server] DeviceStatusServer dtor end")); // wjy: 记录状态服务析构结束。
+    // ===end====
 }
 
 bool DeviceStatusServer::start(uint16_t port)
@@ -122,13 +136,22 @@ bool DeviceStatusServer::start(uint16_t port)
 
 void DeviceStatusServer::stop()
 {
+    // =====wjy====
+    writeStatusServerLog(QStringLiteral("[wjy-status-server] stop begin server=%1").arg(m_server ? 1 : 0)); // wjy: 记录状态服务 stop 是否还有 QTcpServer 需要释放。
+    // ===end====
     if (!m_server) {
+        // =====wjy====
+        writeStatusServerLog(QStringLiteral("[wjy-status-server] stop skipped because server is null")); // wjy: server 已为空时说明前面已经停止过，不会重复删除。
+        // ===end====
         return;
     }
 
     m_server->close();
     delete m_server;
     m_server = nullptr;
+    // =====wjy====
+    writeStatusServerLog(QStringLiteral("[wjy-status-server] stop end")); // wjy: 记录状态服务 QTcpServer 已释放。
+    // ===end====
 }
 
 DevicePresenceState DeviceStatusService::probe(const QString& hostIp, uint16_t port, int timeoutMs)

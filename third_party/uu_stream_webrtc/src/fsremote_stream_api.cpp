@@ -30,8 +30,9 @@ namespace {
 
 thread_local std::string g_last_error;
 std::mutex g_log_mutex;
+std::once_flag g_crash_handler_once;
 
-void append_log(const std::string& line)
+void append_log_to_file(const char* file_name, const std::string& line)
 {
     char exePath[MAX_PATH] = {};
     if (::GetModuleFileNameA(nullptr, exePath, MAX_PATH) == 0) {
@@ -44,7 +45,9 @@ void append_log(const std::string& line)
         return;
     }
     path.resize(slash + 1);
-    path += "data\\stream_host.log";
+    path += "data\\";
+    ::CreateDirectoryA(path.c_str(), nullptr);
+    path += file_name;
 
     std::lock_guard lock(g_log_mutex);
     FILE* file = nullptr;
@@ -55,6 +58,93 @@ void append_log(const std::string& line)
     fwrite("\r\n", 1, 2, file);
     fclose(file);
 }
+
+// =====wjy====
+void reset_log_file(const char* file_name)
+{
+    char exePath[MAX_PATH] = {}; // wjy: clear the log under the running FSRemote.exe directory.
+    if (::GetModuleFileNameA(nullptr, exePath, MAX_PATH) == 0) {
+        return;
+    }
+
+    std::string path(exePath);
+    const size_t slash = path.find_last_of("\\/");
+    if (slash == std::string::npos) {
+        return;
+    }
+    path.resize(slash + 1);
+    path += "data\\";
+    ::CreateDirectoryA(path.c_str(), nullptr);
+    path += file_name;
+
+    std::lock_guard lock(g_log_mutex);
+    FILE* file = nullptr;
+    if (fopen_s(&file, path.c_str(), "wb") == 0 && file) {
+        fclose(file); // wjy: opening with wb truncates old content once per process start.
+    }
+}
+// ===end====
+
+void append_log(const std::string& line)
+{
+    append_log_to_file("stream_host.log", line);
+}
+
+// =====wjy====
+void append_viewer_log(const std::string& line)
+{
+    (void)line;
+    return; // wjy: disable native viewer diagnostics completely while testing stream smoothness.
+
+    SYSTEMTIME time = {}; // wjy: capture wall-clock time so the last line can be matched with the crash moment.
+    ::GetLocalTime(&time);
+    char prefix[96] = {};
+    std::snprintf(prefix, sizeof(prefix), "%04u-%02u-%02u %02u:%02u:%02u.%03u tid=%lu ",
+                  time.wYear, time.wMonth, time.wDay,
+                  time.wHour, time.wMinute, time.wSecond, time.wMilliseconds,
+                  static_cast<unsigned long>(::GetCurrentThreadId()));
+    append_log_to_file("stream_viewer_debug.log", std::string(prefix) + line); // wjy: write one flushed line per diagnostic event.
+}
+
+LONG WINAPI fsremote_crash_filter(EXCEPTION_POINTERS* pointers)
+{
+    const auto* record = pointers ? pointers->ExceptionRecord : nullptr;
+    // =====wjy====
+    const void* crash_address = record ? record->ExceptionAddress : nullptr; // wjy: keep the raw fault address from SEH.
+    MEMORY_BASIC_INFORMATION memory_info = {}; // wjy: VirtualQuery tells which loaded module owns the crash address.
+    const bool has_module = crash_address
+        && ::VirtualQuery(crash_address, &memory_info, sizeof(memory_info)) == sizeof(memory_info)
+        && memory_info.AllocationBase;
+    char module_path[MAX_PATH] = {};
+    if (has_module) {
+        ::GetModuleFileNameA(static_cast<HMODULE>(memory_info.AllocationBase), module_path, MAX_PATH);
+    }
+    const auto module_base = has_module ? reinterpret_cast<uintptr_t>(memory_info.AllocationBase) : 0;
+    const auto fault = reinterpret_cast<uintptr_t>(crash_address);
+    char line[1024] = {};
+    std::snprintf(line, sizeof(line),
+                  "crash exception=0x%08lX address=%p module=%s base=%p offset=0x%llX",
+                  record ? static_cast<unsigned long>(record->ExceptionCode) : 0ul,
+                  crash_address,
+                  module_path[0] ? module_path : "<unknown>",
+                  has_module ? memory_info.AllocationBase : nullptr,
+                  static_cast<unsigned long long>(has_module ? fault - module_base : 0));
+    // ===end====
+    append_viewer_log(line); // wjy: preserve the native exception code/address even when the process terminates immediately.
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void install_crash_logger()
+{
+    std::call_once(g_crash_handler_once, [] {
+        // =====wjy====
+        reset_log_file("stream_viewer_debug.log"); // wjy: each FSRemote process starts with a fresh viewer diagnostic log.
+        // ===end====
+        ::SetUnhandledExceptionFilter(fsremote_crash_filter); // wjy: install once for both host and viewer runs in this process.
+        append_viewer_log("crash logger installed");
+    });
+}
+// ===end====
 
 void set_error(const std::string& error)
 {
@@ -81,6 +171,7 @@ bool handle_message(uu::WebrtcSession& session, const std::string& message)
 {
     const auto split = message.find('\n');
     if (split == std::string::npos) {
+        append_viewer_log("signaling malformed message no-split size=" + std::to_string(message.size()));
         return true;
     }
 
@@ -88,7 +179,13 @@ bool handle_message(uu::WebrtcSession& session, const std::string& message)
     const std::string body = message.substr(split + 1);
     std::string error;
     if (kind == "offer" || kind == "answer" || kind == "pranswer") {
+        // =====wjy====
+        append_viewer_log("signaling recv " + kind + " sdp_size=" + std::to_string(body.size())); // wjy: mark before SetRemoteDescription.
         session.accept_remote_description(kind, body, &error);
+        if (!error.empty()) {
+            append_viewer_log("signaling " + kind + " error=" + error); // wjy: keep parse/set errors outside Qt Creator output.
+        }
+        // ===end====
     } else if (kind == "candidate") {
         const auto split2 = body.find('\n');
         const auto split3 = body.find('\n', split2 == std::string::npos ? 0 : split2 + 1);
@@ -96,7 +193,13 @@ bool handle_message(uu::WebrtcSession& session, const std::string& message)
             const std::string mid = body.substr(0, split2);
             const int mline = std::stoi(body.substr(split2 + 1, split3 - split2 - 1));
             const std::string candidate = body.substr(split3 + 1);
+            // =====wjy====
+            append_viewer_log("signaling recv candidate mid=" + mid + " mline=" + std::to_string(mline)); // wjy: identify whether ICE reaches native WebRTC before the crash.
             session.add_remote_candidate(mid, mline, candidate, &error);
+            if (!error.empty()) {
+                append_viewer_log("signaling candidate error=" + error); // wjy: capture candidate add failures in the durable log.
+            }
+            // ===end====
         }
     }
     return true;
@@ -222,6 +325,9 @@ public:
 
     ~HostInstance() override
     {
+        // =====wjy====
+        stop(); // wjy: stop and join the worker before HostInstance members are destroyed.
+        // ===end====
         if (audio_streamer_) {
             audio_streamer_->stop();
         }
@@ -360,6 +466,9 @@ public:
 
     ~ViewerInstance() override
     {
+        // =====wjy====
+        stop(); // wjy: close sockets and join the worker before viewer members can be freed.
+        // ===end====
         if (audio_player_) {
             audio_player_->stop();
         }
@@ -408,27 +517,47 @@ private:
 
     void run()
     {
+        // =====wjy====
+        append_viewer_log("viewer worker begin ip=" + host_ip_ + " port=" + std::to_string(port_)); // wjy: first durable line from the viewer thread.
+        // ===end====
         std::string error;
         report_status(status_callback_, user_, 10, "Connecting TCP");
         const uintptr_t socket = connectTcp(&error);
         if (!socket || !running_) {
+            append_viewer_log("viewer tcp failed running=" + std::to_string(running_.load()) + " error=" + error); // wjy: separate TCP failure from WebRTC/media crashes.
             if (socket) uu::close_socket(socket);
             report_status(status_callback_, user_, 90, error.empty() ? "TCP connection failed" : error.c_str());
             return;
         }
 
+        append_viewer_log("viewer tcp connected socket=" + std::to_string(socket)); // wjy: mark successful TCP signaling connection before audio/WebRTC start.
         report_status(status_callback_, user_, 20, "TCP connected");
         {
             std::string audio_error;
             audio_player_ = std::make_unique<uu::ViewerAudioPlayer>();
             audio_player_->start(host_ip_, 49105, &audio_error);
+            append_viewer_log("viewer audio start error=" + audio_error); // wjy: record audio startup because it runs parallel to video.
         }
         report_status(status_callback_, user_, 30, "Initializing WebRTC");
         uu::NativeWebrtcRuntime runtime;
+        std::atomic_bool frameReported = false;
+        // =====wjy====
+        runtime.set_decoded_bgra_callback([this, &frameReported](int width, int height, const uint8_t* bgra, size_t size) {
+            bool expected = false;
+            if (frameReported.compare_exchange_strong(expected, true)) {
+                report_status(status_callback_, user_, 50, "Receiving video"); // wjy: the first BGRA frame from this runtime means this viewer is receiving video.
+            }
+            if (frame_callback_ && running_) {
+                frame_callback_(user_, width, height, bgra, static_cast<uint32_t>(size)); // wjy: send only this runtime/decoder's frame to this RemoteDesktopWindow.
+            }
+        });
+        // ===end====
         if (!runtime.initialize(&error)) {
+            append_viewer_log("viewer runtime init failed error=" + error); // wjy: durable error if PeerConnectionFactory cannot initialize.
             report_status(status_callback_, user_, 90, error.empty() ? "WebRTC runtime initialization failed" : error.c_str());
             return;
         }
+        append_viewer_log("viewer runtime ready"); // wjy: mark native WebRTC runtime creation success.
 
         uu::SessionConfig config;
         config.role = uu::SessionRole::Viewer;
@@ -437,21 +566,12 @@ private:
             std::lock_guard lock(session_mutex_);
             active_session_ = &session;
         }
-        std::atomic_bool frameReported = false;
-        uu::SetUuDecodedBgraHook([this, &frameReported](int width, int height, const uint8_t* bgra, size_t size) {
-            bool expected = false;
-            if (frameReported.compare_exchange_strong(expected, true)) {
-                report_status(status_callback_, user_, 50, "Receiving video");
-            }
-            if (frame_callback_ && running_) {
-                frame_callback_(user_, width, height, bgra, static_cast<uint32_t>(size));
-            }
-        });
         session.set_signal_callback([socket](const std::string& kind, const std::string& body) {
+            append_viewer_log("viewer send signaling kind=" + kind + " body_size=" + std::to_string(body.size())); // wjy: show local offer/answer/candidate egress.
             uu::send_message(socket, kind + "\n" + body);
         });
         if (!session.initialize(&error)) {
-            uu::SetUuDecodedBgraHook({});
+            append_viewer_log("viewer session init failed error=" + error); // wjy: durable failure before waiting for remote media.
             {
                 std::lock_guard lock(session_mutex_);
                 active_session_ = nullptr;
@@ -460,19 +580,22 @@ private:
             return;
         }
 
+        append_viewer_log("viewer session initialized waiting stream"); // wjy: last checkpoint before remote signaling/media loop.
         report_status(status_callback_, user_, 40, "Waiting for remote stream");
         std::string message;
         while (running_ && uu::recv_message(socket, &message)) {
+            append_viewer_log("viewer recv raw signaling size=" + std::to_string(message.size())); // wjy: each inbound signaling packet before dispatch.
             handle_message(session, message);
         }
+        append_viewer_log("viewer recv loop end running=" + std::to_string(running_.load())); // wjy: distinguish clean remote close from native crash.
         {
             std::lock_guard lock(session_mutex_);
             active_session_ = nullptr;
         }
-        uu::SetUuDecodedBgraHook({});
         if (running_) {
             report_status(status_callback_, user_, 80, "Remote connection closed");
         }
+        append_viewer_log("viewer worker end"); // wjy: proves the thread exited cleanly.
     }
 
     std::string host_ip_;
@@ -489,6 +612,10 @@ private:
 
 FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_host(uint16_t port)
 {
+    // =====wjy====
+    install_crash_logger(); // wjy: host also installs the crash logger because FSRemote can host and view in one process.
+    append_viewer_log("api start_host port=" + std::to_string(port));
+    // ===end====
     try {
         return new HostInstance(port);
     } catch (const std::exception& ex) {
@@ -503,6 +630,11 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer(
     FsRemoteFrameCallback callback,
     void* user)
 {
+    // =====wjy====
+    install_crash_logger(); // wjy: make sure a viewer-side native crash records exception code/address.
+    append_viewer_log(std::string("api start_viewer ip=") + (host_ip ? host_ip : "<null>")
+        + " port=" + std::to_string(port));
+    // ===end====
     if (!host_ip || !*host_ip || !callback) {
         set_error("invalid viewer arguments");
         return nullptr;
@@ -523,6 +655,11 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_stat
     FsRemoteStatusCallback status_callback,
     void* user)
 {
+    // =====wjy====
+    install_crash_logger(); // wjy: status-enabled viewer is the path used by RemoteDesktopWindow.
+    append_viewer_log(std::string("api start_viewer_with_status ip=") + (host_ip ? host_ip : "<null>")
+        + " port=" + std::to_string(port));
+    // ===end====
     if (!host_ip || !*host_ip || !frame_callback) {
         set_error("invalid viewer arguments");
         report_status(status_callback, user, 90, "Invalid viewer arguments");
@@ -540,6 +677,9 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_stat
 
 void FSREMOTE_STREAM_CALL fsremote_stream_stop(FsRemoteStreamHandle handle)
 {
+    // =====wjy====
+    append_viewer_log("api stop handle=" + std::to_string(reinterpret_cast<uintptr_t>(handle))); // wjy: show whether the crash happens during explicit stop/close.
+    // ===end====
     delete static_cast<StreamInstance*>(handle);
 }
 

@@ -22,6 +22,10 @@
 /_ssh_test2/
 /_ssh_test_ok/
 /_vendor/
+/webRTC/
+/AI_PROJECT_HANDOFF.md
+/temp.txt
+/WJY_CODE_CHANGE_LOG.md
 
 # IDE / editor
 /.vs/

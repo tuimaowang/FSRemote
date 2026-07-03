@@ -11,9 +11,11 @@
 
 namespace uu {
 
+using DecodedBgraCallback = std::function<void(int width, int height, const uint8_t* bgra, size_t size)>;
+
 std::unique_ptr<webrtc::VideoEncoderFactory> CreateUuVideoEncoderFactory();
-std::unique_ptr<webrtc::VideoDecoderFactory> CreateUuVideoDecoderFactory();
+std::unique_ptr<webrtc::VideoDecoderFactory> CreateUuVideoDecoderFactory(DecodedBgraCallback bgra_callback = {});
 void SetUuDecodedFrameHook(std::function<void(const webrtc::VideoFrame&)> hook);
-void SetUuDecodedBgraHook(std::function<void(int width, int height, const uint8_t* bgra, size_t size)> hook);
+void SetUuDecodedBgraHook(DecodedBgraCallback hook);
 
 } // namespace uu

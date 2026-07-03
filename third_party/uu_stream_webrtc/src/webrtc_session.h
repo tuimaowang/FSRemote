@@ -86,6 +86,7 @@ private:
     std::unique_ptr<ParsecVddSession> host_virtual_display_;
     webrtc::scoped_refptr<webrtc::VideoTrackInterface> local_video_track_;
     webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> local_video_source_;
+    webrtc::scoped_refptr<webrtc::VideoTrackInterface> remote_video_track_;
     std::unique_ptr<webrtc::VideoSinkInterface<webrtc::VideoFrame>> remote_video_sink_;
 };
 

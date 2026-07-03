@@ -21,6 +21,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -40,7 +41,46 @@ using Microsoft::WRL::ComPtr;
 std::mutex g_decoded_hook_mutex;
 std::function<void(const webrtc::VideoFrame&)> g_decoded_hook;
 std::mutex g_decoded_bgra_hook_mutex;
-std::function<void(int, int, const uint8_t*, size_t)> g_decoded_bgra_hook;
+DecodedBgraCallback g_decoded_bgra_hook;
+
+// =====wjy====
+void append_viewer_log(const std::string& line)
+{
+    (void)line;
+    return; // wjy: disable codec diagnostics completely while testing stream smoothness.
+
+    char exePath[MAX_PATH] = {}; // wjy: decoder diagnostics go to the same deployed log as session/API checkpoints.
+    if (::GetModuleFileNameA(nullptr, exePath, MAX_PATH) == 0) {
+        return;
+    }
+    std::string path(exePath);
+    const size_t slash = path.find_last_of("\\/");
+    if (slash == std::string::npos) {
+        return;
+    }
+    path.resize(slash + 1);
+    path += "data\\";
+    ::CreateDirectoryA(path.c_str(), nullptr);
+    path += "stream_viewer_debug.log";
+
+    SYSTEMTIME time = {};
+    ::GetLocalTime(&time);
+    char prefix[96] = {};
+    std::snprintf(prefix, sizeof(prefix), "%04u-%02u-%02u %02u:%02u:%02u.%03u tid=%lu ",
+                  time.wYear, time.wMonth, time.wDay,
+                  time.wHour, time.wMinute, time.wSecond, time.wMilliseconds,
+                  static_cast<unsigned long>(::GetCurrentThreadId()));
+
+    FILE* file = nullptr;
+    if (fopen_s(&file, path.c_str(), "ab") != 0 || !file) {
+        return;
+    }
+    const std::string full = std::string(prefix) + line;
+    fwrite(full.data(), 1, full.size(), file);
+    fwrite("\r\n", 1, 2, file);
+    fclose(file);
+}
+// ===end====
 
 bool codec_is(const webrtc::SdpVideoFormat& format, const char* name)
 {
@@ -259,46 +299,77 @@ private:
 
 class HevcD3d11Decoder final : public webrtc::VideoDecoder {
 public:
+    explicit HevcD3d11Decoder(DecodedBgraCallback bgra_callback = {})
+        : bgra_callback_(std::move(bgra_callback)) // wjy: bind one decoder to one viewer window when the runtime provides a callback.
+    {
+    }
+
     bool Configure(const Settings&) override
     {
+        // =====wjy====
+        append_viewer_log("decoder Configure begin"); // wjy: first decoder lifecycle callback after WebRTC chooses H265.
+        // ===end====
         std::cout << "uu-d3d11va-hevc Configure\n";
-        return ensure_device();
+        const bool ok = ensure_device();
+        append_viewer_log(std::string("decoder Configure end ok=") + (ok ? "1" : "0")); // wjy: tell whether D3D11 device creation succeeded.
+        return ok;
     }
 
     int32_t Decode(const webrtc::EncodedImage& input_image, int64_t render_time_ms) override
     {
-        if (!callback_ || !input_image.data() || input_image.size() == 0) return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+        // =====wjy====
+        // if (decode_calls_ < 5 || decode_calls_ % 120 == 0) {
+        //     append_viewer_log("decoder Decode enter call=" + std::to_string(decode_calls_)
+        //         + " size=" + std::to_string(input_image.size())
+        //         + " key=" + std::to_string(input_image.IsKey() ? 1 : 0)
+        //         + " rtp=" + std::to_string(input_image.RtpTimestamp())); // wjy: sampled decode log disabled to reduce video-thread file IO.
+        // }
+        // ===end====
+        if (!callback_ || !input_image.data() || input_image.size() == 0) {
+            append_viewer_log("decoder Decode bad parameter"); // wjy: distinguish bad WebRTC input from native decode crash.
+            return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+        }
         if (decode_calls_ == 0) {
             std::cout << "uu-d3d11va-hevc first Decode size=" << input_image.size()
                       << " rtp=" << input_image.RtpTimestamp() << "\n";
         }
         ++decode_calls_;
-        if (!ensure_device()) return WEBRTC_VIDEO_CODEC_ERROR;
+        if (!ensure_device()) {
+            append_viewer_log("decoder ensure_device failed in Decode"); // wjy: D3D11 device could not be created/reused.
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        }
         std::vector<uint8_t> data(input_image.data(), input_image.data() + input_image.size());
         const bool encoded_keyframe = input_image.IsKey() || hevc_has_random_access_frame(data.data(), data.size());
         if (waiting_for_keyframe_ && !encoded_keyframe) {
             const uint64_t now = GetTickCount64();
             if (now - last_keyframe_request_ms_ >= 50) {
                 last_keyframe_request_ms_ = now;
+                // append_viewer_log("decoder waiting keyframe request error"); // wjy: repeated keyframe-wait log disabled to avoid flooding.
                 return WEBRTC_VIDEO_CODEC_ERROR;
             }
+            // append_viewer_log("decoder waiting keyframe skip"); // wjy: repeated keyframe-wait log disabled to avoid flooding.
             return WEBRTC_VIDEO_CODEC_OK;
         }
         if (encoded_keyframe && waiting_for_keyframe_) {
+            append_viewer_log("decoder keyframe while waiting reset"); // wjy: first usable keyframe resets FFmpeg/D3D decode state.
             decoder_.reset();
             decoder_ready_ = false;
         }
         if (!decoder_ready_) {
             std::string error;
+            append_viewer_log("decoder initialize_d3d11 begin"); // wjy: last checkpoint before FFmpeg D3D11 decoder init.
             if (!decoder_.initialize_d3d11(device_.Get(), context_.Get(), &error)) {
                 std::cerr << "decoder init failed: " << error << "\n";
+                append_viewer_log("decoder initialize_d3d11 failed error=" + error); // wjy: record native decoder initialization failure.
                 return WEBRTC_VIDEO_CODEC_ERROR;
             }
             decoder_ready_ = true;
+            append_viewer_log("decoder initialize_d3d11 ok"); // wjy: native decoder is ready before compressed frame decode.
         }
 
         lsp::DecodedFrame decoded;
         std::string error;
+        // append_viewer_log("decoder ffmpeg decode begin size=" + std::to_string(data.size())); // wjy: per-frame decode log disabled for smoother multi-view streaming.
         if (!decoder_.decode(data, &decoded, &error)) {
             decoder_.reset();
             decoder_ready_ = false;
@@ -307,25 +378,38 @@ public:
             if (++decode_errors_ <= 3 || decode_errors_ % 30 == 0) {
                 std::cerr << "uu-d3d11va-hevc decode failed; reset and request keyframe: " << error << "\n";
             }
+            append_viewer_log("decoder ffmpeg decode failed error=" + error); // wjy: compressed frame decode returned an error.
             return WEBRTC_VIDEO_CODEC_ERROR;
         }
-        if (!decoded.size.valid()) return WEBRTC_VIDEO_CODEC_ERROR;
+        // append_viewer_log("decoder ffmpeg decode ok size=" + std::to_string(decoded.size.width)
+        //     + "x" + std::to_string(decoded.size.height)
+        //     + " bgra=" + std::to_string(decoded.bgra.size())); // wjy: per-frame decode-success log disabled.
+        if (!decoded.size.valid()) {
+            append_viewer_log("decoder invalid decoded size"); // wjy: guard invalid dimensions before allocation/conversion.
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        }
 
         std::vector<uint8_t> bgra;
         if (!decoded.bgra.empty()) {
             bgra = decoded.bgra;
         } else if (!copy_srv_to_bgra(decoded.srv.Get(), decoded.size.width, decoded.size.height, &bgra)) {
             std::cerr << "decoder copy_srv_to_bgra failed\n";
+            append_viewer_log("decoder copy_srv_to_bgra failed"); // wjy: texture readback failed before Qt callback.
             return WEBRTC_VIDEO_CODEC_ERROR;
         }
+        // append_viewer_log("decoder bgra ready size=" + std::to_string(bgra.size())); // wjy: per-frame BGRA-ready log disabled.
         {
-            std::function<void(int, int, const uint8_t*, size_t)> hook;
-            {
+            DecodedBgraCallback hook = bgra_callback_; // wjy: prefer this decoder's viewer callback, so tiled windows do not overwrite each other.
+            if (!hook) {
                 std::lock_guard lock(g_decoded_bgra_hook_mutex);
-                hook = g_decoded_bgra_hook;
+                hook = g_decoded_bgra_hook; // wjy: fallback keeps the old standalone viewer path working.
             }
             if (hook) {
+                // append_viewer_log("decoder bgra hook call"); // wjy: per-frame app-callback log disabled.
                 hook(static_cast<int>(decoded.size.width), static_cast<int>(decoded.size.height), bgra.data(), bgra.size());
+                // append_viewer_log("decoder bgra hook returned"); // wjy: per-frame app-callback log disabled.
+            } else {
+                // append_viewer_log("decoder bgra hook missing"); // wjy: per-frame missing-hook log disabled.
             }
         }
 
@@ -337,7 +421,10 @@ public:
             buffer->MutableDataU(), buffer->StrideU(),
             buffer->MutableDataV(), buffer->StrideV(),
             static_cast<int>(decoded.size.width), static_cast<int>(decoded.size.height));
-        if (converted != 0) return WEBRTC_VIDEO_CODEC_ERROR;
+        if (converted != 0) {
+            append_viewer_log("decoder ARGBToI420 failed code=" + std::to_string(converted)); // wjy: conversion failed after app BGRA callback.
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        }
 
         auto frame = webrtc::VideoFrame::Builder()
             .set_video_frame_buffer(buffer)
@@ -351,9 +438,15 @@ public:
                 std::lock_guard lock(g_decoded_hook_mutex);
                 hook = g_decoded_hook;
             }
-            if (hook) hook(frame);
+            if (hook) {
+                // append_viewer_log("decoder frame hook call"); // wjy: per-frame optional hook log disabled.
+                hook(frame);
+                // append_viewer_log("decoder frame hook returned"); // wjy: per-frame optional hook log disabled.
+            }
         }
+        // append_viewer_log("decoder callback Decoded call"); // wjy: per-frame WebRTC callback log disabled.
         callback_->Decoded(frame);
+        // append_viewer_log("decoder callback Decoded returned"); // wjy: per-frame WebRTC callback log disabled.
         waiting_for_keyframe_ = false;
         ++decoded_frames_;
         if (decoded_frames_ == 1 || decoded_frames_ % 120 == 0) {
@@ -365,16 +458,23 @@ public:
 
     int32_t RegisterDecodeCompleteCallback(webrtc::DecodedImageCallback* callback) override
     {
+        // =====wjy====
+        append_viewer_log(std::string("decoder RegisterDecodeCompleteCallback callback=") + (callback ? "set" : "null")); // wjy: confirm WebRTC installed the decoded-image callback.
+        // ===end====
         callback_ = callback;
         return WEBRTC_VIDEO_CODEC_OK;
     }
 
     int32_t Release() override
     {
+        // =====wjy====
+        append_viewer_log("decoder Release begin"); // wjy: decoder teardown checkpoint.
+        // ===end====
         decoder_.reset();
         callback_ = nullptr;
         decoder_ready_ = false;
         waiting_for_keyframe_ = true;
+        append_viewer_log("decoder Release end"); // wjy: decoder teardown completed.
         return WEBRTC_VIDEO_CODEC_OK;
     }
 
@@ -392,10 +492,15 @@ private:
         if (device_ && context_) return true;
         D3D_FEATURE_LEVEL feature_level = {};
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+        append_viewer_log("decoder D3D11CreateDevice begin"); // wjy: checkpoint before hardware device creation.
         const HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
                                              D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                                              levels, 2, D3D11_SDK_VERSION,
                                              &device_, &feature_level, &context_);
+        char line[128] = {};
+        std::snprintf(line, sizeof(line), "decoder D3D11CreateDevice hr=0x%08lX feature=0x%X",
+                      static_cast<unsigned long>(hr), static_cast<unsigned int>(feature_level));
+        append_viewer_log(line); // wjy: record HRESULT for GPU/device creation failures.
         return SUCCEEDED(hr);
     }
 
@@ -444,6 +549,7 @@ private:
     }
 
     webrtc::DecodedImageCallback* callback_ = nullptr;
+    DecodedBgraCallback bgra_callback_;
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<ID3D11Texture2D> staging_;
@@ -480,6 +586,9 @@ public:
                                                  const webrtc::SdpVideoFormat& format) override
     {
         (void)env;
+        // =====wjy====
+        append_viewer_log("encoder factory Create format=" + format.name); // wjy: record which encoder WebRTC requested.
+        // ===end====
         if (codec_is(format, "H265")) {
             std::cout << "CreateUuVideoEncoderFactory: create H265 NVENC encoder\n";
             return std::make_unique<NvencHevcEncoder>();
@@ -490,6 +599,11 @@ public:
 
 class UuVideoDecoderFactory final : public webrtc::VideoDecoderFactory {
 public:
+    explicit UuVideoDecoderFactory(DecodedBgraCallback bgra_callback = {})
+        : bgra_callback_(std::move(bgra_callback)) // wjy: every NativeWebrtcRuntime gets its own decoder callback copy.
+    {
+    }
+
     std::vector<webrtc::SdpVideoFormat> GetSupportedFormats() const override
     {
         return {webrtc::SdpVideoFormat("H265")};
@@ -508,12 +622,18 @@ public:
                                                  const webrtc::SdpVideoFormat& format) override
     {
         (void)env;
+        // =====wjy====
+        append_viewer_log("decoder factory Create format=" + format.name); // wjy: confirm WebRTC selected the custom H265 decoder.
+        // ===end====
         if (codec_is(format, "H265")) {
             std::cout << "CreateUuVideoDecoderFactory: create H265 D3D11 decoder\n";
-            return std::make_unique<HevcD3d11Decoder>();
+            return std::make_unique<HevcD3d11Decoder>(bgra_callback_); // wjy: pass the viewer-owned callback into this decoder instance.
         }
         return nullptr;
     }
+
+private:
+    DecodedBgraCallback bgra_callback_;
 };
 
 } // namespace
@@ -523,19 +643,25 @@ std::unique_ptr<webrtc::VideoEncoderFactory> CreateUuVideoEncoderFactory()
     return std::make_unique<UuVideoEncoderFactory>();
 }
 
-std::unique_ptr<webrtc::VideoDecoderFactory> CreateUuVideoDecoderFactory()
+std::unique_ptr<webrtc::VideoDecoderFactory> CreateUuVideoDecoderFactory(DecodedBgraCallback bgra_callback)
 {
-    return std::make_unique<UuVideoDecoderFactory>();
+    return std::make_unique<UuVideoDecoderFactory>(std::move(bgra_callback)); // wjy: create a decoder factory scoped to one runtime/viewer when provided.
 }
 
 void SetUuDecodedFrameHook(std::function<void(const webrtc::VideoFrame&)> hook)
 {
+    // =====wjy====
+    append_viewer_log(std::string("decoder SetUuDecodedFrameHook ") + (hook ? "set" : "clear")); // wjy: track optional frame hook lifetime.
+    // ===end====
     std::lock_guard lock(g_decoded_hook_mutex);
     g_decoded_hook = std::move(hook);
 }
 
-void SetUuDecodedBgraHook(std::function<void(int width, int height, const uint8_t* bgra, size_t size)> hook)
+void SetUuDecodedBgraHook(DecodedBgraCallback hook)
 {
+    // =====wjy====
+    append_viewer_log(std::string("decoder SetUuDecodedBgraHook ") + (hook ? "set" : "clear")); // wjy: track app BGRA hook lifetime.
+    // ===end====
     std::lock_guard lock(g_decoded_bgra_hook_mutex);
     g_decoded_bgra_hook = std::move(hook);
 }

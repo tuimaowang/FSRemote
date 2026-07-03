@@ -22,6 +22,7 @@ struct NativeWebrtcRuntime::Impl {
     std::unique_ptr<webrtc::Thread> worker_thread;
     std::unique_ptr<webrtc::Thread> signaling_thread;
     webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
+    DecodedBgraCallback decoded_bgra_callback;
 };
 
 NativeWebrtcRuntime::NativeWebrtcRuntime() = default;
@@ -34,6 +35,7 @@ NativeWebrtcRuntime::~NativeWebrtcRuntime()
 bool NativeWebrtcRuntime::initialize(std::string* error)
 {
     try {
+        DecodedBgraCallback decoded_bgra_callback = impl_ ? impl_->decoded_bgra_callback : DecodedBgraCallback{}; // wjy: keep the viewer-owned callback across initialize's shutdown reset.
         shutdown();
         std::cout << "webrtc runtime: InitializeSSL\n";
         if (!webrtc::InitializeSSL()) {
@@ -42,6 +44,7 @@ bool NativeWebrtcRuntime::initialize(std::string* error)
         }
 
         impl_ = std::make_unique<Impl>();
+        impl_->decoded_bgra_callback = std::move(decoded_bgra_callback); // wjy: pass this viewer's callback into its decoder factory.
         std::cout << "webrtc runtime: create threads\n";
         impl_->network_thread = webrtc::Thread::CreateWithSocketServer();
         impl_->worker_thread = webrtc::Thread::Create();
@@ -72,7 +75,7 @@ bool NativeWebrtcRuntime::initialize(std::string* error)
         deps.env = webrtc::CreateEnvironment(
             std::make_unique<webrtc::FieldTrials>(std::string(field_trials())));
         deps.video_encoder_factory = CreateUuVideoEncoderFactory();
-        deps.video_decoder_factory = CreateUuVideoDecoderFactory();
+        deps.video_decoder_factory = CreateUuVideoDecoderFactory(impl_->decoded_bgra_callback);
         std::cout << "webrtc runtime: enable media defaults\n";
         webrtc::EnableMediaWithDefaults(deps);
 
@@ -103,6 +106,14 @@ void NativeWebrtcRuntime::shutdown()
         impl_.reset();
     }
     webrtc::CleanupSSL();
+}
+
+void NativeWebrtcRuntime::set_decoded_bgra_callback(DecodedBgraCallback callback)
+{
+    if (!impl_) {
+        impl_ = std::make_unique<Impl>(); // wjy: keep the viewer callback before initialize creates the decoder factory.
+    }
+    impl_->decoded_bgra_callback = std::move(callback); // wjy: this callback belongs to one NativeWebrtcRuntime/viewer instance.
 }
 
 webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> NativeWebrtcRuntime::factory() const

@@ -34,7 +34,6 @@ add_library(uu_stream_common STATIC
 #aiÌí¼Ó
 set_property(TARGET uu_stream_common PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
-
 target_include_directories(uu_stream_common PUBLIC
     src
     ../lan_stream_probe/src
@@ -143,11 +142,21 @@ add_library(fsremote_stream SHARED
 #aiÌí¼Ó
 set_property(TARGET fsremote_stream PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
 
-
 target_include_directories(fsremote_stream PUBLIC
     "${CMAKE_CURRENT_LIST_DIR}/../../include"
 )
 target_link_libraries(fsremote_stream PRIVATE uu_stream_common)
+if(MSVC)
+    find_library(MSVC_LIBCPMT libcpmt
+        PATHS
+            "$ENV{VCToolsInstallDir}/lib/x64"
+            "C:/Program Files (x86)/Microsoft Visual Studio/18/BuildTools/VC/Tools/MSVC/14.51.36231/lib/x64"
+        NO_DEFAULT_PATH
+    )
+    if(MSVC_LIBCPMT)
+        target_link_libraries(fsremote_stream PRIVATE "${MSVC_LIBCPMT}")
+    endif()
+endif()
 set_target_properties(fsremote_stream PROPERTIES
     OUTPUT_NAME fsremote_stream
     WINDOWS_EXPORT_ALL_SYMBOLS TRUE
@@ -169,6 +178,3 @@ if(UU_STREAM_WEBRTC_BUILD_VIEWER)
     target_link_libraries(uu_webrtc_viewer PRIVATE uu_stream_common imgui d3d11 dxgi dwmapi)
     copy_uu_stream_ffmpeg_dlls(uu_webrtc_viewer)
 endif()
-
-
-

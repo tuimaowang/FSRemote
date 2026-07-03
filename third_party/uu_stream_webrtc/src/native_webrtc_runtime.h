@@ -2,6 +2,9 @@
 
 #include <api/scoped_refptr.h>
 
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -21,6 +24,7 @@ public:
 
     bool initialize(std::string* error);
     void shutdown();
+    void set_decoded_bgra_callback(std::function<void(int width, int height, const uint8_t* bgra, size_t size)> callback);
 
     webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory() const;
 

@@ -3,6 +3,10 @@
 #include "stream/StreamRuntime.h"
 
 #include <QCloseEvent>
+#include <QCoreApplication>
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
 #include <QKeyEvent>
 #include <QMetaObject>
 #include <QMouseEvent>
@@ -11,6 +15,7 @@
 #include <QPixmap>
 #include <QRegion>
 #include <QResizeEvent>
+#include <QTextStream>
 #include <QTimer>
 #include <QWheelEvent>
 
@@ -52,6 +57,26 @@ QPixmap icon(const QString& name)
 {
     return QPixmap(QStringLiteral(":/UUGuest/resource/images/titlebar/") + name);
 }
+
+// =====wjy====
+void appendViewerDebugLog(const QString& line)
+{
+    Q_UNUSED(line)
+    return; // wjy: disable Qt-side viewer diagnostics completely while tuning remote desktop performance.
+
+    const QString dataDir = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("data")); // wjy: keep Qt-side frame logs beside the native stream DLL logs.
+    QDir().mkpath(dataDir); // wjy: make the data directory if this is the first stream log in a fresh build folder.
+    QFile file(QDir(dataDir).filePath(QStringLiteral("stream_viewer_debug.log"))); // wjy: use the same file as the native WebRTC diagnostics.
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+        return; // wjy: logging must never block or crash the remote desktop UI.
+    }
+    QTextStream stream(&file);
+    stream << QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz"))
+           << QStringLiteral(" qt ")
+           << line
+           << Qt::endl; // wjy: Qt::endl flushes each line so a crash leaves the latest checkpoint.
+}
+// ===end====
 
 void drawWindowButtonIcon(QPainter& painter, const QRectF& rect, const QString& type)
 {
@@ -193,24 +218,40 @@ namespace {
 
 void FSREMOTE_STREAM_CALL onRemoteFrame(void* user, int width, int height, const uint8_t* bgra, uint32_t bgraSize)
 {
+    // =====wjy====
+    // appendViewerDebugLog(QStringLiteral("onRemoteFrame enter user=%1 size=%2x%3 bytes=%4")
+    //     .arg(reinterpret_cast<quintptr>(user))
+    //     .arg(width)
+    //     .arg(height)
+    //     .arg(bgraSize)); // wjy: per-frame log disabled to avoid synchronous file writes on the video path.
+    // ===end====
     auto* window = static_cast<RemoteDesktopWindow*>(user);
     if (!window || width <= 0 || height <= 0 || !bgra) {
+        // appendViewerDebugLog(QStringLiteral("onRemoteFrame reject invalid args")); // wjy: per-frame guard log disabled for smoother rendering.
         return;
     }
 
     const qsizetype expected = qsizetype(width) * qsizetype(height) * 4;
     if (expected <= 0 || bgraSize < quint32(expected)) {
+        // appendViewerDebugLog(QStringLiteral("onRemoteFrame reject byte size expected=%1").arg(expected)); // wjy: per-frame size log disabled for smoother rendering.
         return;
     }
 
+    // appendViewerDebugLog(QStringLiteral("onRemoteFrame before QImage copy")); // wjy: per-frame copy log disabled because QImage copy already costs enough.
     QImage image(bgra, width, height, width * 4, QImage::Format_ARGB32);
     QImage copy = image.copy();
+    // appendViewerDebugLog(QStringLiteral("onRemoteFrame after QImage copy")); // wjy: per-frame copy log disabled to reduce IO pressure.
     QMetaObject::invokeMethod(window, [window, copy = std::move(copy)] {
+        // appendViewerDebugLog(QStringLiteral("onRemoteFrame queued lambda enter")); // wjy: per-frame queued-call log disabled.
         if (window->isClosingConnection()) {
+            // appendViewerDebugLog(QStringLiteral("onRemoteFrame queued lambda skip closing")); // wjy: per-frame close-skip log disabled.
             return;
         }
+        // appendViewerDebugLog(QStringLiteral("onRemoteFrame before setRemoteFrame")); // wjy: per-frame UI update log disabled.
         window->setRemoteFrame(copy);
+        // appendViewerDebugLog(QStringLiteral("onRemoteFrame after setRemoteFrame")); // wjy: per-frame UI update log disabled.
     }, Qt::QueuedConnection);
+    // appendViewerDebugLog(QStringLiteral("onRemoteFrame invoke queued")); // wjy: per-frame invoke log disabled to avoid flooding the log file.
 }
 
 void FSREMOTE_STREAM_CALL onViewerStatus(void* user, int code, const char* message)
@@ -221,6 +262,9 @@ void FSREMOTE_STREAM_CALL onViewerStatus(void* user, int code, const char* messa
     }
 
     const QString text = message ? QString::fromUtf8(message) : QString();
+    // =====wjy====
+    appendViewerDebugLog(QStringLiteral("viewer status code=%1 message=%2").arg(code).arg(text)); // wjy: correlate UI status text with native stream checkpoints.
+    // ===end====
     QMetaObject::invokeMethod(window, [window, code, text] {
         if (window->isClosingConnection()) {
             return;
@@ -236,6 +280,9 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
     , m_deviceName(deviceName)
     , m_hostIp(hostIp)
 {
+    // =====wjy====
+    appendViewerDebugLog(QStringLiteral("RemoteDesktopWindow ctor device=%1 host=%2").arg(deviceName, hostIp)); // wjy: mark each remote desktop window creation.
+    // ===end====
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
     setAttribute(Qt::WA_DeleteOnClose);
     resize(1920, 1120);
@@ -261,12 +308,16 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
 
 RemoteDesktopWindow::~RemoteDesktopWindow()
 {
+    // =====wjy====
+    appendViewerDebugLog(QStringLiteral("RemoteDesktopWindow dtor begin")); // wjy: identify crashes during window teardown.
+    // ===end====
     releasePressedKeys();
     setKeyboardForwardingActive(false);
     if (m_viewerHandle) {
         stream::StreamRuntime::instance().stop(m_viewerHandle);
         m_viewerHandle = nullptr;
     }
+    appendViewerDebugLog(QStringLiteral("RemoteDesktopWindow dtor end")); // wjy: teardown completed.
 }
 
 QRect RemoteDesktopWindow::minimizeRect() const
@@ -425,10 +476,14 @@ void RemoteDesktopWindow::updateWindowMask()
 
 void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
 {
+    // =====wjy====
+    // appendViewerDebugLog(QStringLiteral("setRemoteFrame enter size=%1x%2").arg(image.width()).arg(image.height())); // wjy: per-frame UI log disabled for smoother rendering.
+    // ===end====
     m_remoteFrame = image;
     m_connectionStatusCode = 50;
     m_connectionStatus = QString::fromUtf8("画面已接收");
     update(QRect(0, 40, width(), height() - 40));
+    // appendViewerDebugLog(QStringLiteral("setRemoteFrame update requested")); // wjy: per-frame repaint log disabled to avoid disk IO on every frame.
 }
 
 bool RemoteDesktopWindow::isClosingConnection() const
@@ -454,6 +509,9 @@ bool RemoteDesktopWindow::forwardNativeKey(int virtualKey, bool down)
 
 void RemoteDesktopWindow::startViewerConnection()
 {
+    // =====wjy====
+    appendViewerDebugLog(QStringLiteral("startViewerConnection begin host=%1").arg(m_hostIp)); // wjy: mark when the UI asks the stream DLL to connect.
+    // ===end====
     if (!m_hostIp.trimmed().isEmpty()) {
         m_viewerHandle = stream::StreamRuntime::instance().startViewer(
             m_hostIp.trimmed(),
@@ -461,6 +519,7 @@ void RemoteDesktopWindow::startViewerConnection()
             onRemoteFrame,
             onViewerStatus,
             this);
+        appendViewerDebugLog(QStringLiteral("startViewerConnection handle=%1").arg(reinterpret_cast<quintptr>(m_viewerHandle))); // wjy: record whether the DLL returned a handle.
         if (!m_viewerHandle) {
             setConnectionStatus(90, stream::StreamRuntime::instance().lastError());
         }
@@ -622,6 +681,11 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
 
 void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
 {
+    // =====wjy====
+    appendViewerDebugLog(QStringLiteral("closeEvent handle=%1 closing=%2")
+        .arg(reinterpret_cast<quintptr>(m_viewerHandle))
+        .arg(m_closeInProgress ? 1 : 0)); // wjy: show whether a crash is triggered by closing/stop.
+    // ===end====
     if (!m_viewerHandle || m_closeInProgress) {
         QWidget::closeEvent(event);
         return;
@@ -636,7 +700,9 @@ void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
     hide();
 
     std::thread([this, handle] {
+        appendViewerDebugLog(QStringLiteral("closeEvent stop thread begin handle=%1").arg(reinterpret_cast<quintptr>(handle))); // wjy: background stop starts.
         stream::StreamRuntime::instance().stop(handle);
+        appendViewerDebugLog(QStringLiteral("closeEvent stop thread end")); // wjy: background stop returned cleanly.
         QMetaObject::invokeMethod(this, [this] {
             deleteLater();
         }, Qt::QueuedConnection);

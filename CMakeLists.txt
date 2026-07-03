@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
-option(FSREMOTE_BUILD_UU_STREAM_WEBRTC "Build the vendored UU native WebRTC streaming tools" OFF)
+option(FSREMOTE_BUILD_UU_STREAM_WEBRTC "Build the vendored UU native WebRTC streaming tools" ON)
 
 if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
     add_subdirectory(third_party/uu_stream_webrtc)
@@ -45,6 +45,8 @@ qt_add_executable(FSRemote WIN32
     src/system/WakeOnLanSender.h
     src/system/WolDetector.cpp
     src/system/WolDetector.h
+    src/system/WjyDiagnosticLog.cpp
+    src/system/WjyDiagnosticLog.h
     resources/app.manifest
     resources/app.rc
     resources/resources.qrc

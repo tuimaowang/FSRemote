@@ -2,6 +2,7 @@
 
 #include "system/DeviceInfoService.h"
 #include "system/WakeOnLanSender.h"
+#include "system/WjyDiagnosticLog.h"
 
 #include <QAbstractSocket>
 #include <QPointer>
@@ -12,6 +13,13 @@
 
 namespace platform {
 namespace {
+
+// =====wjy====
+void writeCommandServerLog(const QString& message)
+{
+    writeWjyDiagnosticLog(message); // wjy: 命令服务关闭阶段写入统一诊断日志，用来确认 main 返回后的析构是否触发 Release 堆损坏。
+}
+// ===end====
 
 QByteArray actionCommand(DeviceControlAction action)
 {
@@ -146,12 +154,33 @@ public:
 
     void stop()
     {
+        // =====wjy====
+        writeCommandServerLog(QStringLiteral("[wjy-command] Impl::stop begin server=%1").arg(server_ ? 1 : 0)); // wjy: 记录命令服务内部 stop 开始，判断关闭异常是否发生在 QTcpServer 清理阶段。
+        // ===end====
         if (!server_) {
+            // =====wjy====
+            writeCommandServerLog(QStringLiteral("[wjy-command] Impl::stop skipped because server is null")); // wjy: server 已为空时直接返回，说明外层析构里的二次 stop 不会重复删除。
+            // ===end====
             return;
         }
-        server_->close();
-        server_->deleteLater();
+        // =====wjy====
+        QTcpServer* server = server_.data();
         server_ = nullptr;
+        server->close();
+        delete server; // wjy: 关闭阶段事件循环已经退出，改为同步删除 QTcpServer，避免 deleteLater 延迟事件和父对象立即析构交错。
+        writeCommandServerLog(QStringLiteral("[wjy-command] Impl::stop end")); // wjy: 记录命令服务内部 QTcpServer 已同步释放。
+        // ===end====
+    }
+
+    ~Impl() override
+    {
+        // =====wjy====
+        writeCommandServerLog(QStringLiteral("[wjy-command] Impl dtor begin")); // wjy: 记录命令服务实现对象开始析构，和 main 退出后的异常位置对齐。
+        // ===end====
+        stop();
+        // =====wjy====
+        writeCommandServerLog(QStringLiteral("[wjy-command] Impl dtor end")); // wjy: 记录命令服务实现对象析构完成。
+        // ===end====
     }
 
 private:
@@ -160,7 +189,13 @@ private:
 
 DeviceCommandServer::~DeviceCommandServer()
 {
+    // =====wjy====
+    writeCommandServerLog(QStringLiteral("[wjy-command] DeviceCommandServer dtor begin")); // wjy: 记录命令服务外层析构开始，确认 DeviceGrid 析构后是否继续走到这里。
+    // ===end====
     stop();
+    // =====wjy====
+    writeCommandServerLog(QStringLiteral("[wjy-command] DeviceCommandServer dtor end")); // wjy: 记录命令服务外层析构结束。
+    // ===end====
 }
 
 bool DeviceCommandServer::start(uint16_t port)
@@ -173,12 +208,21 @@ bool DeviceCommandServer::start(uint16_t port)
 
 void DeviceCommandServer::stop()
 {
+    // =====wjy====
+    writeCommandServerLog(QStringLiteral("[wjy-command] DeviceCommandServer::stop begin impl=%1").arg(m_impl ? 1 : 0)); // wjy: 记录外层 stop 是否还有实现对象需要释放。
+    // ===end====
     if (!m_impl) {
+        // =====wjy====
+        writeCommandServerLog(QStringLiteral("[wjy-command] DeviceCommandServer::stop skipped because impl is null")); // wjy: impl 已为空时说明前面已经停止过。
+        // ===end====
         return;
     }
     m_impl->stop();
     delete m_impl;
     m_impl = nullptr;
+    // =====wjy====
+    writeCommandServerLog(QStringLiteral("[wjy-command] DeviceCommandServer::stop end")); // wjy: 记录外层 stop 完成，后面如果还崩就继续看 statusServer 或 QApplication 析构。
+    // ===end====
 }
 
 bool DeviceCommandService::send(const QString& hostIp, DeviceControlAction action, uint16_t port, int timeoutMs)
