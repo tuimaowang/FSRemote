@@ -241,17 +241,7 @@ void FSREMOTE_STREAM_CALL onRemoteFrame(void* user, int width, int height, const
     QImage image(bgra, width, height, width * 4, QImage::Format_ARGB32);
     QImage copy = image.copy();
     // appendViewerDebugLog(QStringLiteral("onRemoteFrame after QImage copy")); // wjy: per-frame copy log disabled to reduce IO pressure.
-    QMetaObject::invokeMethod(window, [window, copy = std::move(copy)] {
-        // appendViewerDebugLog(QStringLiteral("onRemoteFrame queued lambda enter")); // wjy: per-frame queued-call log disabled.
-        if (window->isClosingConnection()) {
-            // appendViewerDebugLog(QStringLiteral("onRemoteFrame queued lambda skip closing")); // wjy: per-frame close-skip log disabled.
-            return;
-        }
-        // appendViewerDebugLog(QStringLiteral("onRemoteFrame before setRemoteFrame")); // wjy: per-frame UI update log disabled.
-        window->setRemoteFrame(copy);
-        // appendViewerDebugLog(QStringLiteral("onRemoteFrame after setRemoteFrame")); // wjy: per-frame UI update log disabled.
-    }, Qt::QueuedConnection);
-    // appendViewerDebugLog(QStringLiteral("onRemoteFrame invoke queued")); // wjy: per-frame invoke log disabled to avoid flooding the log file.
+    window->enqueueRemoteFrame(std::move(copy)); // wjy: UI 忙时只保留最新帧，避免每一帧都排队造成画面和鼠标延迟堆积。
 }
 
 void FSREMOTE_STREAM_CALL onViewerStatus(void* user, int code, const char* message)
@@ -295,13 +285,18 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
     m_nextVirtualScreenNumber = 2;
     m_connectionStatus = zh("\xE5\x87\x86\xE5\xA4\x87\xE8\xBF\x9E\xE6\x8E\xA5");
 
+    startInputWorker();
     m_sessionClock.start();
+    m_mouseMoveInputClock.start();
     m_sessionTimer = new QTimer(this);
     m_sessionTimer->setInterval(1000);
     connect(m_sessionTimer, &QTimer::timeout, this, [this] {
         update(QRect(0, 0, width(), 40));
     });
     m_sessionTimer->start();
+    m_mouseMoveInputTimer = new QTimer(this);
+    m_mouseMoveInputTimer->setSingleShot(true);
+    connect(m_mouseMoveInputTimer, &QTimer::timeout, this, &RemoteDesktopWindow::flushRemoteMouseMove);
 
     QTimer::singleShot(0, this, &RemoteDesktopWindow::startViewerConnection);
 }
@@ -311,8 +306,10 @@ RemoteDesktopWindow::~RemoteDesktopWindow()
     // =====wjy====
     appendViewerDebugLog(QStringLiteral("RemoteDesktopWindow dtor begin")); // wjy: identify crashes during window teardown.
     // ===end====
+    flushRemoteMouseMove();
     releasePressedKeys();
     setKeyboardForwardingActive(false);
+    stopInputWorker();
     if (m_viewerHandle) {
         stream::StreamRuntime::instance().stop(m_viewerHandle);
         m_viewerHandle = nullptr;
@@ -371,7 +368,112 @@ bool RemoteDesktopWindow::normalizedRemotePoint(const QPoint& position, int* x, 
 
 void RemoteDesktopWindow::sendInputMessage(const QByteArray& message)
 {
-    stream::StreamRuntime::instance().sendInput(m_viewerHandle, message);
+// =====wjy====
+    const FsRemoteStreamHandle handle = m_viewerHandle; // wjy: 入队时捕获当前连接 handle，后台线程不直接读写窗口成员，减少跨线程竞争。
+    if (!handle || message.isEmpty()) {
+        return;
+    }
+
+    {
+        std::lock_guard lock(m_inputQueueMutex);
+        if (m_inputThreadStopping) {
+            return; // wjy: 窗口关闭阶段不再接受新的输入消息，避免 stop 之后继续发送。
+        }
+        m_inputQueue.emplace_back(handle, message); // wjy: UI 线程只负责入队，真正 DLL 发送放到输入线程执行。
+    }
+    m_inputQueueWake.notify_one();
+// ===end====
+}
+
+void RemoteDesktopWindow::startInputWorker()
+{
+// =====wjy====
+    {
+        std::lock_guard lock(m_inputQueueMutex);
+        m_inputThreadStopping = false;
+    }
+
+    m_inputThread = std::thread([this] {
+        while (true) {
+            QPair<FsRemoteStreamHandle, QByteArray> item;
+            {
+                std::unique_lock lock(m_inputQueueMutex);
+                m_inputQueueWake.wait(lock, [this] {
+                    return m_inputThreadStopping || !m_inputQueue.empty();
+                });
+                if (m_inputQueue.empty()) {
+                    if (m_inputThreadStopping) {
+                        break;
+                    }
+                    continue;
+                }
+                item = std::move(m_inputQueue.front());
+                m_inputQueue.pop_front();
+            }
+
+            if (item.first && !item.second.isEmpty()) {
+                stream::StreamRuntime::instance().sendInput(item.first, item.second); // wjy: 网络/底层输入发送不再占用 UI 线程，拖动远端窗口时响应更跟手。
+            }
+        }
+    });
+// ===end====
+}
+
+void RemoteDesktopWindow::stopInputWorker()
+{
+// =====wjy====
+    {
+        std::lock_guard lock(m_inputQueueMutex);
+        m_inputThreadStopping = true;
+    }
+    m_inputQueueWake.notify_one();
+    if (m_inputThread.joinable()) {
+        m_inputThread.join(); // wjy: 停止视频连接前先等输入队列发完，避免关闭阶段后台继续使用旧 stream handle。
+    }
+    {
+        std::lock_guard lock(m_inputQueueMutex);
+        m_inputQueue.clear();
+    }
+// ===end====
+}
+
+void RemoteDesktopWindow::queueRemoteMouseMove(int x, int y, int buttons)
+{
+// =====wjy====
+    m_pendingRemoteMousePos = QPoint(x, y); // wjy: 鼠标移动只保留最新坐标，避免拖动时把大量过期移动事件发给远端。
+    m_pendingRemoteMouseButtons = buttons;
+
+    constexpr qint64 minIntervalMs = 8; // wjy: 输入发送已移到后台线程，鼠标移动放宽到约 120Hz，让远端拖动更跟手。
+    const qint64 elapsedMs = m_mouseMoveInputClock.isValid() ? m_mouseMoveInputClock.elapsed() : minIntervalMs;
+    if (elapsedMs >= minIntervalMs) {
+        flushRemoteMouseMove();
+        return;
+    }
+
+    if (m_mouseMoveInputTimer && !m_mouseMoveInputTimer->isActive()) {
+        m_mouseMoveInputTimer->start(qMax<int>(1, static_cast<int>(minIntervalMs - elapsedMs)));
+    }
+// ===end====
+}
+
+void RemoteDesktopWindow::flushRemoteMouseMove()
+{
+// =====wjy====
+    if (m_closeInProgress || m_pendingRemoteMousePos.x() < 0 || m_pendingRemoteMousePos.y() < 0) {
+        return;
+    }
+
+    const QPoint pos = m_pendingRemoteMousePos;
+    const int buttons = m_pendingRemoteMouseButtons;
+    m_pendingRemoteMousePos = QPoint(-1, -1);
+    m_pendingRemoteMouseButtons = 0;
+    m_mouseMoveInputClock.restart();
+
+    sendInputMessage(QByteArray("m ")
+        + QByteArray::number(pos.x()) + ' '
+        + QByteArray::number(pos.y()) + ' '
+        + QByteArray::number(buttons));
+// ===end====
 }
 
 void RemoteDesktopWindow::setKeyboardForwardingActive(bool active)
@@ -474,15 +576,63 @@ void RemoteDesktopWindow::updateWindowMask()
     setMask(QRegion(path.toFillPolygon().toPolygon()));
 }
 
+void RemoteDesktopWindow::enqueueRemoteFrame(QImage image)
+{
+// =====wjy====
+    if (image.isNull() || m_closeInProgress) {
+        return; // wjy: 关闭阶段或空帧不再排入 UI，减少销毁过程中的无效事件。
+    }
+
+    bool shouldQueueUiFlush = false;
+    {
+        std::lock_guard lock(m_pendingFrameMutex);
+        m_pendingRemoteFrame = std::move(image); // wjy: UI 还没来得及绘制时，新帧覆盖旧帧，只保留最新画面。
+        if (!m_remoteFrameUpdateQueued) {
+            m_remoteFrameUpdateQueued = true;
+            shouldQueueUiFlush = true; // wjy: 只有第一次进入待处理状态时才投递 UI 事件，后续帧只更新缓存。
+        }
+    }
+
+    if (shouldQueueUiFlush) {
+        QMetaObject::invokeMethod(this, [this] {
+            flushPendingRemoteFrame();
+        }, Qt::QueuedConnection);
+    }
+// ===end====
+}
+
+void RemoteDesktopWindow::flushPendingRemoteFrame()
+{
+// =====wjy====
+    QImage image;
+    {
+        std::lock_guard lock(m_pendingFrameMutex);
+        image = std::move(m_pendingRemoteFrame);
+        m_pendingRemoteFrame = QImage();
+        m_remoteFrameUpdateQueued = false;
+    }
+
+    if (m_closeInProgress || image.isNull()) {
+        return; // wjy: UI 线程真正处理时窗口可能已经开始关闭，直接丢弃缓存帧。
+    }
+
+    setRemoteFrame(image);
+// ===end====
+}
+
 void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
 {
     // =====wjy====
     // appendViewerDebugLog(QStringLiteral("setRemoteFrame enter size=%1x%2").arg(image.width()).arg(image.height())); // wjy: per-frame UI log disabled for smoother rendering.
     // ===end====
+    const bool firstFrame = m_remoteFrame.isNull();
     m_remoteFrame = image;
-    m_connectionStatusCode = 50;
-    m_connectionStatus = QString::fromUtf8("画面已接收");
-    update(QRect(0, 40, width(), height() - 40));
+    if (firstFrame) {
+        m_connectionStatusCode = 50;
+        m_connectionStatus = QString::fromUtf8("画面已接收"); // wjy: 只在首帧更新状态文字，后续帧避免重复改字符串和触发无意义状态变化。
+    }
+    const QRect target = remoteImageRect();
+    update(target.isValid() ? target : QRect(0, 40, width(), height() - 40)); // wjy: 每帧只刷新真实画面区域，减少单窗口黑边/标题栏之外的无效重绘。
     // appendViewerDebugLog(QStringLiteral("setRemoteFrame update requested")); // wjy: per-frame repaint log disabled to avoid disk IO on every frame.
 }
 
@@ -564,16 +714,15 @@ void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
 
 void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
 {
-    Q_UNUSED(event)
-
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
-    painter.setRenderHint(QPainter::SmoothPixmapTransform);
 
-    painter.fillRect(rect(), QColor(QStringLiteral("#000000")));
+    painter.fillRect(event ? event->rect() : rect(), QColor(QStringLiteral("#000000"))); // wjy: 每帧只清理 Qt 要求重绘的区域，减少单窗口远程画面刷新开销。
     if (!m_remoteFrame.isNull()) {
         const QRect target = remoteImageRect();
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, false); // wjy: 远程桌面画面优先低延迟，关闭平滑缩放减少单窗口拖动时的绘制开销。
         painter.drawImage(target, m_remoteFrame);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, true); // wjy: 后续标题栏图标仍可使用平滑绘制，不影响远程画面快速刷新。
     } else {
         const QRect contentRect(0, 40, width(), height() - 40);
         QFont titleFont(QStringLiteral("Microsoft YaHei UI"));
@@ -695,6 +844,7 @@ void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
     m_closeInProgress = true;
     releasePressedKeys();
     setKeyboardForwardingActive(false);
+    stopInputWorker(); // wjy: 关闭视频流前先等输入队列发送完，避免输入线程和 stream stop 同时操作同一个 handle。
     const FsRemoteStreamHandle handle = m_viewerHandle;
     m_viewerHandle = nullptr;
     hide();
@@ -740,6 +890,7 @@ void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
     const int button = remoteButton(event->button());
     if (button && normalizedRemotePoint(event->pos(), &x, &y)) {
         setFocus(Qt::MouseFocusReason);
+        flushRemoteMouseMove(); // wjy: 鼠标按下前先发送上一段残留移动，避免旧坐标晚于按下事件到达远端。
         sendInputMessage(QByteArray("d ")
             + QByteArray::number(button) + ' '
             + QByteArray::number(x) + ' '
@@ -753,8 +904,11 @@ void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
 
 void RemoteDesktopWindow::mouseMoveEvent(QMouseEvent* event)
 {
+    const QPoint previousHoveredPos = m_hoveredPos;
     m_hoveredPos = event->pos();
-    update(QRect(0, 0, width(), 40));
+    if (previousHoveredPos.y() < 40 || m_hoveredPos.y() < 40) {
+        update(QRect(0, 0, width(), 40)); // wjy: 只有鼠标在标题栏相关区域变化时才重绘顶部，远程画面内移动不再每次刷新标题栏。
+    }
 
     if (m_resizingWindow && (event->buttons() & Qt::LeftButton)) {
         const QPoint delta = event->globalPosition().toPoint() - m_resizeStartGlobal;
@@ -804,10 +958,7 @@ void RemoteDesktopWindow::mouseMoveEvent(QMouseEvent* event)
             (event->buttons() & Qt::LeftButton ? 1 : 0) |
             (event->buttons() & Qt::RightButton ? 2 : 0) |
             (event->buttons() & Qt::MiddleButton ? 4 : 0);
-        sendInputMessage(QByteArray("m ")
-            + QByteArray::number(x) + ' '
-            + QByteArray::number(y) + ' '
-            + QByteArray::number(buttons));
+        queueRemoteMouseMove(x, y, buttons); // wjy: 拖动远端窗口时限频发送鼠标移动，避免输入消息压垮画面线程。
         event->accept();
         return;
     }
@@ -875,6 +1026,7 @@ void RemoteDesktopWindow::mouseReleaseEvent(QMouseEvent* event)
     int y = 0;
     const int button = remoteButton(event->button());
     if (button && normalizedRemotePoint(event->pos(), &x, &y)) {
+        flushRemoteMouseMove(); // wjy: 鼠标释放前先补发最后一次移动，让远端拖动终点更接近本地光标位置。
         sendInputMessage(QByteArray("u ")
             + QByteArray::number(button) + ' '
             + QByteArray::number(x) + ' '
