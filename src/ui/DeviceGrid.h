@@ -67,6 +67,8 @@ private:
     void showDeviceMenu();
     void openCurrentDeviceTerminal();
     void executeCurrentDeviceScriptFolder(const QString& scriptFolderPath); // wjy: Copy one shared script folder to remote work directory and run its entry script.
+    bool executeDeviceScriptFolder(int deviceIndex, const QString& scriptFolderPath, bool showMessages); // wjy: Run one shared script folder on a specified device without forcing the current selection.
+    void executeDeviceGroupScriptFolder(int groupIndex, const QString& scriptFolderPath); // wjy: Run one selected script folder for every device in a group.
     void openRemoteDesktopWindow();
     void openDeviceGroupTiledWindows(int groupIndex); // wjy: Open all devices in one group and tile remote windows.
     void refreshLocalDeviceInfo();
@@ -95,6 +97,36 @@ private:
     void updateScriptFileEditorControls();
     void loadScriptFileEditor(const QString& deviceIp, const QString& loginUser, const QString& scriptWorkName);
     void saveScriptFileEditor();
+    void stopCurrentDeviceScript(); // wjy: Stop the running script on the target device, not only the local SSH process.
+    bool stopDeviceScriptForDeviceIndex(int deviceIndex, bool showMessages); // wjy: Stop a running script for one specified device, used by current-device and group-stop actions.
+    void stopDeviceGroupScripts(int groupIndex); // wjy: Stop all running scripts in one group.
+    QString currentScriptUiDeviceIp() const; // wjy: Return the IP whose script UI should be shown by the current detail page.
+    void saveCurrentScriptUiState(); // wjy: Persist the visible script/editor UI into the per-device state cache before switching devices.
+    void loadScriptUiStateForDevice(const QString& deviceIp); // wjy: Restore script/editor UI that belongs to the newly selected device.
+
+    struct ScriptUiState {
+        bool outputVisible = false;
+        bool outputRunning = false;
+        bool outputFailed = false;
+        int outputScrollOffset = 0;
+        bool outputAutoScroll = true;
+        bool outputDirty = false;
+        QString outputTitle;
+        QString outputText;
+        QString outputFilePath;
+        QString lastScriptFolderPath;
+        std::shared_ptr<std::atomic_bool> cancelRequested;
+        bool editorVisible = false;
+        bool editorLoading = false;
+        bool editorSaving = false;
+        QString editorTitle;
+        QString editorRemotePath;
+        QString editorDeviceIp;
+        QString editorLoginUser;
+        QString editorWorkName;
+        QString editorText;
+        bool editorModified = false;
+    };
 
     QString m_currentDeviceName;
     bool m_scriptOutputVisible = false; // wjy: Show the in-page script terminal after a device script is selected.
@@ -116,6 +148,7 @@ private:
     QString m_scriptEditorDeviceIp;
     QString m_scriptEditorLoginUser;
     QString m_scriptEditorWorkName;
+    QHash<QString, ScriptUiState> m_scriptUiStates; // wjy: Keep script output/editor state isolated per device IP so switching devices does not mix panels.
     QLineEdit* m_statusRefreshIntervalEdit = nullptr; // wjy: Auto refresh interval edit.
     QLineEdit* m_batchSubnetEdit = nullptr; // wjy: 批量新增网段输入框，支持 192.168.3.* 格式。
     QPushButton* m_batchAddButton = nullptr; // wjy: 批量新增按钮，扫描期间禁用避免重复启动。

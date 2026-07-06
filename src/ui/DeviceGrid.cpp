@@ -1963,6 +1963,7 @@ DeviceGrid::DeviceGrid(QWidget* parent)
         if (m_scriptOutputAutoScroll) {
             m_scriptOutputScrollOffset = 0;
         }
+        saveCurrentScriptUiState(); // wjy: 当前设备输出被懒刷新后同步回设备状态缓存，切走再切回仍看到最新滚动位置和文本。
         update(scriptTerminalPanelRect().toAlignedRect().adjusted(-2, -2, 2, 2));
     }); // wjy: Batch script output repaint into a short timer, keeping the UI responsive while still feeling live.
 
@@ -2024,6 +2025,93 @@ void DeviceGrid::runBackgroundTask(std::function<void()> task)
     m_backgroundThreads.emplace_back(std::move(task)); // wjy: 不再 detach，析构时统一 join，减少关闭时堆损坏风险。
 }
 // ===end====
+
+QString DeviceGrid::currentScriptUiDeviceIp() const
+{
+// =====wjy====
+    if (m_selectedDeviceIndex < 0 || m_selectedDeviceIndex >= g_devices.size()) {
+        return QString(); // wjy: 没有当前设备时，脚本 UI 没有归属设备。
+    }
+    return g_devices.at(m_selectedDeviceIndex).ip.trimmed(); // wjy: 以设备 IP 作为脚本 UI 状态 key，避免同名设备切换时串状态。
+// ===end====
+}
+
+void DeviceGrid::saveCurrentScriptUiState()
+{
+// =====wjy====
+    const QString deviceIp = currentScriptUiDeviceIp();
+    if (deviceIp.isEmpty()) {
+        return;
+    }
+
+    ScriptUiState state;
+    state.outputVisible = m_scriptOutputVisible;
+    state.outputRunning = m_scriptOutputRunning;
+    state.outputFailed = m_scriptOutputFailed;
+    state.outputScrollOffset = m_scriptOutputScrollOffset;
+    state.outputAutoScroll = m_scriptOutputAutoScroll;
+    state.outputDirty = m_scriptOutputDirty;
+    state.outputTitle = m_scriptOutputTitle;
+    state.outputText = m_scriptOutputText;
+    state.outputFilePath = m_scriptOutputFilePath;
+    state.lastScriptFolderPath = m_lastScriptFolderPath;
+    state.cancelRequested = m_scriptCancelRequested;
+    state.editorVisible = m_scriptEditorVisible;
+    state.editorLoading = m_scriptEditorLoading;
+    state.editorSaving = m_scriptEditorSaving;
+    state.editorTitle = m_scriptEditorTitle;
+    state.editorRemotePath = m_scriptEditorRemotePath;
+    state.editorDeviceIp = m_scriptEditorDeviceIp;
+    state.editorLoginUser = m_scriptEditorLoginUser;
+    state.editorWorkName = m_scriptEditorWorkName;
+    if (m_scriptFileEdit) {
+        state.editorText = m_scriptFileEdit->toPlainText(); // wjy: 切走设备前保留未保存的编辑器文本，切回来时继续显示。
+        state.editorModified = m_scriptFileEdit->document()->isModified();
+    }
+    m_scriptUiStates.insert(deviceIp, state);
+// ===end====
+}
+
+void DeviceGrid::loadScriptUiStateForDevice(const QString& deviceIp)
+{
+// =====wjy====
+    const QString key = deviceIp.trimmed();
+    const ScriptUiState state = m_scriptUiStates.value(key);
+    m_scriptOutputVisible = state.outputVisible;
+    m_scriptOutputRunning = state.outputRunning;
+    m_scriptOutputFailed = state.outputFailed;
+    m_scriptOutputScrollOffset = state.outputScrollOffset;
+    m_scriptOutputAutoScroll = state.outputAutoScroll;
+    m_scriptOutputDirty = state.outputDirty;
+    m_scriptOutputTitle = state.outputTitle;
+    m_scriptOutputText = state.outputText;
+    m_scriptOutputFilePath = state.outputFilePath;
+    m_lastScriptFolderPath = state.lastScriptFolderPath;
+    m_scriptCancelRequested = state.cancelRequested;
+    if (m_scriptOutputVisible && !m_scriptOutputFilePath.trimmed().isEmpty()) {
+        m_scriptOutputText = stripTerminalControlSequences(readScriptOutputFileTail(m_scriptOutputFilePath)); // wjy: 切回正在运行或已执行设备时，从临时输出文件补读最新内容。
+        m_scriptOutputDirty = false;
+        if (m_scriptOutputAutoScroll) {
+            m_scriptOutputScrollOffset = 0;
+        }
+    }
+
+    m_scriptEditorVisible = state.editorVisible;
+    m_scriptEditorLoading = state.editorLoading;
+    m_scriptEditorSaving = state.editorSaving;
+    m_scriptEditorTitle = state.editorTitle;
+    m_scriptEditorRemotePath = state.editorRemotePath;
+    m_scriptEditorDeviceIp = state.editorDeviceIp.trimmed().isEmpty() ? key : state.editorDeviceIp;
+    m_scriptEditorLoginUser = state.editorLoginUser;
+    m_scriptEditorWorkName = state.editorWorkName;
+    if (m_scriptFileEdit) {
+        m_scriptFileEdit->setPlainText(state.editorText);
+        m_scriptFileEdit->document()->setModified(state.editorModified);
+    }
+    updateScriptFileEditorControls();
+    update(scriptFileEditorRect().adjusted(-2, -2, 2, 2).united(scriptTerminalPanelRect().toAlignedRect().adjusted(-2, -2, 2, 2)));
+// ===end====
+}
 
 void DeviceGrid::setupScriptFileEditor()
 {
@@ -2087,17 +2175,35 @@ void DeviceGrid::loadScriptFileEditor(const QString& deviceIp, const QString& lo
     if (deviceIp.trimmed().isEmpty() || loginUser.trimmed().isEmpty() || scriptWorkName.trimmed().isEmpty()) {
         return;
     }
-    m_scriptEditorVisible = true;
-    m_scriptEditorLoading = true;
-    m_scriptEditorSaving = false;
-    m_scriptEditorRemotePath.clear();
-    m_scriptEditorDeviceIp = deviceIp;
-    m_scriptEditorLoginUser = loginUser;
-    m_scriptEditorWorkName = scriptWorkName;
-    if (m_scriptFileEdit) {
-        m_scriptFileEdit->setPlainText(QString::fromUtf8("正在读取目标设备本地 json/txt 文件..."));
+    const QString targetIp = deviceIp.trimmed();
+    const bool targetIsCurrent = currentScriptUiDeviceIp() == targetIp;
+    ScriptUiState loadingState = m_scriptUiStates.value(targetIp);
+    loadingState.editorVisible = true;
+    loadingState.editorLoading = true;
+    loadingState.editorSaving = false;
+    loadingState.editorTitle = QString::fromUtf8("本地文件");
+    loadingState.editorRemotePath.clear();
+    loadingState.editorDeviceIp = targetIp;
+    loadingState.editorLoginUser = loginUser;
+    loadingState.editorWorkName = scriptWorkName;
+    loadingState.editorText = QString::fromUtf8("正在读取目标设备本地 json/txt 文件...");
+    loadingState.editorModified = false;
+    m_scriptUiStates.insert(targetIp, loadingState); // wjy: 开始读取时先更新目标设备状态，切走设备也不会污染当前编辑器。
+    if (targetIsCurrent) {
+        m_scriptEditorVisible = loadingState.editorVisible;
+        m_scriptEditorLoading = loadingState.editorLoading;
+        m_scriptEditorSaving = loadingState.editorSaving;
+        m_scriptEditorTitle = loadingState.editorTitle;
+        m_scriptEditorRemotePath = loadingState.editorRemotePath;
+        m_scriptEditorDeviceIp = loadingState.editorDeviceIp;
+        m_scriptEditorLoginUser = loadingState.editorLoginUser;
+        m_scriptEditorWorkName = loadingState.editorWorkName;
+        if (m_scriptFileEdit) {
+            m_scriptFileEdit->setPlainText(loadingState.editorText);
+            m_scriptFileEdit->document()->setModified(false);
+        }
+        updateScriptFileEditorControls();
     }
-    updateScriptFileEditorControls();
 
     const QString remotePowerShellScript = QStringLiteral(R"($ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -2145,15 +2251,21 @@ Write-Output 'FSREMOTE_EDIT_END'
         if (!self) {
             return;
         }
-        QMetaObject::invokeMethod(self, [self, ok, scriptWorkName, outputText, errorMessage] {
+        QMetaObject::invokeMethod(self, [self, ok, deviceIp, loginUser, scriptWorkName, outputText, errorMessage] {
             if (!self) {
                 return;
             }
             DeviceGrid* grid = self.data();
-            if (grid->m_scriptEditorWorkName != scriptWorkName) {
+            const QString targetIp = deviceIp.trimmed();
+            const bool targetIsCurrent = grid->currentScriptUiDeviceIp() == targetIp;
+            ScriptUiState state = grid->m_scriptUiStates.value(targetIp);
+            const QString activeWorkName = targetIsCurrent ? grid->m_scriptEditorWorkName : state.editorWorkName;
+            if (activeWorkName != scriptWorkName) {
                 return;
             }
-            grid->m_scriptEditorLoading = false;
+            QString nextRemotePath;
+            QString nextTitle;
+            QString nextText;
             const QString result = ok ? stripTerminalControlSequences(outputText) : errorMessage.trimmed();
             const QStringList lines = result.split(QRegularExpression(QStringLiteral("[\\r\\n]+")), Qt::SkipEmptyParts);
             const int pathMarker = lines.indexOf(QStringLiteral("FSREMOTE_EDIT_PATH_BEGIN"));
@@ -2179,28 +2291,45 @@ Write-Output 'FSREMOTE_EDIT_END'
                 for (int i = contentMarker + 1; i < endMarker; ++i) {
                     contentBase64Parts.append(lines.at(i).trimmed()); // wjy: JSON/TXT 内容较长时 Base64 会被拆成多行，必须拼接全部片段后再解码。
                 }
-                grid->m_scriptEditorRemotePath = utf8FromBase64(pathBase64Parts.join(QString()));
+                nextRemotePath = utf8FromBase64(pathBase64Parts.join(QString()));
                 const QString fileName = utf8FromBase64(nameBase64Parts.join(QString()));
-                const QString content = utf8FromBase64(contentBase64Parts.join(QString()));
-                grid->m_scriptEditorTitle = fileName.trimmed().isEmpty()
-                    ? QFileInfo(grid->m_scriptEditorRemotePath).fileName()
+                nextText = utf8FromBase64(contentBase64Parts.join(QString()));
+                nextTitle = fileName.trimmed().isEmpty()
+                    ? QFileInfo(nextRemotePath).fileName()
                     : fileName; // wjy: 标题优先使用远端直接返回的文件名，降低中文路径或控制字符导致的显示乱码概率。
-                if (grid->m_scriptFileEdit) {
-                    grid->m_scriptFileEdit->setPlainText(content);
-                    grid->m_scriptFileEdit->document()->setModified(false); // wjy: 远端本地文件读取完成后把编辑器标记为干净，避免脚本结束刷新覆盖用户后续手动修改。
-                }
             } else {
-                grid->m_scriptEditorRemotePath.clear();
-                grid->m_scriptEditorTitle.clear();
-                if (grid->m_scriptFileEdit) {
-                    grid->m_scriptFileEdit->setPlainText(ok
-                        ? QString::fromUtf8("当前本地脚本目录没有 json/txt 文件。")
-                        : QString::fromUtf8("读取失败：%1").arg(result));
-                    grid->m_scriptFileEdit->document()->setModified(false); // wjy: 无可编辑文件或读取失败时也清掉脏标记，后续自动刷新可以继续尝试读取。
-                }
+                nextText = ok
+                    ? QString::fromUtf8("当前本地脚本目录没有 json/txt 文件。")
+                    : QString::fromUtf8("读取失败：%1").arg(result);
             }
-            grid->updateScriptFileEditorControls();
-            grid->update(scriptFileEditorRect().adjusted(-2, -2, 2, 2));
+            state.editorVisible = true;
+            state.editorLoading = false;
+            state.editorSaving = false;
+            state.editorTitle = nextTitle;
+            state.editorRemotePath = nextRemotePath;
+            state.editorDeviceIp = targetIp;
+            state.editorLoginUser = loginUser; // wjy: 读取回调保存目标设备自己的 SSH 登录用户，避免切换设备后借用当前界面的用户。
+            state.editorWorkName = scriptWorkName;
+            state.editorText = nextText;
+            state.editorModified = false;
+            grid->m_scriptUiStates.insert(targetIp, state); // wjy: 文件读取结果先归档到目标设备自己的状态，切回来时能恢复对应编辑器。
+
+            if (targetIsCurrent) {
+                grid->m_scriptEditorVisible = state.editorVisible;
+                grid->m_scriptEditorLoading = state.editorLoading;
+                grid->m_scriptEditorSaving = state.editorSaving;
+                grid->m_scriptEditorTitle = state.editorTitle;
+                grid->m_scriptEditorRemotePath = state.editorRemotePath;
+                grid->m_scriptEditorDeviceIp = state.editorDeviceIp;
+                grid->m_scriptEditorLoginUser = state.editorLoginUser;
+                grid->m_scriptEditorWorkName = state.editorWorkName;
+                if (grid->m_scriptFileEdit) {
+                    grid->m_scriptFileEdit->setPlainText(state.editorText);
+                    grid->m_scriptFileEdit->document()->setModified(false); // wjy: 只刷新当前设备自己的编辑器，避免别的设备后台读取覆盖当前文本。
+                }
+                grid->updateScriptFileEditorControls();
+                grid->update(scriptFileEditorRect().adjusted(-2, -2, 2, 2));
+            }
         }, Qt::QueuedConnection);
     });
 // ===end====
@@ -2218,6 +2347,7 @@ void DeviceGrid::saveScriptFileEditor()
     }
     m_scriptEditorSaving = true;
     updateScriptFileEditorControls();
+    saveCurrentScriptUiState(); // wjy: 保存开始时把按钮状态写回当前设备缓存，切走后再回来仍能看到保存中的状态。
     const QString remotePath = m_scriptEditorRemotePath;
     const QString contentBase64 = base64Utf8(m_scriptFileEdit->toPlainText());
     const QString deviceIp = m_scriptEditorDeviceIp;
@@ -2250,39 +2380,217 @@ Write-Output 'FSREMOTE_EDIT_SAVE_OK'
         if (!self) {
             return;
         }
-        QMetaObject::invokeMethod(self, [self, ok, remotePath, outputText, errorMessage] {
+        QMetaObject::invokeMethod(self, [self, ok, deviceIp, remotePath, outputText, errorMessage] {
             if (!self) {
                 return;
             }
             DeviceGrid* grid = self.data();
-            if (grid->m_scriptEditorRemotePath != remotePath) {
+            const QString targetIp = deviceIp.trimmed();
+            const bool targetIsCurrent = grid->currentScriptUiDeviceIp() == targetIp;
+            ScriptUiState state = grid->m_scriptUiStates.value(targetIp);
+            const QString activeRemotePath = targetIsCurrent ? grid->m_scriptEditorRemotePath : state.editorRemotePath;
+            if (activeRemotePath != remotePath) {
                 return;
             }
-            grid->m_scriptEditorSaving = false;
-            if (ok && grid->m_scriptFileEdit) {
-                grid->m_scriptFileEdit->document()->setModified(false); // wjy: 保存成功后标记当前文本已经同步到被控机本地 work 文件。
+            state.editorSaving = false;
+            if (ok) {
+                state.editorModified = false; // wjy: 保存成功只清掉目标设备自己的编辑器脏标记，不影响其它设备正在编辑的文本。
             }
-            if (grid->m_scriptFileSaveButton) {
-                grid->m_scriptFileSaveButton->setText(ok ? QString::fromUtf8("已保存") : QString::fromUtf8("失败"));
-                QTimer::singleShot(1200, grid, [grid] {
-                    if (grid) {
-                        grid->updateScriptFileEditorControls();
-                    }
-                });
+            grid->m_scriptUiStates.insert(targetIp, state);
+            if (targetIsCurrent) {
+                grid->m_scriptEditorSaving = false;
+                if (ok && grid->m_scriptFileEdit) {
+                    grid->m_scriptFileEdit->document()->setModified(false); // wjy: 保存成功后标记当前文本已经同步到被控机本地 work 文件。
+                }
+                if (grid->m_scriptFileSaveButton) {
+                    grid->m_scriptFileSaveButton->setText(ok ? QString::fromUtf8("已保存") : QString::fromUtf8("失败"));
+                    QTimer::singleShot(1200, grid, [grid] {
+                        if (grid) {
+                            grid->updateScriptFileEditorControls();
+                        }
+                    });
+                }
             }
             if (!ok) {
                 writeScriptOutputFile(
-                    grid->m_scriptOutputFilePath,
+                    state.outputFilePath,
                     QString::fromUtf8("\n编辑器保存失败：%1\n").arg(errorMessage.trimmed().isEmpty() ? outputText.trimmed() : errorMessage.trimmed()),
                     QIODevice::Append);
+                state.outputDirty = true;
+                grid->m_scriptUiStates.insert(targetIp, state);
+                if (targetIsCurrent) {
+                    grid->m_scriptOutputDirty = true;
+                }
+                if (targetIsCurrent && !grid->m_scriptOutputFlushTimer->isActive()) {
+                    grid->m_scriptOutputFlushTimer->start();
+                }
+            }
+            if (targetIsCurrent) {
+                grid->updateScriptFileEditorControls();
+            }
+        }, Qt::QueuedConnection);
+    });
+// ===end====
+}
+
+void DeviceGrid::stopCurrentDeviceScript()
+{
+// =====wjy====
+    stopDeviceScriptForDeviceIndex(m_selectedDeviceIndex, true); // wjy: 当前面板的停止按钮也走指定设备停止逻辑，和分组批量停止保持一致。
+// ===end====
+}
+
+bool DeviceGrid::stopDeviceScriptForDeviceIndex(int deviceIndex, bool showMessages)
+{
+// =====wjy====
+    if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
+        return false;
+    }
+
+    const QString deviceIp = g_devices.at(deviceIndex).ip.trimmed();
+    ScriptUiState state = m_scriptUiStates.value(deviceIp);
+    if (!state.outputRunning) {
+        return false;
+    }
+
+    const QString loginUser = state.editorLoginUser.trimmed();
+    const QString scriptWorkName = state.editorWorkName.trimmed();
+    const QString outputFilePath = state.outputFilePath;
+    const auto cancelRequested = state.cancelRequested;
+    if (deviceIp.isEmpty() || loginUser.isEmpty() || scriptWorkName.isEmpty()) {
+        if (cancelRequested) {
+            cancelRequested->store(true); // wjy: 缺少远端定位信息时退回旧逻辑，至少断开当前 SSH 执行。
+        }
+        state.outputRunning = false;
+        state.outputFailed = false;
+        m_scriptUiStates.insert(deviceIp, state);
+        if (currentScriptUiDeviceIp() == deviceIp) {
+            loadScriptUiStateForDevice(deviceIp);
+        }
+        return true;
+    }
+
+    state.outputRunning = false;
+    state.outputFailed = false;
+    writeScriptOutputFile(outputFilePath, QString::fromUtf8("\n状态: 正在停止目标进程...\n"), QIODevice::Append);
+    state.outputText = stripTerminalControlSequences(readScriptOutputFileTail(outputFilePath));
+    m_scriptUiStates.insert(deviceIp, state); // wjy: 先把目标设备状态写成停止中，当前 UI 或切回该设备时都能看到停止状态。
+    if (currentScriptUiDeviceIp() == deviceIp) {
+        loadScriptUiStateForDevice(deviceIp);
+    }
+
+    const QString remotePowerShellScript = QStringLiteral(R"($ErrorActionPreference = 'Continue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$fsremoteExe = Get-Process FSRemote -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path
+if ([string]::IsNullOrWhiteSpace($fsremoteExe)) {
+    Write-Output 'cannot locate FSRemote.exe on target device'
+    exit 0
+}
+$fsremoteDir = Split-Path -Parent $fsremoteExe
+$work = Join-Path (Join-Path $fsremoteDir 'work') '%1'
+$pidFile = Join-Path $work 'fsremote_script_controller_pid.txt'
+$stopRequestFile = Join-Path $work 'fsremote_script_stop_requested.txt'
+('Stop requested: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Set-Content -LiteralPath $stopRequestFile -Encoding UTF8
+if (-not (Test-Path -LiteralPath $pidFile)) {
+    Write-Output 'remote script pid file not found'
+    exit 0
+}
+$pidText = Get-Content -LiteralPath $pidFile -Raw
+$match = [regex]::Match($pidText, '\d+')
+if (-not $match.Success) {
+    Write-Output 'remote script pid file has no pid'
+    exit 0
+}
+$targetPid = [int]$match.Value
+if ($targetPid -le 0) {
+    Write-Output 'remote script pid is invalid'
+    exit 0
+}
+Write-Output ('taskkill remote script tree pid=' + $targetPid)
+& taskkill.exe /PID $targetPid /T /F 2>&1 | ForEach-Object { Write-Output $_ }
+Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+exit 0
+)").arg(escapedPowerShellSingleQuoted(scriptWorkName));
+    const QStringList commands = {
+        QStringLiteral("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand %1 & exit %ERRORLEVEL%")
+            .arg(powerShellEncodedCommand(remotePowerShellScript)),
+    };
+
+    QPointer<DeviceGrid> self(this);
+    runBackgroundTask([self, deviceIp, loginUser, commands, outputFilePath, cancelRequested] {
+        QString outputText;
+        QString errorMessage;
+        const bool ok = platform::PortableOpenSshManager::instance().runRemoteCommands(
+            deviceIp,
+            loginUser,
+            commands,
+            &outputText,
+            &errorMessage,
+            15000);
+        if (cancelRequested) {
+            cancelRequested->store(true); // wjy: 远端 taskkill 发出后再让原 SSH 执行会话退出，避免只杀本地 ssh 留下目标子进程。
+        }
+        if (!self) {
+            return;
+        }
+        QMetaObject::invokeMethod(self, [self, ok, deviceIp, outputFilePath, outputText, errorMessage] {
+            if (!self) {
+                return;
+            }
+            DeviceGrid* grid = self.data();
+            const QString targetIp = deviceIp.trimmed();
+            ScriptUiState state = grid->m_scriptUiStates.value(targetIp);
+            if (state.outputFilePath != outputFilePath) {
+                return;
+            }
+            const QString result = ok ? outputText.trimmed() : errorMessage.trimmed();
+            if (!result.isEmpty()) {
+                writeScriptOutputFile(outputFilePath, QString::fromUtf8("\n%1\n").arg(stripTerminalControlSequences(result)), QIODevice::Append);
+            }
+            state.outputDirty = true;
+            grid->m_scriptUiStates.insert(targetIp, state);
+            if (grid->currentScriptUiDeviceIp() == targetIp) {
                 grid->m_scriptOutputDirty = true;
                 if (!grid->m_scriptOutputFlushTimer->isActive()) {
                     grid->m_scriptOutputFlushTimer->start();
                 }
             }
-            grid->updateScriptFileEditorControls();
         }, Qt::QueuedConnection);
     });
+    return true;
+// ===end====
+}
+
+void DeviceGrid::stopDeviceGroupScripts(int groupIndex)
+{
+// =====wjy====
+    if (groupIndex < 0 || groupIndex >= g_deviceGroupNames.size()) {
+        return;
+    }
+
+    const QString groupName = g_deviceGroupNames.at(groupIndex).trimmed();
+    int stoppedCount = 0;
+    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+        if (g_devices.at(deviceIndex).group.trimmed() != groupName) {
+            continue;
+        }
+        if (stopDeviceScriptForDeviceIndex(deviceIndex, false)) {
+            ++stoppedCount; // wjy: 只停止组内确实正在运行脚本的设备，未运行的设备静默跳过。
+        }
+    }
+
+    if (stoppedCount <= 0) {
+        QMessageBox messageBox(
+            QMessageBox::Information,
+            QString(),
+            QString::fromUtf8("分组内没有正在执行的脚本。"),
+            QMessageBox::NoButton,
+            this);
+        messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+        messageBox.exec();
+    } else {
+        update(); // wjy: 当前详情设备属于该分组时，批量停止后立即刷新停止状态。
+    }
 // ===end====
 }
 
@@ -2682,6 +2990,7 @@ void DeviceGrid::startBatchAddDevices()
                     grid->m_previousDeviceIndex = firstAddedIndex;
                     grid->m_currentDeviceName = deviceDisplayName(g_devices.at(firstAddedIndex));
                     grid->m_previousDeviceName = grid->m_currentDeviceName;
+                    grid->loadScriptUiStateForDevice(grid->currentScriptUiDeviceIp()); // wjy: 批量新增第一台设备时初始化它自己的空脚本 UI。
                     if (grid->m_detailAnimationTimer) {
                         grid->m_detailAnimationTimer->stop();
                     }
@@ -2817,6 +3126,7 @@ void DeviceGrid::saveNewDevice()
         m_previousDeviceIndex = newDeviceIndex;
         m_currentDeviceName = name;
         m_previousDeviceName = name;
+        loadScriptUiStateForDevice(currentScriptUiDeviceIp()); // wjy: 手动新增第一台设备时，下方脚本 UI 初始化为这台设备自己的空状态。
         if (m_detailAnimationTimer) {
             m_detailAnimationTimer->stop();
         }
@@ -3211,102 +3521,156 @@ void DeviceGrid::openCurrentDeviceTerminal()
 void DeviceGrid::executeCurrentDeviceScriptFolder(const QString& scriptFolderPath)
 {
 // =====wjy====
-    if (m_selectedDeviceIndex < 0 || m_selectedDeviceIndex >= g_devices.size()) {
-        return;
+    executeDeviceScriptFolder(m_selectedDeviceIndex, scriptFolderPath, true); // wjy: 设备右键和终端执行按钮仍然按当前详情设备执行脚本。
+// ===end====
+}
+
+bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scriptFolderPath, bool showMessages)
+{
+// =====wjy====
+    if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
+        return false;
     }
 
     const QFileInfo entryScript = scriptEntryFile(scriptFolderPath);
     if (!entryScript.exists()) {
-        QMessageBox messageBox(
-            QMessageBox::Information,
-            QString(),
-            QString::fromUtf8("无可用脚本"),
-            QMessageBox::NoButton,
-            this);
-        messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
-        messageBox.exec();
-        return; // wjy: 选中的文件夹没有 bat/cmd/ps1/py/exe 入口时只提示，不创建 work 也不发远程命令。
+        if (showMessages) {
+            QMessageBox messageBox(
+                QMessageBox::Information,
+                QString(),
+                QString::fromUtf8("无可用脚本"),
+                QMessageBox::NoButton,
+                this);
+            messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+            messageBox.exec();
+        }
+        return false; // wjy: 选中的文件夹没有 bat/cmd/ps1/py/exe 入口时只提示，不创建 work 也不发远程命令。
     }
 
     if (scriptRunCommandForFile(entryScript).trimmed().isEmpty()) {
-        QMessageBox messageBox(
-            QMessageBox::Information,
-            QString(),
-            QString::fromUtf8("无可用脚本"),
-            QMessageBox::NoButton,
-            this);
-        messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
-        messageBox.exec();
-        return;
+        if (showMessages) {
+            QMessageBox messageBox(
+                QMessageBox::Information,
+                QString(),
+                QString::fromUtf8("无可用脚本"),
+                QMessageBox::NoButton,
+                this);
+            messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+            messageBox.exec();
+        }
+        return false;
     }
 
-    const DeviceEntry device = g_devices.at(m_selectedDeviceIndex);
+    const DeviceEntry device = g_devices.at(deviceIndex);
+    const QString targetIp = device.ip.trimmed();
+    const ScriptUiState existingState = m_scriptUiStates.value(targetIp);
+    if (existingState.outputRunning) {
+        if (showMessages) {
+            QMessageBox messageBox(
+                QMessageBox::Information,
+                QString(),
+                QString::fromUtf8("该设备已有脚本正在执行。"),
+                QMessageBox::NoButton,
+                this);
+            messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+            messageBox.exec();
+        }
+        return false; // wjy: 分组批量执行时跳过正在运行脚本的设备，避免同一设备堆出多套 conhost/cmd/python 进程。
+    }
     const QString loginUser = platform::DeviceStatusService::terminalUser(device.ip);
     if (loginUser.isEmpty()) {
-        QMessageBox messageBox(
-            QMessageBox::Warning,
-            QString(),
-            QString::fromUtf8("无法获取目标设备终端用户。"),
-            QMessageBox::NoButton,
-            this);
-        messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
-        messageBox.exec();
-        return;
+        if (showMessages) {
+            QMessageBox messageBox(
+                QMessageBox::Warning,
+                QString(),
+                QString::fromUtf8("无法获取目标设备终端用户。"),
+                QMessageBox::NoButton,
+                this);
+            messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+            messageBox.exec();
+        }
+        return false;
     }
 
     QString errorMessage;
     const QString publicKey = platform::PortableOpenSshManager::instance().clientPublicKey(&errorMessage);
     if (publicKey.isEmpty()
         || !platform::DeviceCommandService::authorizeTerminalKey(device.ip, publicKey, &errorMessage)) {
-        QMessageBox messageBox(
-            QMessageBox::Warning,
-            QString(),
-            errorMessage.isEmpty()
-                ? QString::fromUtf8("无法建立目标设备脚本执行授权。")
-                : errorMessage,
-            QMessageBox::NoButton,
-            this);
-        messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
-        messageBox.exec();
-        return; // wjy: 脚本执行复用远程终端密钥授权，目标设备未准备好时提前提示。
+        if (showMessages) {
+            QMessageBox messageBox(
+                QMessageBox::Warning,
+                QString(),
+                errorMessage.isEmpty()
+                    ? QString::fromUtf8("无法建立目标设备脚本执行授权。")
+                    : errorMessage,
+                QMessageBox::NoButton,
+                this);
+            messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+            messageBox.exec();
+        }
+        return false; // wjy: 脚本执行复用远程终端密钥授权，目标设备未准备好时提前提示。
     }
 
     const QString sourcePath = QDir::toNativeSeparators(QFileInfo(scriptFolderPath).absoluteFilePath());
     const QString targetName = deviceDisplayName(device);
     const QString scriptName = entryScript.fileName();
     const QString scriptWorkName = entryScript.completeBaseName();
-    m_lastScriptFolderPath = scriptFolderPath;
-    m_scriptOutputVisible = true;
-    m_scriptOutputRunning = true;
-    m_scriptOutputFailed = false;
-    m_scriptOutputScrollOffset = 0;
-    m_scriptOutputAutoScroll = true;
-    m_scriptOutputDirty = false;
-    if (!m_scriptOutputFilePath.isEmpty()) {
-        QFile::remove(m_scriptOutputFilePath);
-    }
-    m_scriptOutputFilePath = scriptOutputTempFilePath();
-    m_scriptCancelRequested = std::make_shared<std::atomic_bool>(false);
-    m_scriptOutputTitle = QString::fromUtf8("%1 - %2").arg(targetName, scriptName);
-    m_scriptOutputText = QString::fromUtf8("$ 执行脚本 %1\n目标设备: %2\n状态: 正在复制并执行...\n")
+    const bool targetIsCurrent = currentScriptUiDeviceIp() == targetIp;
+    ScriptUiState state;
+    state.outputVisible = true;
+    state.outputRunning = true;
+    state.outputFailed = false;
+    state.outputScrollOffset = 0;
+    state.outputAutoScroll = true;
+    state.outputDirty = false;
+    state.outputFilePath = scriptOutputTempFilePath();
+    state.cancelRequested = std::make_shared<std::atomic_bool>(false);
+    state.outputTitle = QString::fromUtf8("%1 - %2").arg(targetName, scriptName);
+    state.outputText = QString::fromUtf8("$ 执行脚本 %1\n目标设备: %2\n状态: 正在复制并执行...\n")
         .arg(scriptName, targetName); // wjy: 点击脚本后立即显示右侧终端面板，让用户知道远端任务已经开始。
-    writeScriptOutputFile(m_scriptOutputFilePath, m_scriptOutputText, QIODevice::Truncate);
-    m_scriptEditorVisible = true;
-    m_scriptEditorLoading = true;
-    m_scriptEditorSaving = false;
-    m_scriptEditorTitle = QString::fromUtf8("本地文件");
-    m_scriptEditorRemotePath.clear();
-    m_scriptEditorDeviceIp = device.ip;
-    m_scriptEditorLoginUser = loginUser;
-    m_scriptEditorWorkName = scriptWorkName;
-    if (m_scriptFileEdit) {
-        m_scriptFileEdit->setPlainText(QString::fromUtf8("正在等待脚本文件复制到目标设备本地 work 目录..."));
-        m_scriptFileEdit->document()->setModified(false); // wjy: 新脚本启动时重置编辑器状态，后续只编辑目标设备本地 work 里的副本。
+    state.lastScriptFolderPath = scriptFolderPath;
+    state.editorVisible = true;
+    state.editorLoading = true;
+    state.editorSaving = false;
+    state.editorTitle = QString::fromUtf8("本地文件");
+    state.editorRemotePath.clear();
+    state.editorDeviceIp = targetIp;
+    state.editorLoginUser = loginUser;
+    state.editorWorkName = scriptWorkName;
+    state.editorText = QString::fromUtf8("正在等待脚本文件复制到目标设备本地 work 目录...");
+    state.editorModified = false;
+    writeScriptOutputFile(state.outputFilePath, state.outputText, QIODevice::Truncate);
+    m_scriptUiStates.insert(targetIp, state); // wjy: 指定设备执行脚本时先写入对应 IP 状态，分组批量执行不会抢当前设备 UI。
+    if (targetIsCurrent) {
+        m_lastScriptFolderPath = state.lastScriptFolderPath;
+        m_scriptOutputVisible = state.outputVisible;
+        m_scriptOutputRunning = state.outputRunning;
+        m_scriptOutputFailed = state.outputFailed;
+        m_scriptOutputScrollOffset = state.outputScrollOffset;
+        m_scriptOutputAutoScroll = state.outputAutoScroll;
+        m_scriptOutputDirty = state.outputDirty;
+        m_scriptOutputFilePath = state.outputFilePath;
+        m_scriptCancelRequested = state.cancelRequested;
+        m_scriptOutputTitle = state.outputTitle;
+        m_scriptOutputText = state.outputText;
+        m_scriptEditorVisible = state.editorVisible;
+        m_scriptEditorLoading = state.editorLoading;
+        m_scriptEditorSaving = state.editorSaving;
+        m_scriptEditorTitle = state.editorTitle;
+        m_scriptEditorRemotePath = state.editorRemotePath;
+        m_scriptEditorDeviceIp = state.editorDeviceIp;
+        m_scriptEditorLoginUser = state.editorLoginUser;
+        m_scriptEditorWorkName = state.editorWorkName;
+        if (m_scriptFileEdit) {
+            m_scriptFileEdit->setPlainText(state.editorText);
+            m_scriptFileEdit->document()->setModified(false); // wjy: 新脚本启动时重置编辑器状态，后续只编辑目标设备本地 work 里的副本。
+        }
+        updateScriptFileEditorControls();
+        update();
     }
-    updateScriptFileEditorControls();
-    update();
     QTimer::singleShot(900, this, [this, deviceIp = device.ip, loginUser, scriptWorkName] {
-        if (m_scriptEditorDeviceIp == deviceIp && m_scriptEditorWorkName == scriptWorkName) {
+        const ScriptUiState state = m_scriptUiStates.value(deviceIp.trimmed());
+        if (state.editorWorkName == scriptWorkName) {
             loadScriptFileEditor(deviceIp, loginUser, scriptWorkName); // wjy: 复制开始后短暂延迟读取，让编辑框尽快显示 work 子目录里的 json/txt。
         }
     });
@@ -3352,6 +3716,10 @@ $suffix = '%3'
 $runLog = Join-Path $work 'fsremote_script_run.log'
 $exitCodeFile = Join-Path $work 'fsremote_script_exit_code.txt'
 $finishedFile = Join-Path $work 'fsremote_script_finished.txt'
+$controllerPidFile = Join-Path $work 'fsremote_script_controller_pid.txt'
+$stopRequestFile = Join-Path $work 'fsremote_script_stop_requested.txt'
+Remove-Item -LiteralPath $stopRequestFile -Force -ErrorAction SilentlyContinue
+('PID: ' + $PID) | Set-Content -LiteralPath $controllerPidFile -Encoding UTF8
 @(
     'FSRemote script execution started'
     ('Time: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
@@ -3374,6 +3742,7 @@ if ($null -eq $scriptExit) {
 ('ExitCode: ' + $scriptExit) | Set-Content -LiteralPath $exitCodeFile -Encoding UTF8
 ('Finished: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Set-Content -LiteralPath $finishedFile -Encoding UTF8
 ('ExitCode: ' + $scriptExit) | Add-Content -LiteralPath $runLog -Encoding UTF8
+Remove-Item -LiteralPath $controllerPidFile -Force -ErrorAction SilentlyContinue
 Get-Content -LiteralPath $runLog -Tail 80
 exit $scriptExit
 )").arg(
@@ -3387,7 +3756,7 @@ exit $scriptExit
     }; // wjy: 远端复制/执行脚本整体通过 EncodedCommand 传输，避免中文共享路径经过 cmd 输入流后乱码。
 
     QPointer<DeviceGrid> self(this);
-    runBackgroundTask([self, deviceIp = device.ip, loginUser, commands, targetName, scriptName, scriptWorkName, outputFilePath = m_scriptOutputFilePath, cancelRequested = m_scriptCancelRequested] {
+    runBackgroundTask([self, deviceIp = device.ip, loginUser, commands, targetName, scriptName, scriptWorkName, outputFilePath = state.outputFilePath, cancelRequested = state.cancelRequested] {
         QString outputText;
         QString runError;
         const bool ok = platform::PortableOpenSshManager::instance().runRemoteCommands(
@@ -3397,21 +3766,28 @@ exit $scriptExit
             &outputText,
             &runError,
             0,
-            [self, outputFilePath](const QString& chunk) {
+            [self, deviceIp, outputFilePath](const QString& chunk) {
                 if (!self || chunk.isEmpty()) {
                     return;
                 }
                 writeScriptOutputFile(outputFilePath, stripTerminalControlSequences(chunk), QIODevice::Append);
-                QMetaObject::invokeMethod(self, [self, outputFilePath] {
+                QMetaObject::invokeMethod(self, [self, deviceIp, outputFilePath] {
                     if (!self) {
                         return;
                     }
                     DeviceGrid* grid = self.data();
-                    if (grid->m_scriptOutputFilePath != outputFilePath) {
+                    const QString targetIp = deviceIp.trimmed();
+                    ScriptUiState state = grid->m_scriptUiStates.value(targetIp);
+                    if (state.outputFilePath != outputFilePath) {
                         return;
                     }
-                    grid->m_scriptOutputDirty = true;
-                    if (!grid->m_scriptOutputFlushTimer->isActive()) {
+                    state.outputDirty = true;
+                    grid->m_scriptUiStates.insert(targetIp, state); // wjy: 输出分片先标记到目标设备状态，切到其它设备时不触发当前终端刷新。
+                    const bool targetIsCurrent = grid->currentScriptUiDeviceIp() == targetIp;
+                    if (targetIsCurrent) {
+                        grid->m_scriptOutputDirty = true;
+                    }
+                    if (targetIsCurrent && !grid->m_scriptOutputFlushTimer->isActive()) {
                         grid->m_scriptOutputFlushTimer->start();
                     }
                 }, Qt::QueuedConnection);
@@ -3430,19 +3806,15 @@ exit $scriptExit
             }
 
             DeviceGrid* grid = self.data();
-            if (grid->m_scriptOutputFilePath != outputFilePath) {
+            const QString targetIp = deviceIp.trimmed();
+            ScriptUiState state = grid->m_scriptUiStates.value(targetIp);
+            if (state.outputFilePath != outputFilePath) {
                 return;
             }
             const QString resultText = runError.trimmed().isEmpty() ? outputText.trimmed() : runError.trimmed();
             const bool canceled = cancelRequested && cancelRequested->load();
-            grid->m_scriptOutputVisible = true;
-            grid->m_scriptOutputRunning = false;
-            grid->m_scriptOutputFailed = !ok && !canceled;
-            grid->m_scriptOutputScrollOffset = 0;
-            grid->m_scriptOutputAutoScroll = true;
-            grid->m_scriptOutputTitle = QString::fromUtf8("%1 - %2").arg(targetName, scriptName);
             writeScriptOutputFile(
-                grid->m_scriptOutputFilePath,
+                outputFilePath,
                 QString::fromUtf8("\n状态: %1%2\n")
                     .arg(
                         canceled ? QString::fromUtf8("已停止") : (ok ? QString::fromUtf8("已完成") : QString::fromUtf8("执行失败")),
@@ -3450,14 +3822,87 @@ exit $scriptExit
                             ? QString()
                             : ((!ok && !resultText.isEmpty()) ? QString::fromUtf8("\n%1").arg(resultText) : QString())),
                 QIODevice::Append);
-            grid->m_scriptOutputDirty = false;
-            grid->m_scriptOutputText = stripTerminalControlSequences(readScriptOutputFileTail(grid->m_scriptOutputFilePath));
-            grid->update(scriptTerminalPanelRect().toAlignedRect().adjusted(-2, -2, 2, 2));
-            if (!grid->m_scriptFileEdit || !grid->m_scriptFileEdit->document()->isModified()) {
+            state.outputVisible = true;
+            state.outputRunning = false;
+            state.outputFailed = !ok && !canceled;
+            state.outputScrollOffset = 0;
+            state.outputAutoScroll = true;
+            state.outputDirty = false;
+            state.outputTitle = QString::fromUtf8("%1 - %2").arg(targetName, scriptName);
+            state.outputText = stripTerminalControlSequences(readScriptOutputFileTail(outputFilePath));
+            grid->m_scriptUiStates.insert(targetIp, state); // wjy: 结束状态写回目标设备，后台跑完后切回该设备能看到已完成/失败/停止。
+
+            const bool targetIsCurrent = grid->currentScriptUiDeviceIp() == targetIp;
+            if (targetIsCurrent) {
+                grid->m_scriptOutputVisible = state.outputVisible;
+                grid->m_scriptOutputRunning = state.outputRunning;
+                grid->m_scriptOutputFailed = state.outputFailed;
+                grid->m_scriptOutputScrollOffset = state.outputScrollOffset;
+                grid->m_scriptOutputAutoScroll = state.outputAutoScroll;
+                grid->m_scriptOutputDirty = state.outputDirty;
+                grid->m_scriptOutputTitle = state.outputTitle;
+                grid->m_scriptOutputText = state.outputText;
+                grid->update(scriptTerminalPanelRect().toAlignedRect().adjusted(-2, -2, 2, 2));
+            }
+            const bool editorModified = targetIsCurrent
+                ? (grid->m_scriptFileEdit && grid->m_scriptFileEdit->document()->isModified())
+                : state.editorModified;
+            if (!editorModified) {
                 grid->loadScriptFileEditor(deviceIp, loginUser, scriptWorkName); // wjy: 脚本结束后再刷新一次，保证首次复制较慢时编辑器也能拿到本地 json/txt。
             }
         }, Qt::QueuedConnection);
     });
+    return true;
+// ===end====
+}
+
+void DeviceGrid::executeDeviceGroupScriptFolder(int groupIndex, const QString& scriptFolderPath)
+{
+// =====wjy====
+    if (groupIndex < 0 || groupIndex >= g_deviceGroupNames.size()) {
+        return;
+    }
+
+    const QFileInfo entryScript = scriptEntryFile(scriptFolderPath);
+    if (!entryScript.exists() || scriptRunCommandForFile(entryScript).trimmed().isEmpty()) {
+        QMessageBox messageBox(
+            QMessageBox::Information,
+            QString(),
+            QString::fromUtf8("无可用脚本"),
+            QMessageBox::NoButton,
+            this);
+        messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+        messageBox.exec();
+        return; // wjy: 分组批量执行前先校验一次脚本入口，避免组内每台设备重复弹窗。
+    }
+
+    const QString groupName = g_deviceGroupNames.at(groupIndex).trimmed();
+    QVector<int> groupDeviceIndexes;
+    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+        if (g_devices.at(deviceIndex).group.trimmed() == groupName) {
+            groupDeviceIndexes.append(deviceIndex); // wjy: 以真实分组名收集设备下标，保证菜单行号变化不影响批量目标。
+        }
+    }
+
+    int startedCount = 0;
+    for (int deviceIndex : groupDeviceIndexes) {
+        if (executeDeviceScriptFolder(deviceIndex, scriptFolderPath, false)) {
+            ++startedCount; // wjy: 每台设备各自创建 SSH 任务和 UI 状态，互不共享输出文件或停止标志。
+        }
+    }
+
+    if (startedCount <= 0) {
+        QMessageBox messageBox(
+            QMessageBox::Warning,
+            QString(),
+            QString::fromUtf8("分组内没有可执行设备。"),
+            QMessageBox::NoButton,
+            this);
+        messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+        messageBox.exec();
+    } else {
+        update(); // wjy: 如果当前详情设备属于该分组，批量启动后立即刷新它的脚本面板。
+    }
 // ===end====
 }
 
@@ -3632,11 +4077,13 @@ void DeviceGrid::deleteCurrentDevice()
     }
 
     const QString removedIp = g_devices.at(m_selectedDeviceIndex).ip.trimmed();
+    saveCurrentScriptUiState(); // wjy: 删除当前设备前先收拢编辑框未保存文本和终端状态，随后按 IP 清理缓存。
     g_devices.removeAt(m_selectedDeviceIndex);
     saveDevices();
     m_deviceStatuses.remove(removedIp);
     m_poweringOnDeviceIps.remove(removedIp);
     m_poweringOnStartedAtMs.remove(removedIp);
+    m_scriptUiStates.remove(removedIp); // wjy: 被删除设备的脚本 UI 不再保留，避免后续同 IP 之外的设备误用旧状态。
         if (g_devices.isEmpty()) {
             m_selectedDeviceIndex = 0;
             m_previousDeviceIndex = 0;
@@ -3649,6 +4096,7 @@ void DeviceGrid::deleteCurrentDevice()
             updateAddDeviceControls();
             updateLocalInfoControls();
             updateSettingsControls();
+            loadScriptUiStateForDevice(QString());
             update();
             return;
         }
@@ -3669,6 +4117,7 @@ void DeviceGrid::deleteCurrentDevice()
             nextIndex;
     m_currentDeviceName = deviceDisplayName(g_devices.at(nextIndex));
     m_previousDeviceName = m_currentDeviceName;
+    loadScriptUiStateForDevice(currentScriptUiDeviceIp()); // wjy: 删除后详情切到下一台设备时，下方脚本 UI 同步切到下一台设备。
     setDesktopHoverActive(false);
     clearBottomActionHover();
     update();
@@ -4254,13 +4703,16 @@ void DeviceGrid::startDeviceSwitchAnimation(int newIndex, const QString& newName
         return;
     }
 
+    saveCurrentScriptUiState(); // wjy: 切换设备前保存当前设备的脚本终端和文件编辑器状态，避免显示串到下一台设备。
     m_previousDeviceIndex = m_selectedDeviceIndex;
     m_previousDeviceName = m_currentDeviceName;
     m_selectedDeviceIndex = newIndex;
     m_currentDeviceName = newName;
-    m_detailAnimationProgress = 0.0;
-    m_detailAnimationClock.restart();
-    m_detailAnimationTimer->start();
+    loadScriptUiStateForDevice(currentScriptUiDeviceIp()); // wjy: 新设备详情页加载它自己的脚本 UI；没有历史状态时下方面板保持空白。
+    m_detailAnimationProgress = 1.0; // wjy: 用户不需要设备详情从下往上弹出的过渡，切换时直接显示目标设备。
+    if (m_detailAnimationTimer) {
+        m_detailAnimationTimer->stop(); // wjy: 不再启动详情切换动画，避免 paintEvent 进入滑动绘制分支。
+    }
     update();
 }
 
@@ -4320,16 +4772,20 @@ void DeviceGrid::pruneHiddenDeviceSelections()
         ? firstSelectedVisibleDeviceIndex
         : firstVisibleDeviceIndex; // wjy: 主设备被隐藏时，优先切到可见选中设备，否则切到第一台可见设备。
     if (nextDeviceIndex < 0) {
+        saveCurrentScriptUiState(); // wjy: 没有可见设备前先保存当前脚本 UI，避免折叠分组清空详情时丢掉该设备状态。
         m_selectedDeviceIndexes.clear(); // wjy: 当前没有任何可见设备时，清空左侧选择，避免隐藏设备继续高亮或被拖拽。
         m_draggingDeviceIndexes.clear();
         m_selectionAnchorDeviceIndex = -1;
+        loadScriptUiStateForDevice(QString());
         return;
     }
 
+    saveCurrentScriptUiState(); // wjy: 主设备被折叠隐藏时也属于设备切换，需要保存旧设备脚本 UI。
     m_selectedDeviceIndex = nextDeviceIndex; // wjy: 将右侧详情主设备同步到仍可见的设备，避免详情指向折叠隐藏项。
     m_previousDeviceIndex = nextDeviceIndex;
     m_currentDeviceName = deviceDisplayName(g_devices.at(nextDeviceIndex));
     m_previousDeviceName = m_currentDeviceName;
+    loadScriptUiStateForDevice(currentScriptUiDeviceIp()); // wjy: 折叠后恢复新主设备自己的脚本 UI，避免沿用被隐藏设备的面板。
     m_selectedDeviceIndexes.insert(nextDeviceIndex); // wjy: 新主设备必须在左侧多选集合里，保证视觉选中态一致。
     if (m_selectionAnchorDeviceIndex < 0) {
         m_selectionAnchorDeviceIndex = nextDeviceIndex; // wjy: 没有可用 Shift 锚点时，用新主设备作为下一次范围选择起点。
@@ -4410,14 +4866,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         && !m_localInfoSelected
         && scriptTerminalActionButtonRect().contains(event->position())) {
         if (m_scriptOutputRunning) {
-            if (m_scriptCancelRequested) {
-                m_scriptCancelRequested->store(true);
-            }
-            m_scriptOutputRunning = false;
-            m_scriptOutputFailed = false;
-            writeScriptOutputFile(m_scriptOutputFilePath, QString::fromUtf8("\n状态: 正在停止...\n"), QIODevice::Append);
-            m_scriptOutputText = stripTerminalControlSequences(readScriptOutputFileTail(m_scriptOutputFilePath));
-            update(scriptTerminalPanelRect().toAlignedRect().adjusted(-2, -2, 2, 2));
+            stopCurrentDeviceScript(); // wjy: 停止时先要求目标设备 taskkill 脚本进程树，再让本地 SSH 执行会话退出。
         } else if (!m_lastScriptFolderPath.trimmed().isEmpty()) {
             executeCurrentDeviceScriptFolder(m_lastScriptFolderPath);
         }
@@ -4512,10 +4961,17 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
 
             QMenu menu(this); // wjy: 创建分组右键菜单，用来放分组相关操作入口。
             QAction* tileDevicesAction = menu.addAction(QString::fromUtf8("设备平铺")); // wjy: 设备平铺菜单项先提供入口，具体平铺逻辑后续再实现。
+            QMenu* scriptMenu = menu.addMenu(QString::fromUtf8("执行脚本")); // wjy: 分组右键复用设备右键的脚本目录级联菜单，最终叶子节点批量执行组内设备。
+            populateScriptFolderMenu(scriptMenu, QString::fromUtf8(kRemoteScriptFolderPath));
+            QAction* stopScriptsAction = menu.addAction(QString::fromUtf8("批量停止")); // wjy: 分组级停止会遍历组内设备，停止所有正在运行的脚本进程树。
             QAction* deleteGroupAction = menu.addAction(QString::fromUtf8("删除分组")); // wjy: 删除分组菜单项先显示出来，后续再补真正删除分组和设备归属处理。
             const QAction* selectedAction = menu.exec(mapToGlobal(event->pos())); // wjy: 在分组行右键位置弹出菜单。
             if (selectedAction == tileDevicesAction) {
                 openDeviceGroupTiledWindows(row.groupIndex); // wjy: 点击设备平铺时，打开该分组内所有设备的远程桌面窗口并按屏幕网格排列。
+            } else if (selectedAction && selectedAction->data().isValid()) {
+                executeDeviceGroupScriptFolder(row.groupIndex, selectedAction->data().toString()); // wjy: 点击脚本叶子目录时，对该分组内所有设备启动同一个脚本。
+            } else if (selectedAction == stopScriptsAction) {
+                stopDeviceGroupScripts(row.groupIndex); // wjy: 点击批量停止时，对分组内所有正在运行脚本的设备发远端 taskkill。
             } else if (selectedAction == deleteGroupAction) {
                 const int groupIndex = row.groupIndex; // wjy: 记录要删除的真实分组下标，不能用界面行号删除数据。
                 if (groupIndex >= 0 && groupIndex < g_deviceGroupNames.size()) {
@@ -4798,6 +5254,7 @@ void DeviceGrid::wheelEvent(QWheelEvent* event)
             m_scriptOutputScrollOffset = qBound(0, m_scriptOutputScrollOffset - lineStep, maxOffset);
         }
         m_scriptOutputAutoScroll = (m_scriptOutputScrollOffset == 0);
+        saveCurrentScriptUiState(); // wjy: 每台设备保留自己的终端滚动位置，切到别的设备不会改变当前设备的查看位置。
         update(scriptTerminalPanelRect().toAlignedRect().adjusted(-2, -2, 2, 2));
         event->accept();
         return;
