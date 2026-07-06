@@ -1,6 +1,9 @@
 #pragma once
 
+#include <functional>
+
 #include <QString>
+#include <QStringList>
 
 class QProcess;
 
@@ -14,6 +17,9 @@ public:
     void stopServer();
 
     bool openTerminal(const QString& hostIp, const QString& loginUser, QString* errorMessage = nullptr);
+    bool runRemoteCommands(const QString& hostIp, const QString& loginUser, const QStringList& commands, QString* outputText = nullptr, QString* errorMessage = nullptr, int timeoutMs = 120000, std::function<void(const QString&)> outputCallback = {}, std::function<bool()> shouldCancel = {});
+    QString clientPublicKey(QString* errorMessage = nullptr);
+    bool authorizeClientPublicKey(const QString& publicKey, QString* errorMessage = nullptr);
     QString loginUser() const;
     uint16_t serverPort() const;
 
@@ -25,6 +31,7 @@ private:
     bool ensureLayout(QString* errorMessage) const;
     bool ensureKeys(QString* errorMessage);
     bool ensureConfig(QString* errorMessage);
+    bool ensurePrivateKeyPermissions(const QString& keyPath, QString* errorMessage) const;
     bool cleanupResidualServerProcesses(QString* errorMessage) const;
     bool runTool(const QString& program, const QStringList& arguments, int timeoutMs, QString* errorMessage) const;
 

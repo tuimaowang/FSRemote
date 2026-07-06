@@ -83,3 +83,24 @@ add_custom_command(TARGET FSRemote POST_BUILD
         "$<TARGET_FILE_DIR:FSRemote>/parsec_vdd/parsec-vdd-0.45.0.0.exe"
     VERBATIM
 )
+
+# =====wjy====
+set(FSREMOTE_OPENSSH_RUNTIME_DIR "" CACHE PATH "OpenSSH-Win64 runtime directory copied beside FSRemote.exe")
+if(NOT FSREMOTE_OPENSSH_RUNTIME_DIR)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/openssh/OpenSSH-Win64/ssh.exe")
+        set(FSREMOTE_OPENSSH_RUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/openssh/OpenSSH-Win64") # wjy: 优先使用正式随仓库/发布包放置的 OpenSSH 运行时目录。
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/webRTC/FSRemoteDll/openssh/OpenSSH-Win64/ssh.exe")
+        set(FSREMOTE_OPENSSH_RUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/webRTC/FSRemoteDll/openssh/OpenSSH-Win64") # wjy: 兼容当前本机已有的临时 OpenSSH 目录，方便调试构建自动复制。
+    endif()
+endif()
+
+if(FSREMOTE_OPENSSH_RUNTIME_DIR AND EXISTS "${FSREMOTE_OPENSSH_RUNTIME_DIR}/ssh.exe")
+    add_custom_command(TARGET FSRemote POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:FSRemote>/openssh"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            "${FSREMOTE_OPENSSH_RUNTIME_DIR}"
+            "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64"
+        VERBATIM
+    ) # wjy: 构建后把 ssh.exe/sshd.exe/ssh-keygen.exe/sftp-server.exe 一起复制到程序固定查找路径。
+endif()
+# ===end====

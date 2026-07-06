@@ -7,12 +7,6 @@
 #include <QWidget>
 #include <QElapsedTimer>
 #include <QImage>
-#include <QPair>
-
-#include <condition_variable>
-#include <deque>
-#include <mutex>
-#include <thread>
 
 #include "FsRemoteStreamApi.h"
 
@@ -34,7 +28,6 @@ class RemoteDesktopWindow final : public QWidget {
 public:
     explicit RemoteDesktopWindow(const QString& deviceName, const QString& hostIp, QWidget* parent = nullptr);
     ~RemoteDesktopWindow() override;
-    void enqueueRemoteFrame(QImage image);
     void setRemoteFrame(const QImage& image);
     void setConnectionStatus(int code, const QString& message);
     bool isClosingConnection() const;
@@ -75,11 +68,6 @@ private:
     QRect remoteImageRect() const;
     bool normalizedRemotePoint(const QPoint& position, int* x, int* y) const;
     void sendInputMessage(const QByteArray& message);
-    void startInputWorker();
-    void stopInputWorker();
-    void queueRemoteMouseMove(int x, int y, int buttons);
-    void flushRemoteMouseMove();
-    void flushPendingRemoteFrame();
     void setKeyboardForwardingActive(bool active);
     void releasePressedKeys();
     int remoteButton(Qt::MouseButton button) const;
@@ -105,20 +93,8 @@ private:
     QPoint m_resizeStartGlobal;
     QRect m_resizeStartGeometry;
     QElapsedTimer m_sessionClock;
-    QElapsedTimer m_mouseMoveInputClock;
     QTimer* m_sessionTimer = nullptr;
-    QTimer* m_mouseMoveInputTimer = nullptr;
     QSet<int> m_pressedKeys;
-    std::mutex m_pendingFrameMutex; // wjy: 保护远程帧合并缓存，原生回调线程和 UI 线程都会访问。
-    QImage m_pendingRemoteFrame;
-    bool m_remoteFrameUpdateQueued = false; // wjy: UI 线程已有待处理帧任务时，新帧只覆盖缓存，不继续堆积事件。
-    QPoint m_pendingRemoteMousePos = QPoint(-1, -1);
-    int m_pendingRemoteMouseButtons = 0;
-    std::mutex m_inputQueueMutex; // wjy: 保护远程输入发送队列，让 UI 线程只入队，不直接阻塞在 DLL 发送上。
-    std::condition_variable m_inputQueueWake;
-    std::deque<QPair<FsRemoteStreamHandle, QByteArray>> m_inputQueue;
-    std::thread m_inputThread;
-    bool m_inputThreadStopping = false;
 };
 
 } // namespace ui

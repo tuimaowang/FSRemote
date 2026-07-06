@@ -1,6 +1,7 @@
 #include "system/DeviceCommandService.h"
 
 #include "system/DeviceInfoService.h"
+#include "system/PortableOpenSshManager.h"
 #include "system/WakeOnLanSender.h"
 #include "system/WjyDiagnosticLog.h"
 
@@ -51,6 +52,19 @@ QByteArray wakeCommand(const QString& macAddress)
     }
     return QByteArrayLiteral("wake_mac|") + mac.toUtf8() + QByteArrayLiteral("\n");
 }
+
+// =====wjy====
+QByteArray authorizeTerminalKeyCommand(const QString& publicKey)
+{
+    const QString key = publicKey.trimmed();
+    if (key.isEmpty()) {
+        return {}; // wjy: 没有本机 SSH 公钥时不发送授权命令，避免目标设备写入空行。
+    }
+    return QByteArrayLiteral("authorize_ssh_key|")
+        + QUrl::toPercentEncoding(key)
+        + QByteArrayLiteral("\n"); // wjy: 公钥中包含空格、斜杠和等号，放进 TCP 命令前统一做百分号编码。
+}
+// ===end====
 
 QByteArray renameDeviceCommand(const QString& newName)
 {
@@ -242,6 +256,24 @@ private:
             }
             return;
         }
+// =====wjy====
+        if (command == "authorize_ssh_key") {
+            const QString publicKey = QUrl::fromPercentEncoding(parts.value(1)).trimmed();
+            QString errorMessage;
+            if (PortableOpenSshManager::instance().authorizeClientPublicKey(publicKey, &errorMessage)) {
+                replyAndClose(QByteArrayLiteral("ok\n"));
+            } else {
+                QByteArray payload = QByteArrayLiteral("error");
+                if (!errorMessage.trimmed().isEmpty()) {
+                    payload.append('|');
+                    payload.append(QUrl::toPercentEncoding(errorMessage.trimmed()));
+                }
+                payload.append('\n');
+                replyAndClose(payload);
+            }
+            return; // wjy: 目标机收到发起方公钥后写入 authorized_keys，后续 ssh.exe 才能通过 publickey 认证。
+        }
+// ===end====
 
         replyAndClose(QByteArrayLiteral("error\n"));
     }
@@ -460,6 +492,14 @@ bool DeviceCommandService::renameDevice(const QString& hostIp, const QString& ne
 {
     const QByteArray payload = renameDeviceCommand(newName);
     return sendCommandPayload(hostIp, payload, errorMessage, port, timeoutMs); // wjy: 复用统一 TCP 命令发送流程，把本地重命名同步到目标机器。
+}
+
+bool DeviceCommandService::authorizeTerminalKey(const QString& hostIp, const QString& publicKey, QString* errorMessage, uint16_t port, int timeoutMs)
+{
+// =====wjy====
+    const QByteArray payload = authorizeTerminalKeyCommand(publicKey);
+    return sendCommandPayload(hostIp, payload, errorMessage, port, timeoutMs); // wjy: 打开终端前先把本机公钥登记到目标机，解决多台设备各自生成 key 后互不信任的问题。
+// ===end====
 }
 
 } // namespace platform

@@ -1,4 +1,4 @@
-﻿#include "ui/DeviceGrid.h"
+#include "ui/DeviceGrid.h"
 
 #include "system/AppSettings.h"
 #include "system/DeviceCommandService.h"
@@ -14,6 +14,7 @@
 #include <QAction>
 #include <QAbstractSocket>
 #include <QApplication>
+#include <QByteArray>
 #include <QClipboard>
 #include <QCoreApplication>
 #include <QDateTime>
@@ -22,9 +23,11 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QFontMetrics>
 #include <QHostAddress>
 #include <QIcon>
 #include <QIntValidator>
+#include <QIODevice>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -40,11 +43,14 @@
 #include <QPixmap>
 #include <QPushButton>
 #include <QGuiApplication>
+#include <QRegularExpression>
 #include <QScreen>
 #include <QSet>
 #include <QStringList>
 #include <QTimer>
 #include <QToolButton>
+#include <QTextEdit>
+#include <QTextDocument>
 #include <QTextStream>
 #include <QVector>
 #include <QWheelEvent>
@@ -52,6 +58,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <memory>
 #include <mutex>
 #include <tuple>
 #include <thread>
@@ -180,6 +187,8 @@ struct DeviceListRow {
 
 constexpr int kDeviceGroupReservedBlankHeight = 30; // wjy: 预留“我的设备”列表下方空白，后续可用于右键菜单命中区域。
 constexpr int kDeviceListMaxViewportHeight = 420; // wjy: “我的设备”列表最多占用 420 像素，内容更多时在这块区域内滚动，避免压住设备管理。
+constexpr const char* kRemoteScriptFolderPath = "\\\\192.168.1.100\\广告部工具\\远程脚本文件"; // wjy: 执行脚本入口当前只浏览这个固定共享目录，真正执行逻辑后续再接。
+constexpr const char* kRemoteScriptWorkPath = "%FSREMOTE_DIR%work"; // wjy: 目标设备 FSRemote.exe 所在目录下的 work 文件夹，每次执行前重建。
 
 class RenameDeviceDialog final : public QDialog {
 public:
@@ -282,6 +291,148 @@ private:
     QLabel* m_countLabel = nullptr;
     QPushButton* m_saveButton = nullptr;
 };
+
+// =====wjy====
+QFileInfoList scriptChildDirectories(const QString& folderPath)
+{
+    QDir dir(folderPath);
+    return dir.entryInfoList(
+        QDir::Dirs | QDir::NoDotAndDotDot,
+        QDir::Name | QDir::IgnoreCase); // wjy: 只读取目录并按名称排序，右键级联菜单暂不显示脚本文件本身。
+}
+
+void populateScriptFolderMenu(QMenu* menu, const QString& folderPath)
+{
+    if (!menu) {
+        return;
+    }
+
+    const QDir dir(folderPath);
+    if (!dir.exists()) {
+        QAction* unavailableAction = menu->addAction(QString::fromUtf8("无法访问脚本目录"));
+        unavailableAction->setEnabled(false); // wjy: 共享路径不可访问时直接在子菜单里显示原因，不弹额外窗口打断右键菜单。
+        return;
+    }
+
+    const QFileInfoList childDirectories = scriptChildDirectories(folderPath);
+    if (childDirectories.isEmpty()) {
+        QAction* emptyAction = menu->addAction(QString::fromUtf8("无子文件夹"));
+        emptyAction->setEnabled(false); // wjy: 当前目录没有下级文件夹时显示占位，后续执行逻辑再决定叶子节点点击行为。
+        return;
+    }
+
+    for (const QFileInfo& childInfo : childDirectories) {
+        const QString childPath = childInfo.absoluteFilePath();
+        const QFileInfoList grandChildren = scriptChildDirectories(childPath);
+        if (grandChildren.isEmpty()) {
+            QAction* scriptFolderAction = menu->addAction(childInfo.fileName());
+            scriptFolderAction->setData(childPath); // wjy: 叶子目录保存真实共享路径，菜单点击后用它复制文件并执行入口脚本。
+            continue;
+        }
+
+        QMenu* childMenu = menu->addMenu(childInfo.fileName());
+        populateScriptFolderMenu(childMenu, childPath); // wjy: 有子目录时创建级联菜单，鼠标悬浮即可继续展开下一层。
+    }
+}
+
+QString escapedCmdPath(const QString& path)
+{
+    QString escaped = QDir::toNativeSeparators(path);
+    escaped.replace(QLatin1Char('"'), QStringLiteral("\"\""));
+    return escaped; // wjy: 放入 cmd 引号中的路径只需处理双引号，空格和中文由外层引号保护。
+}
+
+QString escapedPowerShellSingleQuoted(const QString& value)
+{
+    QString escaped = QDir::toNativeSeparators(value);
+    escaped.replace(QLatin1Char('\''), QStringLiteral("''"));
+    return escaped; // wjy: PowerShell 单引号字符串通过两个单引号转义，中文路径由 EncodedCommand 以 Unicode 传到目标设备。
+}
+
+QString powerShellEncodedCommand(const QString& script)
+{
+    const QByteArray utf16LittleEndian(
+        reinterpret_cast<const char*>(script.utf16()),
+        script.size() * int(sizeof(ushort)));
+    return QString::fromLatin1(utf16LittleEndian.toBase64()); // wjy: powershell -EncodedCommand 要求 UTF-16LE 后再 Base64，避免中文 UNC 路径经过 cmd/ssh 时乱码。
+}
+
+QString scriptOutputTempFilePath()
+{
+    const QString fileName = QStringLiteral("fsremote_script_output_%1_%2.log")
+        .arg(QCoreApplication::applicationPid())
+        .arg(QDateTime::currentMSecsSinceEpoch());
+    return QDir(QDir::tempPath()).filePath(fileName); // wjy: Each script run owns one local temp output file, decoupling SSH chunks from the painted terminal.
+}
+
+bool writeScriptOutputFile(const QString& filePath, const QString& text, QIODevice::OpenMode mode)
+{
+    if (filePath.trimmed().isEmpty()) {
+        return false;
+    }
+    QFile file(filePath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text | mode)) {
+        return false;
+    }
+    file.write(text.toUtf8());
+    return true;
+}
+
+QString readScriptOutputFileTail(const QString& filePath, qint64 maxBytes = 256 * 1024)
+{
+    QFile file(filePath);
+    if (!file.open(QIODevice::ReadOnly)) {
+        return {};
+    }
+    if (file.size() > maxBytes) {
+        file.seek(file.size() - maxBytes);
+        file.readLine(); // wjy: Drop a possibly partial first line when reading a large output tail.
+    }
+    return QString::fromUtf8(file.readAll());
+}
+
+QFileInfo scriptEntryFile(const QString& folderPath)
+{
+    const QStringList priorityExtensions = {
+        QStringLiteral("*.bat"),
+        QStringLiteral("*.cmd"),
+        QStringLiteral("*.ps1"),
+        QStringLiteral("*.py"),
+        QStringLiteral("*.exe"),
+    }; // wjy: 优先使用批处理/PowerShell 作为入口，其次 Python，最后才直接运行 exe。
+
+    const QDir dir(folderPath);
+    for (const QString& pattern : priorityExtensions) {
+        const QFileInfoList files = dir.entryInfoList(
+            QStringList{pattern},
+            QDir::Files,
+            QDir::Name | QDir::IgnoreCase);
+        if (!files.isEmpty()) {
+            return files.first(); // wjy: 同类脚本多个时先取名称排序后的第一个，后续可再扩展为脚本选择菜单。
+        }
+    }
+    return {};
+}
+
+QString scriptRunCommandForFile(const QFileInfo& scriptFile)
+{
+    const QString scriptName = scriptFile.fileName();
+    const QString suffix = scriptFile.suffix().toLower();
+    if (suffix == QStringLiteral("py")) {
+        return QStringLiteral("python \"%1\"").arg(escapedCmdPath(scriptName)); // wjy: Python 脚本用目标设备命令行里的 python 解释器运行。
+    }
+    if (suffix == QStringLiteral("ps1")) {
+        return QStringLiteral("powershell -NoProfile -ExecutionPolicy Bypass -File \"%1\"").arg(escapedCmdPath(scriptName)); // wjy: ps1 用 PowerShell 绕过本次进程策略执行。
+    }
+    if (suffix == QStringLiteral("bat") || suffix == QStringLiteral("cmd")) {
+        return QStringLiteral("call \"%1\"").arg(escapedCmdPath(scriptName)); // wjy: 批处理用 call 执行，避免脚本返回后中断外层命令流。
+    }
+    if (suffix == QStringLiteral("exe")) {
+        return QStringLiteral("\"%1\"").arg(escapedCmdPath(scriptName)); // wjy: exe 入口直接运行。
+    }
+    return {};
+}
+// ===end====
 
 QString deviceDisplayName(const DeviceEntry& device)
 {
@@ -846,22 +997,38 @@ QString deviceStatusText(platform::DevicePresenceState state)
     }
 }
 
+// =====wjy====
+constexpr qreal kDeviceDetailCardLeft = 280.0; // wjy: 设备详情卡片左侧固定位置，蓝色桌面图和底部按钮都以它为基准对齐。
+constexpr qreal kDeviceDetailCardWidth = 600.0; // wjy: 设备详情卡片宽度保持不变，只压缩上方蓝色桌面预览高度。
+constexpr qreal kDeviceDesktopImageHeight = 120.0; // wjy: 原来蓝色桌面预览高度是 240，这里缩到 120，让上方蓝色区域明显变小。
+constexpr qreal kDeviceBottomActionHeight = 50.0; // wjy: 底部“文件传输/更多”操作区高度保持 50，避免按钮文字和图标被压缩。
+constexpr qreal kDeviceDetailCardHeight = kDeviceDesktopImageHeight + kDeviceBottomActionHeight + 1.0; // wjy: 卡片总高度跟随蓝色图高度计算，防止白色底部区域位置错位。
+
+qreal deviceDetailCardTop(bool isRemoteControlled)
+{
+    return isRemoteControlled ? 189.0 : 124.0; // wjy: 被控提示出现时，卡片整体下移，原有布局逻辑保持不变。
+}
+
+qreal deviceBottomActionTop(bool isRemoteControlled)
+{
+    return deviceDetailCardTop(isRemoteControlled) + kDeviceDesktopImageHeight; // wjy: 底部操作区紧贴缩小后的蓝色桌面图下边缘。
+}
+
 QRectF desktopImageRect(bool isRemoteControlled)
 {
-    return QRectF(280, isRemoteControlled ? 189 : 124, 600, 240);
+    return QRectF(kDeviceDetailCardLeft, deviceDetailCardTop(isRemoteControlled), kDeviceDetailCardWidth, kDeviceDesktopImageHeight); // wjy: 蓝色桌面图的点击热区和绘制高度同步缩小。
 }
 
 QRectF fileTransferActionRect(bool isRemoteControlled)
 {
-    const qreal cardTop = isRemoteControlled ? 189 : 124;
-    return QRectF(281, cardTop + 240, 298, 50);
+    return QRectF(281, deviceBottomActionTop(isRemoteControlled), 298, kDeviceBottomActionHeight); // wjy: 文件传输按钮跟随新的底部操作区位置。
 }
 
 QRectF moreActionRect(bool isRemoteControlled)
 {
-    const qreal cardTop = isRemoteControlled ? 189 : 124;
-    return QRectF(580, cardTop + 240, 299, 50);
+    return QRectF(580, deviceBottomActionTop(isRemoteControlled), 299, kDeviceBottomActionHeight); // wjy: 更多按钮跟随新的底部操作区位置。
 }
+// ===end====
 
 QRectF wakeButtonRect(bool isRemoteControlled)
 {
@@ -871,6 +1038,236 @@ QRectF wakeButtonRect(bool isRemoteControlled)
         imageRect.center().y() - 36.0,
         72.0,
         72.0);
+}
+
+QRectF scriptTerminalPanelRect()
+{
+    return QRectF(580, 308, 300, 368); // wjy: Place the script output terminal in the right-side blank area marked by the user.
+}
+
+QRect scriptFileEditorRect()
+{
+    return QRect(272, 312, 300, 363); // wjy: Left-side editor area requested by the user, paired with the script terminal panel.
+}
+
+QRect scriptFileEditorSaveButtonRect()
+{
+    const QRect rect = scriptFileEditorRect();
+    return QRect(rect.right() - 68, rect.y() + 7, 56, 24);
+}
+
+QRect scriptFileEditorTextRect()
+{
+    return scriptFileEditorRect().adjusted(8, 38, -8, -8);
+}
+
+QRectF scriptTerminalActionButtonRect()
+{
+    const QRectF panel = scriptTerminalPanelRect();
+    return QRectF(panel.right() - 86, panel.y() + 8, 58, 22); // wjy: Small run/stop button in the panel header at the position marked by the user.
+}
+
+QString stripTerminalControlSequences(const QString& text);
+
+QString base64Utf8(const QString& text)
+{
+    return QString::fromLatin1(text.toUtf8().toBase64());
+}
+
+QString utf8FromBase64(const QString& text)
+{
+    return QString::fromUtf8(QByteArray::fromBase64(text.trimmed().toLatin1()));
+}
+
+QStringList terminalOutputLines(const QString& text)
+{
+    const QString normalized = text.trimmed().isEmpty()
+        ? QString()
+        : text.trimmed();
+    QStringList compactedLines;
+    bool previousLineEmpty = false;
+    for (QString line : normalized.split(QLatin1Char('\n'))) {
+        while (line.endsWith(QLatin1Char(' ')) || line.endsWith(QLatin1Char('\t'))) {
+            line.chop(1);
+        }
+        const bool lineEmpty = line.trimmed().isEmpty();
+        if (lineEmpty && previousLineEmpty) {
+            continue;
+        }
+        compactedLines.append(line);
+        previousLineEmpty = lineEmpty;
+    }
+    return compactedLines; // wjy: Collapse repeated blank lines from terminal repaint/control output while preserving JSON indentation.
+}
+
+int terminalVisibleLineCount(const QFontMetrics& metrics, int contentHeight)
+{
+    return qMax(1, contentHeight / qMax(1, metrics.lineSpacing()));
+}
+
+int maxTerminalScrollOffset(const QString& text, const QFontMetrics& metrics, int contentHeight)
+{
+    const QStringList lines = terminalOutputLines(stripTerminalControlSequences(text));
+    return qMax(0, lines.size() - terminalVisibleLineCount(metrics, contentHeight));
+}
+
+QString terminalVisibleText(const QString& text, const QFontMetrics& metrics, int contentHeight, int scrollOffset)
+{
+    QStringList lines = terminalOutputLines(stripTerminalControlSequences(text));
+    const int visibleLines = terminalVisibleLineCount(metrics, contentHeight);
+    const int maxOffset = qMax(0, lines.size() - visibleLines);
+    const int boundedOffset = qBound(0, scrollOffset, maxOffset);
+    const int start = qMax(0, lines.size() - visibleLines - boundedOffset);
+    if (lines.size() > visibleLines) {
+        lines = lines.mid(start, visibleLines);
+    }
+    return lines.join(QLatin1Char('\n')); // wjy: Draw the selected terminal line window; offset 0 follows the newest output.
+}
+
+QString stripTerminalControlSequences(const QString& text)
+{
+    QString cleaned;
+    cleaned.reserve(text.size());
+    for (int i = 0; i < text.size(); ++i) {
+        const QChar ch = text.at(i);
+        if (ch.unicode() == 0x1B) {
+            if (i + 1 < text.size() && text.at(i + 1) == QLatin1Char('[')) {
+                i += 2;
+                while (i < text.size()) {
+                    const ushort code = text.at(i).unicode();
+                    if (code >= 0x40 && code <= 0x7E) {
+                        break;
+                    }
+                    ++i;
+                }
+            }
+            continue; // wjy: Drop ANSI escape sequences such as ESC[K and ESC[19;1H before painting the fake terminal.
+        }
+        if (ch == QLatin1Char('\r')) {
+            if (i + 1 >= text.size() || text.at(i + 1) != QLatin1Char('\n')) {
+                cleaned.append(QLatin1Char('\n'));
+            }
+            continue;
+        }
+        if (ch.unicode() < 0x20 && ch != QLatin1Char('\n') && ch != QLatin1Char('\t')) {
+            continue;
+        }
+        cleaned.append(ch);
+    }
+    return cleaned;
+}
+
+void drawScriptTerminalPanel(
+    QPainter& painter,
+    const QString& title,
+    const QString& text,
+    bool running,
+    bool failed,
+    int scrollOffset)
+{
+    const QRectF panel = scriptTerminalPanelRect();
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(QPen(QColor(QStringLiteral("#263241")), 1));
+    painter.setBrush(QColor(QStringLiteral("#0B1018")));
+    painter.drawRoundedRect(panel, 4, 4);
+
+    const QRectF header(panel.x(), panel.y(), panel.width(), 34);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(QStringLiteral("#111827")));
+    painter.drawRoundedRect(header, 4, 4);
+    painter.fillRect(header.adjusted(0, 18, 0, 0), QColor(QStringLiteral("#111827")));
+
+    painter.setBrush(failed
+        ? QColor(QStringLiteral("#FF5C5C"))
+        : (running ? QColor(QStringLiteral("#F5C542")) : QColor(QStringLiteral("#22C55E"))));
+    painter.drawEllipse(QRectF(panel.x() + 12, panel.y() + 13, 8, 8));
+
+    QFont titleFont(QStringLiteral("Microsoft YaHei UI"));
+    titleFont.setPixelSize(12);
+    painter.setFont(titleFont);
+    painter.setPen(QColor(QStringLiteral("#DDE7F3")));
+    painter.drawText(
+        QRectF(panel.x() + 28, panel.y() + 7, panel.width() - 122, 20),
+        Qt::AlignVCenter | Qt::AlignLeft,
+        painter.fontMetrics().elidedText(title, Qt::ElideRight, int(panel.width() - 122)));
+
+    const QRectF actionButton = scriptTerminalActionButtonRect();
+    painter.setPen(QPen(running ? QColor(QStringLiteral("#F87171")) : QColor(QStringLiteral("#34D399")), 1));
+    painter.setBrush(running ? QColor(QStringLiteral("#2A151A")) : QColor(QStringLiteral("#10231D")));
+    painter.drawRoundedRect(actionButton, 3, 3);
+    painter.setFont(titleFont);
+    painter.setPen(running ? QColor(QStringLiteral("#FCA5A5")) : QColor(QStringLiteral("#A7F3D0")));
+    painter.drawText(actionButton.adjusted(0, 0, 0, -1), Qt::AlignCenter, running ? QString::fromUtf8("停止") : QString::fromUtf8("执行"));
+
+    const QRectF content = panel.adjusted(12, 46, -18, -12);
+    QFont terminalFont(QStringLiteral("Consolas"));
+    terminalFont.setPixelSize(12);
+    painter.setFont(terminalFont);
+    painter.setPen(failed ? QColor(QStringLiteral("#FFB4B4")) : QColor(QStringLiteral("#A7F3D0")));
+    const int maxOffset = maxTerminalScrollOffset(text, painter.fontMetrics(), qRound(content.height()));
+    painter.setClipRect(content);
+    painter.drawText(
+        content,
+        Qt::AlignLeft | Qt::AlignTop,
+        terminalVisibleText(text, painter.fontMetrics(), qRound(content.height()), scrollOffset));
+    painter.setClipping(false);
+
+    if (maxOffset > 0) {
+        const QRectF track(panel.right() - 10, content.y(), 3, content.height());
+        const int visibleLines = terminalVisibleLineCount(painter.fontMetrics(), qRound(content.height()));
+        const int totalLines = terminalOutputLines(stripTerminalControlSequences(text)).size();
+        const qreal thumbHeight = qMax<qreal>(26.0, track.height() * visibleLines / qMax(visibleLines, totalLines));
+        const qreal travel = qMax<qreal>(0.0, track.height() - thumbHeight);
+        const qreal normalizedFromTop = maxOffset == 0 ? 1.0 : 1.0 - (qBound(0, scrollOffset, maxOffset) / qreal(maxOffset));
+        const QRectF thumb(track.x(), track.y() + travel * normalizedFromTop, track.width(), thumbHeight);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(90, 109, 132, 150));
+        painter.drawRoundedRect(track, 1.5, 1.5);
+        painter.setBrush(QColor(186, 200, 218, 210));
+        painter.drawRoundedRect(thumb, 1.5, 1.5);
+    }
+    painter.restore();
+}
+
+void drawScriptFileEditorPanel(
+    QPainter& painter,
+    const QString& title,
+    bool loading,
+    bool hasFile)
+{
+// =====wjy====
+    const QRect panel = scriptFileEditorRect(); // wjy: 编辑器面板占用用户标出的左侧空白区域，真实文本编辑控件覆盖在正文区域。
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
+    painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
+    painter.drawRoundedRect(QRectF(panel), 4, 4);
+
+    const QRect header(panel.x(), panel.y(), panel.width(), 34);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(QStringLiteral("#F8FAFC")));
+    painter.drawRoundedRect(QRectF(header), 4, 4);
+    painter.fillRect(header.adjusted(0, 18, 0, 0), QColor(QStringLiteral("#F8FAFC")));
+
+    painter.setBrush(loading
+        ? QColor(QStringLiteral("#F5C542"))
+        : (hasFile ? QColor(QStringLiteral("#22C55E")) : QColor(QStringLiteral("#94A3B8"))));
+    painter.drawEllipse(QRectF(panel.x() + 12, panel.y() + 13, 8, 8)); // wjy: 状态点沿用右侧终端的视觉语言，表示读取中/已找到/无文件。
+
+    QFont titleFont(QStringLiteral("Microsoft YaHei UI"));
+    titleFont.setPixelSize(12);
+    painter.setFont(titleFont);
+    painter.setPen(QColor(QStringLiteral("#334155")));
+    const QString displayTitle = title.trimmed().isEmpty()
+        ? QString::fromUtf8("本地文件")
+        : title.trimmed(); // wjy: 标题显示当前 work 目录里正在编辑的 json/txt 文件名。
+    painter.drawText(
+        QRectF(panel.x() + 28, panel.y() + 7, panel.width() - 110, 20),
+        Qt::AlignVCenter | Qt::AlignLeft,
+        painter.fontMetrics().elidedText(displayTitle, Qt::ElideRight, panel.width() - 110));
+    painter.restore();
+// ===end====
 }
 
 qreal easeOutCubic(qreal value)
@@ -983,15 +1380,16 @@ void drawDeviceDetail(
         cardTop = 189;
     }
 
-    const QRectF card(280, cardTop, 600, 291);
+    const QRectF card(kDeviceDetailCardLeft, cardTop, kDeviceDetailCardWidth, kDeviceDetailCardHeight); // wjy: 卡片高度由缩小后的蓝色桌面图高度自动计算。
     painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
     painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
     painter.drawRoundedRect(card, 4, 4);
 
-    drawRoundedDesktopImage(painter, desktopImageRect(isRemoteControlled), uupix(QStringLiteral("desktop_bk_image.png")), 4);
+    const QRectF imageRect = desktopImageRect(isRemoteControlled); // wjy: 缓存缩小后的蓝色桌面图区域，后续绘制、遮罩和文字定位共用同一块范围。
+    drawRoundedDesktopImage(painter, imageRect, uupix(QStringLiteral("desktop_bk_image.png")), 4);
 
     if (dimDetailContent) {
-        painter.fillRect(desktopImageRect(isRemoteControlled), QColor(255, 255, 255, 112));
+        painter.fillRect(imageRect, QColor(255, 255, 255, 112));
     }
 
     if (!showWakeButton) {
@@ -1001,7 +1399,7 @@ void drawDeviceDetail(
 
         const qreal groupShift = 4.0 * desktopHoverProgress;
         const qreal arrowExtend = 5.0 * desktopHoverProgress;
-        const qreal centerY = cardTop + 194.0;
+        const qreal centerY = imageRect.center().y(); // wjy: “进入桌面”文字改为跟随缩小后的蓝色图垂直居中。
         const QRectF enterTextRect(532 + groupShift, centerY - 12.0, 72, 24);
         const qreal arrowStartX = 610 + groupShift;
         const qreal arrowEndX = 627 + groupShift + arrowExtend;
@@ -1066,19 +1464,20 @@ void drawDeviceDetail(
         }
     }
 
-    painter.fillRect(QRectF(281, cardTop + 240, 598, 50), QColor(QStringLiteral("#FFFFFF")));
+    const qreal actionTop = deviceBottomActionTop(isRemoteControlled); // wjy: 操作区顶部跟随蓝色桌面图的新高度，避免留出旧的 240 像素空白。
+    painter.fillRect(QRectF(281, actionTop, 598, kDeviceBottomActionHeight), QColor(QStringLiteral("#FFFFFF")));
     if (dimDetailContent) {
         painter.fillRect(fileTransferActionRect(isRemoteControlled), QColor(QStringLiteral("#F5F7FA")));
     } else if (hoveredBottomAction == BottomAction::FileTransfer) {
         painter.fillRect(fileTransferActionRect(isRemoteControlled), QColor(QStringLiteral("#F3F7FF")));
-        painter.fillRect(QRectF(281, cardTop + 240, 298, 2), QColor(QStringLiteral("#3A7BFC")));
+        painter.fillRect(QRectF(281, actionTop, 298, 2), QColor(QStringLiteral("#3A7BFC")));
     } else if (hoveredBottomAction == BottomAction::More) {
         painter.fillRect(moreActionRect(isRemoteControlled), QColor(QStringLiteral("#F3F7FF")));
-        painter.fillRect(QRectF(580, cardTop + 240, 299, 2), QColor(QStringLiteral("#3A7BFC")));
+        painter.fillRect(QRectF(580, actionTop, 299, 2), QColor(QStringLiteral("#3A7BFC")));
     }
 
     painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
-    painter.drawLine(QPointF(579, cardTop + 255), QPointF(579, cardTop + 277));
+    painter.drawLine(QPointF(579, actionTop + 15), QPointF(579, actionTop + 37));
 
     const bool fileTransferHovered = !dimDetailContent && hoveredBottomAction == BottomAction::FileTransfer;
     const bool moreHovered = hoveredBottomAction == BottomAction::More;
@@ -1087,16 +1486,16 @@ void drawDeviceDetail(
 
     painter.save();
     painter.setOpacity(dimDetailContent ? 0.35 : 1.0);
-    drawUiIcon(painter, QRect(392, qRound(cardTop + 255), 20, 20), QStringLiteral("file_transfer.svg"));
+    drawUiIcon(painter, QRect(392, qRound(actionTop + 15), 20, 20), QStringLiteral("file_transfer.svg"));
     painter.restore();
     painter.setFont(textFont);
     painter.setPen(dimDetailContent
             ? QColor(QStringLiteral("#A8B0BC"))
             : (fileTransferHovered ? hoveredActionText : normalActionText));
-    painter.drawText(QRectF(420, cardTop + 257, 64, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE6\x96\x87\xE4\xBB\xB6\xE4\xBC\xA0\xE8\xBE\x93"));
-    drawUiIcon(painter, QRect(704, qRound(cardTop + 257), 20, 20), QStringLiteral("more.svg"));
+    painter.drawText(QRectF(420, actionTop + 17, 64, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE6\x96\x87\xE4\xBB\xB6\xE4\xBC\xA0\xE8\xBE\x93"));
+    drawUiIcon(painter, QRect(704, qRound(actionTop + 17), 20, 20), QStringLiteral("more.svg"));
     painter.setPen(moreHovered ? hoveredActionText : normalActionText);
-    painter.drawText(QRectF(733, cardTop + 257, 30, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE6\x9B\xB4\xE5\xA4\x9A"));
+    painter.drawText(QRectF(733, actionTop + 17, 30, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE6\x9B\xB4\xE5\xA4\x9A"));
 
     painter.restore();
 }
@@ -1432,6 +1831,7 @@ DeviceGrid::DeviceGrid(QWidget* parent)
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before setupSettingsControls")); // wjy: 记录设置页控件创建前的位置。
     setupSettingsControls();
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after setupSettingsControls")); // wjy: 记录设置页控件创建完成。
+    setupScriptFileEditor();
     updateSettingsControls();
     updateLocalInfoControls();
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after update controls")); // wjy: 记录控件显隐和内容刷新完成。
@@ -1551,6 +1951,21 @@ DeviceGrid::DeviceGrid(QWidget* parent)
     });
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after wake visual timer")); // wjy: 记录远程开机视觉定时器创建完成。
 
+    m_scriptOutputFlushTimer = new QTimer(this);
+    m_scriptOutputFlushTimer->setInterval(120);
+    connect(m_scriptOutputFlushTimer, &QTimer::timeout, this, [this] {
+        if (!m_scriptOutputDirty) {
+            m_scriptOutputFlushTimer->stop();
+            return;
+        }
+        m_scriptOutputDirty = false;
+        m_scriptOutputText = stripTerminalControlSequences(readScriptOutputFileTail(m_scriptOutputFilePath));
+        if (m_scriptOutputAutoScroll) {
+            m_scriptOutputScrollOffset = 0;
+        }
+        update(scriptTerminalPanelRect().toAlignedRect().adjusted(-2, -2, 2, 2));
+    }); // wjy: Batch script output repaint into a short timer, keeping the UI responsive while still feeling live.
+
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before applyStatusAutoRefreshSetting")); // wjy: 记录应用自动刷新设置前的位置。
     applyStatusAutoRefreshSetting(false);
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after applyStatusAutoRefreshSetting")); // wjy: 记录自动刷新设置应用完成。
@@ -1609,6 +2024,267 @@ void DeviceGrid::runBackgroundTask(std::function<void()> task)
     m_backgroundThreads.emplace_back(std::move(task)); // wjy: 不再 detach，析构时统一 join，减少关闭时堆损坏风险。
 }
 // ===end====
+
+void DeviceGrid::setupScriptFileEditor()
+{
+// =====wjy====
+    m_scriptFileEdit = new QTextEdit(this);
+    m_scriptFileEdit->setGeometry(scriptFileEditorTextRect());
+    m_scriptFileEdit->setAcceptRichText(false);
+    m_scriptFileEdit->setLineWrapMode(QTextEdit::NoWrap);
+    QFont editorFont(QStringLiteral("Consolas"));
+    editorFont.setPixelSize(12);
+    m_scriptFileEdit->setFont(editorFont);
+    m_scriptFileEdit->setStyleSheet(QStringLiteral(
+        "QTextEdit{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;"
+        "padding:8px;color:#101828;font-family:Consolas;font-size:12px;}"
+        "QTextEdit:focus{border:1px solid #3A7BFC;}"));
+
+    m_scriptFileSaveButton = new QPushButton(QString::fromUtf8("保存"), this);
+    m_scriptFileSaveButton->setGeometry(scriptFileEditorSaveButtonRect());
+    m_scriptFileSaveButton->setCursor(Qt::PointingHandCursor);
+    m_scriptFileSaveButton->setStyleSheet(QStringLiteral(
+        "QPushButton{border:1px solid #3A7BFC;border-radius:4px;background:#FFFFFF;"
+        "font-family:'Microsoft YaHei UI';font-size:12px;color:#006BFF;}"
+        "QPushButton:hover{background:#F3F7FF;}"
+        "QPushButton:disabled{border-color:#CBD5E1;color:#94A3B8;background:#F8FAFC;}"));
+    connect(m_scriptFileSaveButton, &QPushButton::clicked, this, &DeviceGrid::saveScriptFileEditor);
+    updateScriptFileEditorControls();
+// ===end====
+}
+
+void DeviceGrid::updateScriptFileEditorControls()
+{
+// =====wjy====
+    const bool visible =
+        m_scriptEditorVisible
+        && !m_settingsSelected
+        && !m_remoteAssistSelected
+        && !m_localInfoSelected;
+    if (m_scriptFileEdit) {
+        m_scriptFileEdit->setGeometry(scriptFileEditorTextRect());
+        m_scriptFileEdit->setVisible(visible);
+        m_scriptFileEdit->setEnabled(visible && !m_scriptEditorLoading && !m_scriptEditorSaving && !m_scriptEditorRemotePath.isEmpty());
+        if (visible) {
+            m_scriptFileEdit->raise();
+        }
+    }
+    if (m_scriptFileSaveButton) {
+        m_scriptFileSaveButton->setGeometry(scriptFileEditorSaveButtonRect());
+        m_scriptFileSaveButton->setVisible(visible);
+        m_scriptFileSaveButton->setEnabled(visible && !m_scriptEditorLoading && !m_scriptEditorSaving && !m_scriptEditorRemotePath.isEmpty());
+        m_scriptFileSaveButton->setText(m_scriptEditorSaving ? QString::fromUtf8("保存中") : QString::fromUtf8("保存"));
+        if (visible) {
+            m_scriptFileSaveButton->raise();
+        }
+    }
+// ===end====
+}
+
+void DeviceGrid::loadScriptFileEditor(const QString& deviceIp, const QString& loginUser, const QString& scriptWorkName)
+{
+// =====wjy====
+    if (deviceIp.trimmed().isEmpty() || loginUser.trimmed().isEmpty() || scriptWorkName.trimmed().isEmpty()) {
+        return;
+    }
+    m_scriptEditorVisible = true;
+    m_scriptEditorLoading = true;
+    m_scriptEditorSaving = false;
+    m_scriptEditorRemotePath.clear();
+    m_scriptEditorDeviceIp = deviceIp;
+    m_scriptEditorLoginUser = loginUser;
+    m_scriptEditorWorkName = scriptWorkName;
+    if (m_scriptFileEdit) {
+        m_scriptFileEdit->setPlainText(QString::fromUtf8("正在读取目标设备本地 json/txt 文件..."));
+    }
+    updateScriptFileEditorControls();
+
+    const QString remotePowerShellScript = QStringLiteral(R"($ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$fsremoteExe = Get-Process FSRemote -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path
+if ([string]::IsNullOrWhiteSpace($fsremoteExe)) {
+    Write-Output 'FSREMOTE_EDIT_NOFILE'
+    exit 0
+}
+$fsremoteDir = Split-Path -Parent $fsremoteExe
+$work = Join-Path (Join-Path $fsremoteDir 'work') '%1'
+if (-not (Test-Path -LiteralPath $work)) {
+    Write-Output 'FSREMOTE_EDIT_NOFILE'
+    exit 0
+}
+$file = Get-ChildItem -LiteralPath $work -File | Where-Object { $_.Extension -in '.json', '.txt' } | Sort-Object Name | Select-Object -First 1
+if ($null -eq $file) {
+    Write-Output 'FSREMOTE_EDIT_NOFILE'
+    exit 0
+}
+$content = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
+Write-Output 'FSREMOTE_EDIT_PATH_BEGIN'
+Write-Output ([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($file.FullName)))
+Write-Output 'FSREMOTE_EDIT_NAME_BEGIN'
+Write-Output ([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($file.Name)))
+Write-Output 'FSREMOTE_EDIT_CONTENT_BEGIN'
+Write-Output ([Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($content)))
+Write-Output 'FSREMOTE_EDIT_END'
+)").arg(escapedPowerShellSingleQuoted(scriptWorkName));
+    const QStringList commands = {
+        QStringLiteral("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand %1 & exit %ERRORLEVEL%")
+            .arg(powerShellEncodedCommand(remotePowerShellScript)),
+    };
+
+    QPointer<DeviceGrid> self(this);
+    runBackgroundTask([self, deviceIp, loginUser, scriptWorkName, commands] {
+        QString outputText;
+        QString errorMessage;
+        const bool ok = platform::PortableOpenSshManager::instance().runRemoteCommands(
+            deviceIp,
+            loginUser,
+            commands,
+            &outputText,
+            &errorMessage,
+            60000);
+        if (!self) {
+            return;
+        }
+        QMetaObject::invokeMethod(self, [self, ok, scriptWorkName, outputText, errorMessage] {
+            if (!self) {
+                return;
+            }
+            DeviceGrid* grid = self.data();
+            if (grid->m_scriptEditorWorkName != scriptWorkName) {
+                return;
+            }
+            grid->m_scriptEditorLoading = false;
+            const QString result = ok ? stripTerminalControlSequences(outputText) : errorMessage.trimmed();
+            const QStringList lines = result.split(QRegularExpression(QStringLiteral("[\\r\\n]+")), Qt::SkipEmptyParts);
+            const int pathMarker = lines.indexOf(QStringLiteral("FSREMOTE_EDIT_PATH_BEGIN"));
+            const int nameMarker = lines.indexOf(QStringLiteral("FSREMOTE_EDIT_NAME_BEGIN"));
+            const int contentMarker = lines.indexOf(QStringLiteral("FSREMOTE_EDIT_CONTENT_BEGIN"));
+            const int endMarker = lines.indexOf(QStringLiteral("FSREMOTE_EDIT_END"));
+            if (ok
+                && pathMarker >= 0
+                && nameMarker > pathMarker
+                && contentMarker > nameMarker
+                && endMarker > contentMarker
+                && pathMarker + 1 < nameMarker
+                && nameMarker + 1 < contentMarker) {
+                QStringList pathBase64Parts;
+                for (int i = pathMarker + 1; i < nameMarker; ++i) {
+                    pathBase64Parts.append(lines.at(i).trimmed()); // wjy: 远端输出可能按终端宽度折行，路径 Base64 也按片段拼回完整字符串。
+                }
+                QStringList nameBase64Parts;
+                for (int i = nameMarker + 1; i < contentMarker; ++i) {
+                    nameBase64Parts.append(lines.at(i).trimmed()); // wjy: 文件名单独返回，避免标题从完整路径解析时受特殊字符影响而乱码。
+                }
+                QStringList contentBase64Parts;
+                for (int i = contentMarker + 1; i < endMarker; ++i) {
+                    contentBase64Parts.append(lines.at(i).trimmed()); // wjy: JSON/TXT 内容较长时 Base64 会被拆成多行，必须拼接全部片段后再解码。
+                }
+                grid->m_scriptEditorRemotePath = utf8FromBase64(pathBase64Parts.join(QString()));
+                const QString fileName = utf8FromBase64(nameBase64Parts.join(QString()));
+                const QString content = utf8FromBase64(contentBase64Parts.join(QString()));
+                grid->m_scriptEditorTitle = fileName.trimmed().isEmpty()
+                    ? QFileInfo(grid->m_scriptEditorRemotePath).fileName()
+                    : fileName; // wjy: 标题优先使用远端直接返回的文件名，降低中文路径或控制字符导致的显示乱码概率。
+                if (grid->m_scriptFileEdit) {
+                    grid->m_scriptFileEdit->setPlainText(content);
+                    grid->m_scriptFileEdit->document()->setModified(false); // wjy: 远端本地文件读取完成后把编辑器标记为干净，避免脚本结束刷新覆盖用户后续手动修改。
+                }
+            } else {
+                grid->m_scriptEditorRemotePath.clear();
+                grid->m_scriptEditorTitle.clear();
+                if (grid->m_scriptFileEdit) {
+                    grid->m_scriptFileEdit->setPlainText(ok
+                        ? QString::fromUtf8("当前本地脚本目录没有 json/txt 文件。")
+                        : QString::fromUtf8("读取失败：%1").arg(result));
+                    grid->m_scriptFileEdit->document()->setModified(false); // wjy: 无可编辑文件或读取失败时也清掉脏标记，后续自动刷新可以继续尝试读取。
+                }
+            }
+            grid->updateScriptFileEditorControls();
+            grid->update(scriptFileEditorRect().adjusted(-2, -2, 2, 2));
+        }, Qt::QueuedConnection);
+    });
+// ===end====
+}
+
+void DeviceGrid::saveScriptFileEditor()
+{
+// =====wjy====
+    if (!m_scriptFileEdit
+        || m_scriptEditorRemotePath.trimmed().isEmpty()
+        || m_scriptEditorDeviceIp.trimmed().isEmpty()
+        || m_scriptEditorLoginUser.trimmed().isEmpty()
+        || m_scriptEditorSaving) {
+        return;
+    }
+    m_scriptEditorSaving = true;
+    updateScriptFileEditorControls();
+    const QString remotePath = m_scriptEditorRemotePath;
+    const QString contentBase64 = base64Utf8(m_scriptFileEdit->toPlainText());
+    const QString deviceIp = m_scriptEditorDeviceIp;
+    const QString loginUser = m_scriptEditorLoginUser;
+    const QString remotePowerShellScript = QStringLiteral(R"($ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$path = '%1'
+$content = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%2'))
+[System.IO.File]::WriteAllText($path, $content, [System.Text.UTF8Encoding]::new($false))
+Write-Output 'FSREMOTE_EDIT_SAVE_OK'
+)").arg(
+        escapedPowerShellSingleQuoted(remotePath),
+        contentBase64);
+    const QStringList commands = {
+        QStringLiteral("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand %1 & exit %ERRORLEVEL%")
+            .arg(powerShellEncodedCommand(remotePowerShellScript)),
+    };
+
+    QPointer<DeviceGrid> self(this);
+    runBackgroundTask([self, deviceIp, loginUser, remotePath, commands] {
+        QString outputText;
+        QString errorMessage;
+        const bool ok = platform::PortableOpenSshManager::instance().runRemoteCommands(
+            deviceIp,
+            loginUser,
+            commands,
+            &outputText,
+            &errorMessage,
+            60000);
+        if (!self) {
+            return;
+        }
+        QMetaObject::invokeMethod(self, [self, ok, remotePath, outputText, errorMessage] {
+            if (!self) {
+                return;
+            }
+            DeviceGrid* grid = self.data();
+            if (grid->m_scriptEditorRemotePath != remotePath) {
+                return;
+            }
+            grid->m_scriptEditorSaving = false;
+            if (ok && grid->m_scriptFileEdit) {
+                grid->m_scriptFileEdit->document()->setModified(false); // wjy: 保存成功后标记当前文本已经同步到被控机本地 work 文件。
+            }
+            if (grid->m_scriptFileSaveButton) {
+                grid->m_scriptFileSaveButton->setText(ok ? QString::fromUtf8("已保存") : QString::fromUtf8("失败"));
+                QTimer::singleShot(1200, grid, [grid] {
+                    if (grid) {
+                        grid->updateScriptFileEditorControls();
+                    }
+                });
+            }
+            if (!ok) {
+                writeScriptOutputFile(
+                    grid->m_scriptOutputFilePath,
+                    QString::fromUtf8("\n编辑器保存失败：%1\n").arg(errorMessage.trimmed().isEmpty() ? outputText.trimmed() : errorMessage.trimmed()),
+                    QIODevice::Append);
+                grid->m_scriptOutputDirty = true;
+                if (!grid->m_scriptOutputFlushTimer->isActive()) {
+                    grid->m_scriptOutputFlushTimer->start();
+                }
+            }
+            grid->updateScriptFileEditorControls();
+        }, Qt::QueuedConnection);
+    });
+// ===end====
+}
 
 void DeviceGrid::setupAddDeviceControls()
 {
@@ -2484,10 +3160,41 @@ void DeviceGrid::openCurrentDeviceTerminal()
         return;
     }
 
+// =====wjy====
     QString errorMessage;
+    const QString publicKey = platform::PortableOpenSshManager::instance().clientPublicKey(&errorMessage);
+    if (publicKey.isEmpty()) {
+        QMessageBox messageBox(
+            QMessageBox::Warning,
+            QString(),
+            errorMessage.isEmpty()
+                ? QStringLiteral("无法读取本机远程终端公钥。")
+                : errorMessage,
+            QMessageBox::NoButton,
+            this);
+        messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+        messageBox.exec();
+        return; // wjy: 本机没有可用公钥时不启动 ssh.exe，避免弹出的终端窗口认证失败后立即关闭。
+    }
+
+    if (!platform::DeviceCommandService::authorizeTerminalKey(device.ip, publicKey, &errorMessage)) {
+        QMessageBox messageBox(
+            QMessageBox::Warning,
+            QString(),
+            errorMessage.isEmpty()
+                ? QStringLiteral("无法在目标设备登记远程终端密钥。")
+                : QStringLiteral("无法在目标设备登记远程终端密钥：%1").arg(errorMessage),
+            QMessageBox::NoButton,
+            this);
+        messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+        messageBox.exec();
+        return; // wjy: 目标设备未更新、命令端口不可达或授权写入失败时提前提示，不再让 SSH 黑窗一闪而过。
+    }
+
     if (platform::PortableOpenSshManager::instance().openTerminal(device.ip, loginUser, &errorMessage)) {
         return;
     }
+// ===end====
 
     QMessageBox messageBox(
         QMessageBox::Warning,
@@ -2499,6 +3206,259 @@ void DeviceGrid::openCurrentDeviceTerminal()
         this);
     messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
     messageBox.exec();
+}
+
+void DeviceGrid::executeCurrentDeviceScriptFolder(const QString& scriptFolderPath)
+{
+// =====wjy====
+    if (m_selectedDeviceIndex < 0 || m_selectedDeviceIndex >= g_devices.size()) {
+        return;
+    }
+
+    const QFileInfo entryScript = scriptEntryFile(scriptFolderPath);
+    if (!entryScript.exists()) {
+        QMessageBox messageBox(
+            QMessageBox::Information,
+            QString(),
+            QString::fromUtf8("无可用脚本"),
+            QMessageBox::NoButton,
+            this);
+        messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+        messageBox.exec();
+        return; // wjy: 选中的文件夹没有 bat/cmd/ps1/py/exe 入口时只提示，不创建 work 也不发远程命令。
+    }
+
+    if (scriptRunCommandForFile(entryScript).trimmed().isEmpty()) {
+        QMessageBox messageBox(
+            QMessageBox::Information,
+            QString(),
+            QString::fromUtf8("无可用脚本"),
+            QMessageBox::NoButton,
+            this);
+        messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+        messageBox.exec();
+        return;
+    }
+
+    const DeviceEntry device = g_devices.at(m_selectedDeviceIndex);
+    const QString loginUser = platform::DeviceStatusService::terminalUser(device.ip);
+    if (loginUser.isEmpty()) {
+        QMessageBox messageBox(
+            QMessageBox::Warning,
+            QString(),
+            QString::fromUtf8("无法获取目标设备终端用户。"),
+            QMessageBox::NoButton,
+            this);
+        messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+        messageBox.exec();
+        return;
+    }
+
+    QString errorMessage;
+    const QString publicKey = platform::PortableOpenSshManager::instance().clientPublicKey(&errorMessage);
+    if (publicKey.isEmpty()
+        || !platform::DeviceCommandService::authorizeTerminalKey(device.ip, publicKey, &errorMessage)) {
+        QMessageBox messageBox(
+            QMessageBox::Warning,
+            QString(),
+            errorMessage.isEmpty()
+                ? QString::fromUtf8("无法建立目标设备脚本执行授权。")
+                : errorMessage,
+            QMessageBox::NoButton,
+            this);
+        messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+        messageBox.exec();
+        return; // wjy: 脚本执行复用远程终端密钥授权，目标设备未准备好时提前提示。
+    }
+
+    const QString sourcePath = QDir::toNativeSeparators(QFileInfo(scriptFolderPath).absoluteFilePath());
+    const QString targetName = deviceDisplayName(device);
+    const QString scriptName = entryScript.fileName();
+    const QString scriptWorkName = entryScript.completeBaseName();
+    m_lastScriptFolderPath = scriptFolderPath;
+    m_scriptOutputVisible = true;
+    m_scriptOutputRunning = true;
+    m_scriptOutputFailed = false;
+    m_scriptOutputScrollOffset = 0;
+    m_scriptOutputAutoScroll = true;
+    m_scriptOutputDirty = false;
+    if (!m_scriptOutputFilePath.isEmpty()) {
+        QFile::remove(m_scriptOutputFilePath);
+    }
+    m_scriptOutputFilePath = scriptOutputTempFilePath();
+    m_scriptCancelRequested = std::make_shared<std::atomic_bool>(false);
+    m_scriptOutputTitle = QString::fromUtf8("%1 - %2").arg(targetName, scriptName);
+    m_scriptOutputText = QString::fromUtf8("$ 执行脚本 %1\n目标设备: %2\n状态: 正在复制并执行...\n")
+        .arg(scriptName, targetName); // wjy: 点击脚本后立即显示右侧终端面板，让用户知道远端任务已经开始。
+    writeScriptOutputFile(m_scriptOutputFilePath, m_scriptOutputText, QIODevice::Truncate);
+    m_scriptEditorVisible = true;
+    m_scriptEditorLoading = true;
+    m_scriptEditorSaving = false;
+    m_scriptEditorTitle = QString::fromUtf8("本地文件");
+    m_scriptEditorRemotePath.clear();
+    m_scriptEditorDeviceIp = device.ip;
+    m_scriptEditorLoginUser = loginUser;
+    m_scriptEditorWorkName = scriptWorkName;
+    if (m_scriptFileEdit) {
+        m_scriptFileEdit->setPlainText(QString::fromUtf8("正在等待脚本文件复制到目标设备本地 work 目录..."));
+        m_scriptFileEdit->document()->setModified(false); // wjy: 新脚本启动时重置编辑器状态，后续只编辑目标设备本地 work 里的副本。
+    }
+    updateScriptFileEditorControls();
+    update();
+    QTimer::singleShot(900, this, [this, deviceIp = device.ip, loginUser, scriptWorkName] {
+        if (m_scriptEditorDeviceIp == deviceIp && m_scriptEditorWorkName == scriptWorkName) {
+            loadScriptFileEditor(deviceIp, loginUser, scriptWorkName); // wjy: 复制开始后短暂延迟读取，让编辑框尽快显示 work 子目录里的 json/txt。
+        }
+    });
+
+    const QString remotePowerShellScript = QStringLiteral(R"($ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$env:PYTHONIOENCODING = 'utf-8'
+$env:PYTHONUTF8 = '1'
+$fsremoteExe = Get-Process FSRemote -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path
+if ([string]::IsNullOrWhiteSpace($fsremoteExe)) {
+    Write-Error 'cannot locate FSRemote.exe on target device'
+    exit 9009
+}
+$fsremoteDir = Split-Path -Parent $fsremoteExe
+$workRoot = Join-Path $fsremoteDir 'work'
+New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
+$scriptWorkName = '%4'
+$work = Join-Path $workRoot $scriptWorkName
+$workAlreadyExists = Test-Path -LiteralPath $work
+if (-not $workAlreadyExists) {
+    New-Item -ItemType Directory -Force -Path $work | Out-Null
+    $source = '%1'
+    $log = Join-Path $work 'fsremote_robocopy.log'
+    & robocopy $source $work /E /R:1 /W:1 /NFL /NDL /NJH /NJS "/LOG:$log" | Out-Null
+    $copyExit = $LASTEXITCODE
+    if ($copyExit -ge 8) {
+        if (Test-Path -LiteralPath $log) {
+            Get-Content -LiteralPath $log -Raw
+        }
+        exit $copyExit
+    }
+} else {
+    Write-Output ('FSRemote reuse existing work folder: ' + $work)
+}
+Set-Location -LiteralPath $work
+$entry = Join-Path $work '%2'
+if (-not (Test-Path -LiteralPath $entry)) {
+    Write-Error ('entry script missing in local work folder: ' + $entry)
+    exit 9011
+}
+$suffix = '%3'
+$runLog = Join-Path $work 'fsremote_script_run.log'
+$exitCodeFile = Join-Path $work 'fsremote_script_exit_code.txt'
+$finishedFile = Join-Path $work 'fsremote_script_finished.txt'
+@(
+    'FSRemote script execution started'
+    ('Time: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
+    ('Entry: ' + $entry)
+    ('Type: ' + $suffix)
+    ''
+) | Set-Content -LiteralPath $runLog -Encoding UTF8
+$scriptExit = 0
+switch ($suffix) {
+    'py' { & python -u $entry *>&1 | Tee-Object -FilePath $runLog -Append; $scriptExit = $LASTEXITCODE; break }
+    'ps1' { & powershell -NoProfile -ExecutionPolicy Bypass -File $entry *>&1 | Tee-Object -FilePath $runLog -Append; $scriptExit = $LASTEXITCODE; break }
+    'bat' { & cmd.exe /d /c ('call "' + $entry + '"') *>&1 | Tee-Object -FilePath $runLog -Append; $scriptExit = $LASTEXITCODE; break }
+    'cmd' { & cmd.exe /d /c ('call "' + $entry + '"') *>&1 | Tee-Object -FilePath $runLog -Append; $scriptExit = $LASTEXITCODE; break }
+    'exe' { & $entry *>&1 | Tee-Object -FilePath $runLog -Append; $scriptExit = $LASTEXITCODE; break }
+    default { Write-Error ('unsupported script type: ' + $suffix); exit 9010 }
+}
+if ($null -eq $scriptExit) {
+    $scriptExit = 0
+}
+('ExitCode: ' + $scriptExit) | Set-Content -LiteralPath $exitCodeFile -Encoding UTF8
+('Finished: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Set-Content -LiteralPath $finishedFile -Encoding UTF8
+('ExitCode: ' + $scriptExit) | Add-Content -LiteralPath $runLog -Encoding UTF8
+Get-Content -LiteralPath $runLog -Tail 80
+exit $scriptExit
+)").arg(
+        escapedPowerShellSingleQuoted(sourcePath),
+        escapedPowerShellSingleQuoted(scriptName),
+        escapedPowerShellSingleQuoted(entryScript.suffix().toLower()),
+        escapedPowerShellSingleQuoted(scriptWorkName));
+    const QStringList commands = {
+        QStringLiteral("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand %1 & exit %ERRORLEVEL%")
+            .arg(powerShellEncodedCommand(remotePowerShellScript)),
+    }; // wjy: 远端复制/执行脚本整体通过 EncodedCommand 传输，避免中文共享路径经过 cmd 输入流后乱码。
+
+    QPointer<DeviceGrid> self(this);
+    runBackgroundTask([self, deviceIp = device.ip, loginUser, commands, targetName, scriptName, scriptWorkName, outputFilePath = m_scriptOutputFilePath, cancelRequested = m_scriptCancelRequested] {
+        QString outputText;
+        QString runError;
+        const bool ok = platform::PortableOpenSshManager::instance().runRemoteCommands(
+            deviceIp,
+            loginUser,
+            commands,
+            &outputText,
+            &runError,
+            0,
+            [self, outputFilePath](const QString& chunk) {
+                if (!self || chunk.isEmpty()) {
+                    return;
+                }
+                writeScriptOutputFile(outputFilePath, stripTerminalControlSequences(chunk), QIODevice::Append);
+                QMetaObject::invokeMethod(self, [self, outputFilePath] {
+                    if (!self) {
+                        return;
+                    }
+                    DeviceGrid* grid = self.data();
+                    if (grid->m_scriptOutputFilePath != outputFilePath) {
+                        return;
+                    }
+                    grid->m_scriptOutputDirty = true;
+                    if (!grid->m_scriptOutputFlushTimer->isActive()) {
+                        grid->m_scriptOutputFlushTimer->start();
+                    }
+                }, Qt::QueuedConnection);
+            },
+            [cancelRequested] {
+                return cancelRequested && cancelRequested->load();
+            });
+
+        if (!self) {
+            return;
+        }
+
+        QMetaObject::invokeMethod(self, [self, ok, deviceIp, loginUser, targetName, scriptName, scriptWorkName, outputText, runError, outputFilePath, cancelRequested] {
+            if (!self) {
+                return;
+            }
+
+            DeviceGrid* grid = self.data();
+            if (grid->m_scriptOutputFilePath != outputFilePath) {
+                return;
+            }
+            const QString resultText = runError.trimmed().isEmpty() ? outputText.trimmed() : runError.trimmed();
+            const bool canceled = cancelRequested && cancelRequested->load();
+            grid->m_scriptOutputVisible = true;
+            grid->m_scriptOutputRunning = false;
+            grid->m_scriptOutputFailed = !ok && !canceled;
+            grid->m_scriptOutputScrollOffset = 0;
+            grid->m_scriptOutputAutoScroll = true;
+            grid->m_scriptOutputTitle = QString::fromUtf8("%1 - %2").arg(targetName, scriptName);
+            writeScriptOutputFile(
+                grid->m_scriptOutputFilePath,
+                QString::fromUtf8("\n状态: %1%2\n")
+                    .arg(
+                        canceled ? QString::fromUtf8("已停止") : (ok ? QString::fromUtf8("已完成") : QString::fromUtf8("执行失败")),
+                        canceled
+                            ? QString()
+                            : ((!ok && !resultText.isEmpty()) ? QString::fromUtf8("\n%1").arg(resultText) : QString())),
+                QIODevice::Append);
+            grid->m_scriptOutputDirty = false;
+            grid->m_scriptOutputText = stripTerminalControlSequences(readScriptOutputFileTail(grid->m_scriptOutputFilePath));
+            grid->update(scriptTerminalPanelRect().toAlignedRect().adjusted(-2, -2, 2, 2));
+            if (!grid->m_scriptFileEdit || !grid->m_scriptFileEdit->document()->isModified()) {
+                grid->loadScriptFileEditor(deviceIp, loginUser, scriptWorkName); // wjy: 脚本结束后再刷新一次，保证首次复制较慢时编辑器也能拿到本地 json/txt。
+            }
+        }, Qt::QueuedConnection);
+    });
+// ===end====
 }
 
 void DeviceGrid::openRemoteDesktopWindow()
@@ -3215,7 +4175,32 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             1.0,
             textFont);
     }
+
+    if (!m_settingsSelected
+        && !m_remoteAssistSelected
+        && !m_localInfoSelected
+        && m_scriptEditorVisible) {
+        drawScriptFileEditorPanel(
+            painter,
+            m_scriptEditorTitle,
+            m_scriptEditorLoading,
+            !m_scriptEditorRemotePath.trimmed().isEmpty()); // wjy: 左侧白色编辑面板只在设备详情页显示，避免盖住设置/新增设备页面。
+    }
+
+    if (!m_settingsSelected
+        && !m_remoteAssistSelected
+        && !m_localInfoSelected
+        && m_scriptOutputVisible) {
+        drawScriptTerminalPanel(
+            painter,
+            m_scriptOutputTitle,
+            m_scriptOutputText,
+            m_scriptOutputRunning,
+            m_scriptOutputFailed,
+            m_scriptOutputScrollOffset); // wjy: Script output lives in the right-side blank area after the device detail card is painted.
+    }
     painter.restore();
+    updateScriptFileEditorControls(); // wjy: 绘制完成后同步真实 QTextEdit/QPushButton 的显隐和层级，保证页面切换时不会残留在其它页面。
 
 // =====wjy====
     if (m_draggingDevice
@@ -3418,6 +4403,28 @@ void DeviceGrid::clearBottomActionHover()
 void DeviceGrid::mousePressEvent(QMouseEvent* event)
 {
 // =====wjy====
+    if (event->button() == Qt::LeftButton
+        && m_scriptOutputVisible
+        && !m_settingsSelected
+        && !m_remoteAssistSelected
+        && !m_localInfoSelected
+        && scriptTerminalActionButtonRect().contains(event->position())) {
+        if (m_scriptOutputRunning) {
+            if (m_scriptCancelRequested) {
+                m_scriptCancelRequested->store(true);
+            }
+            m_scriptOutputRunning = false;
+            m_scriptOutputFailed = false;
+            writeScriptOutputFile(m_scriptOutputFilePath, QString::fromUtf8("\n状态: 正在停止...\n"), QIODevice::Append);
+            m_scriptOutputText = stripTerminalControlSequences(readScriptOutputFileTail(m_scriptOutputFilePath));
+            update(scriptTerminalPanelRect().toAlignedRect().adjusted(-2, -2, 2, 2));
+        } else if (!m_lastScriptFolderPath.trimmed().isEmpty()) {
+            executeCurrentDeviceScriptFolder(m_lastScriptFolderPath);
+        }
+        event->accept();
+        return;
+    }
+
     if (m_statusRefreshIntervalEdit
         && m_statusRefreshIntervalEdit->hasFocus()
         && !m_statusRefreshIntervalEdit->geometry().contains(event->pos())) {
@@ -3435,6 +4442,51 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         && m_deviceGroupNameEdit->isVisible()
         && !m_deviceGroupNameEdit->geometry().contains(event->pos())) { // wjy: 点击分组输入框外部时，提交当前名字并关闭输入框。
         finishDeviceGroupRename(true);
+    }
+
+    if (event->button() == Qt::RightButton && m_deviceGroupExpanded) {
+        const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 设备行右键命中使用当前可见行，保证滚动后菜单出现在真实设备上。
+        const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded);
+        for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
+            const DeviceListRow& row = rows.at(rowIndex);
+            if (row.type != DeviceListRow::Type::Device) {
+                continue; // wjy: 这里专门处理设备行，分组行仍交给下面已有的分组右键菜单。
+            }
+
+            const QRect rowRect = scrolledVisibleDeviceRowRect(rowIndex, m_deviceListScrollOffset);
+            const QRect hitRect = rowRect.intersected(deviceListClip);
+            if (!hitRect.contains(event->pos())) {
+                continue;
+            }
+
+            const int deviceIndex = row.deviceIndex;
+            if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
+                continue;
+            }
+
+            m_selectedDeviceIndexes.clear();
+            m_selectedDeviceIndexes.insert(deviceIndex);
+            m_selectionAnchorDeviceIndex = deviceIndex;
+            m_settingsSelected = false;
+            m_remoteAssistSelected = false;
+            m_localInfoSelected = false;
+            setDesktopHoverActive(false);
+            clearBottomActionHover();
+            updateAddDeviceControls();
+            updateLocalInfoControls();
+            updateSettingsControls();
+            startDeviceSwitchAnimation(deviceIndex, deviceDisplayName(g_devices.at(deviceIndex))); // wjy: 右键某台设备时先让右侧详情和后续脚本目标统一到这台设备。
+
+            QMenu menu(this); // wjy: 设备右键菜单样式参照分组右键菜单，使用 Qt 原生级联菜单外观。
+            QMenu* scriptMenu = menu.addMenu(QString::fromUtf8("执行脚本")); // wjy: 鼠标悬浮“执行脚本”时展开脚本共享目录第一层文件夹。
+            populateScriptFolderMenu(scriptMenu, QString::fromUtf8(kRemoteScriptFolderPath)); // wjy: 递归把共享目录下的文件夹转成多级子菜单，暂不绑定点击执行逻辑。
+            const QAction* selectedAction = menu.exec(mapToGlobal(event->pos()));
+            if (selectedAction && selectedAction->data().isValid()) {
+                executeCurrentDeviceScriptFolder(selectedAction->data().toString()); // wjy: 只有点击具体脚本文件夹才触发复制和远程执行，中间层子菜单只负责展开。
+            }
+            event->accept();
+            return;
+        }
     }
 
     if (event->button() == Qt::RightButton && m_deviceGroupExpanded) { // wjy: 右键分组行时弹出分组菜单，先于空白区菜单判断，避免误触发“新建分组”。
@@ -3724,6 +4776,33 @@ void DeviceGrid::mouseDoubleClickEvent(QMouseEvent* event)
 void DeviceGrid::wheelEvent(QWheelEvent* event)
 {
 // =====wjy====
+    if (m_scriptOutputVisible
+        && !m_settingsSelected
+        && !m_remoteAssistSelected
+        && !m_localInfoSelected
+        && scriptTerminalPanelRect().contains(event->position())) {
+        QFont terminalFont(QStringLiteral("Consolas"));
+        terminalFont.setPixelSize(12);
+        const QFontMetrics metrics(terminalFont);
+        const QRectF content = scriptTerminalPanelRect().adjusted(12, 46, -18, -12);
+        if (m_scriptOutputDirty) {
+            m_scriptOutputText = stripTerminalControlSequences(readScriptOutputFileTail(m_scriptOutputFilePath));
+            m_scriptOutputDirty = false;
+        }
+        const int maxOffset = maxTerminalScrollOffset(m_scriptOutputText, metrics, qRound(content.height()));
+        const int wheelSteps = qMax(1, qAbs(event->angleDelta().y()) / 120);
+        const int lineStep = wheelSteps * 3;
+        if (event->angleDelta().y() > 0) {
+            m_scriptOutputScrollOffset = qBound(0, m_scriptOutputScrollOffset + lineStep, maxOffset);
+        } else {
+            m_scriptOutputScrollOffset = qBound(0, m_scriptOutputScrollOffset - lineStep, maxOffset);
+        }
+        m_scriptOutputAutoScroll = (m_scriptOutputScrollOffset == 0);
+        update(scriptTerminalPanelRect().toAlignedRect().adjusted(-2, -2, 2, 2));
+        event->accept();
+        return;
+    }
+
     const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 只有鼠标位于“我的设备”列表视口内，滚轮才控制设备列表。
     const int maxScrollOffset = maxDeviceListScrollOffset(); // wjy: 为 0 表示内容没有超过视口，不需要滚动。
     if (m_deviceGroupExpanded && maxScrollOffset > 0 && deviceListClip.contains(event->position().toPoint())) {

@@ -3,6 +3,7 @@
 #include "system/DeviceInfoService.h"
 #include "system/DeviceStatusService.h"
 
+#include <atomic>
 #include <functional>
 #include <QElapsedTimer>
 #include <QFrame>
@@ -13,6 +14,7 @@
 #include <QVector>
 
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -22,6 +24,7 @@ class QLineEdit;
 class QMouseEvent;
 class QPaintEvent;
 class QPushButton;
+class QTextEdit;
 class QTimer;
 class QWheelEvent;
 
@@ -63,6 +66,7 @@ private:
     void cancelNewDevice();
     void showDeviceMenu();
     void openCurrentDeviceTerminal();
+    void executeCurrentDeviceScriptFolder(const QString& scriptFolderPath); // wjy: Copy one shared script folder to remote work directory and run its entry script.
     void openRemoteDesktopWindow();
     void openDeviceGroupTiledWindows(int groupIndex); // wjy: Open all devices in one group and tile remote windows.
     void refreshLocalDeviceInfo();
@@ -87,8 +91,31 @@ private:
     void finishDeviceGroupRename(bool saveText); // wjy: Finish group rename on Enter or focus loss.
     void pruneHiddenDeviceSelections(); // wjy: Remove collapsed hidden devices from multi-selection state.
     void runBackgroundTask(std::function<void()> task); // wjy: Keep background tasks joinable until DeviceGrid is destroyed.
+    void setupScriptFileEditor();
+    void updateScriptFileEditorControls();
+    void loadScriptFileEditor(const QString& deviceIp, const QString& loginUser, const QString& scriptWorkName);
+    void saveScriptFileEditor();
 
     QString m_currentDeviceName;
+    bool m_scriptOutputVisible = false; // wjy: Show the in-page script terminal after a device script is selected.
+    bool m_scriptOutputRunning = false; // wjy: True while the remote script command is still executing.
+    bool m_scriptOutputFailed = false; // wjy: Paint failure status in the script terminal without blocking the UI with a modal dialog.
+    int m_scriptOutputScrollOffset = 0; // wjy: Terminal scroll offset measured in lines from the newest output; zero means pinned to bottom.
+    bool m_scriptOutputAutoScroll = true; // wjy: Keep following new output until the user scrolls upward.
+    bool m_scriptOutputDirty = false; // wjy: True when the local temp output file has new content waiting to be loaded into the panel.
+    QString m_scriptOutputTitle;
+    QString m_scriptOutputText;
+    QString m_scriptOutputFilePath;
+    QString m_lastScriptFolderPath;
+    std::shared_ptr<std::atomic_bool> m_scriptCancelRequested;
+    bool m_scriptEditorVisible = false;
+    bool m_scriptEditorLoading = false;
+    bool m_scriptEditorSaving = false;
+    QString m_scriptEditorTitle;
+    QString m_scriptEditorRemotePath;
+    QString m_scriptEditorDeviceIp;
+    QString m_scriptEditorLoginUser;
+    QString m_scriptEditorWorkName;
     QLineEdit* m_statusRefreshIntervalEdit = nullptr; // wjy: Auto refresh interval edit.
     QLineEdit* m_batchSubnetEdit = nullptr; // wjy: 批量新增网段输入框，支持 192.168.3.* 格式。
     QPushButton* m_batchAddButton = nullptr; // wjy: 批量新增按钮，扫描期间禁用避免重复启动。
@@ -97,6 +124,8 @@ private:
     QLineEdit* m_deviceMacEdit = nullptr;
     QLineEdit* m_deviceRemarkEdit = nullptr;
     QLineEdit* m_deviceGroupNameEdit = nullptr; // wjy: Group rename editor.
+    QTextEdit* m_scriptFileEdit = nullptr;
+    QPushButton* m_scriptFileSaveButton = nullptr;
     QPushButton* m_saveDeviceButton = nullptr;
     QPushButton* m_cancelDeviceButton = nullptr;
     QVector<QPushButton*> m_localInfoCopyButtons;
@@ -146,6 +175,7 @@ private:
     QTimer* m_refreshTimer = nullptr;
     QTimer* m_statusAutoRefreshTimer = nullptr;
     QTimer* m_wakeVisualTimer = nullptr;
+    QTimer* m_scriptOutputFlushTimer = nullptr;
     QElapsedTimer m_detailAnimationClock;
     QElapsedTimer m_desktopHoverClock;
     QElapsedTimer m_refreshClock;

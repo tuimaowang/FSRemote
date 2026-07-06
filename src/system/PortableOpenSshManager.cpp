@@ -2,6 +2,7 @@
 
 #include <QCoreApplication>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QProcess>
@@ -53,6 +54,37 @@ QString readLogTail(const QString& path, int maxBytes = 4096)
     }
     return QString::fromLocal8Bit(file.readAll()).trimmed();
 }
+
+// =====wjy====
+QByteArray normalizedPublicKeyLine(const QByteArray& key)
+{
+    return key.trimmed(); // wjy: authorized_keys 按单行公钥保存，这里统一去掉首尾空白，避免比较和追加时出现重复行。
+}
+
+bool authorizedKeysContain(const QByteArray& existing, const QByteArray& publicKey)
+{
+    const QByteArray normalizedKey = normalizedPublicKeyLine(publicKey); // wjy: 用规范化后的公钥行和文件中每一行比较。
+    const QList<QByteArray> lines = existing.split('\n');
+    for (const QByteArray& line : lines) {
+        if (normalizedPublicKeyLine(line) == normalizedKey) {
+            return true; // wjy: 目标 authorized_keys 已经包含这把公钥时不再重复追加。
+        }
+    }
+    return false;
+}
+
+QByteArray appendAuthorizedKeyLine(QByteArray existing, const QByteArray& publicKey)
+{
+    const QByteArray normalizedKey = normalizedPublicKeyLine(publicKey); // wjy: 追加前再次规范化，保证写入的每个 key 都是一行。
+    existing = existing.trimmed();
+    if (!existing.isEmpty()) {
+        existing.append('\n'); // wjy: 保留原有远程授权 key，并在末尾换行后追加新的设备公钥。
+    }
+    existing.append(normalizedKey);
+    existing.append('\n');
+    return existing;
+}
+// ===end====
 
 } // namespace
 
@@ -170,15 +202,22 @@ bool PortableOpenSshManager::openTerminal(const QString& hostIp, const QString& 
     startupInfo.wShowWindow = SW_SHOWNORMAL;
 
     PROCESS_INFORMATION processInfo{};
-    std::wstring applicationName = QDir::toNativeSeparators(sshExePath()).toStdWString();
+// =====wjy====
+    std::wstring applicationName = QDir::toNativeSeparators(shellPath()).toStdWString(); // wjy: 通过 cmd.exe 承载 ssh.exe，连接失败时保留窗口显示错误原因，避免黑窗一闪而过。
     QStringList commandParts;
     commandParts.reserve(arguments.size() + 1);
     commandParts.push_back(quoteForCmd(QDir::toNativeSeparators(sshExePath())));
     for (const QString& argument : arguments) {
         commandParts.push_back(argument.contains(QLatin1Char(' ')) ? quoteForCmd(argument) : argument);
     }
-    std::wstring mutableCommandLine = commandParts.join(QLatin1Char(' ')).toStdWString();
+    const QString sshCommand = commandParts.join(QLatin1Char(' ')); // wjy: 保持原有 ssh.exe 参数不变，只把它包进 cmd /k。
+    const QString cmdCommandLine = quoteForCmd(QDir::toNativeSeparators(shellPath()))
+        + QStringLiteral(" /k \"")
+        + sshCommand
+        + QLatin1Char('"'); // wjy: /k 会在 ssh.exe 正常退出或失败后继续停留，方便现场读取认证/网络错误。
+    std::wstring mutableCommandLine = cmdCommandLine.toStdWString();
     std::wstring workingDirectory = QDir::toNativeSeparators(appDir()).toStdWString();
+// ===end====
 
     const BOOL created = CreateProcessW(
         applicationName.c_str(),
@@ -213,6 +252,196 @@ bool PortableOpenSshManager::openTerminal(const QString& hostIp, const QString& 
     }
     return true;
 #endif
+}
+
+bool PortableOpenSshManager::runRemoteCommands(const QString& hostIp, const QString& loginUser, const QStringList& commands, QString* outputText, QString* errorMessage, int timeoutMs, std::function<void(const QString&)> outputCallback, std::function<bool()> shouldCancel)
+{
+// =====wjy====
+    const QString normalizedHost = hostIp.trimmed();
+    const QString normalizedUser = loginUser.trimmed();
+    if (normalizedHost.isEmpty() || normalizedUser.isEmpty()) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("target host or login user is empty");
+        }
+        return false; // wjy: 远程命令必须有目标 IP 和登录用户，否则 ssh.exe 无法建立会话。
+    }
+    if (commands.isEmpty()) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("remote command is empty");
+        }
+        return false; // wjy: 没有命令时不启动 SSH，避免打开一个空的远程 cmd 会话。
+    }
+    if (!ensurePrepared(errorMessage)) {
+        return false;
+    }
+
+    QStringList arguments = sshArguments(
+        QDir::toNativeSeparators(effectiveClientKeyPath()),
+        serverPort(),
+        normalizedUser,
+        normalizedHost);
+
+    QProcess process;
+    process.setProgram(sshExePath());
+    process.setArguments(arguments);
+    process.setWorkingDirectory(appDir());
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    const QString pathKey = environment.contains(QStringLiteral("Path")) ? QStringLiteral("Path") : QStringLiteral("PATH");
+    const QString pathValue = environment.value(pathKey);
+    environment.insert(pathKey, opensshDir() + QLatin1Char(';') + pathValue);
+    process.setProcessEnvironment(environment);
+    process.start();
+    if (!process.waitForStarted(5000)) {
+        if (errorMessage) {
+            *errorMessage = process.errorString();
+        }
+        return false;
+    }
+
+    QString commandText;
+    for (const QString& command : commands) {
+        commandText += command;
+        commandText += QStringLiteral("\r\n"); // wjy: 远端 ForceCommand 是 cmd.exe，把每条命令像终端输入一样写入 stdin。
+    }
+    commandText += QStringLiteral("exit\r\n");
+    process.write(commandText.toLocal8Bit());
+    process.closeWriteChannel();
+
+    QByteArray collectedOutput;
+    auto collectProcessOutput = [&process, &collectedOutput, &outputCallback] {
+        const QByteArray chunk = process.readAllStandardOutput()
+            + process.readAllStandardError();
+        if (chunk.isEmpty()) {
+            return;
+        }
+        collectedOutput += chunk;
+        if (outputCallback) {
+            outputCallback(QString::fromUtf8(chunk)); // wjy: Script output is streamed back as UTF-8; remote PowerShell script sets Console.OutputEncoding accordingly.
+        }
+    };
+    QElapsedTimer commandTimer;
+    commandTimer.start();
+    bool canceled = false;
+    while (process.state() != QProcess::NotRunning) {
+        if (shouldCancel && shouldCancel()) {
+            canceled = true;
+            break;
+        }
+        if (process.waitForFinished(200)) {
+            break;
+        }
+        collectProcessOutput();
+        if (timeoutMs > 0 && commandTimer.elapsed() > timeoutMs) {
+            break;
+        }
+    }
+    collectProcessOutput();
+
+    if (process.state() != QProcess::NotRunning) {
+        process.kill();
+        process.waitForFinished(3000);
+        collectProcessOutput();
+        if (outputText) {
+            *outputText = QString::fromUtf8(collectedOutput).trimmed();
+        }
+        if (errorMessage) {
+            *errorMessage = canceled
+                ? QStringLiteral("remote command canceled")
+                : QStringLiteral("remote command timed out");
+        }
+        return false;
+    }
+
+    const QString output = QString::fromUtf8(collectedOutput);
+    if (outputText) {
+        *outputText = output.trimmed();
+    }
+    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        if (errorMessage) {
+            *errorMessage = output.trimmed().isEmpty()
+                ? QStringLiteral("remote command failed with exit code %1").arg(process.exitCode())
+                : output.trimmed();
+        }
+        return false;
+    }
+
+    if (errorMessage) {
+        errorMessage->clear();
+    }
+    return true;
+// ===end====
+}
+
+QString PortableOpenSshManager::clientPublicKey(QString* errorMessage)
+{
+// =====wjy====
+    if (!ensurePrepared(errorMessage)) {
+        return {}; // wjy: 取公钥前先完成 OpenSSH 布局、密钥和权限准备，保证后续发给目标设备的 key 是当前可用的。
+    }
+
+    QFile publicKeyFile(effectiveClientPublicKeyPath());
+    if (!publicKeyFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("failed to read client public key");
+        }
+        return {}; // wjy: 公钥读不到时不能继续授权目标设备，否则 SSH 仍然会认证失败。
+    }
+
+    const QString publicKey = QString::fromUtf8(publicKeyFile.readAll()).trimmed();
+    if (publicKey.isEmpty() && errorMessage) {
+        *errorMessage = QStringLiteral("client public key is empty");
+    }
+    return publicKey; // wjy: 返回单行公钥，调用方通过命令通道写入目标机 authorized_keys。
+// ===end====
+}
+
+bool PortableOpenSshManager::authorizeClientPublicKey(const QString& publicKey, QString* errorMessage)
+{
+// =====wjy====
+    if (!ensurePrepared(errorMessage)) {
+        return false; // wjy: 写 authorized_keys 前确保 data/openssh 目录和基础配置已经创建完成。
+    }
+
+    const QByteArray normalizedKey = normalizedPublicKeyLine(publicKey.toUtf8());
+    if (normalizedKey.isEmpty()) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("remote client public key is empty");
+        }
+        return false; // wjy: 空公钥没有授权意义，直接拒绝写入目标机 authorized_keys。
+    }
+
+    QFile authorizedKeysFile(authorizedKeysPath());
+    QByteArray existing;
+    if (authorizedKeysFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        existing = authorizedKeysFile.readAll();
+        authorizedKeysFile.close();
+    }
+    if (authorizedKeysContain(existing, normalizedKey)) {
+        if (errorMessage) {
+            errorMessage->clear();
+        }
+        return true; // wjy: 发起方公钥已登记时直接返回成功，避免每次打开终端都重复写文件。
+    }
+
+    QSaveFile saveFile(authorizedKeysPath());
+    if (!saveFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("failed to write authorized_keys");
+        }
+        return false;
+    }
+    saveFile.write(appendAuthorizedKeyLine(existing, normalizedKey)); // wjy: 保留目标机已有授权 key，再追加当前发起设备的公钥。
+    if (!saveFile.commit()) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("failed to commit authorized_keys");
+        }
+        return false;
+    }
+    if (errorMessage) {
+        errorMessage->clear();
+    }
+    return true;
+// ===end====
 }
 
 QString PortableOpenSshManager::loginUser() const
@@ -275,6 +504,9 @@ bool PortableOpenSshManager::ensureKeys(QString* errorMessage)
             return false;
         }
     }
+    if (!ensurePrivateKeyPermissions(hostKeyPath(), errorMessage)) {
+        return false;
+    }
 
     const bool hasBundledSharedKey =
         QFileInfo::exists(bundledClientKeyPath())
@@ -284,6 +516,11 @@ bool PortableOpenSshManager::ensureKeys(QString* errorMessage)
             return false;
         }
     }
+// =====wjy====
+    if (!ensurePrivateKeyPermissions(effectiveClientKeyPath(), errorMessage)) {
+        return false;
+    } // wjy: 无论使用自动生成的 client_ed25519，还是随 OpenSSH 目录分发的 fsremote_client_ed25519，都要修 ACL，否则 ssh.exe 会因 bad permissions 忽略私钥。
+// ===end====
 
     QFile publicKeyFile(effectiveClientPublicKeyPath());
     if (!publicKeyFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
@@ -307,7 +544,8 @@ bool PortableOpenSshManager::ensureKeys(QString* errorMessage)
         existing = authorizedKeysFile.readAll().trimmed();
         authorizedKeysFile.close();
     }
-    if (existing == publicKey) {
+// =====wjy====
+    if (authorizedKeysContain(existing, publicKey)) {
         return true;
     }
 
@@ -318,8 +556,7 @@ bool PortableOpenSshManager::ensureKeys(QString* errorMessage)
         }
         return false;
     }
-    saveFile.write(publicKey);
-    saveFile.write("\n");
+    saveFile.write(appendAuthorizedKeyLine(existing, publicKey)); // wjy: 只追加本机公钥，不覆盖其它 FSRemote 设备已经登记进来的远程公钥。
     if (!saveFile.commit()) {
         if (errorMessage) {
             *errorMessage = QStringLiteral("failed to commit authorized_keys");
@@ -327,6 +564,7 @@ bool PortableOpenSshManager::ensureKeys(QString* errorMessage)
         return false;
     }
     return true;
+// ===end====
 }
 
 bool PortableOpenSshManager::ensureConfig(QString* errorMessage)
@@ -375,6 +613,41 @@ bool PortableOpenSshManager::ensureConfig(QString* errorMessage)
         return false;
     }
     return true;
+}
+
+bool PortableOpenSshManager::ensurePrivateKeyPermissions(const QString& keyPath, QString* errorMessage) const
+{
+// =====wjy====
+#if !defined(_WIN32)
+    Q_UNUSED(keyPath);
+    Q_UNUSED(errorMessage);
+    return true; // wjy: 非 Windows 平台暂不需要 icacls 修复，保持原有行为。
+#else
+    const QString normalizedKeyPath = QDir::toNativeSeparators(QFileInfo(keyPath).absoluteFilePath());
+    const QString user = currentLoginUser();
+    if (normalizedKeyPath.isEmpty() || user.isEmpty()) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("failed to prepare OpenSSH key permission context");
+        }
+        return false; // wjy: 没有明确文件路径或登录用户时不盲目修改 ACL，避免误改其它文件。
+    }
+
+    auto runIcacls = [this, errorMessage](const QStringList& arguments) {
+        return runTool(QStringLiteral("icacls.exe"), arguments, 8000, errorMessage); // wjy: 复用同步工具执行逻辑，失败时把 stderr/stdout 带回 UI。
+    };
+
+    if (!runIcacls({normalizedKeyPath, QStringLiteral("/inheritance:r")})) {
+        return false; // wjy: 关闭继承，避免 Users/Everyone 等宽权限让 OpenSSH 拒绝加载私钥。
+    }
+    return runIcacls({
+        normalizedKeyPath,
+        QStringLiteral("/grant:r"),
+        user + QStringLiteral(":(F)"),
+        QStringLiteral("*S-1-5-18:(F)"),
+        QStringLiteral("*S-1-5-32-544:(F)"),
+    }); // wjy: 仅保留当前登录用户、SYSTEM、Administrators 的完全控制权限，匹配 Windows OpenSSH 对私钥 ACL 的要求。
+#endif
+// ===end====
 }
 
 bool PortableOpenSshManager::cleanupResidualServerProcesses(QString* errorMessage) const
