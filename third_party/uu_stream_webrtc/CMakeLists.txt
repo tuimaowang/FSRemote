@@ -19,16 +19,28 @@ set(WEBRTC_ROOT "c:/Users/test/Documents/Fsremote/webRTC/webrtc-checkout" CACHE 
 include("cmake/FindWebRTCNative.cmake")
 
 add_library(uu_stream_common STATIC
+    # wjy: Register headers beside sources so Qt Creator shows them in the CMake project tree.
     ../lan_stream_probe/src/nvenc_h264_encoder.cpp
+    ../lan_stream_probe/src/nvenc_h264_encoder.h
     ../lan_stream_probe/src/ffmpeg_decoder.cpp
+    ../lan_stream_probe/src/ffmpeg_decoder.h
+    ../lan_stream_probe/src/common.h
     src/native_webrtc_runtime.cpp
+    src/native_webrtc_runtime.h
     src/parsec_vdd_session.cpp
+    src/parsec_vdd_session.h
     src/sdp_guard.cpp
+    src/sdp_guard.h
     src/signaling.cpp
+    src/signaling.h
     src/system_audio_stream.cpp
+    src/system_audio_stream.h
     src/uu_codec_factory.cpp
+    src/uu_codec_factory.h
     src/uu_profile.cpp
+    src/uu_profile.h
     src/webrtc_session.cpp
+    src/webrtc_session.h
 )
 
 #aiÌí¼Ó
@@ -138,6 +150,7 @@ endfunction()
 
 add_library(fsremote_stream SHARED
     src/fsremote_stream_api.cpp
+    ../../include/FsRemoteStreamApi.h # wjy: Register the DLL API header so Qt Creator shows it under this target.
 )
 
 #aiÌí¼Ó

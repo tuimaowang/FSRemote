@@ -15,6 +15,7 @@
 #include <QPixmap>
 #include <QRegion>
 #include <QResizeEvent>
+#include <QStringList>
 #include <QTextStream>
 #include <QTimer>
 #include <QWheelEvent>
@@ -296,6 +297,7 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
     m_connectionStatus = zh("\xE5\x87\x86\xE5\xA4\x87\xE8\xBF\x9E\xE6\x8E\xA5");
 
     m_sessionClock.start();
+    m_frameStatsClock.start(); // wjy: Start a lightweight in-memory FPS meter for the remote desktop overlay.
     m_sessionTimer = new QTimer(this);
     m_sessionTimer->setInterval(1000);
     connect(m_sessionTimer, &QTimer::timeout, this, [this] {
@@ -479,11 +481,35 @@ void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
     // =====wjy====
     // appendViewerDebugLog(QStringLiteral("setRemoteFrame enter size=%1x%2").arg(image.width()).arg(image.height())); // wjy: per-frame UI log disabled for smoother rendering.
     // ===end====
+    updateFrameStats(image); // wjy: Count received UI frames before repainting so the overlay reflects the latest decoded BGRA flow.
     m_remoteFrame = image;
     m_connectionStatusCode = 50;
     m_connectionStatus = QString::fromUtf8("画面已接收");
     update(QRect(0, 40, width(), height() - 40));
     // appendViewerDebugLog(QStringLiteral("setRemoteFrame update requested")); // wjy: per-frame repaint log disabled to avoid disk IO on every frame.
+}
+
+void RemoteDesktopWindow::updateFrameStats(const QImage& image)
+{
+    if (image.isNull()) {
+        return;
+    }
+    if (!m_frameStatsClock.isValid()) {
+        m_frameStatsClock.start(); // wjy: Defensive start in case a frame arrives before the constructor timer state is valid.
+    }
+
+    ++m_frameStatsCount; // wjy: Count frames that reached the Qt/UI handoff, which is the number users actually care about for visual smoothness.
+    m_frameStatsBytes += static_cast<qint64>(image.sizeInBytes()); // wjy: Track decoded BGRA bytes, not compressed WebRTC network bitrate.
+    const qint64 elapsedMs = m_frameStatsClock.elapsed();
+    if (elapsedMs < 1000) {
+        return;
+    }
+
+    m_receiveFps = m_frameStatsCount * 1000.0 / double(elapsedMs); // wjy: Smooth FPS over roughly one second to avoid noisy per-frame values.
+    m_rawBgraMbps = m_frameStatsBytes * 8.0 * 1000.0 / double(elapsedMs) / 1000000.0; // wjy: Raw decoded BGRA throughput helps identify UI/copy pressure separately from network bitrate.
+    m_frameStatsCount = 0;
+    m_frameStatsBytes = 0;
+    m_frameStatsClock.restart();
 }
 
 bool RemoteDesktopWindow::isClosingConnection() const
@@ -574,6 +600,39 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     if (!m_remoteFrame.isNull()) {
         const QRect target = remoteImageRect();
         painter.drawImage(target, m_remoteFrame);
+        // =====wjy====
+        const QStringList statLines = {
+            QStringLiteral("UI %1 fps").arg(m_receiveFps, 0, 'f', 1),
+            QStringLiteral("%1 x %2").arg(m_remoteFrame.width()).arg(m_remoteFrame.height()),
+            QStringLiteral("RAW %1 Mbps").arg(m_rawBgraMbps, 0, 'f', 1),
+        }; // wjy: Keep the overlay compact and explicit: this is UI-side decoded BGRA flow, not compressed network bitrate.
+        QFont statFont(QStringLiteral("Consolas"));
+        statFont.setPixelSize(12);
+        painter.setFont(statFont);
+        const QFontMetrics statMetrics(statFont);
+        int statWidth = 0;
+        for (const QString& line : statLines) {
+            statWidth = qMax(statWidth, statMetrics.horizontalAdvance(line)); // wjy: Size the panel to the widest metric line so text never clips.
+        }
+        const int panelPaddingX = 10;
+        const int panelPaddingY = 7;
+        const int panelWidth = statWidth + panelPaddingX * 2;
+        const int panelHeight = statLines.size() * statMetrics.height() + panelPaddingY * 2;
+        const QRect statPanel(
+            target.right() - panelWidth - 12,
+            target.bottom() - panelHeight - 12,
+            panelWidth,
+            panelHeight); // wjy: Anchor stats to the remote image bottom-right so window chrome and letterboxing stay clear.
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(0, 0, 0, 156));
+        painter.drawRoundedRect(QRectF(statPanel), 5, 5);
+        painter.setPen(QColor(QStringLiteral("#EAF2FF")));
+        int textY = statPanel.top() + panelPaddingY + statMetrics.ascent();
+        for (const QString& line : statLines) {
+            painter.drawText(statPanel.left() + panelPaddingX, textY, line); // wjy: Draw one metric per line for quick reading during remote-control testing.
+            textY += statMetrics.height();
+        }
+        // ===end====
     } else {
         const QRect contentRect(0, 40, width(), height() - 40);
         QFont titleFont(QStringLiteral("Microsoft YaHei UI"));

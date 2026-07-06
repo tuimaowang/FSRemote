@@ -24,7 +24,7 @@ enum class SessionRole {
 
 struct SessionConfig {
     SessionRole role = SessionRole::Host;
-    uint32_t target_bitrate_kbps = 120000;
+    uint32_t target_bitrate_kbps = 20000; // wjy: Default stream bitrate lowered from 120Mbps to 60Mbps for smoother remote-control testing.
     uint32_t fps = 60;
 };
 

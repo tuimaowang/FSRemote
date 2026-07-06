@@ -75,6 +75,7 @@ private:
     int resizeEdgesAt(const QPoint& position) const;
     void updateResizeCursor(const QPoint& position);
     void updateWindowMask();
+    void updateFrameStats(const QImage& image); // wjy: Update the bottom-right stream stats overlay from each received remote frame.
     QString m_deviceName;
     QString m_hostIp;
     QString m_connectionStatus;
@@ -93,6 +94,11 @@ private:
     QPoint m_resizeStartGlobal;
     QRect m_resizeStartGeometry;
     QElapsedTimer m_sessionClock;
+    QElapsedTimer m_frameStatsClock; // wjy: Measures one-second windows for the remote desktop stats overlay.
+    int m_frameStatsCount = 0; // wjy: Counts frames received by the Qt UI handoff during the current stats window.
+    qint64 m_frameStatsBytes = 0; // wjy: Accumulates decoded BGRA bytes for raw-throughput diagnostics.
+    double m_receiveFps = 0.0; // wjy: Last calculated UI-side received FPS shown in the overlay.
+    double m_rawBgraMbps = 0.0; // wjy: Last calculated decoded BGRA throughput, separate from compressed network bitrate.
     QTimer* m_sessionTimer = nullptr;
     QSet<int> m_pressedKeys;
 };
