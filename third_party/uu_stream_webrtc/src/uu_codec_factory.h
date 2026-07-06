@@ -11,7 +11,7 @@
 
 namespace uu {
 
-using DecodedBgraCallback = std::function<void(int width, int height, const uint8_t* bgra, size_t size)>;
+using DecodedBgraCallback = std::function<void(int width, int height, const uint8_t* bgra, size_t size, double encoded_mbps)>;
 
 std::unique_ptr<webrtc::VideoEncoderFactory> CreateUuVideoEncoderFactory();
 std::unique_ptr<webrtc::VideoDecoderFactory> CreateUuVideoDecoderFactory(DecodedBgraCallback bgra_callback = {});

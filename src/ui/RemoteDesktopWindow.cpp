@@ -10,6 +10,7 @@
 #include <QKeyEvent>
 #include <QMetaObject>
 #include <QMouseEvent>
+#include <QMutexLocker>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmap>
@@ -239,20 +240,10 @@ void FSREMOTE_STREAM_CALL onRemoteFrame(void* user, int width, int height, const
     }
 
     // appendViewerDebugLog(QStringLiteral("onRemoteFrame before QImage copy")); // wjy: per-frame copy log disabled because QImage copy already costs enough.
-    QImage image(bgra, width, height, width * 4, QImage::Format_ARGB32);
+    QImage image(bgra, width, height, width * 4, QImage::Format_RGB32); // wjy: Ignore decoder alpha; remote desktop pixels should be opaque, otherwise Qt blending can look like a pale veil.
     QImage copy = image.copy();
     // appendViewerDebugLog(QStringLiteral("onRemoteFrame after QImage copy")); // wjy: per-frame copy log disabled to reduce IO pressure.
-    QMetaObject::invokeMethod(window, [window, copy = std::move(copy)] {
-        // appendViewerDebugLog(QStringLiteral("onRemoteFrame queued lambda enter")); // wjy: per-frame queued-call log disabled.
-        if (window->isClosingConnection()) {
-            // appendViewerDebugLog(QStringLiteral("onRemoteFrame queued lambda skip closing")); // wjy: per-frame close-skip log disabled.
-            return;
-        }
-        // appendViewerDebugLog(QStringLiteral("onRemoteFrame before setRemoteFrame")); // wjy: per-frame UI update log disabled.
-        window->setRemoteFrame(copy);
-        // appendViewerDebugLog(QStringLiteral("onRemoteFrame after setRemoteFrame")); // wjy: per-frame UI update log disabled.
-    }, Qt::QueuedConnection);
-    // appendViewerDebugLog(QStringLiteral("onRemoteFrame invoke queued")); // wjy: per-frame invoke log disabled to avoid flooding the log file.
+    window->enqueueRemoteFrame(std::move(copy)); // wjy: Keep only the newest frame instead of queuing every decoded frame into the Qt event loop.
 }
 
 void FSREMOTE_STREAM_CALL onViewerStatus(void* user, int code, const char* message)
@@ -264,10 +255,20 @@ void FSREMOTE_STREAM_CALL onViewerStatus(void* user, int code, const char* messa
 
     const QString text = message ? QString::fromUtf8(message) : QString();
     // =====wjy====
-    appendViewerDebugLog(QStringLiteral("viewer status code=%1 message=%2").arg(code).arg(text)); // wjy: correlate UI status text with native stream checkpoints.
+    if (code != 60) {
+        appendViewerDebugLog(QStringLiteral("viewer status code=%1 message=%2").arg(code).arg(text)); // wjy: correlate UI status text with native stream checkpoints while avoiding bitrate log spam.
+    }
     // ===end====
     QMetaObject::invokeMethod(window, [window, code, text] {
         if (window->isClosingConnection()) {
+            return;
+        }
+        if (code == 60 && text.startsWith(QStringLiteral("ENC "))) {
+            bool ok = false;
+            const double mbps = text.mid(4).toDouble(&ok);
+            if (ok) {
+                window->setEncodedBitrateMbps(mbps);
+            }
             return;
         }
         window->setConnectionStatus(code, text);
@@ -298,6 +299,11 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
 
     m_sessionClock.start();
     m_frameStatsClock.start(); // wjy: Start a lightweight in-memory FPS meter for the remote desktop overlay.
+    m_framePresentTimer = new QTimer(this);
+    m_framePresentTimer->setTimerType(Qt::PreciseTimer);
+    m_framePresentTimer->setInterval(16);
+    connect(m_framePresentTimer, &QTimer::timeout, this, &RemoteDesktopWindow::flushPendingRemoteFrame);
+    m_framePresentTimer->start(); // wjy: Fixed latest-frame presentation prevents full-screen repaint pressure from building visible latency.
     m_sessionTimer = new QTimer(this);
     m_sessionTimer->setInterval(1000);
     connect(m_sessionTimer, &QTimer::timeout, this, [this] {
@@ -476,6 +482,32 @@ void RemoteDesktopWindow::updateWindowMask()
     setMask(QRegion(path.toFillPolygon().toPolygon()));
 }
 
+void RemoteDesktopWindow::enqueueRemoteFrame(QImage image)
+{
+    if (image.isNull()) {
+        return;
+    }
+
+    QMutexLocker locker(&m_pendingFrameMutex);
+    m_pendingRemoteFrame = std::move(image); // wjy: Overwrite stale frames; the UI timer will pull the newest one when the event loop is ready.
+}
+
+void RemoteDesktopWindow::flushPendingRemoteFrame()
+{
+    QImage image;
+    {
+        QMutexLocker locker(&m_pendingFrameMutex);
+        image = std::move(m_pendingRemoteFrame);
+        m_pendingRemoteFrame = QImage();
+    }
+
+    if (isClosingConnection() || image.isNull()) {
+        return;
+    }
+
+    setRemoteFrame(image);
+}
+
 void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
 {
     // =====wjy====
@@ -494,6 +526,7 @@ void RemoteDesktopWindow::updateFrameStats(const QImage& image)
     if (image.isNull()) {
         return;
     }
+    updateFrameColorStats(image); // wjy: Keep RGB diagnostics visible while testing pure-black remote pages.
     if (!m_frameStatsClock.isValid()) {
         m_frameStatsClock.start(); // wjy: Defensive start in case a frame arrives before the constructor timer state is valid.
     }
@@ -510,6 +543,67 @@ void RemoteDesktopWindow::updateFrameStats(const QImage& image)
     m_frameStatsCount = 0;
     m_frameStatsBytes = 0;
     m_frameStatsClock.restart();
+}
+
+void RemoteDesktopWindow::updateFrameColorStats(const QImage& image)
+{
+    if (image.isNull() || image.depth() < 24) {
+        return;
+    }
+
+    // =====wjy====
+    sampleFrameColorRegion(image, image.rect(), &m_rgbMin, &m_rgbAvg, &m_rgbMax); // wjy: Whole-frame values show the complete decoded desktop range.
+    const int centerWidth = qMax(1, image.width() / 3); // wjy: Center region avoids browser chrome/taskbar when testing a full-screen black webpage.
+    const int centerHeight = qMax(1, image.height() / 3);
+    const QRect centerRegion(
+        (image.width() - centerWidth) / 2,
+        (image.height() - centerHeight) / 2,
+        centerWidth,
+        centerHeight);
+    sampleFrameColorRegion(image, centerRegion, &m_centerRgbMin, &m_centerRgbAvg, &m_centerRgbMax); // wjy: CTR is the key value for checking whether pure black becomes gray in the video path.
+    // ===end====
+}
+
+void RemoteDesktopWindow::sampleFrameColorRegion(const QImage& image, const QRect& region, int* minValue, int* avgValue, int* maxValue) const
+{
+    if (image.isNull() || image.depth() < 24 || !minValue || !avgValue || !maxValue) {
+        return;
+    }
+
+    const QRect sampleRegion = region.intersected(image.rect());
+    if (sampleRegion.isEmpty()) {
+        return;
+    }
+
+    const int stepX = qMax(1, sampleRegion.width() / 64);
+    const int stepY = qMax(1, sampleRegion.height() / 36);
+    int minSample = 255;
+    int maxSample = 0;
+    qint64 sum = 0;
+    qint64 count = 0;
+
+    // =====wjy====
+    for (int y = sampleRegion.top(); y <= sampleRegion.bottom(); y += stepY) {
+        const uchar* row = image.constScanLine(y); // wjy: Remote frames are stored as 4-byte BGRA/RGB32 scanlines.
+        for (int x = sampleRegion.left(); x <= sampleRegion.right(); x += stepX) {
+            const uchar* pixel = row + x * 4; // wjy: Sample B/G/R from the decoded frame without using Qt color conversion helpers.
+            const int b = pixel[0];
+            const int g = pixel[1];
+            const int r = pixel[2];
+            minSample = qMin(minSample, qMin(r, qMin(g, b))); // wjy: Pure black should keep this close to 0.
+            maxSample = qMax(maxSample, qMax(r, qMax(g, b))); // wjy: Pure white or bright UI should move this toward 255.
+            sum += r + g + b;
+            count += 3;
+        }
+    }
+    // ===end====
+
+    if (count <= 0) {
+        return;
+    }
+    *minValue = minSample;
+    *avgValue = static_cast<int>((sum + count / 2) / count);
+    *maxValue = maxSample;
 }
 
 bool RemoteDesktopWindow::isClosingConnection() const
@@ -588,24 +682,33 @@ void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
     update(QRect(0, 40, width(), height() - 40));
 }
 
+void RemoteDesktopWindow::setEncodedBitrateMbps(double mbps)
+{
+    m_encodedMbps = qMax(0.0, mbps); // wjy: Clamp the overlay value because transient decoder stats should never draw negative bitrate.
+    update(remoteImageRect());
+}
+
 void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
 {
     Q_UNUSED(event)
 
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
-    painter.setRenderHint(QPainter::SmoothPixmapTransform);
 
     painter.fillRect(rect(), QColor(QStringLiteral("#000000")));
     if (!m_remoteFrame.isNull()) {
         const QRect target = remoteImageRect();
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, false); // wjy: Prefer low-latency full-screen remote drawing over expensive smooth scaling.
         painter.drawImage(target, m_remoteFrame);
         // =====wjy====
         const QStringList statLines = {
             QStringLiteral("UI %1 fps").arg(m_receiveFps, 0, 'f', 1),
             QStringLiteral("%1 x %2").arg(m_remoteFrame.width()).arg(m_remoteFrame.height()),
+            QStringLiteral("ENC %1 Mbps").arg(m_encodedMbps, 0, 'f', 2),
             QStringLiteral("RAW %1 Mbps").arg(m_rawBgraMbps, 0, 'f', 1),
-        }; // wjy: Keep the overlay compact and explicit: this is UI-side decoded BGRA flow, not compressed network bitrate.
+            QStringLiteral("RGB %1/%2/%3").arg(m_rgbMin).arg(m_rgbAvg).arg(m_rgbMax),
+            QStringLiteral("CTR %1/%2/%3").arg(m_centerRgbMin).arg(m_centerRgbAvg).arg(m_centerRgbMax),
+        }; // wjy: Show real compressed bitrate first; RAW stays as a local decoded-throughput diagnostic.
         QFont statFont(QStringLiteral("Consolas"));
         statFont.setPixelSize(12);
         painter.setFont(statFont);

@@ -7,6 +7,7 @@
 #include <QWidget>
 #include <QElapsedTimer>
 #include <QImage>
+#include <QMutex>
 
 #include "FsRemoteStreamApi.h"
 
@@ -28,8 +29,10 @@ class RemoteDesktopWindow final : public QWidget {
 public:
     explicit RemoteDesktopWindow(const QString& deviceName, const QString& hostIp, QWidget* parent = nullptr);
     ~RemoteDesktopWindow() override;
+    void enqueueRemoteFrame(QImage image);
     void setRemoteFrame(const QImage& image);
     void setConnectionStatus(int code, const QString& message);
+    void setEncodedBitrateMbps(double mbps);
     bool isClosingConnection() const;
     bool forwardNativeKey(int virtualKey, bool down);
 
@@ -75,12 +78,17 @@ private:
     int resizeEdgesAt(const QPoint& position) const;
     void updateResizeCursor(const QPoint& position);
     void updateWindowMask();
+    void flushPendingRemoteFrame();
     void updateFrameStats(const QImage& image); // wjy: Update the bottom-right stream stats overlay from each received remote frame.
+    void updateFrameColorStats(const QImage& image); // wjy: Update right-bottom RGB diagnostics for pure-black webpage tests.
+    void sampleFrameColorRegion(const QImage& image, const QRect& region, int* minValue, int* avgValue, int* maxValue) const; // wjy: Sample RGB values cheaply without scanning every pixel.
     QString m_deviceName;
     QString m_hostIp;
     QString m_connectionStatus;
     int m_connectionStatusCode = 0;
     QImage m_remoteFrame;
+    QMutex m_pendingFrameMutex; // wjy: Protects latest-frame handoff from the decoder thread to the Qt UI thread.
+    QImage m_pendingRemoteFrame; // wjy: Holds only the newest decoded frame so slow full-screen painting cannot build a stale-frame queue.
     FsRemoteStreamHandle m_viewerHandle = nullptr;
     bool m_closeInProgress = false;
     QVector<int> m_virtualScreens;
@@ -99,6 +107,14 @@ private:
     qint64 m_frameStatsBytes = 0; // wjy: Accumulates decoded BGRA bytes for raw-throughput diagnostics.
     double m_receiveFps = 0.0; // wjy: Last calculated UI-side received FPS shown in the overlay.
     double m_rawBgraMbps = 0.0; // wjy: Last calculated decoded BGRA throughput, separate from compressed network bitrate.
+    double m_encodedMbps = 0.0; // wjy: Last calculated compressed video bitrate reported by the decoder from encoded frame bytes.
+    int m_rgbMin = 0; // wjy: Whole-frame minimum sampled RGB value.
+    int m_rgbAvg = 0; // wjy: Whole-frame average sampled RGB value.
+    int m_rgbMax = 0; // wjy: Whole-frame maximum sampled RGB value.
+    int m_centerRgbMin = 0; // wjy: Center-region minimum sampled RGB value for black-page testing.
+    int m_centerRgbAvg = 0; // wjy: Center-region average sampled RGB value for black-page testing.
+    int m_centerRgbMax = 0; // wjy: Center-region maximum sampled RGB value for black-page testing.
+    QTimer* m_framePresentTimer = nullptr; // wjy: Presents the newest pending frame at a fixed UI pace instead of posting one UI task per decoded frame.
     QTimer* m_sessionTimer = nullptr;
     QSet<int> m_pressedKeys;
 };

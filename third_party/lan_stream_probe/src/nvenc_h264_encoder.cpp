@@ -62,12 +62,12 @@ bool NvencH264Encoder::initialize(ID3D11Device* device, Size size, uint32_t bitr
     }
 
     const uint32_t safe_fps = std::max(1u, fps);
-    const uint32_t bitrate = std::max(1000u, bitrate_kbps) * 1000u;
+    const uint32_t bitrate = std::max(10u, bitrate_kbps) * 1000u;
     NV_ENC_CONFIG config = preset.presetCfg;
     config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
     config.gopLength = safe_fps * 5;
     config.frameIntervalP = 1;
-    config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+    config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
     config.rcParams.averageBitRate = bitrate;
     config.rcParams.maxBitRate = bitrate;
     config.rcParams.vbvBufferSize = std::max<uint32_t>(bitrate / safe_fps, 1);

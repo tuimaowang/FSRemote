@@ -138,7 +138,7 @@ public:
         if (!codec_settings || codec_settings->width == 0 || codec_settings->height == 0) {
             return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
         }
-        bitrate_kbps_ = std::max(1000u, codec_settings->startBitrate ? codec_settings->startBitrate : 120000u);
+        bitrate_kbps_ = std::max(10u, codec_settings->startBitrate ? codec_settings->startBitrate : 20000u);
         fps_ = std::max(1u, codec_settings->maxFramerate ? codec_settings->maxFramerate : 60u);
         target_size_ = {codec_settings->width, codec_settings->height};
         return ensure_device() ? WEBRTC_VIDEO_CODEC_OK : WEBRTC_VIDEO_CODEC_ERROR;
@@ -153,6 +153,7 @@ public:
     int32_t Release() override
     {
         encoder_.shutdown();
+        encoder_bitrate_kbps_ = 0; // wjy: Clear the active NVENC bitrate marker when the encoder session is released.
         texture_.Reset();
         argb_.clear();
         callback_ = nullptr;
@@ -171,6 +172,10 @@ public:
         if (width <= 0 || height <= 0) return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
         if (!ensure_device()) return WEBRTC_VIDEO_CODEC_ERROR;
         if (!ensure_texture(width, height)) return WEBRTC_VIDEO_CODEC_ERROR;
+        if (encoder_.ready() && should_reconfigure_bitrate()) {
+            encoder_.shutdown(); // wjy: WebRTC SetRates() changed the target bitrate; rebuild NVENC so the new adaptive rate takes effect.
+            last_bitrate_reconfigure_ms_ = GetTickCount64(); // wjy: Throttle bitrate-driven rebuilds so small WebRTC rate changes do not cause repeated encoder stalls.
+        }
         if (!encoder_.ready() || size_.width != static_cast<uint32_t>(width) || size_.height != static_cast<uint32_t>(height)) {
             std::string error;
             size_ = {static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
@@ -178,6 +183,7 @@ public:
                 std::cerr << "NVENC init failed: " << error << "\n";
                 return WEBRTC_VIDEO_CODEC_ERROR;
             }
+            encoder_bitrate_kbps_ = bitrate_kbps_; // wjy: Remember which bitrate the active NVENC session was initialized with.
         }
 
         argb_.resize(static_cast<size_t>(width) * height * 4);
@@ -232,7 +238,7 @@ public:
     void SetRates(const RateControlParameters& parameters) override
     {
         const uint32_t bps = parameters.bitrate.get_sum_bps();
-        if (bps > 0) bitrate_kbps_ = std::max(1000u, bps / 1000u);
+        if (bps > 0) bitrate_kbps_ = std::max(10u, bps / 1000u);
         if (parameters.framerate_fps > 0.0) fps_ = static_cast<uint32_t>(parameters.framerate_fps + 0.5);
     }
 
@@ -249,6 +255,18 @@ public:
     }
 
 private:
+    bool should_reconfigure_bitrate() const
+    {
+        if (encoder_bitrate_kbps_ == 0 || encoder_bitrate_kbps_ == bitrate_kbps_) {
+            return false;
+        }
+        const uint32_t lower = std::min(encoder_bitrate_kbps_, bitrate_kbps_);
+        const uint32_t upper = std::max(encoder_bitrate_kbps_, bitrate_kbps_);
+        const bool changed_enough = (upper - lower) * 100 >= std::max(upper, 1u) * 15; // wjy: Ignore tiny target-rate jitter; only rebuild NVENC for meaningful adaptive bitrate movement.
+        const bool cooled_down = GetTickCount64() - last_bitrate_reconfigure_ms_ >= 500; // wjy: Keep reconfiguration below roughly twice per second to protect remote-control smoothness.
+        return changed_enough && cooled_down;
+    }
+
     bool ensure_device()
     {
         if (device_ && context_) return true;
@@ -279,6 +297,7 @@ private:
         tex_w_ = width;
         tex_h_ = height;
         encoder_.shutdown();
+        encoder_bitrate_kbps_ = 0; // wjy: Force NVENC reinitialization after texture size changes.
         return true;
     }
 
@@ -290,7 +309,9 @@ private:
     lsp::NvencH264Encoder encoder_;
     lsp::Size size_;
     lsp::Size target_size_;
-    uint32_t bitrate_kbps_ = 120000;
+    uint32_t bitrate_kbps_ = 20000;
+    uint32_t encoder_bitrate_kbps_ = 0;
+    uint64_t last_bitrate_reconfigure_ms_ = 0;
     uint32_t fps_ = 60;
     uint32_t frame_id_ = 0;
     int tex_w_ = 0;
@@ -333,6 +354,7 @@ public:
             std::cout << "uu-d3d11va-hevc first Decode size=" << input_image.size()
                       << " rtp=" << input_image.RtpTimestamp() << "\n";
         }
+        update_encoded_stats(input_image.size()); // wjy: Measure compressed video bytes before decode so the UI can show real encoded bitrate.
         ++decode_calls_;
         if (!ensure_device()) {
             append_viewer_log("decoder ensure_device failed in Decode"); // wjy: D3D11 device could not be created/reused.
@@ -406,7 +428,7 @@ public:
             }
             if (hook) {
                 // append_viewer_log("decoder bgra hook call"); // wjy: per-frame app-callback log disabled.
-                hook(static_cast<int>(decoded.size.width), static_cast<int>(decoded.size.height), bgra.data(), bgra.size());
+                hook(static_cast<int>(decoded.size.width), static_cast<int>(decoded.size.height), bgra.data(), bgra.size(), encoded_mbps_);
                 // append_viewer_log("decoder bgra hook returned"); // wjy: per-frame app-callback log disabled.
             } else {
                 // append_viewer_log("decoder bgra hook missing"); // wjy: per-frame missing-hook log disabled.
@@ -487,6 +509,21 @@ public:
     }
 
 private:
+    void update_encoded_stats(size_t encoded_bytes)
+    {
+        const uint64_t now = GetTickCount64();
+        if (encoded_stats_start_ms_ == 0) {
+            encoded_stats_start_ms_ = now;
+        }
+        encoded_stats_bytes_ += encoded_bytes;
+        const uint64_t elapsed_ms = now - encoded_stats_start_ms_;
+        if (elapsed_ms >= 1000) {
+            encoded_mbps_ = static_cast<double>(encoded_stats_bytes_) * 8.0 * 1000.0 / static_cast<double>(elapsed_ms) / 1000000.0;
+            encoded_stats_bytes_ = 0;
+            encoded_stats_start_ms_ = now;
+        }
+    }
+
     bool ensure_device()
     {
         if (device_ && context_) return true;
@@ -540,9 +577,20 @@ private:
         const auto* src = static_cast<const uint8_t*>(mapped.pData);
         const size_t row_bytes = static_cast<size_t>(width) * 4;
         for (uint32_t y = 0; y < height; ++y) {
-            std::memcpy(dst + static_cast<size_t>(y) * row_bytes,
-                        src + static_cast<size_t>(y) * mapped.RowPitch,
-                        row_bytes);
+            const auto* src_row = src + static_cast<size_t>(y) * mapped.RowPitch;
+            auto* dst_row = dst + static_cast<size_t>(y) * row_bytes;
+            // =====wjy====
+            for (uint32_t x = 0; x < width; ++x) {
+                const auto* src_pixel = src_row + static_cast<size_t>(x) * 4; // wjy: D3D11 output texture is BGRA.
+                auto* dst_pixel = dst_row + static_cast<size_t>(x) * 4;
+                for (int channel = 0; channel < 3; ++channel) {
+                    const int value = src_pixel[channel];
+                    const int expanded = (value - 16) * 255 / 219; // wjy: Restore video limited range 16-235 to desktop full range 0-255 while copying out of D3D11.
+                    dst_pixel[channel] = static_cast<uint8_t>(std::clamp(expanded, 0, 255));
+                }
+                dst_pixel[3] = 255; // wjy: Remote desktop frames should be opaque when Qt wraps them as RGB32.
+            }
+            // ===end====
         }
         context_->Unmap(staging_.Get(), 0);
         return true;
@@ -560,6 +608,9 @@ private:
     uint64_t decoded_frames_ = 0;
     uint64_t decode_errors_ = 0;
     uint64_t last_keyframe_request_ms_ = 0;
+    uint64_t encoded_stats_start_ms_ = 0;
+    uint64_t encoded_stats_bytes_ = 0;
+    double encoded_mbps_ = 0.0;
     uint32_t staging_w_ = 0;
     uint32_t staging_h_ = 0;
     DXGI_FORMAT staging_format_ = DXGI_FORMAT_UNKNOWN;

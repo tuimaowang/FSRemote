@@ -200,7 +200,7 @@ int main(int argc, char** argv)
     uu::SessionConfig config;
     config.role = uu::SessionRole::Viewer;
     uu::WebrtcSession session(&runtime, config);
-    uu::SetUuDecodedBgraHook([](int width, int height, const uint8_t* bgra, size_t size) {
+    uu::SetUuDecodedBgraHook([](int width, int height, const uint8_t* bgra, size_t size, double) {
         store_bgra_frame(width, height, bgra, size);
     });
     session.set_signal_callback([&](const std::string& kind, const std::string& body) {

@@ -542,10 +542,17 @@ private:
         uu::NativeWebrtcRuntime runtime;
         std::atomic_bool frameReported = false;
         // =====wjy====
-        runtime.set_decoded_bgra_callback([this, &frameReported](int width, int height, const uint8_t* bgra, size_t size) {
+        runtime.set_decoded_bgra_callback([this, &frameReported](int width, int height, const uint8_t* bgra, size_t size, double encoded_mbps) {
             bool expected = false;
             if (frameReported.compare_exchange_strong(expected, true)) {
                 report_status(status_callback_, user_, 50, "Receiving video"); // wjy: the first BGRA frame from this runtime means this viewer is receiving video.
+            }
+            const uint64_t now = GetTickCount64();
+            if (status_callback_ && now - last_stats_status_ms_ >= 500) {
+                last_stats_status_ms_ = now;
+                char stats[64] = {};
+                std::snprintf(stats, sizeof(stats), "ENC %.2f", encoded_mbps);
+                report_status(status_callback_, user_, 60, stats); // wjy: code 60 carries viewer-side compressed video bitrate for the Qt overlay.
             }
             if (frame_callback_ && running_) {
                 frame_callback_(user_, width, height, bgra, static_cast<uint32_t>(size)); // wjy: send only this runtime/decoder's frame to this RemoteDesktopWindow.
@@ -605,6 +612,7 @@ private:
     void* user_ = nullptr;
     std::mutex session_mutex_;
     uu::WebrtcSession* active_session_ = nullptr;
+    uint64_t last_stats_status_ms_ = 0;
     std::unique_ptr<uu::ViewerAudioPlayer> audio_player_;
 };
 

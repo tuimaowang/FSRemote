@@ -495,15 +495,17 @@ bool apply_uu_codec_preferences(webrtc::RtpTransceiverInterface* transceiver,
     return true;
 }
 
-void apply_sender_rate(webrtc::RtpSenderInterface* sender, uint32_t bitrate_kbps, uint32_t fps)
+void apply_sender_rate(webrtc::RtpSenderInterface* sender, uint32_t min_bitrate_kbps, uint32_t max_bitrate_kbps, uint32_t fps)
 {
     if (!sender) return;
     auto params = sender->GetParameters();
     if (params.encodings.empty()) params.encodings.emplace_back();
+    const uint32_t safe_min_kbps = std::max(1u, std::min(min_bitrate_kbps, max_bitrate_kbps)); // wjy: Keep the adaptive bitrate floor valid even if callers pass reversed values.
+    const uint32_t safe_max_kbps = std::max(safe_min_kbps, max_bitrate_kbps); // wjy: The ceiling is the user-facing adaptive max bitrate, e.g. 20000 Kbps.
     for (auto& encoding : params.encodings) {
         encoding.active = true;
-        encoding.max_bitrate_bps = static_cast<int>(bitrate_kbps) * 1000;
-        encoding.min_bitrate_bps = static_cast<int>(bitrate_kbps) * 1000;
+        encoding.min_bitrate_bps = static_cast<int>(safe_min_kbps) * 1000; // wjy: Allow WebRTC to reduce bitrate on static desktop frames instead of forcing a fixed stream rate.
+        encoding.max_bitrate_bps = static_cast<int>(safe_max_kbps) * 1000; // wjy: Cap moving/complex scenes at the configured upper bound.
         encoding.max_framerate = static_cast<int>(fps ? fps : 60);
         encoding.network_priority = webrtc::Priority::kHigh;
     }
@@ -780,7 +782,7 @@ bool WebrtcSession::configure_host_media(std::string* error)
             return false;
         }
     }
-    apply_sender_rate(sender.get(), config_.target_bitrate_kbps, config_.fps);
+    apply_sender_rate(sender.get(), config_.min_bitrate_kbps, config_.target_bitrate_kbps, config_.fps);
     std::cout << "host media: native WebRTC desktop source enabled; transport recovery is WebRTC-owned\n";
     std::cout << "host media: custom H265 NVENC codec factory is active\n";
     return true;
