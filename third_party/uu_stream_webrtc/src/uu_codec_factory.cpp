@@ -138,7 +138,7 @@ public:
         if (!codec_settings || codec_settings->width == 0 || codec_settings->height == 0) {
             return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
         }
-        bitrate_kbps_ = std::max(10u, codec_settings->startBitrate ? codec_settings->startBitrate : 20000u);
+        bitrate_kbps_ = std::max(10u, codec_settings->startBitrate ? codec_settings->startBitrate : 120000u);
         fps_ = std::max(1u, codec_settings->maxFramerate ? codec_settings->maxFramerate : 60u);
         target_size_ = {codec_settings->width, codec_settings->height};
         return ensure_device() ? WEBRTC_VIDEO_CODEC_OK : WEBRTC_VIDEO_CODEC_ERROR;
@@ -309,7 +309,7 @@ private:
     lsp::NvencH264Encoder encoder_;
     lsp::Size size_;
     lsp::Size target_size_;
-    uint32_t bitrate_kbps_ = 20000;
+    uint32_t bitrate_kbps_ = 120000;
     uint32_t encoder_bitrate_kbps_ = 0;
     uint64_t last_bitrate_reconfigure_ms_ = 0;
     uint32_t fps_ = 60;

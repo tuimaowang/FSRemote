@@ -501,10 +501,10 @@ void apply_sender_rate(webrtc::RtpSenderInterface* sender, uint32_t min_bitrate_
     auto params = sender->GetParameters();
     if (params.encodings.empty()) params.encodings.emplace_back();
     const uint32_t safe_min_kbps = std::max(1u, std::min(min_bitrate_kbps, max_bitrate_kbps)); // wjy: Keep the adaptive bitrate floor valid even if callers pass reversed values.
-    const uint32_t safe_max_kbps = std::max(safe_min_kbps, max_bitrate_kbps); // wjy: The ceiling is the user-facing adaptive max bitrate, e.g. 20000 Kbps.
+    const uint32_t safe_max_kbps = std::max(safe_min_kbps, max_bitrate_kbps); // wjy: The ceiling is the user-facing adaptive max bitrate, e.g. 120000 Kbps.
     for (auto& encoding : params.encodings) {
         encoding.active = true;
-        encoding.min_bitrate_bps = static_cast<int>(safe_min_kbps) * 1000; // wjy: Allow WebRTC to reduce bitrate on static desktop frames instead of forcing a fixed stream rate.
+        encoding.min_bitrate_bps = static_cast<int>(safe_min_kbps) * 1000; // wjy: Keep WebRTC's adaptive bitrate above the configured quality floor during still desktop scenes.
         encoding.max_bitrate_bps = static_cast<int>(safe_max_kbps) * 1000; // wjy: Cap moving/complex scenes at the configured upper bound.
         encoding.max_framerate = static_cast<int>(fps ? fps : 60);
         encoding.network_priority = webrtc::Priority::kHigh;

@@ -24,8 +24,8 @@ enum class SessionRole {
 
 struct SessionConfig {
     SessionRole role = SessionRole::Host;
-    uint32_t min_bitrate_kbps = 10; // wjy: Let WebRTC drop the compressed video target as low as 10 Kbps when the remote desktop is almost static.
-    uint32_t target_bitrate_kbps = 20000; // wjy: Treat this value as the adaptive bitrate ceiling, currently 20 Mbps for 1080p remote-control testing.
+    uint32_t min_bitrate_kbps = 20000; // wjy: Keep the compressed video target above 20 Mbps so static desktop frames do not collapse into low-quality refreshes.
+    uint32_t target_bitrate_kbps = 120000; // wjy: Treat this value as the adaptive bitrate ceiling, currently 120 Mbps for high-quality remote-control testing.
     uint32_t fps = 60;
 };
 
