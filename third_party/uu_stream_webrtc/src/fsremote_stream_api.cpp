@@ -16,6 +16,7 @@
 #include "webrtc_session.h"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <cstdlib>
@@ -88,6 +89,80 @@ void reset_log_file(const char* file_name)
 void append_log(const std::string& line)
 {
     append_log_to_file("stream_host.log", line);
+}
+
+void append_input_debug_log(const std::string& line)
+{
+    char tempPath[MAX_PATH] = {};
+    if (::GetTempPathA(MAX_PATH, tempPath) == 0) {
+        return;
+    }
+
+    std::string path(tempPath);
+    path += "fsremote_input_debug.log";
+
+    SYSTEMTIME time = {};
+    ::GetLocalTime(&time);
+    char prefix[96] = {};
+    std::snprintf(prefix, sizeof(prefix), "%04u-%02u-%02u %02u:%02u:%02u.%03u tid=%lu native ",
+                  time.wYear, time.wMonth, time.wDay,
+                  time.wHour, time.wMinute, time.wSecond, time.wMilliseconds,
+                  static_cast<unsigned long>(::GetCurrentThreadId()));
+
+    std::lock_guard lock(g_log_mutex);
+    FILE* file = nullptr;
+    if (fopen_s(&file, path.c_str(), "ab") != 0 || !file) {
+        return;
+    }
+    const std::string text = std::string(prefix) + line;
+    fwrite(text.data(), 1, text.size(), file);
+    fwrite("\r\n", 1, 2, file);
+    fclose(file);
+}
+
+bool should_log_input_message(const std::string& message)
+{
+    if (message.rfind("m ", 0) != 0) {
+        return true;
+    }
+
+    static ULONGLONG last_mouse_move_log_ms = 0;
+    const ULONGLONG now_ms = ::GetTickCount64();
+    if (now_ms - last_mouse_move_log_ms < 500) {
+        return false;
+    }
+    last_mouse_move_log_ms = now_ms;
+    return true;
+}
+
+std::string cursor_lock_probe_text()
+{
+    POINT cursor = {};
+    const BOOL cursor_ok = ::GetCursorPos(&cursor);
+    const int screen_x = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int screen_y = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int screen_w = ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int screen_h = ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    const int center_x = screen_x + screen_w / 2;
+    const int center_y = screen_y + screen_h / 2;
+    const int dx = cursor_ok ? cursor.x - center_x : 0;
+    const int dy = cursor_ok ? cursor.y - center_y : 0;
+
+    char text[256] = {};
+    std::snprintf(text, sizeof(text),
+                  " cursor_ok=%d cursor=%ld,%ld vdesk=%d,%d,%d,%d center=%d,%d dist=%d,%d",
+                  cursor_ok ? 1 : 0,
+                  static_cast<long>(cursor.x),
+                  static_cast<long>(cursor.y),
+                  screen_x,
+                  screen_y,
+                  screen_w,
+                  screen_h,
+                  center_x,
+                  center_y,
+                  dx,
+                  dy);
+    return text;
 }
 
 // =====wjy====
@@ -205,14 +280,225 @@ bool handle_message(uu::WebrtcSession& session, const std::string& message)
     return true;
 }
 
-void move_mouse_absolute(int x, int y)
+void move_mouse_absolute(int x, int y, bool log_result)
 {
     INPUT input = {};
     input.type = INPUT_MOUSE;
     input.mi.dx = x;
     input.mi.dy = y;
     input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
-    SendInput(1, &input, sizeof(input));
+    ::SetLastError(ERROR_SUCCESS);
+    const UINT sent = SendInput(1, &input, sizeof(input));
+    const DWORD error = ::GetLastError();
+    if (log_result) {
+        append_input_debug_log("host SendInput abs x=" + std::to_string(x)
+            + " y=" + std::to_string(y)
+            + " sent=" + std::to_string(sent)
+            + " error=" + std::to_string(error)
+            + cursor_lock_probe_text());
+    }
+}
+
+void move_mouse_relative(int dx, int dy, bool log_result)
+{
+    if (dx == 0 && dy == 0) {
+        return;
+    }
+
+    INPUT input = {};
+    input.type = INPUT_MOUSE;
+    input.mi.dx = dx;
+    input.mi.dy = dy;
+    input.mi.dwFlags = MOUSEEVENTF_MOVE;
+    ::SetLastError(ERROR_SUCCESS);
+    const UINT sent = SendInput(1, &input, sizeof(input));
+    const DWORD error = ::GetLastError();
+    if (log_result) {
+        append_input_debug_log("host SendInput rel dx=" + std::to_string(dx)
+            + " dy=" + std::to_string(dy)
+            + " sent=" + std::to_string(sent)
+            + " error=" + std::to_string(error)
+            + cursor_lock_probe_text());
+    }
+}
+
+struct MouseInputModeState {
+    bool game_relative_mode = false;
+    bool has_last_viewer_pos = false;
+    int last_viewer_x = 0;
+    int last_viewer_y = 0;
+    int lock_score = 0;
+    int unlock_score = 0;
+};
+
+MouseInputModeState g_mouse_input_mode;
+
+bool get_cursor_center_distance(int& dx, int& dy, int& screen_w, int& screen_h)
+{
+    POINT cursor = {};
+    if (!::GetCursorPos(&cursor)) {
+        dx = 0;
+        dy = 0;
+        screen_w = 0;
+        screen_h = 0;
+        return false;
+    }
+
+    const int screen_x = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int screen_y = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
+    screen_w = ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    screen_h = ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    const int center_x = screen_x + screen_w / 2;
+    const int center_y = screen_y + screen_h / 2;
+    dx = cursor.x - center_x;
+    dy = cursor.y - center_y;
+    return true;
+}
+
+bool normalized_point_far_from_center(int x, int y, int screen_w, int screen_h)
+{
+    if (screen_w <= 0 || screen_h <= 0) {
+        return false;
+    }
+
+    const int px = (x * screen_w) / 65535;
+    const int py = (y * screen_h) / 65535;
+    const int dx = px - screen_w / 2;
+    const int dy = py - screen_h / 2;
+    return std::abs(dx) > 48 || std::abs(dy) > 48;
+}
+
+void publish_mouse_mode(uu::WebrtcSession* session, bool relative, const char* reason)
+{
+    if (!session) {
+        return;
+    }
+
+    const char* mode = relative ? "relative" : "desktop";
+    const bool ok = session->send_control_message(std::string("__fsremote_mouse_mode ") + mode);
+    append_input_debug_log(std::string("host mouse mode notify mode=") + mode
+        + " ok=" + std::to_string(ok ? 1 : 0)
+        + " reason=" + reason);
+}
+
+void reset_mouse_relative_mode(const char* reason, bool log_result, uu::WebrtcSession* session)
+{
+    (void)log_result;
+    const bool was_relative = g_mouse_input_mode.game_relative_mode;
+    g_mouse_input_mode = {};
+    if (was_relative) {
+        append_input_debug_log(std::string("host mouse mode desktop reason=") + reason + cursor_lock_probe_text());
+        publish_mouse_mode(session, false, reason);
+    }
+}
+
+void update_relative_unlock_probe(bool log_result, uu::WebrtcSession* session)
+{
+    if (!g_mouse_input_mode.game_relative_mode) {
+        return;
+    }
+
+    int center_dx = 0;
+    int center_dy = 0;
+    int screen_w = 0;
+    int screen_h = 0;
+    const bool cursor_ok = get_cursor_center_distance(center_dx, center_dy, screen_w, screen_h);
+    const bool cursor_near_center = cursor_ok && std::abs(center_dx) <= 12 && std::abs(center_dy) <= 12;
+    if (cursor_near_center) {
+        g_mouse_input_mode.unlock_score = 0;
+        return;
+    }
+
+    g_mouse_input_mode.unlock_score = std::min(g_mouse_input_mode.unlock_score + 1, 10);
+    if (g_mouse_input_mode.unlock_score >= 10) {
+        reset_mouse_relative_mode("cursor-left-center", log_result, session);
+    }
+}
+
+bool should_use_relative_mouse_for_move(int x, int y, bool log_result, uu::WebrtcSession* session)
+{
+    (void)x;
+    (void)y;
+    int center_dx = 0;
+    int center_dy = 0;
+    int screen_w = 0;
+    int screen_h = 0;
+#if 1
+    const bool cursor_ok = get_cursor_center_distance(center_dx, center_dy, screen_w, screen_h);
+    const bool cursor_near_center = cursor_ok && std::abs(center_dx) <= 3 && std::abs(center_dy) <= 3;
+    const bool target_far = normalized_point_far_from_center(x, y, screen_w, screen_h);
+
+    if (cursor_near_center && target_far) {
+        g_mouse_input_mode.lock_score = std::min(g_mouse_input_mode.lock_score + 1, 4);
+        g_mouse_input_mode.unlock_score = 0;
+    } else if (g_mouse_input_mode.game_relative_mode) {
+        g_mouse_input_mode.unlock_score = std::min(g_mouse_input_mode.unlock_score + 1, 10);
+    } else {
+        g_mouse_input_mode.lock_score = 0;
+    }
+
+    if (!g_mouse_input_mode.game_relative_mode && g_mouse_input_mode.lock_score >= 3) {
+        g_mouse_input_mode.game_relative_mode = true;
+        g_mouse_input_mode.has_last_viewer_pos = false;
+        g_mouse_input_mode.unlock_score = 0;
+        append_input_debug_log("host mouse mode relative reason=center-lock" + cursor_lock_probe_text());
+        publish_mouse_mode(session, true, "center-lock");
+    }
+
+    if (g_mouse_input_mode.game_relative_mode && g_mouse_input_mode.unlock_score >= 10) {
+        reset_mouse_relative_mode("cursor-unlocked", log_result, session);
+    }
+#else
+    (void)log_result;
+    (void)session;
+    (void)center_dx;
+    (void)center_dy;
+    (void)screen_w;
+    (void)screen_h;
+#endif
+
+    return g_mouse_input_mode.game_relative_mode;
+}
+
+void move_mouse_auto(int x, int y, bool log_result, uu::WebrtcSession* session)
+{
+    if (!should_use_relative_mouse_for_move(x, y, log_result, session)) {
+        g_mouse_input_mode.has_last_viewer_pos = true;
+        g_mouse_input_mode.last_viewer_x = x;
+        g_mouse_input_mode.last_viewer_y = y;
+        move_mouse_absolute(x, y, log_result);
+        return;
+    }
+
+    if (!g_mouse_input_mode.has_last_viewer_pos) {
+        g_mouse_input_mode.has_last_viewer_pos = true;
+        g_mouse_input_mode.last_viewer_x = x;
+        g_mouse_input_mode.last_viewer_y = y;
+        if (log_result) {
+            append_input_debug_log("host SendInput rel skipped reason=prime-last-viewer-pos" + cursor_lock_probe_text());
+        }
+        return;
+    }
+
+    int screen_w = ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int screen_h = ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (screen_w <= 0) {
+        screen_w = 1920;
+    }
+    if (screen_h <= 0) {
+        screen_h = 1080;
+    }
+
+    const int raw_dx = x - g_mouse_input_mode.last_viewer_x;
+    const int raw_dy = y - g_mouse_input_mode.last_viewer_y;
+    g_mouse_input_mode.last_viewer_x = x;
+    g_mouse_input_mode.last_viewer_y = y;
+
+    int rel_dx = (raw_dx * screen_w) / 65535;
+    int rel_dy = (raw_dy * screen_h) / 65535;
+    rel_dx = std::clamp(rel_dx, -200, 200);
+    rel_dy = std::clamp(rel_dy, -200, 200);
+    move_mouse_relative(rel_dx, rel_dy, log_result);
 }
 
 void send_mouse_button(DWORD flag)
@@ -241,8 +527,13 @@ void send_key(int vk, bool down)
     SendInput(1, &input, sizeof(input));
 }
 
-void inject_input_message(const std::string& message)
+void inject_input_message(const std::string& message, uu::WebrtcSession* session)
 {
+    const bool log_message = should_log_input_message(message);
+    if (log_message) {
+        append_input_debug_log("host recv msg=\"" + message + "\"" + cursor_lock_probe_text());
+    }
+
     std::istringstream input(message);
     std::string kind;
     input >> kind;
@@ -251,7 +542,26 @@ void inject_input_message(const std::string& message)
         int y = 0;
         int buttons = 0;
         if (input >> x >> y >> buttons) {
-            move_mouse_absolute(x, y);
+            move_mouse_auto(x, y, log_message, session);
+        }
+        return;
+    }
+    if (kind == "r") {
+        int dx = 0;
+        int dy = 0;
+        int buttons = 0;
+        if (input >> dx >> dy >> buttons) {
+            update_relative_unlock_probe(log_message, session);
+            move_mouse_relative(std::clamp(dx, -200, 200), std::clamp(dy, -200, 200), log_message);
+        }
+        return;
+    }
+    if (kind == "c") {
+        int active = 0;
+        if (input >> active) {
+            if (active == 0) {
+                reset_mouse_relative_mode("viewer-release", log_message, session);
+            }
         }
         return;
     }
@@ -260,7 +570,11 @@ void inject_input_message(const std::string& message)
         int x = 0;
         int y = 0;
         if (!(input >> button >> x >> y)) return;
-        move_mouse_absolute(x, y);
+        if (g_mouse_input_mode.game_relative_mode) {
+            g_mouse_input_mode.has_last_viewer_pos = false;
+        } else {
+            move_mouse_absolute(x, y, log_message);
+        }
         const bool down = kind == "d";
         if (button == 1) send_mouse_button(down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP);
         if (button == 2) send_mouse_button(down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP);
@@ -272,7 +586,9 @@ void inject_input_message(const std::string& message)
         int x = 0;
         int y = 0;
         if (input >> delta >> x >> y) {
-            move_mouse_absolute(x, y);
+            if (!g_mouse_input_mode.game_relative_mode) {
+                move_mouse_absolute(x, y, log_message);
+            }
             send_mouse_wheel(delta);
         }
         return;
@@ -281,6 +597,9 @@ void inject_input_message(const std::string& message)
         int vk = 0;
         int down = 0;
         if (input >> vk >> down) {
+            if (vk == VK_ESCAPE && down != 0) {
+                reset_mouse_relative_mode("escape", log_message, session);
+            }
             send_key(vk, down != 0);
         }
     }
@@ -415,8 +734,8 @@ private:
                 session.set_signal_callback([socket](const std::string& kind, const std::string& body) {
                     uu::send_message(socket, kind + "\n" + body);
                 });
-                session.set_control_callback([](const std::string& message) {
-                    inject_input_message(message);
+                session.set_control_callback([&session](const std::string& message) {
+                    inject_input_message(message, &session);
                 });
                 append_log("host session initialize begin");
                 if (session.initialize(&error) && session.start_offer(&error)) {
@@ -595,6 +914,13 @@ private:
         session.set_signal_callback([socket](const std::string& kind, const std::string& body) {
             append_viewer_log("viewer send signaling kind=" + kind + " body_size=" + std::to_string(body.size())); // wjy: show local offer/answer/candidate egress.
             uu::send_message(socket, kind + "\n" + body);
+        });
+        session.set_control_callback([this](const std::string& message) {
+            if (message == "__fsremote_mouse_mode relative") {
+                report_status(status_callback_, user_, 61, "MOUSE relative");
+            } else if (message == "__fsremote_mouse_mode desktop") {
+                report_status(status_callback_, user_, 61, "MOUSE desktop");
+            }
         });
         if (!session.initialize(&error)) {
             append_viewer_log("viewer session init failed error=" + error); // wjy: durable failure before waiting for remote media.

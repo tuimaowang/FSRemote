@@ -5,6 +5,7 @@
 
 #include <QCloseEvent>
 #include <QCoreApplication>
+#include <QCursor>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -80,6 +81,35 @@ void appendViewerDebugLog(const QString& line)
            << Qt::endl; // wjy: Qt::endl flushes each line so a crash leaves the latest checkpoint.
 }
 // ===end====
+
+void appendInputDebugLog(const QString& line)
+{
+    QFile file(QDir::temp().filePath(QStringLiteral("fsremote_input_debug.log")));
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+        return;
+    }
+
+    QTextStream stream(&file);
+    stream << QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz"))
+           << QStringLiteral(" qt ")
+           << line
+           << Qt::endl;
+}
+
+bool shouldLogInputMessage(const QByteArray& message)
+{
+    if (!message.startsWith("m ")) {
+        return true;
+    }
+
+    static qint64 lastMouseMoveLogMs = 0;
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (nowMs - lastMouseMoveLogMs < 500) {
+        return false;
+    }
+    lastMouseMoveLogMs = nowMs;
+    return true;
+}
 
 void drawWindowButtonIcon(QPainter& painter, const QRectF& rect, const QString& type)
 {
@@ -281,6 +311,10 @@ void FSREMOTE_STREAM_CALL onViewerStatus(void* user, int code, const char* messa
             }
             return;
         }
+        if (code == 61 && text.startsWith(QStringLiteral("MOUSE "))) {
+            window->setRemoteMouseCaptureActive(text == QStringLiteral("MOUSE relative"));
+            return;
+        }
         window->setConnectionStatus(code, text);
     }, Qt::QueuedConnection);
 }
@@ -315,6 +349,11 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
     connect(m_framePresentTimer, &QTimer::timeout, this, &RemoteDesktopWindow::flushPendingRemoteFrame);
     m_framePresentTimer->start(); // wjy: Fixed latest-frame presentation prevents full-screen repaint pressure from building visible latency.
     m_texturePresenter = new D3D11FramePresenter(this);
+    m_texturePresenter->setMouseMoveCallback([this](const QPoint& parentPosition, Qt::MouseButtons buttons) {
+        m_hoveredPos = parentPosition;
+        update(QRect(0, 0, width(), 40));
+        sendRemoteMouseMove(parentPosition, buttons);
+    });
     m_sessionTimer = new QTimer(this);
     m_sessionTimer->setInterval(1000);
     connect(m_sessionTimer, &QTimer::timeout, this, [this] {
@@ -330,6 +369,7 @@ RemoteDesktopWindow::~RemoteDesktopWindow()
     // =====wjy====
     appendViewerDebugLog(QStringLiteral("RemoteDesktopWindow dtor begin")); // wjy: identify crashes during window teardown.
     // ===end====
+    setRemoteMouseCaptureActive(false);
     releasePressedKeys();
     setKeyboardForwardingActive(false);
     if (m_viewerHandle) {
@@ -364,12 +404,7 @@ QRect RemoteDesktopWindow::controlCenterRect() const
 
 QRect RemoteDesktopWindow::remoteImageRect() const
 {
-    QSize remoteSize;
-    if (!m_remoteFrame.isNull()) {
-        remoteSize = m_remoteFrame.size();
-    } else if (m_textureFrameActive && m_remoteTextureSize.isValid()) {
-        remoteSize = m_remoteTextureSize;
-    }
+    const QSize remoteSize = remoteFrameSize();
     if (!remoteSize.isValid()) {
         return {};
     }
@@ -380,6 +415,17 @@ QRect RemoteDesktopWindow::remoteImageRect() const
         contentRect.y() + (contentRect.height() - scaled.height()) / 2,
         scaled.width(),
         scaled.height());
+}
+
+QSize RemoteDesktopWindow::remoteFrameSize() const
+{
+    if (!m_remoteFrame.isNull()) {
+        return m_remoteFrame.size();
+    }
+    if (m_textureFrameActive && m_remoteTextureSize.isValid()) {
+        return m_remoteTextureSize;
+    }
+    return {};
 }
 
 bool RemoteDesktopWindow::normalizedRemotePoint(const QPoint& position, int* x, int* y) const
@@ -399,7 +445,109 @@ bool RemoteDesktopWindow::normalizedRemotePoint(const QPoint& position, int* x, 
 
 void RemoteDesktopWindow::sendInputMessage(const QByteArray& message)
 {
-    stream::StreamRuntime::instance().sendInput(m_viewerHandle, message);
+    const bool shouldLog = shouldLogInputMessage(message);
+    const bool ok = stream::StreamRuntime::instance().sendInput(m_viewerHandle, message);
+    if (shouldLog) {
+        appendInputDebugLog(QStringLiteral("viewer send handle=%1 ok=%2 msg=\"%3\"")
+            .arg(reinterpret_cast<quintptr>(m_viewerHandle))
+            .arg(ok ? 1 : 0)
+            .arg(QString::fromLatin1(message)));
+    }
+}
+
+void RemoteDesktopWindow::setRemoteMouseCaptureActive(bool active)
+{
+    if (m_remoteMouseCaptureActive == active) {
+        if (active) {
+            recenterRemoteMouseCapture();
+        }
+        return;
+    }
+
+    m_remoteMouseCaptureActive = active;
+    if (active) {
+        setCursor(Qt::BlankCursor);
+        if (m_texturePresenter) {
+            m_texturePresenter->setCursor(Qt::BlankCursor);
+        }
+        recenterRemoteMouseCapture();
+    } else {
+        unsetCursor();
+        if (m_texturePresenter) {
+            m_texturePresenter->unsetCursor();
+        }
+        sendInputMessage(QByteArray("c 0"));
+    }
+}
+
+bool RemoteDesktopWindow::sendRemoteMouseMove(const QPoint& position, Qt::MouseButtons buttons)
+{
+    if (m_remoteMouseCaptureActive) {
+        return sendRemoteMouseRelativeMove(position, buttons);
+    }
+
+    int x = 0;
+    int y = 0;
+    if (!normalizedRemotePoint(position, &x, &y)) {
+        return false;
+    }
+
+    const int remoteButtons =
+        (buttons & Qt::LeftButton ? 1 : 0) |
+        (buttons & Qt::RightButton ? 2 : 0) |
+        (buttons & Qt::MiddleButton ? 4 : 0);
+    sendInputMessage(QByteArray("m ")
+        + QByteArray::number(x) + ' '
+        + QByteArray::number(y) + ' '
+        + QByteArray::number(remoteButtons));
+    return true;
+}
+
+bool RemoteDesktopWindow::sendRemoteMouseRelativeMove(const QPoint& position, Qt::MouseButtons buttons)
+{
+    const QRect imageRect = remoteImageRect();
+    if (!imageRect.isValid()) {
+        return false;
+    }
+
+    const QPoint center = imageRect.center();
+    const QPoint delta = position - center;
+    if (delta.isNull()) {
+        return true;
+    }
+
+    const QSize remoteSize = remoteFrameSize();
+    int dx = delta.x();
+    int dy = delta.y();
+    if (remoteSize.isValid() && imageRect.width() > 0 && imageRect.height() > 0) {
+        dx = qRound(double(delta.x()) * double(remoteSize.width()) / double(imageRect.width()));
+        dy = qRound(double(delta.y()) * double(remoteSize.height()) / double(imageRect.height()));
+    }
+
+    const int remoteButtons =
+        (buttons & Qt::LeftButton ? 1 : 0) |
+        (buttons & Qt::RightButton ? 2 : 0) |
+        (buttons & Qt::MiddleButton ? 4 : 0);
+    sendInputMessage(QByteArray("r ")
+        + QByteArray::number(dx) + ' '
+        + QByteArray::number(dy) + ' '
+        + QByteArray::number(remoteButtons));
+    recenterRemoteMouseCapture();
+    return true;
+}
+
+void RemoteDesktopWindow::recenterRemoteMouseCapture()
+{
+#if defined(Q_OS_WIN)
+    if (!m_remoteMouseCaptureActive || !isActiveWindow()) {
+        return;
+    }
+    const QRect imageRect = remoteImageRect();
+    if (!imageRect.isValid()) {
+        return;
+    }
+    QCursor::setPos(mapToGlobal(imageRect.center()));
+#endif
 }
 
 void RemoteDesktopWindow::setKeyboardForwardingActive(bool active)
@@ -909,6 +1057,7 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
 
     painter.drawPixmap(QRect(width() - 223, 7, 26, 26), icon(QStringLiteral("rd_control_center.svg")));
     painter.setPen(QColor(QStringLiteral("#111820")));
+    painter.setFont(textFont);
     painter.drawText(QRectF(width() - 197, 9, 64, 22), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE6\x8E\xA7\xE5\x88\xB6\xE4\xB8\xAD\xE5\xBF\x83"));
 
     painter.drawPixmap(QRect(width() - 137, 0, 46, 40), icon(QStringLiteral("rd_minimize.svg")));
@@ -930,6 +1079,7 @@ void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
 
     event->ignore();
     m_closeInProgress = true;
+    setRemoteMouseCaptureActive(false);
     releasePressedKeys();
     setKeyboardForwardingActive(false);
     const FsRemoteStreamHandle handle = m_viewerHandle;
@@ -1034,17 +1184,7 @@ void RemoteDesktopWindow::mouseMoveEvent(QMouseEvent* event)
         return;
     }
 
-    int x = 0;
-    int y = 0;
-    if (normalizedRemotePoint(event->pos(), &x, &y)) {
-        const int buttons =
-            (event->buttons() & Qt::LeftButton ? 1 : 0) |
-            (event->buttons() & Qt::RightButton ? 2 : 0) |
-            (event->buttons() & Qt::MiddleButton ? 4 : 0);
-        sendInputMessage(QByteArray("m ")
-            + QByteArray::number(x) + ' '
-            + QByteArray::number(y) + ' '
-            + QByteArray::number(buttons));
+    if (sendRemoteMouseMove(event->pos(), event->buttons())) {
         event->accept();
         return;
     }
@@ -1170,6 +1310,7 @@ void RemoteDesktopWindow::focusInEvent(QFocusEvent* event)
 
 void RemoteDesktopWindow::focusOutEvent(QFocusEvent* event)
 {
+    setRemoteMouseCaptureActive(false);
     releasePressedKeys();
     setKeyboardForwardingActive(false);
     QWidget::focusOutEvent(event);

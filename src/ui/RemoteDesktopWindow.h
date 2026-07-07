@@ -39,6 +39,7 @@ public:
     void setRemoteFrame(const QImage& image);
     void setConnectionStatus(int code, const QString& message);
     void setEncodedBitrateMbps(double mbps);
+    void setRemoteMouseCaptureActive(bool active);
     bool isClosingConnection() const;
     bool forwardNativeKey(int virtualKey, bool down);
 
@@ -75,8 +76,12 @@ private:
     QRect closeRect() const;
     QRect controlCenterRect() const;
     QRect remoteImageRect() const;
+    QSize remoteFrameSize() const;
     bool normalizedRemotePoint(const QPoint& position, int* x, int* y) const;
     void sendInputMessage(const QByteArray& message);
+    bool sendRemoteMouseMove(const QPoint& position, Qt::MouseButtons buttons);
+    bool sendRemoteMouseRelativeMove(const QPoint& position, Qt::MouseButtons buttons);
+    void recenterRemoteMouseCapture();
     void setKeyboardForwardingActive(bool active);
     void releasePressedKeys();
     int remoteButton(Qt::MouseButton button) const;
@@ -124,6 +129,7 @@ private:
     int m_centerRgbMin = 0; // wjy: Center-region minimum sampled RGB value for black-page testing.
     int m_centerRgbAvg = 0; // wjy: Center-region average sampled RGB value for black-page testing.
     int m_centerRgbMax = 0; // wjy: Center-region maximum sampled RGB value for black-page testing.
+    bool m_remoteMouseCaptureActive = false;
     QTimer* m_framePresentTimer = nullptr; // wjy: Presents the newest pending frame at a fixed UI pace instead of posting one UI task per decoded frame.
     QTimer* m_sessionTimer = nullptr;
     QSet<int> m_pressedKeys;

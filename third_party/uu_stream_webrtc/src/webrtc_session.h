@@ -24,7 +24,7 @@ enum class SessionRole {
 
 struct SessionConfig {
     SessionRole role = SessionRole::Host;
-    uint32_t min_bitrate_kbps = 20000; // wjy: Keep the compressed video target above 20 Mbps so static desktop frames do not collapse into low-quality refreshes.
+    uint32_t min_bitrate_kbps = 9000; // wjy: Keep the compressed video target above 20 Mbps so static desktop frames do not collapse into low-quality refreshes.
     uint32_t target_bitrate_kbps = 120000; // wjy: Treat this value as the adaptive bitrate ceiling, currently 120 Mbps for high-quality remote-control testing.
     uint32_t fps = 60;
 };
