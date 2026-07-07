@@ -453,11 +453,13 @@ public:
         std::string hostIp,
         uint16_t port,
         FsRemoteFrameCallback frameCallback,
+        FsRemoteTextureFrameCallback textureCallback,
         FsRemoteStatusCallback statusCallback,
         void* user)
         : host_ip_(std::move(hostIp))
         , port_(port)
         , frame_callback_(frameCallback)
+        , texture_callback_(textureCallback)
         , status_callback_(statusCallback)
         , user_(user)
     {
@@ -541,6 +543,23 @@ private:
         report_status(status_callback_, user_, 30, "Initializing WebRTC");
         uu::NativeWebrtcRuntime runtime;
         std::atomic_bool frameReported = false;
+        runtime.set_decoded_texture_callback([this, &frameReported](int width, int height, void* shared_handle, uint64_t frame_id, double encoded_mbps) {
+            if (!texture_callback_ || !running_ || !shared_handle) {
+                return false;
+            }
+            bool expected = false;
+            if (frameReported.compare_exchange_strong(expected, true)) {
+                report_status(status_callback_, user_, 50, "Receiving video");
+            }
+            const uint64_t now = GetTickCount64();
+            if (status_callback_ && now - last_stats_status_ms_ >= 500) {
+                last_stats_status_ms_ = now;
+                char stats[64] = {};
+                std::snprintf(stats, sizeof(stats), "ENC %.2f", encoded_mbps);
+                report_status(status_callback_, user_, 60, stats);
+            }
+            return texture_callback_(user_, width, height, shared_handle, frame_id, encoded_mbps) != 0;
+        });
         // =====wjy====
         runtime.set_decoded_bgra_callback([this, &frameReported](int width, int height, const uint8_t* bgra, size_t size, double encoded_mbps) {
             bool expected = false;
@@ -608,6 +627,7 @@ private:
     std::string host_ip_;
     uint16_t port_ = 49100;
     FsRemoteFrameCallback frame_callback_ = nullptr;
+    FsRemoteTextureFrameCallback texture_callback_ = nullptr;
     FsRemoteStatusCallback status_callback_ = nullptr;
     void* user_ = nullptr;
     std::mutex session_mutex_;
@@ -649,7 +669,7 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer(
     }
 
     try {
-        return new ViewerInstance(host_ip, port, callback, nullptr, user);
+        return new ViewerInstance(host_ip, port, callback, nullptr, nullptr, user);
     } catch (const std::exception& ex) {
         set_error(ex.what());
         return nullptr;
@@ -675,7 +695,33 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_stat
     }
 
     try {
-        return new ViewerInstance(host_ip, port, frame_callback, status_callback, user);
+        return new ViewerInstance(host_ip, port, frame_callback, nullptr, status_callback, user);
+    } catch (const std::exception& ex) {
+        set_error(ex.what());
+        report_status(status_callback, user, 90, ex.what());
+        return nullptr;
+    }
+}
+
+FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_texture(
+    const char* host_ip,
+    uint16_t port,
+    FsRemoteFrameCallback frame_callback,
+    FsRemoteTextureFrameCallback texture_callback,
+    FsRemoteStatusCallback status_callback,
+    void* user)
+{
+    install_crash_logger();
+    append_viewer_log(std::string("api start_viewer_with_texture ip=") + (host_ip ? host_ip : "<null>")
+        + " port=" + std::to_string(port));
+    if (!host_ip || !*host_ip || !frame_callback) {
+        set_error("invalid texture viewer arguments");
+        report_status(status_callback, user, 90, "Invalid texture viewer arguments");
+        return nullptr;
+    }
+
+    try {
+        return new ViewerInstance(host_ip, port, frame_callback, texture_callback, status_callback, user);
     } catch (const std::exception& ex) {
         set_error(ex.what());
         report_status(status_callback, user, 90, ex.what());

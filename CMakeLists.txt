@@ -23,6 +23,8 @@ qt_add_executable(FSRemote WIN32
     src/ui/DeviceGrid.h
     src/ui/RemoteDesktopWindow.cpp
     src/ui/RemoteDesktopWindow.h
+    src/ui/D3D11FramePresenter.cpp
+    src/ui/D3D11FramePresenter.h
     src/stream/StreamRuntime.cpp
     src/stream/StreamRuntime.h
     src/system/AppSettings.cpp
@@ -55,11 +57,21 @@ qt_add_executable(FSRemote WIN32
 target_include_directories(FSRemote PRIVATE src include third_party/parsec_vdd)
 target_link_libraries(FSRemote PRIVATE Qt6::Widgets Qt6::Svg Qt6::Network)
 if(WIN32)
-    target_link_libraries(FSRemote PRIVATE wbemuuid ole32 oleaut32 iphlpapi ws2_32 advapi32 shell32 setupapi cfgmgr32)
+    target_link_libraries(FSRemote PRIVATE wbemuuid ole32 oleaut32 iphlpapi ws2_32 advapi32 shell32 setupapi cfgmgr32 d3d11 dxgi)
 endif()
 
 if(MSVC)
     target_compile_options(FSRemote PRIVATE /utf-8)
+endif()
+
+if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
+    add_dependencies(FSRemote fsremote_stream)
+    add_custom_command(TARGET FSRemote POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:fsremote_stream>"
+            "$<TARGET_FILE_DIR:FSRemote>"
+        VERBATIM
+    )
 endif()
 
 set_target_properties(FSRemote PROPERTIES

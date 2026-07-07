@@ -24,6 +24,14 @@ typedef void(FSREMOTE_STREAM_CALL* FsRemoteStatusCallback)(
     int status_code,
     const char* message);
 
+typedef int(FSREMOTE_STREAM_CALL* FsRemoteTextureFrameCallback)(
+    void* user,
+    int width,
+    int height,
+    void* shared_handle,
+    uint64_t frame_id,
+    double encoded_mbps);
+
 typedef void* FsRemoteStreamHandle;
 
 FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_host(uint16_t port);
@@ -36,6 +44,13 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_stat
     const char* host_ip,
     uint16_t port,
     FsRemoteFrameCallback frame_callback,
+    FsRemoteStatusCallback status_callback,
+    void* user);
+FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_texture(
+    const char* host_ip,
+    uint16_t port,
+    FsRemoteFrameCallback frame_callback,
+    FsRemoteTextureFrameCallback texture_callback,
     FsRemoteStatusCallback status_callback,
     void* user);
 void FSREMOTE_STREAM_CALL fsremote_stream_stop(FsRemoteStreamHandle handle);

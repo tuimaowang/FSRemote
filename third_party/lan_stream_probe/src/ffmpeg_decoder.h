@@ -21,6 +21,7 @@ struct DecodedFrame {
     Size size;
     std::vector<uint8_t> bgra;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
+    void* shared_handle = nullptr;
 };
 
 class H264Decoder {
@@ -45,6 +46,7 @@ private:
     Microsoft::WRL::ComPtr<ID3D11VideoProcessor> processor_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> output_textures_[2];
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> output_srvs_[2];
+    void* output_shared_handles_[2] = {};
     int output_index_ = 0;
     int processor_width_ = 0;
     int processor_height_ = 0;

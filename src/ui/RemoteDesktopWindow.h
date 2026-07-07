@@ -8,6 +8,9 @@
 #include <QElapsedTimer>
 #include <QImage>
 #include <QMutex>
+#include <QSize>
+
+#include <atomic>
 
 #include "FsRemoteStreamApi.h"
 
@@ -23,6 +26,8 @@ class QWheelEvent;
 
 namespace ui {
 
+class D3D11FramePresenter;
+
 class RemoteDesktopWindow final : public QWidget {
     Q_OBJECT
 
@@ -30,6 +35,7 @@ public:
     explicit RemoteDesktopWindow(const QString& deviceName, const QString& hostIp, QWidget* parent = nullptr);
     ~RemoteDesktopWindow() override;
     void enqueueRemoteFrame(QImage image);
+    bool enqueueRemoteTextureFrame(int width, int height, void* sharedHandle, quint64 frameId, double encodedMbps);
     void setRemoteFrame(const QImage& image);
     void setConnectionStatus(int code, const QString& message);
     void setEncodedBitrateMbps(double mbps);
@@ -78,6 +84,7 @@ private:
     int resizeEdgesAt(const QPoint& position) const;
     void updateResizeCursor(const QPoint& position);
     void updateWindowMask();
+    void updateTexturePresenterGeometry();
     void flushPendingRemoteFrame();
     void updateFrameStats(const QImage& image); // wjy: Update the bottom-right stream stats overlay from each received remote frame.
     void updateFrameColorStats(const QImage& image); // wjy: Update right-bottom RGB diagnostics for pure-black webpage tests.
@@ -87,10 +94,13 @@ private:
     QString m_connectionStatus;
     int m_connectionStatusCode = 0;
     QImage m_remoteFrame;
+    QSize m_remoteTextureSize;
     QMutex m_pendingFrameMutex; // wjy: Protects latest-frame handoff from the decoder thread to the Qt UI thread.
     QImage m_pendingRemoteFrame; // wjy: Holds only the newest decoded frame so slow full-screen painting cannot build a stale-frame queue.
     FsRemoteStreamHandle m_viewerHandle = nullptr;
     bool m_closeInProgress = false;
+    bool m_textureFrameActive = false;
+    std::atomic_bool m_texturePresentFailed = false;
     QVector<int> m_virtualScreens;
     int m_nextVirtualScreenNumber = 1;
     int m_activeTabIndex = 0;
@@ -117,6 +127,7 @@ private:
     QTimer* m_framePresentTimer = nullptr; // wjy: Presents the newest pending frame at a fixed UI pace instead of posting one UI task per decoded frame.
     QTimer* m_sessionTimer = nullptr;
     QSet<int> m_pressedKeys;
+    D3D11FramePresenter* m_texturePresenter = nullptr;
 };
 
 } // namespace ui

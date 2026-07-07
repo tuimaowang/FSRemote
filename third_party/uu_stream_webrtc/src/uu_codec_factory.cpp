@@ -320,8 +320,9 @@ private:
 
 class HevcD3d11Decoder final : public webrtc::VideoDecoder {
 public:
-    explicit HevcD3d11Decoder(DecodedBgraCallback bgra_callback = {})
+    explicit HevcD3d11Decoder(DecodedBgraCallback bgra_callback = {}, DecodedTextureCallback texture_callback = {})
         : bgra_callback_(std::move(bgra_callback)) // wjy: bind one decoder to one viewer window when the runtime provides a callback.
+        , texture_callback_(std::move(texture_callback))
     {
     }
 
@@ -411,41 +412,63 @@ public:
             return WEBRTC_VIDEO_CODEC_ERROR;
         }
 
-        std::vector<uint8_t> bgra;
-        if (!decoded.bgra.empty()) {
-            bgra = decoded.bgra;
-        } else if (!copy_srv_to_bgra(decoded.srv.Get(), decoded.size.width, decoded.size.height, &bgra)) {
-            std::cerr << "decoder copy_srv_to_bgra failed\n";
-            append_viewer_log("decoder copy_srv_to_bgra failed"); // wjy: texture readback failed before Qt callback.
-            return WEBRTC_VIDEO_CODEC_ERROR;
-        }
-        // append_viewer_log("decoder bgra ready size=" + std::to_string(bgra.size())); // wjy: per-frame BGRA-ready log disabled.
-        {
-            DecodedBgraCallback hook = bgra_callback_; // wjy: prefer this decoder's viewer callback, so tiled windows do not overwrite each other.
-            if (!hook) {
-                std::lock_guard lock(g_decoded_bgra_hook_mutex);
-                hook = g_decoded_bgra_hook; // wjy: fallback keeps the old standalone viewer path working.
-            }
-            if (hook) {
-                // append_viewer_log("decoder bgra hook call"); // wjy: per-frame app-callback log disabled.
-                hook(static_cast<int>(decoded.size.width), static_cast<int>(decoded.size.height), bgra.data(), bgra.size(), encoded_mbps_);
-                // append_viewer_log("decoder bgra hook returned"); // wjy: per-frame app-callback log disabled.
-            } else {
-                // append_viewer_log("decoder bgra hook missing"); // wjy: per-frame missing-hook log disabled.
-            }
-        }
-
         auto buffer = webrtc::I420Buffer::Create(static_cast<int>(decoded.size.width),
                                                  static_cast<int>(decoded.size.height));
-        const int converted = libyuv::ARGBToI420(
-            bgra.data(), static_cast<int>(decoded.size.width) * 4,
-            buffer->MutableDataY(), buffer->StrideY(),
-            buffer->MutableDataU(), buffer->StrideU(),
-            buffer->MutableDataV(), buffer->StrideV(),
-            static_cast<int>(decoded.size.width), static_cast<int>(decoded.size.height));
-        if (converted != 0) {
-            append_viewer_log("decoder ARGBToI420 failed code=" + std::to_string(converted)); // wjy: conversion failed after app BGRA callback.
-            return WEBRTC_VIDEO_CODEC_ERROR;
+        bool texture_presented = false;
+        if (texture_callback_ && decoded.shared_handle) {
+            texture_presented = texture_callback_(
+                static_cast<int>(decoded.size.width),
+                static_cast<int>(decoded.size.height),
+                decoded.shared_handle,
+                decoded_frames_ + 1,
+                encoded_mbps_);
+        }
+
+        if (texture_presented) {
+            const int width = static_cast<int>(decoded.size.width);
+            const int height = static_cast<int>(decoded.size.height);
+            for (int y = 0; y < height; ++y) {
+                std::memset(buffer->MutableDataY() + y * buffer->StrideY(), 16, static_cast<size_t>(width));
+            }
+            for (int y = 0; y < (height + 1) / 2; ++y) {
+                std::memset(buffer->MutableDataU() + y * buffer->StrideU(), 128, static_cast<size_t>((width + 1) / 2));
+                std::memset(buffer->MutableDataV() + y * buffer->StrideV(), 128, static_cast<size_t>((width + 1) / 2));
+            }
+        } else {
+            std::vector<uint8_t> bgra;
+            if (!decoded.bgra.empty()) {
+                bgra = decoded.bgra;
+            } else if (!copy_srv_to_bgra(decoded.srv.Get(), decoded.size.width, decoded.size.height, &bgra)) {
+                std::cerr << "decoder copy_srv_to_bgra failed\n";
+                append_viewer_log("decoder copy_srv_to_bgra failed"); // wjy: texture readback failed before Qt callback.
+                return WEBRTC_VIDEO_CODEC_ERROR;
+            }
+            // append_viewer_log("decoder bgra ready size=" + std::to_string(bgra.size())); // wjy: per-frame BGRA-ready log disabled.
+            {
+                DecodedBgraCallback hook = bgra_callback_; // wjy: prefer this decoder's viewer callback, so tiled windows do not overwrite each other.
+                if (!hook) {
+                    std::lock_guard lock(g_decoded_bgra_hook_mutex);
+                    hook = g_decoded_bgra_hook; // wjy: fallback keeps the old standalone viewer path working.
+                }
+                if (hook) {
+                    // append_viewer_log("decoder bgra hook call"); // wjy: per-frame app-callback log disabled.
+                    hook(static_cast<int>(decoded.size.width), static_cast<int>(decoded.size.height), bgra.data(), bgra.size(), encoded_mbps_);
+                    // append_viewer_log("decoder bgra hook returned"); // wjy: per-frame app-callback log disabled.
+                } else {
+                    // append_viewer_log("decoder bgra hook missing"); // wjy: per-frame missing-hook log disabled.
+                }
+            }
+
+            const int converted = libyuv::ARGBToI420(
+                bgra.data(), static_cast<int>(decoded.size.width) * 4,
+                buffer->MutableDataY(), buffer->StrideY(),
+                buffer->MutableDataU(), buffer->StrideU(),
+                buffer->MutableDataV(), buffer->StrideV(),
+                static_cast<int>(decoded.size.width), static_cast<int>(decoded.size.height));
+            if (converted != 0) {
+                append_viewer_log("decoder ARGBToI420 failed code=" + std::to_string(converted)); // wjy: conversion failed after app BGRA callback.
+                return WEBRTC_VIDEO_CODEC_ERROR;
+            }
         }
 
         auto frame = webrtc::VideoFrame::Builder()
@@ -598,6 +621,7 @@ private:
 
     webrtc::DecodedImageCallback* callback_ = nullptr;
     DecodedBgraCallback bgra_callback_;
+    DecodedTextureCallback texture_callback_;
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<ID3D11Texture2D> staging_;
@@ -650,8 +674,9 @@ public:
 
 class UuVideoDecoderFactory final : public webrtc::VideoDecoderFactory {
 public:
-    explicit UuVideoDecoderFactory(DecodedBgraCallback bgra_callback = {})
+    explicit UuVideoDecoderFactory(DecodedBgraCallback bgra_callback = {}, DecodedTextureCallback texture_callback = {})
         : bgra_callback_(std::move(bgra_callback)) // wjy: every NativeWebrtcRuntime gets its own decoder callback copy.
+        , texture_callback_(std::move(texture_callback))
     {
     }
 
@@ -678,13 +703,14 @@ public:
         // ===end====
         if (codec_is(format, "H265")) {
             std::cout << "CreateUuVideoDecoderFactory: create H265 D3D11 decoder\n";
-            return std::make_unique<HevcD3d11Decoder>(bgra_callback_); // wjy: pass the viewer-owned callback into this decoder instance.
+            return std::make_unique<HevcD3d11Decoder>(bgra_callback_, texture_callback_); // wjy: pass the viewer-owned callbacks into this decoder instance.
         }
         return nullptr;
     }
 
 private:
     DecodedBgraCallback bgra_callback_;
+    DecodedTextureCallback texture_callback_;
 };
 
 } // namespace
@@ -694,9 +720,9 @@ std::unique_ptr<webrtc::VideoEncoderFactory> CreateUuVideoEncoderFactory()
     return std::make_unique<UuVideoEncoderFactory>();
 }
 
-std::unique_ptr<webrtc::VideoDecoderFactory> CreateUuVideoDecoderFactory(DecodedBgraCallback bgra_callback)
+std::unique_ptr<webrtc::VideoDecoderFactory> CreateUuVideoDecoderFactory(DecodedBgraCallback bgra_callback, DecodedTextureCallback texture_callback)
 {
-    return std::make_unique<UuVideoDecoderFactory>(std::move(bgra_callback)); // wjy: create a decoder factory scoped to one runtime/viewer when provided.
+    return std::make_unique<UuVideoDecoderFactory>(std::move(bgra_callback), std::move(texture_callback)); // wjy: create a decoder factory scoped to one runtime/viewer when provided.
 }
 
 void SetUuDecodedFrameHook(std::function<void(const webrtc::VideoFrame&)> hook)

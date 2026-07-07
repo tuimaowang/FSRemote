@@ -1,6 +1,11 @@
 include(FetchContent)
 
 set(_nvenc_local_dir "${CMAKE_BINARY_DIR}/_deps/nvenc-src")
+set(_nvenc_existing_dir "${CMAKE_BINARY_DIR}/_deps/nvenc_sdk-src")
+
+if(NOT EXISTS "${_nvenc_local_dir}/Interface/nvEncodeAPI.h" AND EXISTS "${_nvenc_existing_dir}/Interface/nvEncodeAPI.h")
+    set(_nvenc_local_dir "${_nvenc_existing_dir}")
+endif()
 
 if(EXISTS "${_nvenc_local_dir}/Interface/nvEncodeAPI.h")
     FetchContent_Declare(

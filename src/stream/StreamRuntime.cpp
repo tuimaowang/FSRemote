@@ -23,6 +23,7 @@ StreamRuntime::StreamRuntime()
     m_startHost = reinterpret_cast<StartHostFn>(library->resolve("fsremote_stream_start_host"));
     m_startViewer = reinterpret_cast<StartViewerFn>(library->resolve("fsremote_stream_start_viewer"));
     m_startViewerWithStatus = reinterpret_cast<StartViewerWithStatusFn>(library->resolve("fsremote_stream_start_viewer_with_status"));
+    m_startViewerWithTexture = reinterpret_cast<StartViewerWithTextureFn>(library->resolve("fsremote_stream_start_viewer_with_texture"));
     m_stop = reinterpret_cast<StopFn>(library->resolve("fsremote_stream_stop"));
     m_sendInput = reinterpret_cast<SendInputFn>(library->resolve("fsremote_stream_send_input"));
     m_isBusy = reinterpret_cast<IsBusyFn>(library->resolve("fsremote_stream_is_busy"));
@@ -82,6 +83,21 @@ FsRemoteStreamHandle StreamRuntime::startViewer(
         statusCallback(user, 0, "DLL status callback export is unavailable");
     }
     return m_startViewer ? m_startViewer(ip.constData(), port, frameCallback, user) : nullptr;
+}
+
+FsRemoteStreamHandle StreamRuntime::startViewer(
+    const QString& hostIp,
+    uint16_t port,
+    FsRemoteFrameCallback frameCallback,
+    FsRemoteTextureFrameCallback textureCallback,
+    FsRemoteStatusCallback statusCallback,
+    void* user)
+{
+    const QByteArray ip = hostIp.toUtf8();
+    if (m_startViewerWithTexture) {
+        return m_startViewerWithTexture(ip.constData(), port, frameCallback, textureCallback, statusCallback, user);
+    }
+    return startViewer(hostIp, port, frameCallback, statusCallback, user);
 }
 
 void StreamRuntime::stop(FsRemoteStreamHandle handle)

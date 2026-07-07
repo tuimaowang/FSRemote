@@ -245,6 +245,7 @@ bool H264Decoder::convert_d3d11_frame(DecodedFrame* decoded, std::string* error)
     decoded->bgra.clear();
     output_index_ = write_index;
     decoded->srv = output_srvs_[output_index_];
+    decoded->shared_handle = output_shared_handles_[output_index_];
     return true;
 }
 
@@ -260,6 +261,8 @@ bool H264Decoder::ensure_video_processor(int width, int height, std::string* err
     output_srvs_[1].Reset();
     output_textures_[0].Reset();
     output_textures_[1].Reset();
+    output_shared_handles_[0] = nullptr;
+    output_shared_handles_[1] = nullptr;
 
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC content = {};
     content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
@@ -288,6 +291,7 @@ bool H264Decoder::ensure_video_processor(int width, int height, std::string* err
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
     for (int i = 0; i < 2; ++i) {
         hr = device_->CreateTexture2D(&desc, nullptr, &output_textures_[i]);
         if (FAILED(hr)) {
@@ -304,6 +308,19 @@ bool H264Decoder::ensure_video_processor(int width, int height, std::string* err
             if (error) *error = "CreateShaderResourceView(BGRA output) failed: 0x" + std::to_string(static_cast<unsigned long>(hr));
             return false;
         }
+        Microsoft::WRL::ComPtr<IDXGIResource> shared_resource;
+        hr = output_textures_[i].As(&shared_resource);
+        if (FAILED(hr) || !shared_resource) {
+            if (error) *error = "QueryInterface(IDXGIResource) failed for BGRA output texture";
+            return false;
+        }
+        HANDLE shared_handle = nullptr;
+        hr = shared_resource->GetSharedHandle(&shared_handle);
+        if (FAILED(hr) || !shared_handle) {
+            if (error) *error = "GetSharedHandle(BGRA output) failed: 0x" + std::to_string(static_cast<unsigned long>(hr));
+            return false;
+        }
+        output_shared_handles_[i] = shared_handle;
     }
 
     output_index_ = 0;
@@ -320,6 +337,8 @@ void H264Decoder::shutdown()
     output_srvs_[1].Reset();
     output_textures_[0].Reset();
     output_textures_[1].Reset();
+    output_shared_handles_[0] = nullptr;
+    output_shared_handles_[1] = nullptr;
     output_index_ = 0;
     video_context_.Reset();
     video_device_.Reset();

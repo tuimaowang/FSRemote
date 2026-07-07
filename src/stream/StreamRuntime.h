@@ -26,6 +26,13 @@ public:
         FsRemoteFrameCallback frameCallback,
         FsRemoteStatusCallback statusCallback,
         void* user);
+    FsRemoteStreamHandle startViewer(
+        const QString& hostIp,
+        uint16_t port,
+        FsRemoteFrameCallback frameCallback,
+        FsRemoteTextureFrameCallback textureCallback,
+        FsRemoteStatusCallback statusCallback,
+        void* user);
     void stop(FsRemoteStreamHandle handle);
     bool sendInput(FsRemoteStreamHandle handle, const QByteArray& message);
     bool isBusy(FsRemoteStreamHandle handle) const;
@@ -45,6 +52,13 @@ private:
         FsRemoteFrameCallback,
         FsRemoteStatusCallback,
         void*);
+    using StartViewerWithTextureFn = FsRemoteStreamHandle(FSREMOTE_STREAM_CALL*)(
+        const char*,
+        uint16_t,
+        FsRemoteFrameCallback,
+        FsRemoteTextureFrameCallback,
+        FsRemoteStatusCallback,
+        void*);
     using StopFn = void(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
     using SendInputFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, const char*);
     using IsBusyFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
@@ -55,6 +69,7 @@ private:
     StartHostFn m_startHost = nullptr;
     StartViewerFn m_startViewer = nullptr;
     StartViewerWithStatusFn m_startViewerWithStatus = nullptr;
+    StartViewerWithTextureFn m_startViewerWithTexture = nullptr;
     StopFn m_stop = nullptr;
     SendInputFn m_sendInput = nullptr;
     IsBusyFn m_isBusy = nullptr;

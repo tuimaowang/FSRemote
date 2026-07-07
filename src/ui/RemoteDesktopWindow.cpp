@@ -1,6 +1,7 @@
 ﻿#include "ui/RemoteDesktopWindow.h"
 
 #include "stream/StreamRuntime.h"
+#include "ui/D3D11FramePresenter.h"
 
 #include <QCloseEvent>
 #include <QCoreApplication>
@@ -246,6 +247,15 @@ void FSREMOTE_STREAM_CALL onRemoteFrame(void* user, int width, int height, const
     window->enqueueRemoteFrame(std::move(copy)); // wjy: Keep only the newest frame instead of queuing every decoded frame into the Qt event loop.
 }
 
+int FSREMOTE_STREAM_CALL onRemoteTextureFrame(void* user, int width, int height, void* sharedHandle, uint64_t frameId, double encodedMbps)
+{
+    auto* window = static_cast<RemoteDesktopWindow*>(user);
+    if (!window || width <= 0 || height <= 0 || !sharedHandle) {
+        return 0;
+    }
+    return window->enqueueRemoteTextureFrame(width, height, sharedHandle, frameId, encodedMbps) ? 1 : 0;
+}
+
 void FSREMOTE_STREAM_CALL onViewerStatus(void* user, int code, const char* message)
 {
     auto* window = static_cast<RemoteDesktopWindow*>(user);
@@ -304,6 +314,7 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
     m_framePresentTimer->setInterval(16);
     connect(m_framePresentTimer, &QTimer::timeout, this, &RemoteDesktopWindow::flushPendingRemoteFrame);
     m_framePresentTimer->start(); // wjy: Fixed latest-frame presentation prevents full-screen repaint pressure from building visible latency.
+    m_texturePresenter = new D3D11FramePresenter(this);
     m_sessionTimer = new QTimer(this);
     m_sessionTimer->setInterval(1000);
     connect(m_sessionTimer, &QTimer::timeout, this, [this] {
@@ -324,6 +335,9 @@ RemoteDesktopWindow::~RemoteDesktopWindow()
     if (m_viewerHandle) {
         stream::StreamRuntime::instance().stop(m_viewerHandle);
         m_viewerHandle = nullptr;
+    }
+    if (m_texturePresenter) {
+        m_texturePresenter->reset();
     }
     appendViewerDebugLog(QStringLiteral("RemoteDesktopWindow dtor end")); // wjy: teardown completed.
 }
@@ -350,11 +364,17 @@ QRect RemoteDesktopWindow::controlCenterRect() const
 
 QRect RemoteDesktopWindow::remoteImageRect() const
 {
-    if (m_remoteFrame.isNull()) {
+    QSize remoteSize;
+    if (!m_remoteFrame.isNull()) {
+        remoteSize = m_remoteFrame.size();
+    } else if (m_textureFrameActive && m_remoteTextureSize.isValid()) {
+        remoteSize = m_remoteTextureSize;
+    }
+    if (!remoteSize.isValid()) {
         return {};
     }
     const QRect contentRect(0, 40, width(), height() - 40);
-    const QSize scaled = m_remoteFrame.size().scaled(contentRect.size(), Qt::KeepAspectRatio);
+    const QSize scaled = remoteSize.scaled(contentRect.size(), Qt::KeepAspectRatio);
     return QRect(
         contentRect.x() + (contentRect.width() - scaled.width()) / 2,
         contentRect.y() + (contentRect.height() - scaled.height()) / 2,
@@ -482,6 +502,21 @@ void RemoteDesktopWindow::updateWindowMask()
     setMask(QRegion(path.toFillPolygon().toPolygon()));
 }
 
+void RemoteDesktopWindow::updateTexturePresenterGeometry()
+{
+    if (!m_texturePresenter) {
+        return;
+    }
+    const QRect target = remoteImageRect();
+    if (target.isEmpty() || !m_textureFrameActive) {
+        m_texturePresenter->hide();
+        return;
+    }
+    if (m_texturePresenter->geometry() != target) {
+        m_texturePresenter->setGeometry(target);
+    }
+}
+
 void RemoteDesktopWindow::enqueueRemoteFrame(QImage image)
 {
     if (image.isNull()) {
@@ -490,6 +525,39 @@ void RemoteDesktopWindow::enqueueRemoteFrame(QImage image)
 
     QMutexLocker locker(&m_pendingFrameMutex);
     m_pendingRemoteFrame = std::move(image); // wjy: Overwrite stale frames; the UI timer will pull the newest one when the event loop is ready.
+}
+
+bool RemoteDesktopWindow::enqueueRemoteTextureFrame(int width, int height, void* sharedHandle, quint64 frameId, double encodedMbps)
+{
+    Q_UNUSED(frameId)
+    if (m_closeInProgress || m_texturePresentFailed.load() || width <= 0 || height <= 0 || !sharedHandle) {
+        return false;
+    }
+
+    QMetaObject::invokeMethod(this, [this, width, height, sharedHandle, encodedMbps] {
+        if (isClosingConnection() || m_texturePresentFailed.load() || !m_texturePresenter) {
+            return;
+        }
+        m_remoteTextureSize = QSize(width, height);
+        m_textureFrameActive = true;
+        m_remoteFrame = QImage();
+        m_encodedMbps = qMax(0.0, encodedMbps);
+        updateTexturePresenterGeometry();
+        if (!m_texturePresenter->presentSharedTexture(sharedHandle, width, height)) {
+            m_texturePresentFailed.store(true);
+            m_textureFrameActive = false;
+            m_texturePresenter->hide();
+            m_texturePresenter->reset();
+            update(QRect(0, 40, this->width(), this->height() - 40));
+            return;
+        }
+        m_connectionStatusCode = 50;
+        m_connectionStatus = QString::fromUtf8("画面已接收");
+        m_texturePresenter->show();
+        m_texturePresenter->raise();
+        update(QRect(0, 0, this->width(), 40));
+    }, Qt::QueuedConnection);
+    return true;
 }
 
 void RemoteDesktopWindow::flushPendingRemoteFrame()
@@ -514,6 +582,10 @@ void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
     // appendViewerDebugLog(QStringLiteral("setRemoteFrame enter size=%1x%2").arg(image.width()).arg(image.height())); // wjy: per-frame UI log disabled for smoother rendering.
     // ===end====
     updateFrameStats(image); // wjy: Count received UI frames before repainting so the overlay reflects the latest decoded BGRA flow.
+    m_textureFrameActive = false;
+    if (m_texturePresenter) {
+        m_texturePresenter->hide();
+    }
     m_remoteFrame = image;
     m_connectionStatusCode = 50;
     m_connectionStatus = QString::fromUtf8("画面已接收");
@@ -637,6 +709,7 @@ void RemoteDesktopWindow::startViewerConnection()
             m_hostIp.trimmed(),
             49100,
             onRemoteFrame,
+            onRemoteTextureFrame,
             onViewerStatus,
             this);
         appendViewerDebugLog(QStringLiteral("startViewerConnection handle=%1").arg(reinterpret_cast<quintptr>(m_viewerHandle))); // wjy: record whether the DLL returned a handle.
@@ -696,7 +769,9 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     painter.setRenderHint(QPainter::Antialiasing);
 
     painter.fillRect(rect(), QColor(QStringLiteral("#000000")));
-    if (!m_remoteFrame.isNull()) {
+    if (m_textureFrameActive && m_texturePresenter && m_texturePresenter->isVisible()) {
+        updateTexturePresenterGeometry();
+    } else if (!m_remoteFrame.isNull()) {
         const QRect target = remoteImageRect();
         painter.setRenderHint(QPainter::SmoothPixmapTransform, false); // wjy: Prefer low-latency full-screen remote drawing over expensive smooth scaling.
         painter.drawImage(target, m_remoteFrame);
@@ -1103,6 +1178,7 @@ void RemoteDesktopWindow::focusOutEvent(QFocusEvent* event)
 void RemoteDesktopWindow::resizeEvent(QResizeEvent* event)
 {
     updateWindowMask();
+    updateTexturePresenterGeometry();
     QWidget::resizeEvent(event);
 }
 
