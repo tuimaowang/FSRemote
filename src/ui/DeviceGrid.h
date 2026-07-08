@@ -9,6 +9,7 @@
 #include <QFrame>
 #include <QHash>
 #include <QPoint>
+#include <QPointer>
 #include <QSet>
 #include <QString>
 #include <QVector>
@@ -29,6 +30,8 @@ class QTimer;
 class QWheelEvent;
 
 namespace ui {
+
+class RemoteDesktopWindow;
 
 enum class BottomAction {
     None,
@@ -223,7 +226,9 @@ private:
     BottomAction m_hoveredBottomAction = BottomAction::None;
     QSet<QString> m_poweringOnDeviceIps;
     QHash<QString, qint64> m_poweringOnStartedAtMs;
+    QHash<QString, QString> m_pendingRemoteRenameNames; // wjy: 记录远端改名等待重启生效的设备，避免自动刷新立刻用旧电脑名覆盖手动新名字。
     platform::DeviceInfo m_localDeviceInfo;
+    QVector<QPointer<RemoteDesktopWindow>> m_tiledRemoteWindows; // wjy: 记录设备平铺创建的窗口，下次平铺前先关闭旧窗口再重新排列。
 };
 
 } // namespace ui

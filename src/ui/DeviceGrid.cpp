@@ -522,12 +522,23 @@ QVector<DeviceEntry> g_devices;
 QVector<QString> g_deviceGroupNames; // wjy: 保存右键新建的分组名称，会写入 devices.json 的 groups 字段。
 QVector<bool> g_deviceGroupExpandedStates; // wjy: 保存每个分组是否展开，会和分组名称一起持久化。
 
-bool deviceIpExists(const QString& ip)
+int deviceIndexForIp(const QString& ip)
 {
     const QString trimmedIp = ip.trimmed();
-    return g_devices.cend() != std::find_if(g_devices.cbegin(), g_devices.cend(), [&trimmedIp](const DeviceEntry& device) {
-        return device.ip.trimmed() == trimmedIp; // wjy: 按 IP 去重，避免批量扫描把已有设备再次写入 devices.json。
-    });
+    if (trimmedIp.isEmpty()) {
+        return -1;
+    }
+    for (int i = 0; i < g_devices.size(); ++i) {
+        if (g_devices.at(i).ip.trimmed() == trimmedIp) {
+            return i; // wjy: 按 IP 定位设备记录，批量扫描补齐 MAC 时复用同一份去重依据。
+        }
+    }
+    return -1;
+}
+
+bool deviceIpExists(const QString& ip)
+{
+    return deviceIndexForIp(ip) >= 0; // wjy: 按 IP 去重，避免批量扫描把已有设备再次写入 devices.json。
 }
 
 QString deviceStorePath()
@@ -2878,9 +2889,7 @@ void DeviceGrid::startBatchAddDevices()
     QStringList scanIps;
     scanIps.reserve(allScanIps.size());
     for (const QString& ip : allScanIps) {
-        if (!deviceIpExists(ip)) {
-            scanIps.append(ip); // wjy: 已存在的设备不再扫描和追加，避免批量新增制造重复 IP。
-        }
+        scanIps.append(ip); // wjy: 已存在设备也继续扫描，用返回的 MAC 补齐旧记录，避免远程开机时仍提示未填写 MAC。
     }
     if (scanIps.isEmpty()) {
         qWarning().noquote() << QStringLiteral("[batch-add] no new ip to scan subnet=%1").arg(subnetText);
@@ -2957,11 +2966,32 @@ void DeviceGrid::startBatchAddDevices()
             const bool wasEmpty = g_devices.isEmpty();
             int firstAddedIndex = -1;
             int addedCount = 0;
+            int updatedCount = 0;
             QSet<QString> addedIps;
             for (const BatchAddResult& result : results) {
                 const QString ip = result.ip.trimmed();
-                if (ip.isEmpty() || deviceIpExists(ip) || addedIps.contains(ip)) {
+                if (ip.isEmpty() || addedIps.contains(ip)) {
                     continue; // wjy: UI 线程最终追加前再次去重，防止扫描期间用户手动新增同一 IP。
+                }
+
+                const int existingIndex = deviceIndexForIp(ip);
+                if (existingIndex >= 0) {
+                    bool deviceUpdated = false;
+                    DeviceEntry& existingDevice = g_devices[existingIndex];
+                    if (existingDevice.mac.trimmed().isEmpty() && !result.mac.trimmed().isEmpty()) {
+                        existingDevice.mac = result.mac.trimmed(); // wjy: 批量扫描命中旧设备时补齐 MAC，让后续远程开机不再因为旧记录为空而被拦截。
+                        deviceUpdated = true;
+                    }
+                    if (existingDevice.broadcastIp.trimmed().isEmpty() && !result.broadcastIp.trimmed().isEmpty()) {
+                        existingDevice.broadcastIp = result.broadcastIp.trimmed(); // wjy: 同步保存广播地址，远程开机代理可直接复用扫描到的网段信息。
+                        deviceUpdated = true;
+                    }
+                    grid->m_deviceStatuses.insert(ip, platform::DevicePresenceState::Online);
+                    addedIps.insert(ip);
+                    if (deviceUpdated) {
+                        ++updatedCount;
+                    }
+                    continue;
                 }
 
                 const QString name = result.name.trimmed().isEmpty() ? ip : result.name.trimmed();
@@ -2974,8 +3004,11 @@ void DeviceGrid::startBatchAddDevices()
                 ++addedCount;
             }
 
-            if (addedCount > 0) {
+            if (addedCount > 0 || updatedCount > 0) {
                 saveDevices();
+            }
+
+            if (addedCount > 0) {
                 grid->m_remoteAssistSelected = false;
                 grid->m_localInfoSelected = false;
                 grid->m_settingsSelected = false;
@@ -3004,9 +3037,10 @@ void DeviceGrid::startBatchAddDevices()
             grid->updateAddDeviceControls();
             grid->updateLocalInfoControls();
             grid->update();
-            qWarning().noquote() << QStringLiteral("[batch-add] scan end found=%1 added=%2")
+            qWarning().noquote() << QStringLiteral("[batch-add] scan end found=%1 added=%2 updated=%3")
                 .arg(results.size())
-                .arg(addedCount);
+                .arg(addedCount)
+                .arg(updatedCount);
         }, Qt::QueuedConnection);
     });
 // ===end====
@@ -3229,7 +3263,13 @@ void DeviceGrid::refreshDeviceStatuses()
         writeDeviceGridStartupLog(QStringLiteral("[wjy-status] background thread start ipCount=%1").arg(ips.size())); // wjy: 后台总线程启动日志写入文件，确认是否进入线程阶段。
 // ===end====
         QHash<QString, platform::DevicePresenceState> statuses;
+        statuses.reserve(ips.size());
+        for (const QString& ip : ips) {
+            statuses.insert(ip, platform::DevicePresenceState::Offline); // wjy: 每轮刷新先默认离线，只有状态服务明确返回 online/busy 时才覆盖，避免沿用旧在线状态。
+        }
         QHash<QString, QString> remoteDeviceNames; // wjy: 自动刷新时顺便记录远端真实设备名，用来同步 devices.json 的 name 字段。
+        QHash<QString, QString> remoteDeviceMacs; // wjy: 状态服务返回 MAC 时用于补齐旧设备记录，避免远程开机仍读到空 MAC。
+        QHash<QString, QString> remoteDeviceBroadcastIps; // wjy: 同步记录广播地址，后续远程开机代理可直接使用正确网段。
         std::mutex resultMutex;
         std::atomic_int nextIndex = 0;
         const int workerCount = std::max(1, std::min<int>(8, ips.size()));
@@ -3269,6 +3309,12 @@ void DeviceGrid::refreshDeviceStatuses()
                     if (!info.deviceName.trimmed().isEmpty()) {
                         remoteDeviceNames.insert(ip, info.deviceName.trimmed()); // wjy: 只有新版远端返回了真实设备名时才参与本地 JSON 同步。
                     }
+                    if (!info.mac.trimmed().isEmpty()) {
+                        remoteDeviceMacs.insert(ip, info.mac.trimmed()); // wjy: 在线刷新拿到 MAC 后回填本地设备记录，修复旧批量新增留下的空值。
+                    }
+                    if (!info.broadcastIp.trimmed().isEmpty()) {
+                        remoteDeviceBroadcastIps.insert(ip, info.broadcastIp.trimmed()); // wjy: 广播地址和 MAC 一起回填，保持远程开机参数完整。
+                    }
                 }
 // =====wjy====
                 writeDeviceGridStartupLog(QStringLiteral("[wjy-status] worker end worker=%1").arg(worker)); // wjy: worker 结束日志，判断线程是否正常跑完。
@@ -3294,7 +3340,7 @@ void DeviceGrid::refreshDeviceStatuses()
 
 // =====wjy====
         writeDeviceGridStartupLog(QStringLiteral("[wjy-status] invoke ui post begin")); // wjy: 准备把后台探测结果投递回 UI 线程；如果有 begin 没有 end，说明崩在投递附近。
-        const bool invokeQueued = QMetaObject::invokeMethod(self, [self, statuses = std::move(statuses), remoteDeviceNames = std::move(remoteDeviceNames)]() mutable {
+        const bool invokeQueued = QMetaObject::invokeMethod(self, [self, statuses = std::move(statuses), remoteDeviceNames = std::move(remoteDeviceNames), remoteDeviceMacs = std::move(remoteDeviceMacs), remoteDeviceBroadcastIps = std::move(remoteDeviceBroadcastIps)]() mutable {
 // =====wjy====
             writeDeviceGridStartupLog(QStringLiteral("[wjy-status] invoke ui begin")); // wjy: 回到 UI 线程前半段日志，判断崩溃是否发生在 UI 更新阶段。
 // ===end====
@@ -3306,10 +3352,35 @@ void DeviceGrid::refreshDeviceStatuses()
             }
             DeviceGrid* grid = self.data();
             grid->m_deviceStatuses = std::move(statuses);
-            bool deviceNameChanged = false;
+            bool deviceRecordChanged = false;
             for (DeviceEntry& device : g_devices) {
                 const QString ip = device.ip.trimmed();
+                const QString remoteMac = remoteDeviceMacs.value(ip).trimmed();
+                const QString remoteBroadcastIp = remoteDeviceBroadcastIps.value(ip).trimmed();
+                if (!ip.isEmpty()
+                    && device.mac.trimmed().isEmpty()
+                    && !remoteMac.isEmpty()) {
+                    qWarning().noquote() << QStringLiteral("[wjy-status] sync device mac ip=%1 mac=%2")
+                        .arg(ip)
+                        .arg(remoteMac); // wjy: 自动刷新发现旧设备没有 MAC 时补齐，避免远程开机入口继续弹未填写 MAC。
+                    device.mac = remoteMac;
+                    deviceRecordChanged = true;
+                }
+                if (!ip.isEmpty()
+                    && device.broadcastIp.trimmed().isEmpty()
+                    && !remoteBroadcastIp.isEmpty()) {
+                    device.broadcastIp = remoteBroadcastIp; // wjy: 旧记录没有广播地址时顺手补齐，和批量新增保存结构保持一致。
+                    deviceRecordChanged = true;
+                }
                 const QString remoteName = remoteDeviceNames.value(ip).trimmed();
+                const QString pendingRemoteRename = grid->m_pendingRemoteRenameNames.value(ip).trimmed(); // wjy: 远端改名成功后 Windows 可能要重启才上报新电脑名，先记住等待生效的新名字。
+                if (!pendingRemoteRename.isEmpty()) {
+                    if (remoteName == pendingRemoteRename) {
+                        grid->m_pendingRemoteRenameNames.remove(ip); // wjy: 远端已经上报新名字，说明重启或系统刷新后改名生效，可以恢复正常自动同步。
+                    } else {
+                        continue; // wjy: 远端仍上报旧名字时不要覆盖本地手动新名字，避免 53_TEST 改 53 后被刷新立刻改回去。
+                    }
+                }
                 if (!ip.isEmpty()
                     && !remoteName.isEmpty()
                     && device.name.trimmed() != remoteName) {
@@ -3318,11 +3389,11 @@ void DeviceGrid::refreshDeviceStatuses()
                         .arg(device.name.trimmed())
                         .arg(remoteName); // wjy: 自动刷新发现 JSON 设备名和远端真实设备名不一致，按远端设备名修正本地记录。
                     device.name = remoteName;
-                    deviceNameChanged = true;
+                    deviceRecordChanged = true;
                 }
             }
-            if (deviceNameChanged) {
-                saveDevices(); // wjy: 设备名同步后立即保存 devices.json，保证下次启动仍使用真实设备名。
+            if (deviceRecordChanged) {
+                saveDevices(); // wjy: 设备名或 MAC/广播地址同步后立即保存 devices.json，保证下次启动仍使用修正后的记录。
                 if (grid->m_selectedDeviceIndex >= 0 && grid->m_selectedDeviceIndex < g_devices.size()) {
                     grid->m_currentDeviceName = deviceDisplayName(g_devices.at(grid->m_selectedDeviceIndex));
                     grid->m_previousDeviceName = grid->m_currentDeviceName;
@@ -3931,6 +4002,13 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
         return; // wjy: 空分组名没有稳定匹配依据，不打开任何窗口。
     }
 
+    for (const QPointer<RemoteDesktopWindow>& tiledWindow : m_tiledRemoteWindows) {
+        if (tiledWindow && !tiledWindow->isClosingConnection()) {
+            tiledWindow->close(); // wjy: 再次点击设备平铺时先关闭上一批平铺窗口，避免重复创建叠加的新窗口。
+        }
+    }
+    m_tiledRemoteWindows.clear(); // wjy: 旧窗口已进入关闭流程，后续只记录本次重新平铺创建的新窗口。
+
     QVector<int> groupDeviceIndexes; // wjy: 保存这个分组里的真实设备下标，后面创建窗口时要用真实设备名和 IP。
     for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
         if (g_devices.at(deviceIndex).group.trimmed() == groupName) {
@@ -3976,6 +4054,7 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
         auto* remoteWindow = new RemoteDesktopWindow(
             deviceDisplayName(g_devices.at(deviceIndex)),
             g_devices.at(deviceIndex).ip); // wjy: 复用现有远程桌面窗口，每台设备各自启动自己的 viewer 连接。
+        m_tiledRemoteWindows.append(remoteWindow); // wjy: 记录本次平铺创建的窗口，下一次设备平铺前统一关闭并重排。
         remoteWindow->setMinimumSize(240, 180); // wjy: 平铺模式允许窗口小于普通远程桌面的默认最小尺寸，确保 3x3 时能尽量塞进屏幕可用区域。
         remoteWindow->setGeometry(targetRect); // wjy: 按网格设置窗口位置和大小，形成 2x2、3x3 等平铺效果。
         remoteWindow->show();
@@ -4047,16 +4126,24 @@ void DeviceGrid::renameCurrentDevice()
         return;
     }
 
+    const QString oldName = g_devices.at(m_selectedDeviceIndex).name.trimmed(); // wjy: 保存旧名字，远端改名命令明确失败时用于回滚本地显示。
+    if (newName == oldName) {
+        return; // wjy: 名字没有变化时不写 devices.json，也不发送远端改名命令。
+    }
+
     const QString targetIp = g_devices.at(m_selectedDeviceIndex).ip.trimmed();
+    const bool shouldRenameRemote = !targetIp.isEmpty()
+        && devicePresenceForIndex(m_selectedDeviceIndex) != platform::DevicePresenceState::Offline; // wjy: 离线设备只改本地显示名，在线设备才尝试同步远端电脑名。
     g_devices[m_selectedDeviceIndex].name = newName;
     saveDevices();
     m_currentDeviceName = newName;
     m_previousDeviceName = newName;
     update();
 
-    if (!targetIp.isEmpty()) {
+    if (shouldRenameRemote) {
+        m_pendingRemoteRenameNames.insert(targetIp, newName); // wjy: Windows 改电脑名通常要重启才从状态服务返回新名，先阻止自动刷新用旧名覆盖。
         QPointer<DeviceGrid> self(this);
-        runBackgroundTask([self, targetIp, newName] {
+        runBackgroundTask([self, targetIp, oldName, newName] {
             QString errorMessage;
             const bool renamed = platform::DeviceCommandService::renameDevice(targetIp, newName, &errorMessage);
             qWarning().noquote() << QStringLiteral("[rename-device] remote ip=%1 renamed=%2 error=%3")
@@ -4066,6 +4153,47 @@ void DeviceGrid::renameCurrentDevice()
             if (!self) {
                 return;
             }
+            if (renamed) {
+                return; // wjy: 远端已接受改名请求，等待目标系统重启后状态服务上报新电脑名。
+            }
+            QMetaObject::invokeMethod(self, [self, targetIp, oldName, newName, errorMessage] {
+                if (!self) {
+                    return;
+                }
+
+                DeviceGrid* grid = self.data();
+                if (grid->m_pendingRemoteRenameNames.value(targetIp).trimmed() == newName) {
+                    grid->m_pendingRemoteRenameNames.remove(targetIp); // wjy: 命令明确失败后取消待生效保护，让后续刷新恢复正常同步。
+                }
+
+                bool reverted = false;
+                for (DeviceEntry& device : g_devices) {
+                    if (device.ip.trimmed() == targetIp && device.name.trimmed() == newName) {
+                        device.name = oldName; // wjy: 远端没有接受改名时回滚本地名，避免界面显示一个不会在目标机生效的名字。
+                        reverted = true;
+                        break;
+                    }
+                }
+                if (reverted) {
+                    saveDevices();
+                    if (grid->m_selectedDeviceIndex >= 0 && grid->m_selectedDeviceIndex < g_devices.size()) {
+                        grid->m_currentDeviceName = deviceDisplayName(g_devices.at(grid->m_selectedDeviceIndex));
+                        grid->m_previousDeviceName = grid->m_currentDeviceName;
+                    }
+                    grid->update();
+                }
+
+                QMessageBox messageBox(
+                    QMessageBox::Warning,
+                    QString(),
+                    errorMessage.trimmed().isEmpty()
+                        ? QString::fromUtf8("目标设备重命名失败。")
+                        : QString::fromUtf8("目标设备重命名失败：%1").arg(errorMessage.trimmed()),
+                    QMessageBox::NoButton,
+                    grid);
+                messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+                messageBox.exec();
+            }, Qt::QueuedConnection);
         });
     }
 }
@@ -4929,9 +5057,34 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
             QMenu menu(this); // wjy: 设备右键菜单样式参照分组右键菜单，使用 Qt 原生级联菜单外观。
             QMenu* scriptMenu = menu.addMenu(QString::fromUtf8("执行脚本")); // wjy: 鼠标悬浮“执行脚本”时展开脚本共享目录第一层文件夹。
             populateScriptFolderMenu(scriptMenu, QString::fromUtf8(kRemoteScriptFolderPath)); // wjy: 递归把共享目录下的文件夹转成多级子菜单，暂不绑定点击执行逻辑。
+            // =====wjy====
+            const bool offlineOnly = devicePresenceForIndex(m_selectedDeviceIndex) == platform::DevicePresenceState::Offline; // wjy: 设备右键菜单复用“更多”的在线判断，离线设备不显示需要远程连接的操作。
+            QAction* terminalAction = nullptr; // wjy: 在线设备才创建终端入口，后面用指针判断用户点了哪一项。
+            QAction* shutdownAction = nullptr; // wjy: 在线设备才允许发送关机命令。
+            QAction* restartAction = nullptr; // wjy: 在线设备才允许发送重启命令。
+            if (!offlineOnly) {
+                terminalAction = menu.addAction(menuIcon(QStringLiteral("terminal.svg")), zh("\xE7\xBB\x88\xE7\xAB\xAF")); // wjy: 放在“执行脚本”下面，和底部“更多”菜单保持同一套终端功能。
+                shutdownAction = menu.addAction(menuIcon(QStringLiteral("power.svg")), zh("\xE5\x85\xB3\xE6\x9C\xBA")); // wjy: 复用当前设备的远程关机逻辑。
+                restartAction = menu.addAction(menuIcon(QStringLiteral("restart.svg")), zh("\xE9\x87\x8D\xE5\x90\xAF")); // wjy: 复用当前设备的远程重启逻辑。
+            }
+            QAction* renameAction = menu.addAction(menuIcon(QStringLiteral("rename.svg")), zh("\xE9\x87\x8D\xE5\x91\xBD\xE5\x90\x8D")); // wjy: 重命名不依赖在线状态，离线设备也可以改本地记录。
+            QAction* deleteAction = menu.addAction(menuIcon(QStringLiteral("delete.svg")), zh("\xE5\x88\xA0\xE9\x99\xA4\xE8\xAE\xBE\xE5\xA4\x87")); // wjy: 删除设备也放进设备右键菜单，和底部“更多”保持一致。
+            // ===end====
             const QAction* selectedAction = menu.exec(mapToGlobal(event->pos()));
             if (selectedAction && selectedAction->data().isValid()) {
                 executeCurrentDeviceScriptFolder(selectedAction->data().toString()); // wjy: 只有点击具体脚本文件夹才触发复制和远程执行，中间层子菜单只负责展开。
+            // =====wjy====
+            } else if (selectedAction && selectedAction == terminalAction) {
+                openCurrentDeviceTerminal(); // wjy: 设备右键点击“终端”时执行和底部“更多”相同的打开终端流程。
+            } else if (selectedAction && selectedAction == shutdownAction) {
+                shutdownCurrentDevice(); // wjy: 设备右键点击“关机”时发送当前设备关机命令。
+            } else if (selectedAction && selectedAction == restartAction) {
+                restartCurrentDevice(); // wjy: 设备右键点击“重启”时发送当前设备重启命令。
+            } else if (selectedAction && selectedAction == renameAction) {
+                renameCurrentDevice(); // wjy: 设备右键点击“重命名”时打开当前设备重命名弹窗。
+            } else if (selectedAction && selectedAction == deleteAction) {
+                deleteCurrentDevice(); // wjy: 设备右键点击“删除设备”时复用现有删除当前设备逻辑。
+            // ===end====
             }
             event->accept();
             return;

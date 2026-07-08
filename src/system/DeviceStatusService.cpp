@@ -54,18 +54,22 @@ DeviceStatusInfo queryStatusInfo(const QString& hostIp, uint16_t port, int timeo
 
     if (!socket.waitForReadyRead(timeoutMs)) {
         socket.disconnectFromHost();
-        info.state = DevicePresenceState::Online;
-        return info;
+        return info; // wjy: 能连上端口但没有状态响应时不能当在线，目标进程卡住或端口残留都会造成假在线。
     }
 
     const QByteArray payload = socket.readAll().trimmed();
     socket.disconnectFromHost();
+    if (payload.isEmpty()) {
+        return info; // wjy: 空响应没有确认目标 FSRemote 状态服务正常工作，保持默认离线。
+    }
     const QList<QByteArray> parts = payload.split('|');
     const QByteArray statePart = parts.value(0).trimmed().toLower();
     if (statePart.startsWith("busy")) {
         info.state = DevicePresenceState::Busy;
-    } else {
+    } else if (statePart.startsWith("online")) {
         info.state = DevicePresenceState::Online;
+    } else {
+        return info; // wjy: 未识别的状态文本不再兜底在线，避免非状态服务占用端口时误显示在线。
     }
     if (parts.size() > 1) {
         info.terminalUser = QString::fromUtf8(parts.at(1)).trimmed();
