@@ -72,6 +72,25 @@ namespace {
 constexpr int kTitleBarHeight = 28;
 constexpr int kSidebarContentTop = kTitleBarHeight + 10;
 
+// =====wjy====
+constexpr int kTitleBarVisualHeight = 18; // wjy: 标题栏内文字、图标和分隔竖线共用的视觉高度，避免各自写死不同的上下位置。
+
+QRect titleBarCenteredRect(int x, int width, int visualHeight = kTitleBarVisualHeight)
+{
+    return QRect(x, (kTitleBarHeight - visualHeight) / 2, width, visualHeight); // wjy: 根据标题栏总高度统一计算垂直居中位置，让刷新、最小化、关闭和左上标题名高度对齐。
+}
+
+QRect titlebarLaunchButtonRect()
+{
+    return QRect(12, 0, 132, kTitleBarHeight); // wjy: 左上角“丰实远程控制”标题名现在作为打开远程窗口的点击入口。
+}
+
+QRect titlebarSettingsRect()
+{
+    return QRect(740, 0, 48, kTitleBarHeight); // wjy: 设置入口移动到刷新按钮左边，保持和标题栏按钮同高。
+}
+// ===end====
+
 
 QString zh(const char* utf8)
 {
@@ -170,7 +189,7 @@ QRect closeRect()
 
 QRect sidebarCollapseButtonRect(bool collapsed)
 {
-    return collapsed ? QRect(12, kTitleBarHeight + 610, 32, 28) : QRect(200, kTitleBarHeight + 610, 32, 28);//>> :<<
+    return collapsed ? QRect(5, kTitleBarHeight + 620, 32, 28) : QRect(245, kTitleBarHeight + 620, 32, 28);//>> :<<
 }
 
 int deviceDetailHeaderX(bool sidebarCollapsed)
@@ -214,6 +233,15 @@ QRect deviceDragGhostRect(const QPoint& currentPos, const QSize& bounds)
     return QRect(ghostX, ghostY, ghostWidth, ghostHeight);
 }
 
+QRect groupDragGhostRect(const QPoint& currentPos, const QSize& bounds)
+{
+    constexpr int ghostWidth = 188;
+    constexpr int ghostHeight = 36;
+    const int ghostX = qBound(8, currentPos.x() - ghostWidth / 2, bounds.width() - ghostWidth - 8);
+    const int ghostY = qBound(kTitleBarHeight + 4, currentPos.y() - ghostHeight / 2, bounds.height() - ghostHeight - 8);
+    return QRect(ghostX, ghostY, ghostWidth, ghostHeight);
+}
+
 QRect deviceGroupHeaderRect()//左侧设备列表开始位置
 {
     return QRect(0, kSidebarContentTop, 236, 34);
@@ -241,8 +269,12 @@ struct DeviceListRow {
 };
 // ===end====
 
-constexpr int kDeviceGroupReservedBlankHeight = 30; // wjy: 预留“我的设备”列表下方空白，后续可用于右键菜单命中区域。
-constexpr int kDeviceListMaxViewportHeight = 420; // wjy: “我的设备”列表最多占用 420 像素，内容更多时在这块区域内滚动，避免压住设备管理。
+constexpr int kDeviceGroupReservedBlankMinHeight = 30; // wjy: 列表内容很多时，底部仍至少保留 30 像素空白给右键菜单和拖回根部使用。
+constexpr int kSidebarListBottomY = 680; // wjy: 设置栏删除后，左侧设备列表空白区直接延伸到侧栏底部。
+constexpr int kDeviceListMaxViewportHeight = kSidebarListBottomY - kSidebarContentTop; // wjy: “我的设备”列表最大高度直接到左侧栏底部。
+constexpr int kGroupNameTextX = 40; // wjy: 分组名从远程唤醒图标右侧开始显示。
+constexpr int kGroupNameDisplayCharacters = 10; // wjy: 分组名显示和编辑都限制为十个字符宽度。
+constexpr int kDeviceNameEditCharacters = 5; // wjy: 设备原地重命名输入框缩小到五个字符宽。
 constexpr const char* kRemoteScriptFolderPath = "\\\\192.168.1.100\\广告部工具\\远程脚本文件"; // wjy: 执行脚本入口当前只浏览这个固定共享目录，真正执行逻辑后续再接。
 constexpr const char* kRemoteScriptWorkPath = "%FSREMOTE_DIR%work"; // wjy: 目标设备 FSRemote.exe 所在目录下的 work 文件夹，每次执行前重建。
 
@@ -740,6 +772,8 @@ int visibleDeviceListRowCount(); // wjy: 统计“我的设备”下拉框里的
 bool deviceGroupExpandedForIndex(int groupIndex);
 QVector<DeviceListRow> visibleDeviceRows();
 int rootDeviceRowCount();
+int visualRowIndexForDeviceIndex(int deviceIndex);
+int visualRowIndexForGroupIndex(int groupIndex);
 QRect visibleDeviceRowRect(int rowIndex);
 int visibleDeviceListContentHeight();
 int visibleDeviceListViewportHeight(bool deviceGroupExpanded);
@@ -747,6 +781,9 @@ int maxDeviceListScrollOffset();
 QRect deviceListViewportRect(bool deviceGroupExpanded);
 QRect scrolledVisibleDeviceRowRect(int rowIndex, int scrollOffset);
 QRect scrolledDeviceGroupReservedBlankRect(int scrollOffset);
+QRect groupNameTextRect(int rowY, const QFont& font);
+QRect groupNameEditRect(int rowY);
+QRect deviceNameEditRect(int rowY, bool insideGroup);
 // =====end====self1
 // QStringList deviceNames()
 // {
@@ -818,6 +855,50 @@ int deviceGroupIndexByName(const QString& groupName)
     return -1;
 }
 
+bool deviceIndexLessByLeadingCharacter(int leftIndex, int rightIndex)
+{
+    const QString leftName = deviceDisplayName(g_devices.at(leftIndex)).trimmed();
+    const QString rightName = deviceDisplayName(g_devices.at(rightIndex)).trimmed();
+    const QString leftKey = leftName.left(1).toCaseFolded();
+    const QString rightKey = rightName.left(1).toCaseFolded();
+    const int keyCompare = QString::localeAwareCompare(leftKey, rightKey);
+    if (keyCompare != 0) {
+        return keyCompare < 0;
+    }
+
+    const int nameCompare = QString::localeAwareCompare(leftName, rightName);
+    if (nameCompare != 0) {
+        return nameCompare < 0;
+    }
+
+    return leftIndex < rightIndex;
+}
+
+QVector<int> sortedDeviceIndexesForGroup(int groupIndex)
+{
+    QVector<int> deviceIndexes;
+    deviceIndexes.reserve(g_devices.size());
+    const QString groupName = groupIndex >= 0 && groupIndex < g_deviceGroupNames.size()
+        ? g_deviceGroupNames.at(groupIndex).trimmed()
+        : QString();
+
+    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+        if (groupIndex < 0) {
+            if (deviceGroupIndexByName(g_devices.at(deviceIndex).group) < 0) {
+                deviceIndexes.append(deviceIndex);
+            }
+            continue;
+        }
+
+        if (g_devices.at(deviceIndex).group.trimmed() == groupName) {
+            deviceIndexes.append(deviceIndex);
+        }
+    }
+
+    std::stable_sort(deviceIndexes.begin(), deviceIndexes.end(), deviceIndexLessByLeadingCharacter);
+    return deviceIndexes;
+}
+
 QVector<DeviceListRow> visibleDeviceRows()
 {
     QVector<DeviceListRow> rows;
@@ -825,10 +906,8 @@ QVector<DeviceListRow> visibleDeviceRows()
 
     // 1. 先显示没有分组的设备。
     // 如果设备 group 指向一个已经不存在的分组，也先显示在根部，避免设备消失。
-    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
-        if (deviceGroupIndexByName(g_devices.at(deviceIndex).group) < 0) {
-            rows.append({DeviceListRow::Type::Device, deviceIndex, -1});
-        }
+    for (int deviceIndex : sortedDeviceIndexesForGroup(-1)) {
+        rows.append({DeviceListRow::Type::Device, deviceIndex, -1});
     }
 
     // 2. 再显示分组行。
@@ -840,11 +919,8 @@ QVector<DeviceListRow> visibleDeviceRows()
             continue;
         }
 
-        const QString groupName = g_deviceGroupNames.at(groupIndex).trimmed();
-        for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
-            if (g_devices.at(deviceIndex).group.trimmed() == groupName) {
-                rows.append({DeviceListRow::Type::Device, deviceIndex, groupIndex});
-            }
+        for (int deviceIndex : sortedDeviceIndexesForGroup(groupIndex)) {
+            rows.append({DeviceListRow::Type::Device, deviceIndex, groupIndex});
         }
     }
 
@@ -870,6 +946,19 @@ int rootDeviceRowCount()
     }
     return count;
 // ===end====
+}
+
+int visualRowIndexForDeviceIndex(int deviceIndex)
+{
+    const QVector<DeviceListRow> rows = visibleDeviceRows();
+    for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
+        const DeviceListRow& row = rows.at(rowIndex);
+        if (row.type == DeviceListRow::Type::Device && row.deviceIndex == deviceIndex) {
+            return rowIndex;
+        }
+    }
+
+    return -1;
 }
 
 int visualRowIndexForGroupIndex(int groupIndex)
@@ -1066,10 +1155,18 @@ QRect visibleDeviceRowRect(int rowIndex)
 // ===end====
 }
 
+int deviceGroupReservedBlankHeight()
+{
+// =====wjy====
+    const int blankTop = kSidebarContentTop + visibleDeviceListRowCount() * 40; // wjy: 空白区从最后一个设备/分组行下面开始。
+    return qMax(kDeviceGroupReservedBlankMinHeight, kSidebarListBottomY - blankTop); // wjy: 行少时填满到左侧栏底部，行多时保留最小空白并允许滚动。
+// ===end====
+}
+
 int visibleDeviceListContentHeight()
 {
 // =====wjy====
-    return visibleDeviceListRowCount() * 40 + kDeviceGroupReservedBlankHeight; // wjy: 列表真实内容高度 = 所有可见行高度 + 根部预留空白高度。
+    return visibleDeviceListRowCount() * 40 + deviceGroupReservedBlankHeight(); // wjy: 列表真实内容高度 = 所有可见行高度 + 动态根部空白高度。
 // ===end====
 }
 
@@ -1080,7 +1177,7 @@ int visibleDeviceListViewportHeight(bool deviceGroupExpanded)
         return 0; // wjy: “我的设备”收起时，内部列表视口高度为 0，下面栏目贴着标题显示。
     }
 
-    return qMin(visibleDeviceListContentHeight(), kDeviceListMaxViewportHeight); // wjy: 展开时最多占 420 像素，超出的设备和分组通过滚轮查看。
+    return qMin(visibleDeviceListContentHeight(), kDeviceListMaxViewportHeight); // wjy: 展开时最多占到左侧栏底部，超出的设备和分组通过滚轮查看。
 // ===end====
 }
 
@@ -1112,7 +1209,7 @@ QRect deviceGroupReservedBlankRect() //底部空白区
 {
 // =====wjy====
     const int blankTop = kSidebarContentTop  + visibleDeviceListRowCount() * 40; // wjy: 空白区固定放到所有设备和分组行后面，不再插在无分组设备与第一个分组之间。
-    return QRect(4, blankTop, 232, kDeviceGroupReservedBlankHeight); // wjy: 这个空白区既能右键新建分组，也能作为拖回“无分组”的落点。
+    return QRect(4, blankTop, 232, deviceGroupReservedBlankHeight()); // wjy: 这个空白区行少时直接铺到侧栏底部，行多时保留最小落点高度。
 // ===end====
 }
 
@@ -1123,6 +1220,43 @@ QRect scrolledDeviceGroupReservedBlankRect(int scrollOffset)
     blankRect.translate(0, -scrollOffset); // wjy: 列表滚动后，空白区也要跟着内容一起上移或下移。
     return blankRect;
 // ===end====
+}
+
+int groupNameVisualWidth(const QFont& font)
+{
+    const QFontMetrics metrics(font);
+    return metrics.horizontalAdvance(QString(kGroupNameDisplayCharacters, QChar(0x4E00)));
+}
+
+int deviceNameEditVisualWidth(const QFont& font)
+{
+    const QFontMetrics metrics(font);
+    return metrics.horizontalAdvance(QString(kDeviceNameEditCharacters, QChar(0x4E00)));
+}
+
+QFont sidebarListTextFont()
+{
+    QFont font(QStringLiteral("Microsoft YaHei UI"));
+    font.setPixelSize(14);
+    return font;
+}
+
+QRect groupNameTextRect(int rowY, const QFont& font)
+{
+    return QRect(kGroupNameTextX, rowY + 7, groupNameVisualWidth(font), 22);
+}
+
+QRect groupNameEditRect(int rowY)
+{
+    const QFont font = sidebarListTextFont();
+    return QRect(kGroupNameTextX, rowY + 5, groupNameVisualWidth(font), 26);
+}
+
+QRect deviceNameEditRect(int rowY, bool insideGroup)
+{
+    const int textX = insideGroup ? 76 : 56;
+    const QFont font = sidebarListTextFont();
+    return QRect(textX, rowY + 5, deviceNameEditVisualWidth(font), 26);
 }
 
 QColor deviceStatusDotColor(platform::DevicePresenceState state)
@@ -1138,6 +1272,15 @@ QColor deviceStatusDotColor(platform::DevicePresenceState state)
     default:
         return QColor(QStringLiteral("#C7CDD6"));
     }
+}
+
+QColor deviceListStatusAccentColor(platform::DevicePresenceState state)
+{
+    if (state == platform::DevicePresenceState::Busy) {
+        return deviceStatusDotColor(platform::DevicePresenceState::Online);
+    }
+
+    return deviceStatusDotColor(state);
 }
 
 QSize deviceHeaderStatusBadgeSize(platform::DevicePresenceState state, bool poweringOn)
@@ -2011,6 +2154,18 @@ DeviceGrid::DeviceGrid(QWidget* parent)
         finishDeviceGroupRename(true);
     });
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after group rename editor create")); // wjy: 记录分组原地重命名输入框创建和信号连接完成。
+
+    m_deviceListNameEdit = new QLineEdit(this); // wjy: 设备双击后在左侧列表原地重命名，和分组重命名保持同一交互。
+    m_deviceListNameEdit->setVisible(false);
+    m_deviceListNameEdit->setStyleSheet(QStringLiteral(
+        "QLineEdit{background:#FFFFFF;border:1px solid #3A7BFC;border-radius:4px;"
+        "padding:0 8px;font-family:'Microsoft YaHei UI';font-size:14px;color:#111827;}"));
+    connect(m_deviceListNameEdit, &QLineEdit::returnPressed, this, [this] {
+        finishDeviceRename(true);
+    });
+    connect(m_deviceListNameEdit, &QLineEdit::editingFinished, this, [this] {
+        finishDeviceRename(true);
+    });
 // ===end====
 
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before detail animation timer")); // wjy: 记录详情动画定时器创建前的位置。
@@ -3243,6 +3398,7 @@ void DeviceGrid::beginDeviceGroupRename(int groupIndex)
     if (!m_deviceGroupNameEdit || groupIndex < 0 || groupIndex >= g_deviceGroupNames.size()) {
         return; // wjy: 输入框不存在或分组下标无效时，不进入编辑状态。
     }
+    finishDeviceRename(true);
 
     const int rowIndex = visualRowIndexForGroupIndex(groupIndex); // wjy: 找到分组当前在左侧列表中的视觉行号。
     if (rowIndex < 0) {
@@ -3251,7 +3407,7 @@ void DeviceGrid::beginDeviceGroupRename(int groupIndex)
 
     const QRect rowRect = scrolledVisibleDeviceRowRect(rowIndex, m_deviceListScrollOffset); // wjy: 复用分组滚动后的可见行矩形，让输入框贴在当前屏幕位置。
     m_renamingDeviceGroupIndex = groupIndex; // wjy: 记录正在编辑的分组，绘制时隐藏底层文字。
-    m_deviceGroupNameEdit->setGeometry(QRect(20, rowRect.y() + 5, 136, 26)); // wjy: 输入框覆盖分组文字区域，不挡住右侧箭头。
+    m_deviceGroupNameEdit->setGeometry(groupNameEditRect(rowRect.y())); // wjy: 输入框和分组显示文字共用十字符宽度，并从图标右侧文字起点开始。
     m_deviceGroupNameEdit->setText(g_deviceGroupNames.at(groupIndex)); // wjy: 把当前分组名放进输入框，方便直接修改。
     m_deviceGroupNameEdit->selectAll(); // wjy: 双击后默认全选，用户可以直接输入新名字覆盖。
     m_deviceGroupNameEdit->show();
@@ -3302,6 +3458,62 @@ void DeviceGrid::finishDeviceGroupRename(bool saveText)
 
     m_renamingDeviceGroupIndex = -1; // wjy: 清空编辑状态。
     m_deviceGroupNameEdit->hide(); // wjy: 隐藏输入框，恢复普通分组行显示。
+    if (rowRect.isValid()) {
+        update(rowRect);
+    } else {
+        update();
+    }
+// ===end====
+}
+
+bool DeviceGrid::beginDeviceRename(int deviceIndex)
+{
+// =====wjy====
+    if (!m_deviceListNameEdit || deviceIndex < 0 || deviceIndex >= g_devices.size()) {
+        return false;
+    }
+    finishDeviceGroupRename(true);
+
+    const int rowIndex = visualRowIndexForDeviceIndex(deviceIndex);
+    if (rowIndex < 0) {
+        return false;
+    }
+
+    const QVector<DeviceListRow> rows = visibleDeviceRows();
+    if (rowIndex >= rows.size()) {
+        return false;
+    }
+
+    const DeviceListRow& row = rows.at(rowIndex);
+    const QRect rowRect = scrolledVisibleDeviceRowRect(rowIndex, m_deviceListScrollOffset);
+    m_renamingDeviceIndex = deviceIndex;
+    m_deviceListNameEdit->setGeometry(deviceNameEditRect(rowRect.y(), row.groupIndex >= 0));
+    m_deviceListNameEdit->setText(deviceDisplayName(g_devices.at(deviceIndex)));
+    m_deviceListNameEdit->selectAll();
+    m_deviceListNameEdit->show();
+    m_deviceListNameEdit->raise();
+    m_deviceListNameEdit->setFocus(Qt::MouseFocusReason);
+    update(rowRect);
+    return true;
+// ===end====
+}
+
+void DeviceGrid::finishDeviceRename(bool saveText)
+{
+// =====wjy====
+    if (!m_deviceListNameEdit || m_renamingDeviceIndex < 0) {
+        return;
+    }
+
+    const int deviceIndex = m_renamingDeviceIndex;
+    const int rowIndex = visualRowIndexForDeviceIndex(deviceIndex);
+    const QRect rowRect = rowIndex >= 0 ? scrolledVisibleDeviceRowRect(rowIndex, m_deviceListScrollOffset) : QRect();
+    if (saveText && deviceIndex >= 0 && deviceIndex < g_devices.size()) {
+        applyDeviceRename(deviceIndex, m_deviceListNameEdit->text().trimmed());
+    }
+
+    m_renamingDeviceIndex = -1;
+    m_deviceListNameEdit->hide();
     if (rowRect.isValid()) {
         update(rowRect);
     } else {
@@ -4176,7 +4388,16 @@ void DeviceGrid::openRemoteDesktopWindow()
         return;
     }
 
-    const QString deviceIp = g_devices.at(m_selectedDeviceIndex).ip.trimmed();
+    openRemoteDesktopWindowForDevice(m_selectedDeviceIndex, QPoint(42, 24));
+}
+
+void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex, const QPoint& fallbackOffset)
+{
+    if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
+        return;
+    }
+
+    const QString deviceIp = g_devices.at(deviceIndex).ip.trimmed();
     if (deviceIp.isEmpty()) {
         return;
     }
@@ -4193,16 +4414,48 @@ void DeviceGrid::openRemoteDesktopWindow()
     m_remoteDesktopWindows.remove(deviceIp);
 
     auto* remoteWindow = new RemoteDesktopWindow(
-        deviceDisplayName(g_devices.at(m_selectedDeviceIndex)),
+        deviceDisplayName(g_devices.at(deviceIndex)),
         deviceIp);
     m_remoteDesktopWindows.insert(deviceIp, remoteWindow);
     connect(remoteWindow, &QObject::destroyed, this, [this, deviceIp] {
         m_remoteDesktopWindows.remove(deviceIp);
     });
     if (!platform::AppSettings::hasRemoteDesktopWindowGeometry(deviceIp)) {
-        remoteWindow->move(window()->frameGeometry().topLeft() + QPoint(42, 24));
+        remoteWindow->move(window()->frameGeometry().topLeft() + fallbackOffset);
     }
     remoteWindow->show();
+}
+
+void DeviceGrid::launchSelectedRemoteDesktopWindows()
+{
+    QVector<int> launchIndexes;
+    const QVector<DeviceListRow> rows = visibleDeviceRows();
+    for (const DeviceListRow& row : rows) {
+        if (row.type == DeviceListRow::Type::Device
+            && row.deviceIndex >= 0
+            && row.deviceIndex < g_devices.size()
+            && m_selectedDeviceIndexes.contains(row.deviceIndex)) {
+            launchIndexes.append(row.deviceIndex);
+        }
+    }
+    if (launchIndexes.isEmpty()
+        && m_selectedDeviceIndex >= 0
+        && m_selectedDeviceIndex < g_devices.size()) {
+        launchIndexes.append(m_selectedDeviceIndex);
+    }
+
+    const int originalSelectedDeviceIndex = m_selectedDeviceIndex;
+    for (int launchOrder = 0; launchOrder < launchIndexes.size(); ++launchOrder) {
+        const int deviceIndex = launchIndexes.at(launchOrder);
+        if (devicePresenceForIndex(deviceIndex) == platform::DevicePresenceState::Offline
+            && !devicePoweringOnForIndex(deviceIndex)) {
+            m_selectedDeviceIndex = deviceIndex; // wjy: 远程开机逻辑依赖当前设备下标，这里临时切换，随后恢复用户当前选择。
+            wakeCurrentDevice();
+        }
+
+        openRemoteDesktopWindowForDevice(deviceIndex, QPoint(42 + launchOrder * 28, 24 + launchOrder * 28));
+    }
+    m_selectedDeviceIndex = originalSelectedDeviceIndex;
 }
 
 void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
@@ -4324,44 +4577,38 @@ void DeviceGrid::restartCurrentDevice()
     messageBox.exec();
 }
 
-void DeviceGrid::renameCurrentDevice()
+void DeviceGrid::applyDeviceRename(int deviceIndex, const QString& newName)
 {
-    if (m_selectedDeviceIndex < 0 || m_selectedDeviceIndex >= g_devices.size()) {
+    if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
+        return;
+    }
+    if (newName.trimmed().isEmpty()) {
         return;
     }
 
-    RenameDeviceDialog dialog(g_devices.at(m_selectedDeviceIndex).name, this);
-    const QPoint topLeft = window()->frameGeometry().center() - QPoint(dialog.width() / 2, dialog.height() / 2);
-    dialog.move(topLeft);
-    if (dialog.exec() != QDialog::Accepted) {
-        return;
-    }
-
-    const QString newName = dialog.name();
-    if (newName.isEmpty()) {
-        return;
-    }
-
-    const QString oldName = g_devices.at(m_selectedDeviceIndex).name.trimmed(); // wjy: 保存旧名字，远端改名命令明确失败时用于回滚本地显示。
-    if (newName == oldName) {
+    const QString normalizedNewName = newName.trimmed();
+    const QString oldName = g_devices.at(deviceIndex).name.trimmed(); // wjy: 保存旧名字，远端改名命令明确失败时用于回滚本地显示。
+    if (normalizedNewName == oldName) {
         return; // wjy: 名字没有变化时不写 devices.json，也不发送远端改名命令。
     }
 
-    const QString targetIp = g_devices.at(m_selectedDeviceIndex).ip.trimmed();
+    const QString targetIp = g_devices.at(deviceIndex).ip.trimmed();
     const bool shouldRenameRemote = !targetIp.isEmpty()
-        && devicePresenceForIndex(m_selectedDeviceIndex) != platform::DevicePresenceState::Offline; // wjy: 离线设备只改本地显示名，在线设备才尝试同步远端电脑名。
-    g_devices[m_selectedDeviceIndex].name = newName;
+        && devicePresenceForIndex(deviceIndex) != platform::DevicePresenceState::Offline; // wjy: 离线设备只改本地显示名，在线设备才尝试同步远端电脑名。
+    g_devices[deviceIndex].name = normalizedNewName;
     saveDevices();
-    m_currentDeviceName = newName;
-    m_previousDeviceName = newName;
+    if (deviceIndex == m_selectedDeviceIndex) {
+        m_currentDeviceName = normalizedNewName;
+        m_previousDeviceName = normalizedNewName;
+    }
     update();
 
     if (shouldRenameRemote) {
-        m_pendingRemoteRenameNames.insert(targetIp, newName); // wjy: Windows 改电脑名通常要重启才从状态服务返回新名，先阻止自动刷新用旧名覆盖。
+        m_pendingRemoteRenameNames.insert(targetIp, normalizedNewName); // wjy: Windows 改电脑名通常要重启才从状态服务返回新名，先阻止自动刷新用旧名覆盖。
         QPointer<DeviceGrid> self(this);
-        runBackgroundTask([self, targetIp, oldName, newName] {
+        runBackgroundTask([self, targetIp, oldName, normalizedNewName] {
             QString errorMessage;
-            const bool renamed = platform::DeviceCommandService::renameDevice(targetIp, newName, &errorMessage);
+            const bool renamed = platform::DeviceCommandService::renameDevice(targetIp, normalizedNewName, &errorMessage);
             qWarning().noquote() << QStringLiteral("[rename-device] remote ip=%1 renamed=%2 error=%3")
                 .arg(targetIp)
                 .arg(renamed)
@@ -4372,19 +4619,19 @@ void DeviceGrid::renameCurrentDevice()
             if (renamed) {
                 return; // wjy: 远端已接受改名请求，等待目标系统重启后状态服务上报新电脑名。
             }
-            QMetaObject::invokeMethod(self, [self, targetIp, oldName, newName, errorMessage] {
+            QMetaObject::invokeMethod(self, [self, targetIp, oldName, normalizedNewName, errorMessage] {
                 if (!self) {
                     return;
                 }
 
                 DeviceGrid* grid = self.data();
-                if (grid->m_pendingRemoteRenameNames.value(targetIp).trimmed() == newName) {
+                if (grid->m_pendingRemoteRenameNames.value(targetIp).trimmed() == normalizedNewName) {
                     grid->m_pendingRemoteRenameNames.remove(targetIp); // wjy: 命令明确失败后取消待生效保护，让后续刷新恢复正常同步。
                 }
 
                 bool reverted = false;
                 for (DeviceEntry& device : g_devices) {
-                    if (device.ip.trimmed() == targetIp && device.name.trimmed() == newName) {
+                    if (device.ip.trimmed() == targetIp && device.name.trimmed() == normalizedNewName) {
                         device.name = oldName; // wjy: 远端没有接受改名时回滚本地名，避免界面显示一个不会在目标机生效的名字。
                         reverted = true;
                         break;
@@ -4412,6 +4659,15 @@ void DeviceGrid::renameCurrentDevice()
             }, Qt::QueuedConnection);
         });
     }
+}
+
+void DeviceGrid::renameCurrentDevice()
+{
+    if (m_selectedDeviceIndex < 0 || m_selectedDeviceIndex >= g_devices.size()) {
+        return;
+    }
+
+    beginDeviceRename(m_selectedDeviceIndex); // wjy: 设备重命名改为左侧列表原地编辑，和分组双击重命名保持一致。
 }
 
 void DeviceGrid::deleteCurrentDevice()
@@ -4723,19 +4979,33 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
         painter.drawLine(240, kTitleBarHeight, 240, 680);
     }
 
-    painter.drawPixmap(QRect(18, 15, 116, 18), uupix(QStringLiteral("titlebar/title_wordmark.png")));
+// =====wjy====
+    const QRect titleWordmarkRect = titleBarCenteredRect(18, 116); // wjy: 左上角标题名使用统一标题栏视觉高度，不再从 y=15 开始下沉。
+    const QRect settingsIconRect = titleBarCenteredRect(754, 20, 20); // wjy: 设置按钮只保留图标，放在刷新按钮左侧并垂直居中。
+    const QRect refreshIconRect = titleBarCenteredRect(798, 28, 22); // wjy: 刷新图标保留原有资源高度 22，并由标题栏高度统一居中。
+    const QRect minimizeIconRect = titleBarCenteredRect(848, 24, 24); // wjy: 最小化图标保留原有 24 像素资源尺寸，并与同一标题栏中线对齐。
+    const QRect closeIconRect = titleBarCenteredRect(897, 10, 10); // wjy: 关闭图标保留原有 10 像素资源尺寸，统一由标题栏中线计算垂直位置。
+    const qreal separatorTop = (kTitleBarHeight - kTitleBarVisualHeight) / 2.0; // wjy: 竖杠顶部也跟随统一视觉高度，避免越过标题栏下边界。
+    const qreal separatorBottom = separatorTop + kTitleBarVisualHeight; // wjy: 竖杠底部由顶部加统一高度得到，和左上标题名保持同一高度。
 
-    const QRect refreshIconRect(798, 5, 28, 22);//刷新位置
+    painter.drawPixmap(titleWordmarkRect, uupix(QStringLiteral("titlebar/title_wordmark.png"))); // wjy: 实际绘制标题名时复用统一矩形，保证左上标题与右侧按钮同高。
+    if (m_settingsSelected) {
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(QStringLiteral("#DDE6EF")));
+        painter.drawRoundedRect(QRectF(titlebarSettingsRect()).adjusted(8, 4, -8, -4), 4, 4);
+    }
+    drawUiIcon(painter, settingsIconRect, QStringLiteral("settings.svg")); // wjy: 设置入口从左侧底部移到标题栏，左侧不再显示“设置”文字。
     painter.save();
     painter.translate(refreshIconRect.center());
     painter.rotate(m_refreshRotation);
     painter.translate(-refreshIconRect.center());
-    drawUiIcon(painter, refreshIconRect, QStringLiteral("refresh.svg"));
+    drawUiIcon(painter, refreshIconRect, QStringLiteral("refresh.svg")); // wjy: 刷新旋转动画仍围绕居中后的图标中心点旋转。
     painter.restore();
     painter.setPen(QPen(QColor(QStringLiteral("#D8DEE5")), 1));
-    painter.drawLine(QPointF(835.5, 16), QPointF(835.5, 32));
-    drawUiIcon(painter, QRect(848, 5, 24, 24), QStringLiteral("minimize.svg")); //最小化位置
-    drawUiIcon(painter, QRect(897, 10, 10, 10), QStringLiteral("close.svg"));
+    painter.drawLine(QPointF(835.5, separatorTop), QPointF(835.5, separatorBottom)); // wjy: 竖杠高度统一为标题栏视觉高度，和标题名对齐。
+    drawUiIcon(painter, minimizeIconRect, QStringLiteral("minimize.svg")); // wjy: 最小化位置由统一居中矩形控制。
+    drawUiIcon(painter, closeIconRect, QStringLiteral("close.svg")); // wjy: 关闭位置由统一居中矩形控制。
+// ===end====
 
     QFont textFont(QStringLiteral("Microsoft YaHei UI"));
     textFont.setPixelSize(14);
@@ -4840,7 +5110,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                     || deviceState == platform::DevicePresenceState::Busy; // wjy: 左侧列表只有在线/占用才显示状态圆点；离线和未检测不再画灰色圆点。
                 painter.setPen(Qt::NoPen);
                 if (deviceOnlineLike) {
-                    painter.setBrush(deviceStatusDotColor(deviceState)); // wjy: 在线/占用圆点按真实设备状态绘制，不受视觉行号影响。
+                    painter.setBrush(deviceListStatusAccentColor(deviceState)); // wjy: 左侧列表里占用设备继续使用在线绿点，不影响右侧占用胶囊。
                     painter.drawEllipse(QRectF(statusDotX, statusDotY, statusDotSize, statusDotSize));
                 }
                 drawDeviceTileIcon(
@@ -4854,7 +5124,9 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
 
                 painter.setFont(textFont);
                 painter.setPen(QColor(QStringLiteral("#111827")));
-                painter.drawText(QRectF(textX, rowY + 7, textWidth, 22), Qt::AlignVCenter | Qt::AlignLeft, deviceDisplayName(g_devices.at(deviceIndex))); // wjy: 显示真实设备名，分组排序变化不会改错名字。
+                if (m_renamingDeviceIndex != deviceIndex) {
+                    painter.drawText(QRectF(textX, rowY + 7, textWidth, 22), Qt::AlignVCenter | Qt::AlignLeft, deviceDisplayName(g_devices.at(deviceIndex))); // wjy: 显示真实设备名，分组排序变化不会改错名字。
+                }
                 if (badges.contains(deviceIndex)) {
                     drawRemoteBadge(painter, 202, rowY + 12); // wjy: 角标也使用真实设备下标，避免分组行插入后角标错位。
                 }
@@ -4868,17 +5140,23 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                 }
 
                 painter.setPen(Qt::NoPen);
-                painter.setBrush(QColor(QStringLiteral("#4687ff"))); // wjy: 分组背景颜色，和普通设备行区分开。
+                painter.setBrush(QColor(QStringLiteral("#fcfdff"))); // wjy: 分组背景颜色，和普通设备行区分开。
                 painter.drawRoundedRect(QRectF(rowRect), 5, 5);
+                drawResourceIcon(painter, QRect(12, rowY + 8, 20, 20), QStringLiteral("settings/remote_wakeup.svg")); // wjy: 分组栏文字左侧改用远程唤醒图标，强调这一行是可集中管理的分组入口。
                 drawUiIcon(
                     painter,
                     QRect(203, rowY + 8, 24, 20),
                     deviceGroupExpandedForIndex(groupIndex) ? QStringLiteral("chevron_up.svg") : QStringLiteral("chevron_down.svg")); // wjy: 根据分组展开状态绘制上箭头或下箭头。
 
                 painter.setFont(textFont);
-                painter.setPen(QColor(QStringLiteral("#FFFFFF"))); //分组字体颜色
+                painter.setPen(QColor(QStringLiteral("#000000"))); //分组字体颜色
                 if (m_renamingDeviceGroupIndex != groupIndex) {
-                    painter.drawText(QRectF(10, rowY + 7, 132, 22), Qt::AlignVCenter | Qt::AlignLeft, g_deviceGroupNames.at(groupIndex)); // wjy: 分组正在原地重命名时不画底层文字，避免和输入框重叠。
+                    const QRect groupTextRect = groupNameTextRect(rowY, textFont);
+                    const QString groupNameText = QFontMetrics(textFont).elidedText(
+                        g_deviceGroupNames.at(groupIndex),
+                        Qt::ElideRight,
+                        groupTextRect.width());
+                    painter.drawText(QRectF(groupTextRect), Qt::AlignVCenter | Qt::AlignLeft, groupNameText); // wjy: 分组文字限制到十字符视觉宽度，超长时省略。
                 }
             }
         }
@@ -4886,14 +5164,14 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
         const QRect visibleBlankRect = blankRect.intersected(deviceListClip);
         if (!visibleBlankRect.isEmpty()) {
             painter.setPen(Qt::NoPen);
-            painter.setBrush(QColor(QStringLiteral("#F3F6FA"))); // wjy: 底部空白落点使用更淡的灰色，和分组内设备的浅灰区域区分开。
+            painter.setBrush(QColor(QStringLiteral("#F3F6FA"))); // wjy: 底部空白落点使用更淡的灰色，并延伸覆盖原设置栏区域。
             painter.drawRoundedRect(QRectF(blankRect), 4, 4);
         }
         painter.restore();
 
         const int maxScrollOffset = maxDeviceListScrollOffset(); // wjy: 大于 0 表示内容高度超过视口，需要显示滚动条。
         if (maxScrollOffset > 0 && deviceListClip.height() > 0) {
-            const QRect scrollTrack(deviceListClip.right() - 3, deviceListClip.y() + 5, 6, qMax(1, deviceListClip.height() - 10)); // wjy: 滚动条贴在左侧列表右边缘，不占用设备文字区域。
+            const QRect scrollTrack(231, deviceListClip.y() + 5, 5, qMax(1, deviceListClip.height() - 10)); // wjy: 滚动条移到设备行和左侧边框之间的缝隙中间。
             const int thumbHeight = qMax(28, scrollTrack.height() * deviceListClip.height() / qMax(1, visibleDeviceListContentHeight())); // wjy: 滑块高度按可见比例计算，太短时固定最小高度方便观察。
             const int thumbTravel = qMax(0, scrollTrack.height() - thumbHeight);
             const int thumbY = scrollTrack.y() + (thumbTravel * m_deviceListScrollOffset / maxScrollOffset); // wjy: 当前滚动偏移映射成滑块在轨道中的位置。
@@ -4904,19 +5182,6 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
     }
 // ===end====
 
-    painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
-    painter.drawLine(0, 623, 240, 623);
-    if (m_settingsSelected) {
-        painter.setPen(Qt::NoPen);
-        painter.setBrush(QColor(QStringLiteral("#DFE6EC")));
-        painter.drawRoundedRect(QRectF(4, 632, 232, 40), 5, 5);
-        painter.setBrush(QColor(QStringLiteral("#3A7BFC")));
-        painter.drawRoundedRect(QRectF(4, 644, 4, 17), 2, 2);
-    }
-    drawUiIcon(painter, QRect(16, 642, 20, 20), QStringLiteral("settings.svg"));
-    painter.setFont(textFont);
-    painter.setPen(QColor(QStringLiteral("#040B18")));
-    painter.drawText(QRectF(43, 641, 40, 22), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE8\xAE\xBE\xE7\xBD\xAE"));
     }
 
     painter.save();
@@ -5038,13 +5303,33 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
         painter.setBrush(QColor(QStringLiteral("#F7FAFE")));
         painter.drawRoundedRect(QRectF(ghostRect), 6, 6);
         painter.setPen(Qt::NoPen);
-        painter.setBrush(deviceStatusDotColor(devicePresenceForIndex(m_draggingDeviceIndex)));
+        painter.setBrush(deviceListStatusAccentColor(devicePresenceForIndex(m_draggingDeviceIndex)));
         painter.drawEllipse(QRectF(ghostX + 18, ghostY + 15, 6, 6));
         drawDeviceTileIcon(painter, ghostX + 34, ghostY + 8, 20);
         painter.setOpacity(0.88); // wjy: 文字和图标比背景稍清楚，拖动时仍能看出是哪台设备。
         painter.setFont(textFont);
         painter.setPen(QColor(QStringLiteral("#111827")));
         painter.drawText(QRectF(ghostX + 66, ghostY + 7, ghostWidth - 78, 22), Qt::AlignVCenter | Qt::AlignLeft, ghostName);
+        painter.restore();
+    }
+
+    if (m_draggingGroup
+        && m_draggingGroupIndex >= 0
+        && m_draggingGroupIndex < g_deviceGroupNames.size()) {
+        const QRect ghostRect = groupDragGhostRect(m_groupDragCurrentPos, size());
+        painter.save();
+        painter.setOpacity(0.76);
+        painter.setPen(QPen(QColor(QStringLiteral("#B9C3D0")), 1));
+        painter.setBrush(QColor(QStringLiteral("#FCFDFF")));
+        painter.drawRoundedRect(QRectF(ghostRect), 6, 6);
+        drawResourceIcon(painter, QRect(ghostRect.x() + 14, ghostRect.y() + 8, 20, 20), QStringLiteral("settings/remote_wakeup.svg"));
+        painter.setOpacity(0.9);
+        painter.setFont(textFont);
+        painter.setPen(QColor(QStringLiteral("#111827")));
+        painter.drawText(
+            QRectF(ghostRect.x() + 44, ghostRect.y() + 7, ghostRect.width() - 56, 22),
+            Qt::AlignVCenter | Qt::AlignLeft,
+            QFontMetrics(textFont).elidedText(g_deviceGroupNames.at(m_draggingGroupIndex), Qt::ElideRight, ghostRect.width() - 56));
         painter.restore();
     }
 // ===end====
@@ -5234,6 +5519,11 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         && !m_deviceGroupNameEdit->geometry().contains(event->pos())) { // wjy: 点击分组输入框外部时，提交当前名字并关闭输入框。
         finishDeviceGroupRename(true);
     }
+    if (m_deviceListNameEdit
+        && m_deviceListNameEdit->isVisible()
+        && !m_deviceListNameEdit->geometry().contains(event->pos())) {
+        finishDeviceRename(true);
+    }
 
     if (event->button() == Qt::RightButton && !m_leftSidebarCollapsed && m_deviceGroupExpanded) {
         const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 设备行右键命中使用当前可见行，保证滚动后菜单出现在真实设备上。
@@ -5410,6 +5700,8 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
     if (event->button() == Qt::LeftButton
         && event->pos().y() >= 0
         && event->pos().y() < kTitleBarHeight //窗口拖动
+        && !titlebarLaunchButtonRect().contains(event->pos())
+        && !titlebarSettingsRect().contains(event->pos())
         && !refreshRect().contains(event->pos())
         && !minimizeRect().contains(event->pos())
         && !closeRect().contains(event->pos())) {
@@ -5425,9 +5717,6 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 只允许在当前可见滚动视口内开始拖拽。
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
             const DeviceListRow& row = rows.at(rowIndex); // wjy: rowIndex 是界面行号，row.deviceIndex 才是真实设备下标。
-            if (row.type != DeviceListRow::Type::Device) {
-                continue; // wjy: 分组行只负责展开收起，不作为可拖拽设备。
-            }
             const QRect rowRect =
                 scrolledVisibleDeviceRowRect(
                     rowIndex,
@@ -5437,6 +5726,26 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
                 rowRect.intersected(deviceListClip);
 
             if (!hitRect.contains(event->pos())) {
+                continue;
+            }
+
+            if (row.type == DeviceListRow::Type::Group) {
+                if (row.groupIndex < 0 || row.groupIndex >= g_deviceGroupNames.size()) {
+                    continue;
+                }
+                m_groupDragCandidateActive = true;
+                m_draggingGroup = false;
+                m_draggingGroupIndex = row.groupIndex;
+                m_groupDragStartPos = event->pos();
+                m_groupDragCurrentPos = event->pos();
+                m_deviceDragCandidateActive = false;
+                m_draggingDevice = false;
+                m_draggingDeviceIndex = -1;
+                m_draggingDeviceIndexes.clear();
+                break;
+            }
+
+            if (row.type != DeviceListRow::Type::Device) {
                 continue;
             }
 
@@ -5519,6 +5828,27 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
     }
 
 // =====wjy====
+    if (m_groupDragCandidateActive && (event->buttons() & Qt::LeftButton)) {
+        m_groupDragCurrentPos = event->pos();
+        const int movedDistance = (event->pos() - m_groupDragStartPos).manhattanLength();
+        if (!m_draggingGroup && movedDistance >= QApplication::startDragDistance()) {
+            m_draggingGroup = true;
+            const QString groupName = (m_draggingGroupIndex >= 0 && m_draggingGroupIndex < g_deviceGroupNames.size())
+                ? g_deviceGroupNames.at(m_draggingGroupIndex)
+                : QString();
+            writeDeviceGridStartupLog(QStringLiteral("[wjy-group-drag] start groupIndex=%1 group=%2 distance=%3")
+                .arg(m_draggingGroupIndex)
+                .arg(groupName)
+                .arg(movedDistance));
+        }
+        if (m_draggingGroup) {
+            setCursor(Qt::ClosedHandCursor);
+            update();
+            event->accept();
+            return;
+        }
+    }
+
     if (m_deviceDragCandidateActive && (event->buttons() & Qt::LeftButton)) { // wjy: 只有按住左键移动时，才判断设备拖拽。
         m_deviceDragCurrentPos = event->pos(); // wjy: 拖拽候选期间持续记录鼠标位置，正式拖拽后虚影才能跟着走。
         const int movedDistance = (event->pos() - m_deviceDragStartPos).manhattanLength(); // wjy: 用曼哈顿距离判断移动是否超过 Qt 推荐拖拽阈值。
@@ -5544,6 +5874,9 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
     updateDesktopHover(event->pos());
     updateBottomActionHover(event->pos());
     const bool sidebarButtonHovered = sidebarCollapseButtonRect(m_leftSidebarCollapsed).contains(event->pos());
+    const bool titlebarButtonHovered = titlebarLaunchButtonRect().contains(event->pos())
+        || titlebarSettingsRect().contains(event->pos())
+        || refreshRect().contains(event->pos());
     const bool wakeButtonHovered = false;
     const bool settingsSwitchHovered = m_settingsSelected
         && (settingsScrolledRect(settingsAutoRunSwitchRect(), m_settingsScrollOffset).contains(event->pos())
@@ -5554,6 +5887,7 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
             || settingsScrolledRect(settingsAddDeviceHeaderRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset).contains(event->pos()));
     if (m_desktopHovered
         || sidebarButtonHovered
+        || titlebarButtonHovered
         || wakeButtonHovered
         || m_hoveredBottomAction != BottomAction::None
         || settingsSwitchHovered) {
@@ -5567,7 +5901,7 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
 void DeviceGrid::mouseDoubleClickEvent(QMouseEvent* event)
 {
 // =====wjy====
-    if (event->button() == Qt::LeftButton && !m_leftSidebarCollapsed && m_deviceGroupExpanded) { // wjy: 左键双击左侧列表时，设备行进入桌面，分组行进入重命名。
+    if (event->button() == Qt::LeftButton && !m_leftSidebarCollapsed && m_deviceGroupExpanded) { // wjy: 左键双击左侧列表时，设备行和分组行都进入原地重命名。
         const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 双击命中也使用可见行，分组和设备位置会跟随 UI 绘制变化。
         const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 双击只识别当前可见视口内的列表行。
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
@@ -5601,17 +5935,8 @@ void DeviceGrid::mouseDoubleClickEvent(QMouseEvent* event)
                 updateAddDeviceControls();
                 updateLocalInfoControls();
                 updateSettingsControls();
-                startDeviceSwitchAnimation(deviceIndex, deviceDisplayName(g_devices.at(deviceIndex))); // wjy: 双击进入桌面前先把当前设备同步到被双击的真实设备。
-
-                if (devicePresenceForIndex(deviceIndex) == platform::DevicePresenceState::Offline) {
-                    if (!devicePoweringOnForIndex(deviceIndex)) {
-                        wakeCurrentDevice(); // wjy: 双击关机/离线设备时复用远程开机流程，成功发包后详情状态会从“离线”进入“正在开机”。
-                    }
-                    event->accept();
-                    return;
-                }
-
-                openRemoteDesktopWindow();
+                startDeviceSwitchAnimation(deviceIndex, deviceDisplayName(g_devices.at(deviceIndex))); // wjy: 双击设备时先同步详情选择，然后进入左侧行内重命名。
+                beginDeviceRename(deviceIndex);
                 event->accept();
                 return;
             }
@@ -5693,6 +6018,7 @@ void DeviceGrid::wheelEvent(QWheelEvent* event)
             m_deviceListScrollOffset = qBound(0, m_deviceListScrollOffset - wheelDelta, maxScrollOffset); // wjy: 向下滚时偏移增大，向上滚时偏移减小，并限制在有效范围内。
             if (m_deviceListScrollOffset != oldOffset) {
                 finishDeviceGroupRename(true); // wjy: 滚动时提交并关闭分组输入框，避免输入框停留在旧位置。
+                finishDeviceRename(true);
                 update();
                 event->accept();
                 return;
@@ -5719,6 +6045,77 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         m_draggingWindow = false;
 
 // =====wjy====
+        if (m_draggingGroup) {
+            int targetInsertionIndex = g_deviceGroupNames.size();
+            if (!m_leftSidebarCollapsed && m_deviceGroupExpanded) {
+                const QVector<DeviceListRow> rows = visibleDeviceRows();
+                const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded);
+                targetInsertionIndex = 0;
+                for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
+                    const DeviceListRow& row = rows.at(rowIndex);
+                    if (row.type != DeviceListRow::Type::Group
+                        || row.groupIndex < 0
+                        || row.groupIndex >= g_deviceGroupNames.size()) {
+                        continue;
+                    }
+
+                    const QRect rowRect = scrolledVisibleDeviceRowRect(rowIndex, m_deviceListScrollOffset);
+                    if (!rowRect.intersects(deviceListClip)) {
+                        continue;
+                    }
+
+                    if (event->pos().y() < rowRect.center().y()) {
+                        targetInsertionIndex = row.groupIndex;
+                        break;
+                    }
+                    targetInsertionIndex = row.groupIndex + 1;
+                }
+            }
+
+            const int sourceGroupIndex = m_draggingGroupIndex;
+            bool groupOrderChanged = false;
+            if (sourceGroupIndex >= 0 && sourceGroupIndex < g_deviceGroupNames.size()) {
+                while (g_deviceGroupExpandedStates.size() < g_deviceGroupNames.size()) {
+                    g_deviceGroupExpandedStates.append(true);
+                }
+
+                int insertIndex = qBound(0, targetInsertionIndex, g_deviceGroupNames.size());
+                if (insertIndex > sourceGroupIndex) {
+                    --insertIndex;
+                }
+
+                if (insertIndex != sourceGroupIndex) {
+                    const QString movedGroupName = g_deviceGroupNames.takeAt(sourceGroupIndex);
+                    const bool movedExpanded = sourceGroupIndex < g_deviceGroupExpandedStates.size()
+                        ? g_deviceGroupExpandedStates.takeAt(sourceGroupIndex)
+                        : true;
+                    g_deviceGroupNames.insert(insertIndex, movedGroupName);
+                    g_deviceGroupExpandedStates.insert(insertIndex, movedExpanded);
+                    groupOrderChanged = true;
+                    saveDevices();
+                    writeDeviceGridStartupLog(QStringLiteral("[wjy-group-drag] moved group=%1 from=%2 to=%3")
+                        .arg(movedGroupName)
+                        .arg(sourceGroupIndex)
+                        .arg(insertIndex));
+                }
+            }
+
+            m_groupDragCandidateActive = false;
+            m_draggingGroup = false;
+            m_draggingGroupIndex = -1;
+            unsetCursor();
+            if (groupOrderChanged) {
+                m_deviceListScrollOffset = qBound(0, m_deviceListScrollOffset, maxDeviceListScrollOffset());
+            }
+            update();
+            event->accept();
+            return;
+        }
+        if (m_groupDragCandidateActive) {
+            m_groupDragCandidateActive = false;
+            m_draggingGroupIndex = -1;
+        }
+
         if (m_draggingDevice) { // wjy: 如果本次鼠标操作已经进入设备拖拽状态，松开时只输出落点日志。
             QString targetType = QStringLiteral("none"); // wjy: 默认表示没有落到可识别的分组目标。
             QString targetGroup;
@@ -5853,8 +6250,37 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         if (sidebarCollapseButtonRect(m_leftSidebarCollapsed).contains(event->pos())) {
             m_leftSidebarCollapsed = !m_leftSidebarCollapsed;
             finishDeviceGroupRename(true);
+            finishDeviceRename(true);
             setDesktopHoverActive(false);
             clearBottomActionHover();
+            update();
+            event->accept();
+            return;
+        }
+
+        if (titlebarLaunchButtonRect().contains(event->pos())) {
+            finishDeviceGroupRename(true);
+            finishDeviceRename(true);
+            launchSelectedRemoteDesktopWindows();
+            event->accept();
+            return;
+        }
+
+        if (titlebarSettingsRect().contains(event->pos())) {
+            finishDeviceGroupRename(true);
+            finishDeviceRename(true);
+            m_settingsSelected = true;
+            m_remoteAssistSelected = false;
+            m_localInfoSelected = false;
+            m_detailAnimationTimer->stop();
+            if (m_settingsLocalInfoExpanded) {
+                refreshLocalDeviceInfo();
+            }
+            setDesktopHoverActive(false);
+            clearBottomActionHover();
+            updateAddDeviceControls();
+            updateLocalInfoControls();
+            updateSettingsControls();
             update();
             event->accept();
             return;
@@ -5919,6 +6345,10 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                     if (deviceIndex < 0
                         || deviceIndex >= g_devices.size()) {
                         continue;
+                    }
+                    if (m_renamingDeviceIndex == deviceIndex) {
+                        event->accept();
+                        return;
                     }
 
                     const bool shiftPressed =
@@ -6053,24 +6483,6 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 }
             }
 // ===end====
-        }
-
-        if (!m_leftSidebarCollapsed && QRect(0, 623, 240, 57).contains(event->pos())) {
-            m_settingsSelected = true;
-            m_remoteAssistSelected = false;
-            m_localInfoSelected = false;
-            m_detailAnimationTimer->stop();
-            if (m_settingsLocalInfoExpanded) {
-                refreshLocalDeviceInfo();
-            }
-            setDesktopHoverActive(false);
-            clearBottomActionHover();
-            updateAddDeviceControls();
-            updateLocalInfoControls();
-            updateSettingsControls();
-            update();
-            event->accept();
-            return;
         }
 
         if (m_settingsSelected) {

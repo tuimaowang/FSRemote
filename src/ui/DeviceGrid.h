@@ -50,7 +50,7 @@ protected:
     void paintEvent(QPaintEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
-    void mouseDoubleClickEvent(QMouseEvent* event) override; // wjy: Double click device rows to enter/wake, and group rows to rename in place.
+    void mouseDoubleClickEvent(QMouseEvent* event) override; // wjy: Double click device or group rows to rename in place.
     void mouseReleaseEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override; // wjy: The hand-painted device list handles scrolling here.
     void leaveEvent(QEvent* event) override;
@@ -73,6 +73,8 @@ private:
     bool executeDeviceScriptFolder(int deviceIndex, const QString& scriptFolderPath, bool showMessages); // wjy: Run one shared script folder on a specified device without forcing the current selection.
     void executeDeviceGroupScriptFolder(int groupIndex, const QString& scriptFolderPath); // wjy: Run one selected script folder for every device in a group.
     void openRemoteDesktopWindow();
+    void openRemoteDesktopWindowForDevice(int deviceIndex, const QPoint& fallbackOffset);
+    void launchSelectedRemoteDesktopWindows();
     void openDeviceGroupTiledWindows(int groupIndex); // wjy: Open all devices in one group and tile remote windows.
     void refreshLocalDeviceInfo();
     void shutdownCurrentDevice();
@@ -94,6 +96,9 @@ private:
     void startBatchAddDevices(); // wjy: 从设置页网段输入框启动批量扫描并追加在线设备。
     void beginDeviceGroupRename(int groupIndex); // wjy: Show the group rename editor in place.
     void finishDeviceGroupRename(bool saveText); // wjy: Finish group rename on Enter or focus loss.
+    bool beginDeviceRename(int deviceIndex);
+    void finishDeviceRename(bool saveText);
+    void applyDeviceRename(int deviceIndex, const QString& newName);
     void pruneHiddenDeviceSelections(); // wjy: Remove collapsed hidden devices from multi-selection state.
     void runBackgroundTask(std::function<void()> task); // wjy: Keep background tasks joinable until DeviceGrid is destroyed.
     void setupScriptFileEditor();
@@ -160,6 +165,7 @@ private:
     QLineEdit* m_deviceMacEdit = nullptr;
     QLineEdit* m_deviceRemarkEdit = nullptr;
     QLineEdit* m_deviceGroupNameEdit = nullptr; // wjy: Group rename editor.
+    QLineEdit* m_deviceListNameEdit = nullptr; // wjy: Device rename editor shown directly on the left list row.
     QTextEdit* m_scriptFileEdit = nullptr;
     QPushButton* m_scriptFileSaveButton = nullptr;
     QPushButton* m_saveDeviceButton = nullptr;
@@ -170,11 +176,16 @@ private:
     bool m_deviceDragCandidateActive = false; // wjy: Mouse-down device row is a drag candidate before crossing threshold.
     bool m_draggingDevice = false; // wjy: True while dragging devices.
     int m_draggingDeviceIndex = -1; // wjy: Current dragged device index, -1 means none.
+    bool m_groupDragCandidateActive = false; // wjy: Mouse-down group row before crossing the drag threshold.
+    bool m_draggingGroup = false; // wjy: True while reordering groups.
+    int m_draggingGroupIndex = -1; // wjy: Current dragged group index, -1 means none.
 
     // wjy: Device indexes that should move together in the current drag.
     QSet<int> m_draggingDeviceIndexes;
     QPoint m_deviceDragStartPos; // wjy: Device drag start position.
     QPoint m_deviceDragCurrentPos; // wjy: Current mouse position while dragging devices.
+    QPoint m_groupDragStartPos; // wjy: Group drag start position.
+    QPoint m_groupDragCurrentPos; // wjy: Current mouse position while dragging a group.
     bool m_deviceGroupExpanded = true;
     bool m_remoteAssistSelected = false;
     bool m_localInfoSelected = false;
@@ -194,6 +205,7 @@ private:
     int m_deviceListScrollOffset = 0; // wjy: Scroll offset for the hand-painted device list.
     int m_settingsScrollOffset = 0; // wjy: Scroll offset for the Settings > General content area.
     int m_renamingDeviceGroupIndex = -1; // wjy: Current renaming group index, -1 means none.
+    int m_renamingDeviceIndex = -1; // wjy: Current inline-renaming device index, -1 means none.
     // wjy: Primary device shown on the right detail page.
     int m_selectedDeviceIndex = 0;
 
@@ -229,7 +241,7 @@ private:
     BottomAction m_hoveredBottomAction = BottomAction::None;
     QSet<QString> m_poweringOnDeviceIps;
     QHash<QString, qint64> m_poweringOnStartedAtMs;
-    QHash<QString, QPointer<RemoteDesktopWindow>> m_remoteDesktopWindows; // wjy: 普通双击打开的远程桌面窗口按设备 IP 去重，再次双击只激活原窗口。
+    QHash<QString, QPointer<RemoteDesktopWindow>> m_remoteDesktopWindows; // wjy: 标题栏启动的远程桌面窗口按设备 IP 去重，再次启动只激活原窗口。
     QHash<QString, QString> m_pendingRemoteRenameNames; // wjy: 记录远端改名等待重启生效的设备，避免自动刷新立刻用旧电脑名覆盖手动新名字。
     platform::DeviceInfo m_localDeviceInfo;
     QVector<QPointer<RemoteDesktopWindow>> m_tiledRemoteWindows; // wjy: 记录设备平铺创建的窗口，下次平铺前先关闭旧窗口再重新排列。
