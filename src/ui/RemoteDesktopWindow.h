@@ -40,6 +40,7 @@ public:
     void setConnectionStatus(int code, const QString& message);
     void setEncodedBitrateMbps(double mbps);
     void setRemoteMouseCaptureActive(bool active);
+    void setRememberGeometryEnabled(bool enabled);
     bool isClosingConnection() const;
     bool forwardNativeKey(int virtualKey, bool down);
 
@@ -91,6 +92,7 @@ private:
     void updateWindowMask();
     void updateTexturePresenterGeometry();
     void flushPendingRemoteFrame();
+    void saveWindowGeometry();
     void updateFrameStats(const QImage& image); // wjy: Update the bottom-right stream stats overlay from each received remote frame.
     void updateFrameColorStats(const QImage& image); // wjy: Update right-bottom RGB diagnostics for pure-black webpage tests.
     void sampleFrameColorRegion(const QImage& image, const QRect& region, int* minValue, int* avgValue, int* maxValue) const; // wjy: Sample RGB values cheaply without scanning every pixel.
@@ -104,6 +106,7 @@ private:
     QImage m_pendingRemoteFrame; // wjy: Holds only the newest decoded frame so slow full-screen painting cannot build a stale-frame queue.
     FsRemoteStreamHandle m_viewerHandle = nullptr;
     bool m_closeInProgress = false;
+    bool m_rememberGeometry = true;
     bool m_textureFrameActive = false;
     std::atomic_bool m_texturePresentFailed = false;
     QVector<int> m_virtualScreens;

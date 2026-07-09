@@ -50,7 +50,7 @@ protected:
     void paintEvent(QPaintEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
-    void mouseDoubleClickEvent(QMouseEvent* event) override; // wjy: Double click a group row to rename in place.
+    void mouseDoubleClickEvent(QMouseEvent* event) override; // wjy: Double click device rows to enter/wake, and group rows to rename in place.
     void mouseReleaseEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override; // wjy: The hand-painted device list handles scrolling here.
     void leaveEvent(QEvent* event) override;
@@ -176,10 +176,12 @@ private:
     QPoint m_deviceDragStartPos; // wjy: Device drag start position.
     QPoint m_deviceDragCurrentPos; // wjy: Current mouse position while dragging devices.
     bool m_deviceGroupExpanded = true;
-    bool m_remoteAssistExpanded = true;
     bool m_remoteAssistSelected = false;
     bool m_localInfoSelected = false;
     bool m_settingsSelected = false;
+    bool m_leftSidebarCollapsed = false;
+    bool m_settingsLocalInfoExpanded = false;
+    bool m_settingsAddDeviceExpanded = false;
     bool m_autoRunEnabled = true;
     bool m_remoteWakeupEnabled = false;
     bool m_wolDetectionInProgress = false;
@@ -190,6 +192,7 @@ private:
     bool m_batchAddInProgress = false; // wjy: 标记批量新增扫描是否正在后台执行。
     int m_statusAutoRefreshIntervalSeconds = 60; // wjy: Default auto refresh interval is 60 seconds.
     int m_deviceListScrollOffset = 0; // wjy: Scroll offset for the hand-painted device list.
+    int m_settingsScrollOffset = 0; // wjy: Scroll offset for the Settings > General content area.
     int m_renamingDeviceGroupIndex = -1; // wjy: Current renaming group index, -1 means none.
     // wjy: Primary device shown on the right detail page.
     int m_selectedDeviceIndex = 0;
@@ -226,6 +229,7 @@ private:
     BottomAction m_hoveredBottomAction = BottomAction::None;
     QSet<QString> m_poweringOnDeviceIps;
     QHash<QString, qint64> m_poweringOnStartedAtMs;
+    QHash<QString, QPointer<RemoteDesktopWindow>> m_remoteDesktopWindows; // wjy: 普通双击打开的远程桌面窗口按设备 IP 去重，再次双击只激活原窗口。
     QHash<QString, QString> m_pendingRemoteRenameNames; // wjy: 记录远端改名等待重启生效的设备，避免自动刷新立刻用旧电脑名覆盖手动新名字。
     platform::DeviceInfo m_localDeviceInfo;
     QVector<QPointer<RemoteDesktopWindow>> m_tiledRemoteWindows; // wjy: 记录设备平铺创建的窗口，下次平铺前先关闭旧窗口再重新排列。

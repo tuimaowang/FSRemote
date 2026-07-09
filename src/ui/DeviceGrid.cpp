@@ -68,6 +68,11 @@ namespace ui {
 
 namespace {
 
+//标题栏高度常量
+constexpr int kTitleBarHeight = 28;
+constexpr int kSidebarContentTop = kTitleBarHeight + 10;
+
+
 QString zh(const char* utf8)
 {
     return QString::fromUtf8(utf8);
@@ -90,10 +95,10 @@ void writeDeviceGridStartupLog(const QString& message)
 }
 // ===end====
 
-void drawDeviceTileIcon(QPainter& painter, int x, int y, int size = 20)
+void drawDeviceTileIcon(QPainter& painter, int x, int y, int size, const QColor& backgroundColor)
 {
     painter.setPen(Qt::NoPen);
-    painter.setBrush(QColor(QStringLiteral("#3A7BFC")));
+    painter.setBrush(backgroundColor);
     painter.drawRoundedRect(QRectF(x, y, size, size), 4, 4);
 
     const qreal cell = size >= 20 ? 5.0 : 4.0;
@@ -105,6 +110,11 @@ void drawDeviceTileIcon(QPainter& painter, int x, int y, int size = 20)
     painter.drawRoundedRect(QRectF(left + cell + gap, top, cell, cell), 1, 1);
     painter.drawRoundedRect(QRectF(left, top + cell + gap, cell, cell), 1, 1);
     painter.drawRoundedRect(QRectF(left + cell + gap, top + cell + gap, cell, cell), 1, 1);
+}
+
+void drawDeviceTileIcon(QPainter& painter, int x, int y, int size = 20)
+{
+    drawDeviceTileIcon(painter, x, y, size, QColor(QStringLiteral("#3A7BFC")));
 }
 
 void drawRemoteBadge(QPainter& painter, int x, int y)
@@ -145,22 +155,68 @@ void drawResourceIcon(QPainter& painter, const QRect& target, const QString& nam
 
 QRect minimizeRect()
 {
-    return QRect(836, 0, 48, 48);
+    return QRect(836, 0, 48, kTitleBarHeight); //最小化图标
 }
 
 QRect refreshRect()
 {
-    return QRect(788, 0, 48, 48);
+    return QRect(788, 0, 48, kTitleBarHeight); //刷新图标
 }
 
 QRect closeRect()
 {
-    return QRect(872, 0, 48, 48);
+    return QRect(872, 0, 48, kTitleBarHeight); //关闭按钮图标
 }
 
-QRect deviceGroupHeaderRect()
+QRect sidebarCollapseButtonRect(bool collapsed)
 {
-    return QRect(0, 58, 236, 34);
+    return collapsed ? QRect(12, kTitleBarHeight + 610, 32, 28) : QRect(200, kTitleBarHeight + 610, 32, 28);//>> :<<
+}
+
+int deviceDetailHeaderX(bool sidebarCollapsed)
+{
+    return sidebarCollapsed ? 52 : 280;
+}
+
+int deviceDetailHeaderRight(bool sidebarCollapsed)
+{
+    return sidebarCollapsed ? 860 : 720;
+}
+
+void drawSidebarCollapseButton(QPainter& painter, bool collapsed)
+{
+    const QRect buttonRect = sidebarCollapseButtonRect(collapsed);
+    painter.save();
+    painter.setPen(QPen(QColor(QStringLiteral("#D8DEE5")), 1));
+    painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
+    painter.drawRoundedRect(QRectF(buttonRect), 6, 6);
+
+    QFont buttonFont(QStringLiteral("Microsoft YaHei UI"));
+    buttonFont.setPixelSize(13);
+    buttonFont.setBold(true);
+    painter.setFont(buttonFont);
+    painter.setPen(QColor(QStringLiteral("#334155")));
+    painter.drawText(QRectF(buttonRect), Qt::AlignCenter, collapsed ? QStringLiteral(">>") : QStringLiteral("<<"));
+    painter.restore();
+}
+
+QRect rootDeviceDropZoneRect()
+{
+    return QRect(0, kTitleBarHeight, 236, 10);
+}
+
+QRect deviceDragGhostRect(const QPoint& currentPos, const QSize& bounds)
+{
+    constexpr int ghostWidth = 172;
+    constexpr int ghostHeight = 36;
+    const int ghostX = qBound(8, currentPos.x() - ghostWidth / 2, bounds.width() - ghostWidth - 8);
+    const int ghostY = qBound(kTitleBarHeight+4, currentPos.y() - ghostHeight / 2, bounds.height() - ghostHeight - 8); //这是设备拖动上方限制位置
+    return QRect(ghostX, ghostY, ghostWidth, ghostHeight);
+}
+
+QRect deviceGroupHeaderRect()//左侧设备列表开始位置
+{
+    return QRect(0, kSidebarContentTop, 236, 34);
 }
 
 struct DeviceEntry {
@@ -692,25 +748,6 @@ QRect deviceListViewportRect(bool deviceGroupExpanded);
 QRect scrolledVisibleDeviceRowRect(int rowIndex, int scrollOffset);
 QRect scrolledDeviceGroupReservedBlankRect(int scrollOffset);
 // =====end====self1
-QRect remoteAssistGroupHeaderRect(bool deviceGroupExpanded)
-{
-// =====wjy====
-    const int deviceRowsHeight = visibleDeviceListViewportHeight(deviceGroupExpanded); // wjy: 设备很多时只按视口高度占位，超出的内容放在“我的设备”内部滚动，避免压住设备管理。
-// ===end====
-    return QRect(0, deviceGroupHeaderRect().bottom() + 1 + deviceRowsHeight, 236, 34);
-}
-
-QRect remoteAssistStartRect(bool deviceGroupExpanded)
-{
-    return QRect(4, remoteAssistGroupHeaderRect(deviceGroupExpanded).bottom() + 1, 232, 36);
-}
-
-QRect localDeviceInfoRect(bool deviceGroupExpanded)
-{
-    const QRect addRect = remoteAssistStartRect(deviceGroupExpanded);
-    return QRect(addRect.x(), addRect.y() + 40, addRect.width(), addRect.height());
-}
-
 // QStringList deviceNames()
 // {
 //     QStringList names;
@@ -864,36 +901,168 @@ QString infoValueText(const QString& value)
 
 QRect localInfoFieldRect(int index)
 {
-    switch (index) {
-    case 0: return QRect(304, 250, 206, 34);
-    case 1: return QRect(584, 250, 206, 34);
-    case 2: return QRect(304, 332, 206, 34);
-    case 3: return QRect(584, 332, 206, 34);
-    case 4: return QRect(304, 414, 206, 34);
-    case 5: return QRect(584, 414, 206, 34);
-    default: return {};
+    if (index < 0 || index >= 6) {
+        return {};
     }
+
+    const int column = index % 2;
+    const int row = index / 2;
+    const int labelX = column == 0 ? 304 : 584;
+    return QRect(labelX + 70, 576 + row * 32, 150, 26);
+}
+
+QRect localInfoLabelRect(int index)
+{
+    if (index < 0 || index >= 6) {
+        return {};
+    }
+
+    const int column = index % 2;
+    const int row = index / 2;
+    const int labelX = column == 0 ? 304 : 584;
+    return QRect(labelX, 576 + row * 32, 64, 26);
 }
 
 QRect localInfoCopyButtonRect(int index)
 {
     const QRect field = localInfoFieldRect(index);
-    return QRect(field.right() + 8, field.y() + 3, 38, 28);
+    return QRect(field.right() + 8, field.y(), 38, 26);
 }
 
-QRect deviceRowRect(int index)
+QRect settingsLocalInfoHeaderRect()
 {
-    return QRect(4, 96 + index * 40, 232, 36);
+    return QRect(270, 520, 600, 44);
+}
+
+QRect settingsLocalInfoCardRect(bool expanded)
+{
+    return QRect(270, 520, 600, expanded ? 152 : 44);
+}
+
+QRect settingsScrollViewportRect()
+{
+    return QRect(240, 112, 642, 568);
+}
+
+QRect settingsScrolledRect(const QRect& rect, int scrollOffset)
+{
+    QRect result = rect;
+    result.translate(0, -scrollOffset);
+    return result;
+}
+
+QRect settingsVerticalScrollbarTrackRect()
+{
+    return QRect(891, 120, 5, 544);
+}
+
+QRect settingsVerticalScrollbarThumbRect(int scrollOffset, int maxScrollOffset)
+{
+    const QRect track = settingsVerticalScrollbarTrackRect();
+    if (maxScrollOffset <= 0) {
+        return {};
+    }
+
+    const int contentHeight = settingsScrollViewportRect().height() + maxScrollOffset;
+    const int thumbHeight = qMax(48, track.height() * settingsScrollViewportRect().height() / qMax(1, contentHeight));
+    const int travel = qMax(0, track.height() - thumbHeight);
+    const int thumbY = track.y() + (travel * qBound(0, scrollOffset, maxScrollOffset)) / maxScrollOffset;
+    return QRect(track.x(), thumbY, track.width(), thumbHeight);
+}
+
+QRect settingsAddDeviceHeaderRect(bool localInfoExpanded)
+{
+    const QRect localCard = settingsLocalInfoCardRect(localInfoExpanded);
+    return QRect(270, localCard.bottom() + 13, 600, 44);
+}
+
+QRect settingsAddDeviceCardRect(bool localInfoExpanded, bool addDeviceExpanded)
+{
+    const QRect header = settingsAddDeviceHeaderRect(localInfoExpanded);
+    return QRect(header.x(), header.y(), header.width(), addDeviceExpanded ? 352 : 44);
+}
+
+QRect settingsAddDeviceIpEditRect(bool localInfoExpanded)
+{
+    const int top = settingsAddDeviceHeaderRect(localInfoExpanded).y();
+    return QRect(304, top + 160, 252, 34);
+}
+
+QRect settingsAddDeviceNameEditRect(bool localInfoExpanded)
+{
+    const int top = settingsAddDeviceHeaderRect(localInfoExpanded).y();
+    return QRect(584, top + 160, 252, 34);
+}
+
+QRect settingsAddDeviceMacEditRect(bool localInfoExpanded)
+{
+    const int top = settingsAddDeviceHeaderRect(localInfoExpanded).y();
+    return QRect(304, top + 242, 252, 34);
+}
+
+QRect settingsAddDeviceRemarkEditRect(bool localInfoExpanded)
+{
+    const int top = settingsAddDeviceHeaderRect(localInfoExpanded).y();
+    return QRect(584, top + 242, 252, 34);
+}
+
+QRect settingsAddDeviceCancelButtonRect(bool localInfoExpanded)
+{
+    const int top = settingsAddDeviceHeaderRect(localInfoExpanded).y();
+    return QRect(572, top + 300, 124, 34);
+}
+
+QRect settingsAddDeviceSaveButtonRect(bool localInfoExpanded)
+{
+    const int top = settingsAddDeviceHeaderRect(localInfoExpanded).y();
+    return QRect(712, top + 300, 124, 34);
+}
+
+int settingsContentBottom(bool localInfoExpanded, bool addDeviceExpanded)
+{
+    return settingsAddDeviceCardRect(localInfoExpanded, addDeviceExpanded).bottom() + 16;
+}
+
+int maxSettingsScrollOffset(bool localInfoExpanded, bool addDeviceExpanded)
+{
+    return qMax(0, settingsContentBottom(localInfoExpanded, addDeviceExpanded) - settingsScrollViewportRect().bottom());
+}
+
+QString localInfoLabelText(int index)
+{
+    switch (index) {
+    case 0: return zh("\xE8\xAE\xBE\xE5\xA4\x87\xE5\x90\x8D\xE7\xA7\xB0");
+    case 1: return QStringLiteral("IPv4");
+    case 2: return QStringLiteral("MAC");
+    case 3: return zh("\xE5\xB9\xBF\xE6\x92\xAD\xE5\x9C\xB0\xE5\x9D\x80");
+    case 4: return zh("\xE5\xAD\x90\xE7\xBD\x91\xE6\x8E\xA9\xE7\xA0\x81");
+    case 5: return zh("\xE9\xBB\x98\xE8\xAE\xA4\xE7\xBD\x91\xE5\x85\xB3");
+    default: return {};
+    }
+}
+
+QString localInfoValueText(const platform::DeviceInfo& info, int index)
+{
+    switch (index) {
+    case 0: return infoValueText(info.name);
+    case 1: return infoValueText(info.ip);
+    case 2: return infoValueText(info.mac);
+    case 3: return infoValueText(info.broadcastIp);
+    case 4: return infoValueText(info.subnetMask);
+    case 5: return infoValueText(info.gateway);
+    default: return QStringLiteral("--");
+    }
+}
+
+QRect deviceRowRect(int index) //设备行
+{
+    return QRect(4, kSidebarContentTop  + index * 40, 223, 36);
 }
 
 QRect visibleDeviceRowRect(int rowIndex)
 {
 // =====wjy====
-    QRect rowRect = deviceRowRect(rowIndex); // wjy: 先按原来的每行 40 像素计算基础位置。
-    if (rowIndex >= rootDeviceRowCount()) {
-        rowRect.translate(0, kDeviceGroupReservedBlankHeight); // wjy: 从第一个分组行开始整体下移，给无分组设备区域和分组区域之间留空白。
-    }
-    return rowRect;
+    return deviceRowRect(rowIndex); // wjy: 空白区改到列表最下面，设备和分组行按自然顺序连续排列。
 // ===end====
 }
 
@@ -925,7 +1094,7 @@ int maxDeviceListScrollOffset()
 QRect deviceListViewportRect(bool deviceGroupExpanded)
 {
 // =====wjy====
-    return QRect(0, deviceGroupHeaderRect().bottom() + 1, 236, visibleDeviceListViewportHeight(deviceGroupExpanded)); // wjy: “我的设备”标题下方的可滚动视口，绘制和鼠标命中都限制在这里。
+    return QRect(0, deviceGroupHeaderRect().top(), 236, visibleDeviceListViewportHeight(deviceGroupExpanded)); // wjy: 去掉“我的设备”标题后，设备和分组直接从原标题位置开始绘制和命中。
 // ===end====
 }
 
@@ -939,10 +1108,10 @@ QRect scrolledVisibleDeviceRowRect(int rowIndex, int scrollOffset)
 }
 
 //新增下方矩形计算公式
-QRect deviceGroupReservedBlankRect()
+QRect deviceGroupReservedBlankRect() //底部空白区
 {
 // =====wjy====
-    const int blankTop = 96 + rootDeviceRowCount() * 40; // wjy: 空白区固定排在无分组设备后面；没有无分组设备时，就紧贴“我的设备”标题下方。
+    const int blankTop = kSidebarContentTop  + visibleDeviceListRowCount() * 40; // wjy: 空白区固定放到所有设备和分组行后面，不再插在无分组设备与第一个分组之间。
     return QRect(4, blankTop, 232, kDeviceGroupReservedBlankHeight); // wjy: 这个空白区既能右键新建分组，也能作为拖回“无分组”的落点。
 // ===end====
 }
@@ -962,7 +1131,7 @@ QColor deviceStatusDotColor(platform::DevicePresenceState state)
     case platform::DevicePresenceState::Online:
         return QColor(QStringLiteral("#28D13B"));
     case platform::DevicePresenceState::Busy:
-        return QColor(QStringLiteral("#FFEC42"));
+        return QColor(QStringLiteral("#EF4444"));
     case platform::DevicePresenceState::Offline:
         return QColor(QStringLiteral("#B0B3B8"));
     case platform::DevicePresenceState::Unknown:
@@ -971,26 +1140,11 @@ QColor deviceStatusDotColor(platform::DevicePresenceState state)
     }
 }
 
-QPixmap deviceStatusBadgePixmap(platform::DevicePresenceState state)
+QSize deviceHeaderStatusBadgeSize(platform::DevicePresenceState state, bool poweringOn)
 {
-    if (state == platform::DevicePresenceState::Offline) {
-        return uupix(QStringLiteral("titlebar/device_status_offline.svg"));
-    }
-    if (state == platform::DevicePresenceState::Busy) {
-        return uupix(QStringLiteral("titlebar/device_status_busy.svg"));
-    }
-    return {};
-}
-
-QSize deviceStatusBadgeSize(platform::DevicePresenceState state)
-{
-    if (state == platform::DevicePresenceState::Offline) {
-        return QSize(60, 28);
-    }
-    if (state == platform::DevicePresenceState::Busy) {
-        return QSize(72, 28);
-    }
-    return QSize(52, 23);
+    Q_UNUSED(state)
+    Q_UNUSED(poweringOn)
+    return QSize(72, 28);
 }
 
 QString deviceStatusText(platform::DevicePresenceState state)
@@ -1006,6 +1160,39 @@ QString deviceStatusText(platform::DevicePresenceState state)
     default:
         return zh("\xE5\x9C\xA8\xE7\xBA\xBF");
     }
+}
+
+QString deviceHeaderStatusText(platform::DevicePresenceState state, bool poweringOn)
+{
+    if (state == platform::DevicePresenceState::Offline && poweringOn) {
+        return zh("\xE5\xBC\x80\xE6\x9C\xBA\xE4\xB8\xAD");
+    }
+    return deviceStatusText(state);
+}
+
+QColor deviceHeaderStatusBackground(platform::DevicePresenceState state, bool poweringOn)
+{
+    if (poweringOn) {
+        return QColor(QStringLiteral("#3A7BFC"));
+    }
+    if (state == platform::DevicePresenceState::Busy) {
+        return QColor(QStringLiteral("#EF4444"));
+    }
+    if (state == platform::DevicePresenceState::Offline || state == platform::DevicePresenceState::Unknown) {
+        return QColor(QStringLiteral("#606266"));
+    }
+    return QColor(QStringLiteral("#111111"));
+}
+
+QColor deviceHeaderStatusDotColor(platform::DevicePresenceState state, bool poweringOn)
+{
+    if (poweringOn || state == platform::DevicePresenceState::Busy) {
+        return QColor(QStringLiteral("#FFFFFF"));
+    }
+    if (state == platform::DevicePresenceState::Offline || state == platform::DevicePresenceState::Unknown) {
+        return QColor(QStringLiteral("#B0B3B8"));
+    }
+    return QColor(QStringLiteral("#19E58B"));
 }
 
 // =====wjy====
@@ -1299,50 +1486,46 @@ void drawDeviceDetail(
     BottomAction hoveredBottomAction,
     qreal yOffset,
     qreal opacity,
+    bool leftSidebarCollapsed,
     const QFont& textFont)
 {
+    Q_UNUSED(wakeRemainingSeconds)
+    Q_UNUSED(desktopHoverProgress)
+    Q_UNUSED(wakeVisualRotation)
+    Q_UNUSED(hoveredBottomAction)
     painter.save();
     painter.setOpacity(opacity);
     painter.translate(0, yOffset);
 
-    constexpr int headerGroupX = 280;
+    const int headerGroupX = deviceDetailHeaderX(leftSidebarCollapsed);
     constexpr int headerGroupGap = 8;
-    constexpr int headerGroupRight = 720;
+    const int headerGroupRight = deviceDetailHeaderRight(leftSidebarCollapsed);
     const bool offlineState = deviceState == platform::DevicePresenceState::Offline;
-    const bool showWakeButton = offlineState;
     const bool showWakeLoading = offlineState && poweringOn;
     const bool dimDetailContent = offlineState;
 
     QFont deviceTitle(QStringLiteral("Microsoft YaHei UI"));
     deviceTitle.setPixelSize(24);
     deviceTitle.setBold(true);
-    const QSize statusBadgeSize = deviceStatusBadgeSize(deviceState);
+    const QSize statusBadgeSize = deviceHeaderStatusBadgeSize(deviceState, showWakeLoading);
     const QRect statusRect(
         headerGroupX,
-        deviceState == platform::DevicePresenceState::Online ? 76 : 73,
+        73,
         statusBadgeSize.width(),
         statusBadgeSize.height());
-    if (deviceState == platform::DevicePresenceState::Online || deviceState == platform::DevicePresenceState::Unknown) {
-        painter.setPen(Qt::NoPen);
-        painter.setBrush(deviceState == platform::DevicePresenceState::Unknown
-                ? QColor(QStringLiteral("#606266"))
-                : QColor(QStringLiteral("#111111")));
-        painter.drawRoundedRect(QRectF(statusRect), statusRect.height() / 2.0, statusRect.height() / 2.0);
-        painter.setBrush(deviceState == platform::DevicePresenceState::Unknown
-                ? QColor(QStringLiteral("#B0B3B8"))
-                : QColor(QStringLiteral("#19E58B")));
-        painter.drawEllipse(QRectF(statusRect.x() + 8, statusRect.y() + 7.5, 8, 8));
-        QFont pillFont(QStringLiteral("Microsoft YaHei UI"));
-        pillFont.setPixelSize(12);
-        painter.setFont(pillFont);
-        painter.setPen(Qt::white);
-        painter.drawText(
-            QRectF(statusRect.x() + 22, statusRect.y() + 1, statusRect.width() - 24, statusRect.height() - 2),
-            Qt::AlignVCenter | Qt::AlignLeft,
-            deviceStatusText(deviceState));
-    } else {
-        painter.drawPixmap(statusRect, deviceStatusBadgePixmap(deviceState));
-    }
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(deviceHeaderStatusBackground(deviceState, showWakeLoading));
+    painter.drawRoundedRect(QRectF(statusRect), statusRect.height() / 2.0, statusRect.height() / 2.0);
+    painter.setBrush(deviceHeaderStatusDotColor(deviceState, showWakeLoading));
+    painter.drawEllipse(QRectF(statusRect.x() + 8, statusRect.y() + 10, 8, 8));
+    QFont pillFont(QStringLiteral("Microsoft YaHei UI"));
+    pillFont.setPixelSize(12);
+    painter.setFont(pillFont);
+    painter.setPen(Qt::white);
+    painter.drawText(
+        QRectF(statusRect.x() + 22, statusRect.y() + 1, statusRect.width() - 24, statusRect.height() - 2),
+        Qt::AlignVCenter | Qt::AlignLeft,
+        deviceHeaderStatusText(deviceState, showWakeLoading));
 
     const int nameX = statusRect.x() + statusRect.width() + headerGroupGap;
     painter.setFont(deviceTitle);
@@ -1389,10 +1572,17 @@ void drawDeviceDetail(
             zh("\xE6\x96\xAD\xE5\xBC\x80\xE6\x89\x80\xE6\x9C\x89\xE8\xBF\x9C\xE6\x8E\xA7"));
 
         cardTop = 189;
+        painter.restore();
+        return;
     }
 
     const QRectF card(kDeviceDetailCardLeft, cardTop, kDeviceDetailCardWidth, kDeviceDetailCardHeight); // wjy: 卡片高度由缩小后的蓝色桌面图高度自动计算。
     painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
+    Q_UNUSED(card)
+    painter.restore();
+    return;
+
+#if 0
     painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
     painter.drawRoundedRect(card, 4, 4);
 
@@ -1509,174 +1699,7 @@ void drawDeviceDetail(
     painter.drawText(QRectF(733, actionTop + 17, 30, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE6\x9B\xB4\xE5\xA4\x9A"));
 
     painter.restore();
-}
-
-void drawAddDevicePage(QPainter& painter, const QFont& textFont)
-{
-    QFont titleFont(QStringLiteral("Microsoft YaHei UI"));
-    titleFont.setPixelSize(24);
-    titleFont.setBold(true);
-    painter.setFont(titleFont);
-    painter.setPen(QColor(QStringLiteral("#040B18")));
-    painter.drawText(
-        QRectF(280, 75, 220, 32),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        zh("\xE6\x96\xB0\xE5\xA2\x9E\xE8\xAE\xBE\xE5\xA4\x87"));
-
-    const QRectF formCard(280, 124, 600, 278);
-    painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
-    painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
-    painter.drawRoundedRect(formCard, 4, 4);
-
-    QFont sectionFont(QStringLiteral("Microsoft YaHei UI"));
-    sectionFont.setPixelSize(14);
-    sectionFont.setBold(true);
-    painter.setFont(sectionFont);
-    painter.setPen(QColor(QStringLiteral("#040B18")));
-    painter.drawText(
-        QRectF(304, 144, 120, 20),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        zh("\xE8\xAE\xBE\xE5\xA4\x87\xE4\xBF\xA1\xE6\x81\xAF"));
-
-    painter.setFont(textFont);
-    painter.setPen(QColor(QStringLiteral("#687384")));
-    painter.drawText(
-        QRectF(304, 168, 360, 18),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        zh("\xE6\xB7\xBB\xE5\x8A\xA0\xE5\x90\x8E\xE5\x8F\xAF\xE4\xBB\xA5\xE5\x9C\xA8\xE5\xB7\xA6\xE4\xBE\xA7\xE8\xAE\xBE\xE5\xA4\x87\xE5\x88\x97\xE8\xA1\xA8\xE4\xB8\xAD\xE6\x89\xBE\xE5\x88\xB0\xE5\xAE\x83"));
-
-    painter.setPen(QPen(QColor(QStringLiteral("#EEF1F5")), 1));
-    painter.drawLine(280, 202, 880, 202);
-
-    painter.setFont(textFont);
-    painter.setPen(QColor(QStringLiteral("#687384")));
-    painter.drawText(
-        QRectF(304, 226, 120, 18),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        zh("\xE7\x9B\xAE\xE6\xA0\x87\xE6\x9C\xBA\xE5\x99\xA8IP"));
-    painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
-    painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
-    painter.drawRoundedRect(QRectF(304, 250, 252, 34), 4, 4);
-    painter.setFont(textFont);
-    painter.setPen(QColor(QStringLiteral("#A0A8B3")));
-    painter.drawText(
-        QRectF(318, 250, 210, 34),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        QStringLiteral("192.168.1.100"));
-
-    painter.setPen(QColor(QStringLiteral("#687384")));
-    painter.drawText(
-        QRectF(584, 226, 120, 18),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        zh("\xE8\xAE\xBE\xE5\xA4\x87\xE5\x90\x8D\xE7\xA7\xB0"));
-    painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
-    painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
-    painter.drawRoundedRect(QRectF(584, 250, 252, 34), 4, 4);
-    painter.setPen(QColor(QStringLiteral("#A0A8B3")));
-    painter.drawText(
-        QRectF(598, 250, 210, 34),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        zh("\xE4\xBE\x8B\xE5\xA6\x82\xEF\xBC\x9A\xE5\x8A\x9E\xE5\x85\xAC\xE5\xAE\xA4\xE4\xB8\xBB\xE6\x9C\xBA"));
-
-    painter.setPen(QColor(QStringLiteral("#687384")));
-    painter.drawText(
-        QRectF(304, 308, 120, 18),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        QStringLiteral("MAC"));
-    painter.setPen(QColor(QStringLiteral("#687384")));
-    painter.drawText(
-        QRectF(584, 308, 120, 18),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        zh("\xE5\xA4\x87\xE6\xB3\xA8"));
-    painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
-    painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
-    painter.drawRoundedRect(QRectF(304, 332, 252, 34), 4, 4);
-    painter.drawRoundedRect(QRectF(584, 332, 252, 34), 4, 4);
-    painter.setPen(QColor(QStringLiteral("#A0A8B3")));
-    painter.drawText(
-        QRectF(318, 332, 210, 34),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        zh("\xE5\x8F\xAF\xE9\x80\x89"));
-    painter.drawText(
-        QRectF(598, 332, 210, 34),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        zh("\xE5\x8F\xAF\xE9\x80\x89"));
-
-    painter.setPen(Qt::NoPen);
-    painter.setBrush(QColor(QStringLiteral("#3A7BFC")));
-    painter.drawRoundedRect(QRectF(712, 424, 124, 34), 4, 4);
-    painter.setFont(textFont);
-    painter.setPen(Qt::white);
-    painter.drawText(QRectF(712, 424, 124, 34), Qt::AlignCenter, zh("\xE4\xBF\x9D\xE5\xAD\x98"));
-
-    painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
-    painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
-    painter.drawRoundedRect(QRectF(572, 424, 124, 34), 4, 4);
-    painter.setFont(textFont);
-    painter.setPen(QColor(QStringLiteral("#040B18")));
-    painter.drawText(QRectF(572, 424, 124, 34), Qt::AlignCenter, zh("\xE5\x8F\x96\xE6\xB6\x88"));
-}
-
-void drawLocalDeviceInfoPage(QPainter& painter, const QFont& textFont, const platform::DeviceInfo& info)
-{
-    QFont titleFont(QStringLiteral("Microsoft YaHei UI"));
-    titleFont.setPixelSize(24);
-    titleFont.setBold(true);
-    painter.setFont(titleFont);
-    painter.setPen(QColor(QStringLiteral("#040B18")));
-    painter.drawText(
-        QRectF(280, 75, 220, 32),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        zh("\xE6\x9C\xAC\xE6\x9C\xBA\xE4\xBF\xA1\xE6\x81\xAF"));
-
-    const QRectF infoCard(280, 124, 600, 360);
-    painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
-    painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
-    painter.drawRoundedRect(infoCard, 4, 4);
-
-    QFont sectionFont(QStringLiteral("Microsoft YaHei UI"));
-    sectionFont.setPixelSize(14);
-    sectionFont.setBold(true);
-    painter.setFont(sectionFont);
-    painter.setPen(QColor(QStringLiteral("#040B18")));
-    painter.drawText(
-        QRectF(304, 144, 120, 20),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        zh("\xE5\xBD\x93\xE5\x89\x8D\xE8\xAE\xBE\xE5\xA4\x87"));
-
-    painter.setFont(textFont);
-    painter.setPen(QColor(QStringLiteral("#687384")));
-    painter.drawText(
-        QRectF(304, 168, 420, 18),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        zh("\xE8\x87\xAA\xE5\x8A\xA8\xE8\xAF\xBB\xE5\x8F\x96\xE5\xBD\x93\xE5\x89\x8D\xE5\xB1\x80\xE5\x9F\x9F\xE7\xBD\x91\xE7\xBD\x91\xE5\x8D\xA1\xE4\xBF\xA1\xE6\x81\xAF"));
-
-    painter.setPen(QPen(QColor(QStringLiteral("#EEF1F5")), 1));
-    painter.drawLine(280, 202, 880, 202);
-
-    painter.setFont(textFont);
-    painter.setPen(QColor(QStringLiteral("#687384")));
-    painter.drawText(QRectF(304, 226, 120, 18), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE8\xAE\xBE\xE5\xA4\x87\xE5\x90\x8D\xE7\xA7\xB0"));
-    painter.drawText(QRectF(584, 226, 120, 18), Qt::AlignVCenter | Qt::AlignLeft, QStringLiteral("IPv4"));
-    painter.drawText(QRectF(304, 308, 120, 18), Qt::AlignVCenter | Qt::AlignLeft, QStringLiteral("MAC"));
-    painter.drawText(QRectF(584, 308, 120, 18), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE5\xB9\xBF\xE6\x92\xAD\xE5\x9C\xB0\xE5\x9D\x80"));
-    painter.drawText(QRectF(304, 390, 120, 18), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE5\xAD\x90\xE7\xBD\x91\xE6\x8E\xA9\xE7\xA0\x81"));
-    painter.drawText(QRectF(584, 390, 120, 18), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE9\xBB\x98\xE8\xAE\xA4\xE7\xBD\x91\xE5\x85\xB3"));
-
-    painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
-    painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
-    for (int i = 0; i < 6; ++i) {
-        painter.drawRoundedRect(QRectF(localInfoFieldRect(i)), 4, 4);
-    }
-
-    painter.setFont(textFont);
-    painter.setPen(QColor(QStringLiteral("#040B18")));
-    painter.drawText(localInfoFieldRect(0).adjusted(14, 0, -12, 0), Qt::AlignVCenter | Qt::AlignLeft, infoValueText(info.name));
-    painter.drawText(localInfoFieldRect(1).adjusted(14, 0, -12, 0), Qt::AlignVCenter | Qt::AlignLeft, infoValueText(info.ip));
-    painter.drawText(localInfoFieldRect(2).adjusted(14, 0, -12, 0), Qt::AlignVCenter | Qt::AlignLeft, infoValueText(info.mac));
-    painter.drawText(localInfoFieldRect(3).adjusted(14, 0, -12, 0), Qt::AlignVCenter | Qt::AlignLeft, infoValueText(info.broadcastIp));
-    painter.drawText(localInfoFieldRect(4).adjusted(14, 0, -12, 0), Qt::AlignVCenter | Qt::AlignLeft, infoValueText(info.subnetMask));
-    painter.drawText(localInfoFieldRect(5).adjusted(14, 0, -12, 0), Qt::AlignVCenter | Qt::AlignLeft, infoValueText(info.gateway));
+#endif
 }
 
 void drawSettingsSwitch(QPainter& painter, int x, int y, bool checked)
@@ -1712,6 +1735,11 @@ QRect settingsAutoRefreshSwitchRect()
     return QRect(780, 368, 82, 32);
 }
 
+QRect settingsStatusRefreshIntervalInputRect()
+{
+    return QRect(654, 364, 112, 32);
+}
+
 QRect settingsBatchSubnetInputRect()
 {
     return QRect(596, 448, 140, 32);
@@ -1728,7 +1756,11 @@ void drawSettingsPage(
     bool autoRunEnabled,
     bool remoteWakeupEnabled,
     bool preventSleepEnabled,
-    bool statusAutoRefreshEnabled)
+    bool statusAutoRefreshEnabled,
+    bool localInfoExpanded,
+    bool addDeviceExpanded,
+    const platform::DeviceInfo& localInfo,
+    int settingsScrollOffset)
 {
     QFont titleFont(QStringLiteral("Microsoft YaHei UI"));
     titleFont.setPixelSize(24);
@@ -1745,18 +1777,31 @@ void drawSettingsPage(
     painter.setPen(QColor(QStringLiteral("#040B18")));
     painter.drawText(QRectF(330, 78, 40, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE9\x94\xAE\xE7\x9B\x98"));
 
+    painter.save();
+    painter.setClipRect(settingsScrollViewportRect());
+    painter.translate(0, -settingsScrollOffset);
+
     painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
     painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
     painter.drawRoundedRect(QRectF(270.5, 120.5, 599, 143), 4, 4);
     painter.drawRoundedRect(QRectF(270.5, 268.5, 599, 71), 4, 4);
     painter.drawRoundedRect(QRectF(270.5, 344.5, 599, 71), 4, 4);
     painter.drawRoundedRect(QRectF(270.5, 420.5, 599, 88), 4, 4);
+    painter.drawRoundedRect(QRectF(settingsLocalInfoCardRect(localInfoExpanded)).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
     painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
     painter.drawLine(QPointF(270, 192.5), QPointF(870, 192.5));
+    if (localInfoExpanded) {
+        painter.drawLine(QPointF(270, 563.5), QPointF(870, 563.5));
+    }
 
     drawResourceIcon(painter, QRect(289, 144, 24, 24), QStringLiteral("settings/auto_run.svg"));
     drawResourceIcon(painter, QRect(289, 290, 24, 24), QStringLiteral("settings/prevent_sleep.svg"));
     drawDeviceTileIcon(painter, 291, 450, 20);
+    drawDeviceTileIcon(painter, 291, 532, 20);
+    drawUiIcon(
+        painter,
+        QRect(832, 530, 24, 24),
+        localInfoExpanded ? QStringLiteral("chevron_up.svg") : QStringLiteral("chevron_down.svg"));
 
     painter.setFont(textFont);
     painter.setPen(QColor(QStringLiteral("#040B18")));
@@ -1765,6 +1810,7 @@ void drawSettingsPage(
     painter.drawText(QRectF(330, 284, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE9\x98\xB2\xE6\xAD\xA2\xE7\x94\xB5\xE8\x84\x91\xE4\xBC\x91\xE7\x9C\xA0"));
     painter.drawText(QRectF(330, 360, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE5\x88\x97\xE8\xA1\xA8\xE8\x87\xAA\xE5\x8A\xA8\xE5\x88\xB7\xE6\x96\xB0"));
     painter.drawText(QRectF(330, 444, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QStringLiteral("批量新增设备"));
+    painter.drawText(QRectF(330, 532, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE6\x9C\xAC\xE6\x9C\xBA\xE4\xBF\xA1\xE6\x81\xAF"));
 
     QFont subFont(QStringLiteral("Microsoft YaHei UI"));
     subFont.setPixelSize(12);
@@ -1786,6 +1832,107 @@ void drawSettingsPage(
     drawSettingsSwitch(painter, 815, 218, remoteWakeupEnabled);
     drawSettingsSwitch(painter, 815, 295, preventSleepEnabled);
     drawSettingsSwitch(painter, 815, 370, statusAutoRefreshEnabled);
+
+    if (localInfoExpanded) {
+        QFont localLabelFont(QStringLiteral("Microsoft YaHei UI"));
+        localLabelFont.setPixelSize(12);
+        painter.setFont(localLabelFont);
+        painter.setPen(QColor(QStringLiteral("#687384")));
+        for (int i = 0; i < 6; ++i) {
+            painter.drawText(QRectF(localInfoLabelRect(i)), Qt::AlignVCenter | Qt::AlignLeft, localInfoLabelText(i));
+        }
+
+        painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
+        painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
+        for (int i = 0; i < 6; ++i) {
+            painter.drawRoundedRect(QRectF(localInfoFieldRect(i)), 4, 4);
+        }
+
+        painter.setFont(localLabelFont);
+        painter.setPen(QColor(QStringLiteral("#040B18")));
+        for (int i = 0; i < 6; ++i) {
+            painter.drawText(
+                localInfoFieldRect(i).adjusted(8, 0, -8, 0),
+                Qt::AlignVCenter | Qt::AlignLeft,
+                localInfoValueText(localInfo, i));
+        }
+    }
+
+    const QRect addCard = settingsAddDeviceCardRect(localInfoExpanded, addDeviceExpanded);
+    painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
+    painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
+    painter.drawRoundedRect(QRectF(addCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
+    if (addDeviceExpanded) {
+        painter.drawLine(QPointF(addCard.left(), addCard.y() + 43.5), QPointF(addCard.right(), addCard.y() + 43.5));
+    }
+
+    drawDeviceTileIcon(painter, 291, addCard.y() + 12, 20);
+    drawUiIcon(
+        painter,
+        QRect(832, addCard.y() + 10, 24, 24),
+        addDeviceExpanded ? QStringLiteral("chevron_up.svg") : QStringLiteral("chevron_down.svg"));
+    painter.setFont(textFont);
+    painter.setPen(QColor(QStringLiteral("#040B18")));
+    painter.drawText(
+        QRectF(330, addCard.y() + 12, 180, 20),
+        Qt::AlignVCenter | Qt::AlignLeft,
+        zh("\xE6\x96\xB0\xE5\xA2\x9E\xE8\xAE\xBE\xE5\xA4\x87"));
+
+    if (addDeviceExpanded) {
+
+    QFont sectionFont(QStringLiteral("Microsoft YaHei UI"));
+    sectionFont.setPixelSize(14);
+    sectionFont.setBold(true);
+    painter.setFont(sectionFont);
+    painter.setPen(QColor(QStringLiteral("#040B18")));
+    painter.drawText(
+        QRectF(304, addCard.y() + 60, 120, 20),
+        Qt::AlignVCenter | Qt::AlignLeft,
+        zh("\xE8\xAE\xBE\xE5\xA4\x87\xE4\xBF\xA1\xE6\x81\xAF"));
+
+    painter.setFont(textFont);
+    painter.setPen(QColor(QStringLiteral("#687384")));
+    painter.drawText(
+        QRectF(304, addCard.y() + 84, 360, 18),
+        Qt::AlignVCenter | Qt::AlignLeft,
+        zh("\xE6\xB7\xBB\xE5\x8A\xA0\xE5\x90\x8E\xE5\x8F\xAF\xE4\xBB\xA5\xE5\x9C\xA8\xE5\xB7\xA6\xE4\xBE\xA7\xE8\xAE\xBE\xE5\xA4\x87\xE5\x88\x97\xE8\xA1\xA8\xE4\xB8\xAD\xE6\x89\xBE\xE5\x88\xB0\xE5\xAE\x83"));
+
+    painter.setPen(QPen(QColor(QStringLiteral("#EEF1F5")), 1));
+    painter.drawLine(addCard.left(), addCard.y() + 112, addCard.right(), addCard.y() + 112);
+
+    painter.setFont(textFont);
+    painter.setPen(QColor(QStringLiteral("#687384")));
+    painter.drawText(QRectF(304, addCard.y() + 136, 120, 18), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE7\x9B\xAE\xE6\xA0\x87\xE6\x9C\xBA\xE5\x99\xA8IP"));
+    painter.drawText(QRectF(584, addCard.y() + 136, 120, 18), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE8\xAE\xBE\xE5\xA4\x87\xE5\x90\x8D\xE7\xA7\xB0"));
+    painter.drawText(QRectF(304, addCard.y() + 218, 120, 18), Qt::AlignVCenter | Qt::AlignLeft, QStringLiteral("MAC"));
+    painter.drawText(QRectF(584, addCard.y() + 218, 120, 18), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE5\xA4\x87\xE6\xB3\xA8"));
+
+    painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
+    painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
+    painter.drawRoundedRect(QRectF(settingsAddDeviceIpEditRect(localInfoExpanded)), 4, 4);
+    painter.drawRoundedRect(QRectF(settingsAddDeviceNameEditRect(localInfoExpanded)), 4, 4);
+    painter.drawRoundedRect(QRectF(settingsAddDeviceMacEditRect(localInfoExpanded)), 4, 4);
+    painter.drawRoundedRect(QRectF(settingsAddDeviceRemarkEditRect(localInfoExpanded)), 4, 4);
+
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(QColor(QStringLiteral("#3A7BFC")));
+    painter.drawRoundedRect(QRectF(settingsAddDeviceSaveButtonRect(localInfoExpanded)), 4, 4);
+    painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
+    painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
+    painter.drawRoundedRect(QRectF(settingsAddDeviceCancelButtonRect(localInfoExpanded)), 4, 4);
+    }
+
+    painter.restore();
+
+    const int maxScrollOffset = maxSettingsScrollOffset(localInfoExpanded, addDeviceExpanded);
+    if (maxScrollOffset > 0) {
+        const QRect track = settingsVerticalScrollbarTrackRect();
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(QStringLiteral("#E5EAF1")));
+        painter.drawRoundedRect(QRectF(track), 2.5, 2.5);
+        painter.setBrush(QColor(QStringLiteral("#AAB3C0")));
+        painter.drawRoundedRect(QRectF(settingsVerticalScrollbarThumbRect(settingsScrollOffset, maxScrollOffset)), 2.5, 2.5);
+    }
 }
 
 } // namespace
@@ -1819,7 +1966,10 @@ DeviceGrid::DeviceGrid(QWidget* parent)
     loadDevices(); // wjy: 恢复读取已保存设备和分组，避免每次启动都丢失设备列表。
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] defer DeviceInfoService::local")); // wjy: Release 堆损坏诊断：构造函数里先不读取网卡信息，避免窗口创建阶段触发 GetAdaptersAddresses。
     if (g_devices.isEmpty()) {
-        m_remoteAssistSelected = true;
+        m_settingsSelected = true;
+        m_remoteAssistSelected = false;
+        m_settingsAddDeviceExpanded = true;
+        m_settingsScrollOffset = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
 
         m_selectedDeviceIndexes.clear();
         m_selectionAnchorDeviceIndex = -1;
@@ -1943,7 +2093,7 @@ DeviceGrid::DeviceGrid(QWidget* parent)
 
         for (auto it = m_poweringOnDeviceIps.begin(); it != m_poweringOnDeviceIps.end();) {
             const qint64 startedAtMs = m_poweringOnStartedAtMs.value(*it, 0);
-            if (startedAtMs > 0 && QDateTime::currentMSecsSinceEpoch() - startedAtMs >= 40000) {
+            if (startedAtMs > 0 && QDateTime::currentMSecsSinceEpoch() - startedAtMs >= 80000) {
                 m_poweringOnStartedAtMs.remove(*it);
                 it = m_poweringOnDeviceIps.erase(it);
             } else {
@@ -2761,15 +2911,37 @@ void DeviceGrid::updateAddDeviceControls()
         return; // wjy: 没有新增设备控件时直接跳过显隐/可用状态刷新，避免空指针崩溃干扰堆损坏定位。
     }
 
-    const bool addPageVisible = m_remoteAssistSelected && !m_localInfoSelected && !m_settingsSelected;
-    m_deviceIpEdit->setVisible(addPageVisible);
-    m_deviceNameEdit->setVisible(addPageVisible);
-    m_deviceMacEdit->setVisible(addPageVisible);
-    m_deviceRemarkEdit->setVisible(addPageVisible);
-    m_saveDeviceButton->setVisible(addPageVisible);
-    m_cancelDeviceButton->setVisible(addPageVisible);
+    m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded));
+    const QRect viewport = settingsScrollViewportRect();
+    const QRect ipRect = settingsScrolledRect(settingsAddDeviceIpEditRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset);
+    const QRect nameRect = settingsScrolledRect(settingsAddDeviceNameEditRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset);
+    const QRect macRect = settingsScrolledRect(settingsAddDeviceMacEditRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset);
+    const QRect remarkRect = settingsScrolledRect(settingsAddDeviceRemarkEditRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset);
+    const QRect saveRect = settingsScrolledRect(settingsAddDeviceSaveButtonRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset);
+    const QRect cancelRect = settingsScrolledRect(settingsAddDeviceCancelButtonRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset);
+    const bool addPageVisible = m_settingsSelected && m_settingsAddDeviceExpanded && !m_localInfoSelected;
+    m_deviceIpEdit->setGeometry(ipRect);
+    m_deviceNameEdit->setGeometry(nameRect);
+    m_deviceMacEdit->setGeometry(macRect);
+    m_deviceRemarkEdit->setGeometry(remarkRect);
+    m_saveDeviceButton->setGeometry(saveRect);
+    m_cancelDeviceButton->setGeometry(cancelRect);
+    m_deviceIpEdit->setVisible(addPageVisible && viewport.contains(ipRect));
+    m_deviceNameEdit->setVisible(addPageVisible && viewport.contains(nameRect));
+    m_deviceMacEdit->setVisible(addPageVisible && viewport.contains(macRect));
+    m_deviceRemarkEdit->setVisible(addPageVisible && viewport.contains(remarkRect));
+    m_saveDeviceButton->setVisible(addPageVisible && viewport.contains(saveRect));
+    m_cancelDeviceButton->setVisible(addPageVisible && viewport.contains(cancelRect));
 
     m_saveDeviceButton->setEnabled(!m_deviceIpEdit->text().trimmed().isEmpty());
+    if (addPageVisible) {
+        m_deviceIpEdit->raise();
+        m_deviceNameEdit->raise();
+        m_deviceMacEdit->raise();
+        m_deviceRemarkEdit->raise();
+        m_cancelDeviceButton->raise();
+        m_saveDeviceButton->raise();
+    }
 }
 
 void DeviceGrid::setupLocalInfoControls()
@@ -2806,10 +2978,18 @@ void DeviceGrid::setupLocalInfoControls()
 
 void DeviceGrid::updateLocalInfoControls()
 {
-    const bool visible = m_localInfoSelected;
-    for (QPushButton* button : m_localInfoCopyButtons) {
+    m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded));
+    const QRect viewport = settingsScrollViewportRect();
+    const bool visible = m_settingsSelected && m_settingsLocalInfoExpanded;
+    for (int i = 0; i < m_localInfoCopyButtons.size(); ++i) {
+        QPushButton* button = m_localInfoCopyButtons.at(i);
         if (button) {
-            button->setVisible(visible);
+            const QRect buttonRect = settingsScrolledRect(localInfoCopyButtonRect(i), m_settingsScrollOffset);
+            button->setGeometry(buttonRect);
+            button->setVisible(visible && viewport.contains(buttonRect));
+            if (button->isVisible()) {
+                button->raise();
+            }
         }
     }
 }
@@ -2825,9 +3005,14 @@ void DeviceGrid::updateSettingsControls()
         return;
     }
 // =====wjy====
+    m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded));
+    const QRect viewport = settingsScrollViewportRect();
+    const QRect intervalRect = settingsScrolledRect(settingsStatusRefreshIntervalInputRect(), m_settingsScrollOffset);
     const bool visible =
         m_settingsSelected
-        && m_statusAutoRefreshEnabled; // wjy: 自动刷新关闭时隐藏秒数输入框；打开后才显示，避免设置页出现无效输入区域。
+        && m_statusAutoRefreshEnabled
+        && viewport.contains(intervalRect); // wjy: 自动刷新关闭或滚出设置页视口时隐藏真实输入框，避免控件漂在固定标题上。
+    m_statusRefreshIntervalEdit->setGeometry(intervalRect);
     m_statusRefreshIntervalEdit->setVisible(visible);
     m_statusRefreshIntervalEdit->setEnabled(m_statusAutoRefreshEnabled);
     if (visible) {
@@ -2835,14 +3020,20 @@ void DeviceGrid::updateSettingsControls()
     }
 
     if (m_batchSubnetEdit && m_batchAddButton) {
+        const QRect batchEditRect = settingsScrolledRect(settingsBatchSubnetInputRect(), m_settingsScrollOffset);
+        const QRect batchButtonRect = settingsScrolledRect(settingsBatchAddButtonRect(), m_settingsScrollOffset);
         const bool batchVisible = m_settingsSelected; // wjy: 批量新增属于设置页功能，离开设置页时隐藏真实控件。
-        m_batchSubnetEdit->setVisible(batchVisible);
-        m_batchAddButton->setVisible(batchVisible);
+        m_batchSubnetEdit->setGeometry(batchEditRect);
+        m_batchAddButton->setGeometry(batchButtonRect);
+        m_batchSubnetEdit->setVisible(batchVisible && viewport.contains(batchEditRect));
+        m_batchAddButton->setVisible(batchVisible && viewport.contains(batchButtonRect));
         m_batchSubnetEdit->setEnabled(batchVisible && !m_batchAddInProgress);
         m_batchAddButton->setEnabled(batchVisible && !m_batchAddInProgress);
         m_batchAddButton->setText(m_batchAddInProgress ? QStringLiteral("扫描中") : QStringLiteral("批量新增"));
-        if (batchVisible) {
+        if (m_batchSubnetEdit->isVisible()) {
             m_batchSubnetEdit->raise();
+        }
+        if (m_batchAddButton->isVisible()) {
             m_batchAddButton->raise();
         }
     }
@@ -3060,7 +3251,7 @@ void DeviceGrid::beginDeviceGroupRename(int groupIndex)
 
     const QRect rowRect = scrolledVisibleDeviceRowRect(rowIndex, m_deviceListScrollOffset); // wjy: 复用分组滚动后的可见行矩形，让输入框贴在当前屏幕位置。
     m_renamingDeviceGroupIndex = groupIndex; // wjy: 记录正在编辑的分组，绘制时隐藏底层文字。
-    m_deviceGroupNameEdit->setGeometry(QRect(56, rowRect.y() + 5, 136, 26)); // wjy: 输入框覆盖分组文字区域，不挡住右侧箭头。
+    m_deviceGroupNameEdit->setGeometry(QRect(20, rowRect.y() + 5, 136, 26)); // wjy: 输入框覆盖分组文字区域，不挡住右侧箭头。
     m_deviceGroupNameEdit->setText(g_deviceGroupNames.at(groupIndex)); // wjy: 把当前分组名放进输入框，方便直接修改。
     m_deviceGroupNameEdit->selectAll(); // wjy: 双击后默认全选，用户可以直接输入新名字覆盖。
     m_deviceGroupNameEdit->show();
@@ -3142,6 +3333,8 @@ void DeviceGrid::saveNewDevice()
 
     m_remoteAssistSelected = false;
     m_localInfoSelected = false;
+    m_settingsSelected = false;
+    m_settingsScrollOffset = 0;
     m_deviceGroupExpanded = true;
     setDesktopHoverActive(false);
     clearBottomActionHover();
@@ -3218,12 +3411,12 @@ int DeviceGrid::devicePoweringOnRemainingSecondsForIndex(int index) const
     const QString ip = g_devices.at(index).ip.trimmed();
     const qint64 startedAtMs = m_poweringOnStartedAtMs.value(ip, 0);
     if (startedAtMs <= 0) {
-        return 40;
+        return 80;
     }
 
     const qint64 elapsedMs = qMax<qint64>(0, QDateTime::currentMSecsSinceEpoch() - startedAtMs);
     const int elapsedSeconds = static_cast<int>(elapsedMs / 1000);
-    return qMax(0, 40 - elapsedSeconds);
+    return qMax(0, 80 - elapsedSeconds);
 }
 
 void DeviceGrid::refreshDeviceStatuses()
@@ -3983,10 +4176,32 @@ void DeviceGrid::openRemoteDesktopWindow()
         return;
     }
 
+    const QString deviceIp = g_devices.at(m_selectedDeviceIndex).ip.trimmed();
+    if (deviceIp.isEmpty()) {
+        return;
+    }
+    QPointer<RemoteDesktopWindow> existingWindow = m_remoteDesktopWindows.value(deviceIp);
+    if (existingWindow && !existingWindow->isClosingConnection()) {
+        if (existingWindow->isMinimized()) {
+            existingWindow->showNormal();
+        }
+        existingWindow->show();
+        existingWindow->raise();
+        existingWindow->activateWindow();
+        return;
+    }
+    m_remoteDesktopWindows.remove(deviceIp);
+
     auto* remoteWindow = new RemoteDesktopWindow(
         deviceDisplayName(g_devices.at(m_selectedDeviceIndex)),
-        g_devices.at(m_selectedDeviceIndex).ip);
-    remoteWindow->move(window()->frameGeometry().topLeft() + QPoint(42, 24));
+        deviceIp);
+    m_remoteDesktopWindows.insert(deviceIp, remoteWindow);
+    connect(remoteWindow, &QObject::destroyed, this, [this, deviceIp] {
+        m_remoteDesktopWindows.remove(deviceIp);
+    });
+    if (!platform::AppSettings::hasRemoteDesktopWindowGeometry(deviceIp)) {
+        remoteWindow->move(window()->frameGeometry().topLeft() + QPoint(42, 24));
+    }
     remoteWindow->show();
 }
 
@@ -4054,6 +4269,7 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
         auto* remoteWindow = new RemoteDesktopWindow(
             deviceDisplayName(g_devices.at(deviceIndex)),
             g_devices.at(deviceIndex).ip); // wjy: 复用现有远程桌面窗口，每台设备各自启动自己的 viewer 连接。
+        remoteWindow->setRememberGeometryEnabled(false);
         m_tiledRemoteWindows.append(remoteWindow); // wjy: 记录本次平铺创建的窗口，下一次设备平铺前统一关闭并重排。
         remoteWindow->setMinimumSize(240, 180); // wjy: 平铺模式允许窗口小于普通远程桌面的默认最小尺寸，确保 3x3 时能尽量塞进屏幕可用区域。
         remoteWindow->setGeometry(targetRect); // wjy: 按网格设置窗口位置和大小，形成 2x2、3x3 等平铺效果。
@@ -4220,7 +4436,10 @@ void DeviceGrid::deleteCurrentDevice()
             m_selectionAnchorDeviceIndex = -1;
             m_currentDeviceName.clear();
             m_previousDeviceName.clear();
-            m_remoteAssistSelected = true;
+            m_settingsSelected = true;
+            m_remoteAssistSelected = false;
+            m_settingsAddDeviceExpanded = true;
+            m_settingsScrollOffset = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
             updateAddDeviceControls();
             updateLocalInfoControls();
             updateSettingsControls();
@@ -4491,18 +4710,22 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
     painter.setRenderHint(QPainter::SmoothPixmapTransform);
 
     painter.fillRect(rect(), QColor(QStringLiteral("#F8FAFC")));
-    painter.fillRect(QRectF(0, 0, 920, 48), QColor(QStringLiteral("#EEF3F7")));
-    painter.fillRect(QRectF(0, 48, 240, 632), QColor(QStringLiteral("#EEF3F7")));
+    painter.fillRect(QRectF(0, 0, 920, kTitleBarHeight), QColor(QStringLiteral("#EEF3F7"))); //标题栏
+    if (!m_leftSidebarCollapsed) {
+        painter.fillRect(QRectF(0, kTitleBarHeight, 240, 680-kTitleBarHeight), QColor(QStringLiteral("#EEF3F7")));
+    }
 
     painter.setPen(QPen(QColor(QStringLiteral("#BFC7D1")), 1));
     painter.setBrush(Qt::NoBrush);
     painter.drawRoundedRect(QRectF(0.5, 0.5, 919, 679), 6, 6);
     painter.setPen(QPen(QColor(QStringLiteral("#D8DEE5")), 1));
-    painter.drawLine(240, 48, 240, 680);
+    if (!m_leftSidebarCollapsed) { //分割线
+        painter.drawLine(240, kTitleBarHeight, 240, 680);
+    }
 
     painter.drawPixmap(QRect(18, 15, 116, 18), uupix(QStringLiteral("titlebar/title_wordmark.png")));
 
-    const QRect refreshIconRect(798, 13, 28, 22);
+    const QRect refreshIconRect(798, 5, 28, 22);//刷新位置
     painter.save();
     painter.translate(refreshIconRect.center());
     painter.rotate(m_refreshRotation);
@@ -4511,28 +4734,56 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
     painter.restore();
     painter.setPen(QPen(QColor(QStringLiteral("#D8DEE5")), 1));
     painter.drawLine(QPointF(835.5, 16), QPointF(835.5, 32));
-    drawUiIcon(painter, QRect(848, 13, 24, 24), QStringLiteral("minimize.svg"));
-    drawUiIcon(painter, QRect(897, 19, 10, 10), QStringLiteral("close.svg"));
+    drawUiIcon(painter, QRect(848, 5, 24, 24), QStringLiteral("minimize.svg")); //最小化位置
+    drawUiIcon(painter, QRect(897, 10, 10, 10), QStringLiteral("close.svg"));
 
-    drawUiIcon(painter, QRect(17, 68, 20, 20), QStringLiteral("device_group.svg"));
     QFont textFont(QStringLiteral("Microsoft YaHei UI"));
     textFont.setPixelSize(14);
-    painter.setFont(textFont);
-    painter.setPen(QColor(QStringLiteral("#040B18")));
-    painter.drawText(QRectF(43, 66, 72, 20), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE6\x88\x91\xE7\x9A\x84\xE8\xAE\xBE\xE5\xA4\x87"));
-    drawUiIcon(
-        painter,
-        QRect(203, 64, 24, 20),
-        m_deviceGroupExpanded ? QStringLiteral("chevron_up.svg") : QStringLiteral("chevron_down.svg"));
 
 // =====wjy====
-    m_deviceListScrollOffset = qBound(0, m_deviceListScrollOffset, maxDeviceListScrollOffset()); // wjy: 每次绘制前校正滚动偏移，避免删除设备或折叠分组后停在无效滚动位置。
-    const QVector<DeviceListRow> deviceRows = visibleDeviceRows(); // wjy: 左侧列表改为按“真实可见行”绘制，设备和分组的顺序由分组数据统一决定。
     const QSet<int> badges = deviceBadgeIndexes(); // wjy: 远程控制角标仍然按真实设备下标判断，避免分组行影响设备下标。
-    const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: “我的设备”内部滚动视口，设备和分组只能画在这个范围内。
-    if (m_deviceGroupExpanded) {
+    if (!m_leftSidebarCollapsed) {
+        m_deviceListScrollOffset = qBound(0, m_deviceListScrollOffset, maxDeviceListScrollOffset()); // wjy: 每次绘制前校正滚动偏移，避免删除设备或折叠分组后停在无效滚动位置。
+        const QVector<DeviceListRow> deviceRows = visibleDeviceRows(); // wjy: 左侧列表改为按“真实可见行”绘制，设备和分组的顺序由分组数据统一决定。
+        const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: “我的设备”内部滚动视口，设备和分组只能画在这个范围内。
+        if (m_deviceGroupExpanded) {
         painter.save();
         painter.setClipRect(deviceListClip); // wjy: 内容超出视口时直接裁掉，避免设备行压到下面的设备管理区域。
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(QStringLiteral("#E8EDF3")));
+        for (int rowIndex = 0; rowIndex < deviceRows.size(); ++rowIndex) {
+            const DeviceListRow& row = deviceRows.at(rowIndex);
+            if (row.type != DeviceListRow::Type::Group || row.groupIndex < 0) {
+                continue;
+            }
+
+            int firstDeviceRow = -1;
+            int lastDeviceRow = -1;
+            for (int childRowIndex = rowIndex + 1; childRowIndex < deviceRows.size(); ++childRowIndex) {
+                const DeviceListRow& childRow = deviceRows.at(childRowIndex);
+                if (childRow.type == DeviceListRow::Type::Group) {
+                    break; // wjy: 到下一个分组时结束当前分组内容背景计算。
+                }
+                if (childRow.type == DeviceListRow::Type::Device && childRow.groupIndex == row.groupIndex) {
+                    if (firstDeviceRow < 0) {
+                        firstDeviceRow = childRowIndex;
+                    }
+                    lastDeviceRow = childRowIndex;
+                }
+            }
+
+            if (firstDeviceRow < 0 || lastDeviceRow < firstDeviceRow) {
+                continue;
+            }
+
+            QRect groupContentRect = scrolledVisibleDeviceRowRect(firstDeviceRow, m_deviceListScrollOffset);
+            groupContentRect = groupContentRect.united(scrolledVisibleDeviceRowRect(lastDeviceRow, m_deviceListScrollOffset));
+            if (!groupContentRect.intersects(deviceListClip)) {
+                continue;
+            }
+            painter.drawRoundedRect(QRectF(groupContentRect), 5, 5); // wjy: 分组内设备背景按整块绘制，把设备行之间的缝隙也填成同一片灰色。
+        }
+
         for (int rowIndex = 0; rowIndex < deviceRows.size(); ++rowIndex) { // wjy: 每一行都来自 visibleDeviceRows，包含无分组设备、分组行、分组内设备。
             const DeviceListRow& row = deviceRows.at(rowIndex); // wjy: row 保存这一行到底是设备还是分组，以及对应的真实下标。
             const QRect rowRect = scrolledVisibleDeviceRowRect(rowIndex, m_deviceListScrollOffset); // wjy: 行坐标减去滚动偏移，得到当前真正显示在屏幕上的位置。
@@ -4547,6 +4798,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                     continue; // wjy: 防御性跳过异常设备行，避免手动编辑 JSON 后出现越界。
                 }
 
+                const bool deviceInsideGroup = row.groupIndex >= 0; // wjy: 分组内设备稍微右移，视觉上表示它属于上方分组。
                 const bool deviceSelected =
                     m_selectedDeviceIndexes.contains(deviceIndex);
 
@@ -4576,16 +4828,29 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                     }
                 }
 
-                const bool deviceInsideGroup = row.groupIndex >= 0; // wjy: 分组内设备稍微右移，视觉上表示它属于上方分组。
-                const int statusDotX = 200; // wjy: 根部设备保持旧坐标，分组内设备整体缩进。 这是原点坐标
-                const int iconX = deviceInsideGroup ? 58 : 42;
-                const int textX = deviceInsideGroup ? 90 : 74;
+                const int iconX = deviceInsideGroup ? 50 : 30;
+                const int textX = deviceInsideGroup ? 76 : 56;
                 const int textWidth = deviceInsideGroup ? 96 : 116; // wjy: 缩进后收窄文字区域，避免碰到右侧角标。
+                constexpr qreal statusDotSize = 6.0; // wjy: 左侧列表状态点改小，贴近用户示例图里的轻量提示样式。
+                const qreal statusDotX = iconX - 23.0+6.0;
+                const qreal statusDotY = rowY + 9 + (20.0 - statusDotSize) / 2.0; // wjy: 状态点移动到设备图标左侧，并和图标垂直居中。
 
+                const platform::DevicePresenceState deviceState = devicePresenceForIndex(deviceIndex);
+                const bool deviceOnlineLike = deviceState == platform::DevicePresenceState::Online
+                    || deviceState == platform::DevicePresenceState::Busy; // wjy: 左侧列表只有在线/占用才显示状态圆点；离线和未检测不再画灰色圆点。
                 painter.setPen(Qt::NoPen);
-                painter.setBrush(deviceStatusDotColor(devicePresenceForIndex(deviceIndex))); // wjy: 在线圆点按真实设备状态绘制，不受视觉行号影响。
-                painter.drawEllipse(QRectF(statusDotX, rowY + 11, 13, 13));
-                drawDeviceTileIcon(painter, iconX, rowY + 9, 20);
+                if (deviceOnlineLike) {
+                    painter.setBrush(deviceStatusDotColor(deviceState)); // wjy: 在线/占用圆点按真实设备状态绘制，不受视觉行号影响。
+                    painter.drawEllipse(QRectF(statusDotX, statusDotY, statusDotSize, statusDotSize));
+                }
+                drawDeviceTileIcon(
+                    painter,
+                    iconX,
+                    rowY + 9,
+                    20,
+                    deviceOnlineLike
+                        ? QColor(QStringLiteral("#3A7BFC"))
+                        : QColor(QStringLiteral("#9CA3AF"))); // wjy: 离线或未检测时把左侧设备图标底色改成灰色，替代右侧灰色状态点。
 
                 painter.setFont(textFont);
                 painter.setPen(QColor(QStringLiteral("#111827")));
@@ -4603,7 +4868,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                 }
 
                 painter.setPen(Qt::NoPen);
-                painter.setBrush(QColor(QStringLiteral("#1E3A5F"))); // wjy: 分组行使用深蓝背景，和普通设备行区分开。
+                painter.setBrush(QColor(QStringLiteral("#4687ff"))); // wjy: 分组背景颜色，和普通设备行区分开。
                 painter.drawRoundedRect(QRectF(rowRect), 5, 5);
                 drawUiIcon(
                     painter,
@@ -4613,15 +4878,22 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                 painter.setFont(textFont);
                 painter.setPen(QColor(QStringLiteral("#FFFFFF"))); //分组字体颜色
                 if (m_renamingDeviceGroupIndex != groupIndex) {
-                    painter.drawText(QRectF(58, rowY + 7, 132, 22), Qt::AlignVCenter | Qt::AlignLeft, g_deviceGroupNames.at(groupIndex)); // wjy: 分组正在原地重命名时不画底层文字，避免和输入框重叠。
+                    painter.drawText(QRectF(10, rowY + 7, 132, 22), Qt::AlignVCenter | Qt::AlignLeft, g_deviceGroupNames.at(groupIndex)); // wjy: 分组正在原地重命名时不画底层文字，避免和输入框重叠。
                 }
             }
+        }
+        const QRect blankRect = scrolledDeviceGroupReservedBlankRect(m_deviceListScrollOffset);
+        const QRect visibleBlankRect = blankRect.intersected(deviceListClip);
+        if (!visibleBlankRect.isEmpty()) {
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(QColor(QStringLiteral("#F3F6FA"))); // wjy: 底部空白落点使用更淡的灰色，和分组内设备的浅灰区域区分开。
+            painter.drawRoundedRect(QRectF(blankRect), 4, 4);
         }
         painter.restore();
 
         const int maxScrollOffset = maxDeviceListScrollOffset(); // wjy: 大于 0 表示内容高度超过视口，需要显示滚动条。
         if (maxScrollOffset > 0 && deviceListClip.height() > 0) {
-            const QRect scrollTrack(deviceListClip.right() - 6, deviceListClip.y() + 5, 3, qMax(1, deviceListClip.height() - 10)); // wjy: 滚动条贴在左侧列表右边缘，不占用设备文字区域。
+            const QRect scrollTrack(deviceListClip.right() - 3, deviceListClip.y() + 5, 6, qMax(1, deviceListClip.height() - 10)); // wjy: 滚动条贴在左侧列表右边缘，不占用设备文字区域。
             const int thumbHeight = qMax(28, scrollTrack.height() * deviceListClip.height() / qMax(1, visibleDeviceListContentHeight())); // wjy: 滑块高度按可见比例计算，太短时固定最小高度方便观察。
             const int thumbTravel = qMax(0, scrollTrack.height() - thumbHeight);
             const int thumbY = scrollTrack.y() + (thumbTravel * m_deviceListScrollOffset / maxScrollOffset); // wjy: 当前滚动偏移映射成滑块在轨道中的位置。
@@ -4631,55 +4903,6 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
         }
     }
 // ===end====
-
-    const QRect assistHeader = remoteAssistGroupHeaderRect(m_deviceGroupExpanded);
-    drawUiIcon(painter, QRect(17, assistHeader.y() + 10, 20, 20), QStringLiteral("remote_assist_group.svg"));
-    painter.setFont(textFont);
-    painter.setPen(QColor(QStringLiteral("#040B18")));
-    painter.drawText(
-        QRectF(43, assistHeader.y() + 8, 88, 20),
-        Qt::AlignVCenter | Qt::AlignLeft,
-        zh("\xE8\xAE\xBE\xE5\xA4\x87\xE7\xAE\xA1\xE7\x90\x86"));
-    drawUiIcon(
-        painter,
-        QRect(203, assistHeader.y() + 6, 24, 20),
-        m_remoteAssistExpanded ? QStringLiteral("chevron_up.svg") : QStringLiteral("chevron_down.svg"));
-
-    if (m_remoteAssistExpanded) {
-        const QRect assistRow = remoteAssistStartRect(m_deviceGroupExpanded);
-        if (m_remoteAssistSelected) {
-            painter.setPen(Qt::NoPen);
-            painter.setBrush(QColor(QStringLiteral("#DFE6EC")));
-            painter.drawRoundedRect(QRectF(assistRow), 5, 5);
-            painter.setBrush(QColor(QStringLiteral("#3A7BFC")));
-            painter.drawRoundedRect(QRectF(4, assistRow.y() + 10, 4, 17), 2, 2);
-        }
-
-        drawUiIcon(painter, QRect(42, assistRow.y() + 8, 20, 20), QStringLiteral("remote_assist_start.svg"));
-        painter.setFont(textFont);
-        painter.setPen(QColor(QStringLiteral("#111827")));
-        painter.drawText(
-            QRectF(74, assistRow.y() + 7, 76, 22),
-            Qt::AlignVCenter | Qt::AlignLeft,
-            zh("\xE6\x96\xB0\xE5\xA2\x9E\xE8\xAE\xBE\xE5\xA4\x87"));
-
-        const QRect localInfoRow = localDeviceInfoRect(m_deviceGroupExpanded);
-        if (m_localInfoSelected) {
-            painter.setPen(Qt::NoPen);
-            painter.setBrush(QColor(QStringLiteral("#DFE6EC")));
-            painter.drawRoundedRect(QRectF(localInfoRow), 5, 5);
-            painter.setBrush(QColor(QStringLiteral("#3A7BFC")));
-            painter.drawRoundedRect(QRectF(4, localInfoRow.y() + 10, 4, 17), 2, 2);
-        }
-
-        drawDeviceTileIcon(painter, 42, localInfoRow.y() + 8, 20);
-        painter.setFont(textFont);
-        painter.setPen(QColor(QStringLiteral("#111827")));
-        painter.drawText(
-            QRectF(74, localInfoRow.y() + 7, 76, 22),
-            Qt::AlignVCenter | Qt::AlignLeft,
-            zh("\xE6\x9C\xAC\xE6\x9C\xBA\xE4\xBF\xA1\xE6\x81\xAF"));
-    }
 
     painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
     painter.drawLine(0, 623, 240, 623);
@@ -4694,21 +4917,27 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
     painter.setFont(textFont);
     painter.setPen(QColor(QStringLiteral("#040B18")));
     painter.drawText(QRectF(43, 641, 40, 22), Qt::AlignVCenter | Qt::AlignLeft, zh("\xE8\xAE\xBE\xE7\xBD\xAE"));
+    }
 
     painter.save();
-    painter.setClipRect(QRectF(240, 48, 680, 632));
+    //右侧内容裁剪区域
+    painter.setClipRect(
+        m_leftSidebarCollapsed
+            ? QRectF(0, kTitleBarHeight, 920, 680 - kTitleBarHeight)
+            : QRectF(240, kTitleBarHeight, 680, 680 - kTitleBarHeight));
     if (m_settingsSelected) {
+        m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded));
         drawSettingsPage(
             painter,
             textFont,
             m_autoRunEnabled,
             m_remoteWakeupEnabled,
             m_preventSleepEnabled,
-            m_statusAutoRefreshEnabled);
-    } else if (m_localInfoSelected) {
-        drawLocalDeviceInfoPage(painter, textFont, m_localDeviceInfo);
-    } else if (m_remoteAssistSelected) {
-        drawAddDevicePage(painter, textFont);
+            m_statusAutoRefreshEnabled,
+            m_settingsLocalInfoExpanded,
+            m_settingsAddDeviceExpanded,
+            m_localDeviceInfo,
+            m_settingsScrollOffset);
     } else if (m_detailAnimationTimer->isActive()) {
         const qreal eased = easeOutCubic(m_detailAnimationProgress);
         drawDeviceDetail(
@@ -4723,6 +4952,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             BottomAction::None,
             -24.0 * eased,
             1.0 - eased,
+            m_leftSidebarCollapsed,
             textFont);
         drawDeviceDetail(
             painter,
@@ -4736,6 +4966,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             BottomAction::None,
             32.0 * (1.0 - eased),
             eased,
+            m_leftSidebarCollapsed,
             textFont);
     } else {
         drawDeviceDetail(
@@ -4750,6 +4981,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             m_hoveredBottomAction,
             0,
             1.0,
+            m_leftSidebarCollapsed,
             textFont);
     }
 
@@ -4777,6 +5009,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             m_scriptOutputScrollOffset); // wjy: Script output lives in the right-side blank area after the device detail card is painted.
     }
     painter.restore();
+    drawSidebarCollapseButton(painter, m_leftSidebarCollapsed);
     updateScriptFileEditorControls(); // wjy: 绘制完成后同步真实 QTextEdit/QPushButton 的显隐和层级，保证页面切换时不会残留在其它页面。
 
 // =====wjy====
@@ -4785,11 +5018,10 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
         && m_draggingDeviceIndex >= 0
         && m_draggingDeviceIndex
                < g_devices.size()) {
-        const int ghostWidth = 172; // wjy: 虚影宽度略小于左侧列表宽度，像一条被拖起的设备行。
-        const int ghostHeight = 36;
-        const int ghostX = qBound(8, m_deviceDragCurrentPos.x() - 86, width() - ghostWidth - 8); // wjy: 让虚影围绕鼠标居中，同时限制在窗口范围内。
-        const int ghostY = qBound(52, m_deviceDragCurrentPos.y() - 18, height() - ghostHeight - 8); // wjy: 避免虚影跑出窗口顶部或底部。
-        const QRectF ghostRect(ghostX, ghostY, ghostWidth, ghostHeight);
+        const QRect ghostRect = deviceDragGhostRect(m_deviceDragCurrentPos, size()); // wjy: 绘制和释放落点共用同一个虚影矩形，避免鼠标越界时判断和视觉不一致。
+        const int ghostX = ghostRect.x();
+        const int ghostY = ghostRect.y();
+        const int ghostWidth = ghostRect.width();
         const int draggingDeviceCount =
             m_draggingDeviceIndexes.size();
 
@@ -4804,7 +5036,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
         painter.setOpacity(0.72); // wjy: 半透明效果表示“正在拖动的临时虚影”，不是真实列表行。
         painter.setPen(QPen(QColor(QStringLiteral("#B9C3D0")), 1));
         painter.setBrush(QColor(QStringLiteral("#F7FAFE")));
-        painter.drawRoundedRect(ghostRect, 6, 6);
+        painter.drawRoundedRect(QRectF(ghostRect), 6, 6);
         painter.setPen(Qt::NoPen);
         painter.setBrush(deviceStatusDotColor(devicePresenceForIndex(m_draggingDeviceIndex)));
         painter.drawEllipse(QRectF(ghostX + 18, ghostY + 15, 6, 6));
@@ -4938,32 +5170,14 @@ void DeviceGrid::setDesktopHoverActive(bool active)
 
 void DeviceGrid::updateDesktopHover(const QPoint& position)
 {
-    if (m_settingsSelected || m_remoteAssistSelected || m_localInfoSelected || m_detailAnimationTimer->isActive()) {
-        setDesktopHoverActive(false);
-        return;
-    }
-
-    if (devicePresenceForIndex(m_selectedDeviceIndex) == platform::DevicePresenceState::Offline) {
-        setDesktopHoverActive(false);
-        return;
-    }
-
-    const bool isRemoteControlled = deviceBadgeIndexes().contains(m_selectedDeviceIndex);
-    setDesktopHoverActive(desktopImageRect(isRemoteControlled).contains(position));
+    Q_UNUSED(position)
+    setDesktopHoverActive(false); // wjy: 进入桌面改为双击左侧设备行触发，右侧桌面图不再显示可点击悬停态。
 }
 
 void DeviceGrid::updateBottomActionHover(const QPoint& position)
 {
+    Q_UNUSED(position)
     BottomAction nextAction = BottomAction::None;
-    if (!m_settingsSelected && !m_remoteAssistSelected && !m_localInfoSelected && !m_detailAnimationTimer->isActive()) {
-        const bool isRemoteControlled = deviceBadgeIndexes().contains(m_selectedDeviceIndex);
-        const bool offlineState = devicePresenceForIndex(m_selectedDeviceIndex) == platform::DevicePresenceState::Offline;
-        if (!offlineState && fileTransferActionRect(isRemoteControlled).contains(position)) {
-            nextAction = BottomAction::FileTransfer;
-        } else if (moreActionRect(isRemoteControlled).contains(position)) {
-            nextAction = BottomAction::More;
-        }
-    }
 
     if (m_hoveredBottomAction == nextAction) {
         return;
@@ -5021,7 +5235,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         finishDeviceGroupRename(true);
     }
 
-    if (event->button() == Qt::RightButton && m_deviceGroupExpanded) {
+    if (event->button() == Qt::RightButton && !m_leftSidebarCollapsed && m_deviceGroupExpanded) {
         const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 设备行右键命中使用当前可见行，保证滚动后菜单出现在真实设备上。
         const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded);
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
@@ -5059,16 +5273,17 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
             populateScriptFolderMenu(scriptMenu, QString::fromUtf8(kRemoteScriptFolderPath)); // wjy: 递归把共享目录下的文件夹转成多级子菜单，暂不绑定点击执行逻辑。
             // =====wjy====
             const bool offlineOnly = devicePresenceForIndex(m_selectedDeviceIndex) == platform::DevicePresenceState::Offline; // wjy: 设备右键菜单复用“更多”的在线判断，离线设备不显示需要远程连接的操作。
+            QMenu* systemMenu = menu.addMenu(menuIcon(QStringLiteral("settings.svg")), QString::fromUtf8("系统设置")); // wjy: 把设备系统操作收进级联子菜单，悬浮展开方式和“执行脚本”保持一致。
             QAction* terminalAction = nullptr; // wjy: 在线设备才创建终端入口，后面用指针判断用户点了哪一项。
             QAction* shutdownAction = nullptr; // wjy: 在线设备才允许发送关机命令。
             QAction* restartAction = nullptr; // wjy: 在线设备才允许发送重启命令。
             if (!offlineOnly) {
-                terminalAction = menu.addAction(menuIcon(QStringLiteral("terminal.svg")), zh("\xE7\xBB\x88\xE7\xAB\xAF")); // wjy: 放在“执行脚本”下面，和底部“更多”菜单保持同一套终端功能。
-                shutdownAction = menu.addAction(menuIcon(QStringLiteral("power.svg")), zh("\xE5\x85\xB3\xE6\x9C\xBA")); // wjy: 复用当前设备的远程关机逻辑。
-                restartAction = menu.addAction(menuIcon(QStringLiteral("restart.svg")), zh("\xE9\x87\x8D\xE5\x90\xAF")); // wjy: 复用当前设备的远程重启逻辑。
+                terminalAction = systemMenu->addAction(menuIcon(QStringLiteral("terminal.svg")), zh("\xE7\xBB\x88\xE7\xAB\xAF")); // wjy: 在线设备才在“系统设置”子菜单里显示终端入口。
+                shutdownAction = systemMenu->addAction(menuIcon(QStringLiteral("power.svg")), zh("\xE5\x85\xB3\xE6\x9C\xBA")); // wjy: 复用当前设备的远程关机逻辑。
+                restartAction = systemMenu->addAction(menuIcon(QStringLiteral("restart.svg")), zh("\xE9\x87\x8D\xE5\x90\xAF")); // wjy: 复用当前设备的远程重启逻辑。
             }
-            QAction* renameAction = menu.addAction(menuIcon(QStringLiteral("rename.svg")), zh("\xE9\x87\x8D\xE5\x91\xBD\xE5\x90\x8D")); // wjy: 重命名不依赖在线状态，离线设备也可以改本地记录。
-            QAction* deleteAction = menu.addAction(menuIcon(QStringLiteral("delete.svg")), zh("\xE5\x88\xA0\xE9\x99\xA4\xE8\xAE\xBE\xE5\xA4\x87")); // wjy: 删除设备也放进设备右键菜单，和底部“更多”保持一致。
+            QAction* renameAction = systemMenu->addAction(menuIcon(QStringLiteral("rename.svg")), zh("\xE9\x87\x8D\xE5\x91\xBD\xE5\x90\x8D")); // wjy: 重命名不依赖在线状态，离线设备也可以改本地记录。
+            QAction* deleteAction = systemMenu->addAction(menuIcon(QStringLiteral("delete.svg")), zh("\xE5\x88\xA0\xE9\x99\xA4\xE8\xAE\xBE\xE5\xA4\x87")); // wjy: 删除设备也放进系统设置子菜单，和设备右键主菜单分层显示。
             // ===end====
             const QAction* selectedAction = menu.exec(mapToGlobal(event->pos()));
             if (selectedAction && selectedAction->data().isValid()) {
@@ -5091,7 +5306,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         }
     }
 
-    if (event->button() == Qt::RightButton && m_deviceGroupExpanded) { // wjy: 右键分组行时弹出分组菜单，先于空白区菜单判断，避免误触发“新建分组”。
+    if (event->button() == Qt::RightButton && !m_leftSidebarCollapsed && m_deviceGroupExpanded) { // wjy: 右键分组行时弹出分组菜单，先于空白区菜单判断，避免误触发“新建分组”。
         const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 分组右键命中也复用当前可见行，滚动后坐标和绘制保持一致。
         const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 只允许右键当前可见视口里的分组行。
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
@@ -5164,6 +5379,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
                     m_deviceGroupExpanded));
 
     if (event->button() == Qt::RightButton
+        && !m_leftSidebarCollapsed
         && m_deviceGroupExpanded
         && blankHitRect.contains(event->pos())) { // wjy: 确认右键点在滚动后的预留空白区域里。
         QMenu menu(this); // wjy: 创建右键菜单，父对象设为当前控件，交给 Qt 管理生命周期。
@@ -5193,7 +5409,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
 
     if (event->button() == Qt::LeftButton
         && event->pos().y() >= 0
-        && event->pos().y() < 48
+        && event->pos().y() < kTitleBarHeight //窗口拖动
         && !refreshRect().contains(event->pos())
         && !minimizeRect().contains(event->pos())
         && !closeRect().contains(event->pos())) {
@@ -5204,7 +5420,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
     }
 
 // =====wjy====
-    if (event->button() == Qt::LeftButton && m_deviceGroupExpanded) { // wjy: 左键按在“我的设备”的设备行上时，先记录为拖拽候选。
+    if (event->button() == Qt::LeftButton && !m_leftSidebarCollapsed && m_deviceGroupExpanded) { // wjy: 左键按在“我的设备”的设备行上时，先记录为拖拽候选。
         const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 拖拽按下也使用当前可见行顺序，避免分组行插入后设备下标错位。
         const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 只允许在当前可见滚动视口内开始拖拽。
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
@@ -5327,18 +5543,17 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
 
     updateDesktopHover(event->pos());
     updateBottomActionHover(event->pos());
-    const bool offlineState = !m_settingsSelected
-        && !m_remoteAssistSelected
-        && !m_localInfoSelected
-        && devicePresenceForIndex(m_selectedDeviceIndex) == platform::DevicePresenceState::Offline;
-    const bool isRemoteControlled = deviceBadgeIndexes().contains(m_selectedDeviceIndex);
-    const bool wakeButtonHovered = offlineState && wakeButtonRect(isRemoteControlled).contains(event->pos());
+    const bool sidebarButtonHovered = sidebarCollapseButtonRect(m_leftSidebarCollapsed).contains(event->pos());
+    const bool wakeButtonHovered = false;
     const bool settingsSwitchHovered = m_settingsSelected
-        && (settingsAutoRunSwitchRect().contains(event->pos())
-            || settingsRemoteWakeupSwitchRect().contains(event->pos())
-            || settingsPreventSleepSwitchRect().contains(event->pos())
-            || settingsAutoRefreshSwitchRect().contains(event->pos()));
+        && (settingsScrolledRect(settingsAutoRunSwitchRect(), m_settingsScrollOffset).contains(event->pos())
+            || settingsScrolledRect(settingsRemoteWakeupSwitchRect(), m_settingsScrollOffset).contains(event->pos())
+            || settingsScrolledRect(settingsPreventSleepSwitchRect(), m_settingsScrollOffset).contains(event->pos())
+            || settingsScrolledRect(settingsAutoRefreshSwitchRect(), m_settingsScrollOffset).contains(event->pos())
+            || settingsScrolledRect(settingsLocalInfoHeaderRect(), m_settingsScrollOffset).contains(event->pos())
+            || settingsScrolledRect(settingsAddDeviceHeaderRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset).contains(event->pos()));
     if (m_desktopHovered
+        || sidebarButtonHovered
         || wakeButtonHovered
         || m_hoveredBottomAction != BottomAction::None
         || settingsSwitchHovered) {
@@ -5352,14 +5567,11 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
 void DeviceGrid::mouseDoubleClickEvent(QMouseEvent* event)
 {
 // =====wjy====
-    if (event->button() == Qt::LeftButton && m_deviceGroupExpanded) { // wjy: 只有左键双击展开的“我的设备”列表时，才尝试重命名分组。
-        const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 双击命中也使用可见行，分组位置会跟随 UI 绘制变化。
-        const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 双击只识别当前可见视口内的分组行。
+    if (event->button() == Qt::LeftButton && !m_leftSidebarCollapsed && m_deviceGroupExpanded) { // wjy: 左键双击左侧列表时，设备行进入桌面，分组行进入重命名。
+        const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 双击命中也使用可见行，分组和设备位置会跟随 UI 绘制变化。
+        const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 双击只识别当前可见视口内的列表行。
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
             const DeviceListRow& row = rows.at(rowIndex);
-            if (row.type != DeviceListRow::Type::Group) {
-                continue; // wjy: 只有分组行支持双击原地重命名。
-            }
             const QRect rowRect =
                 scrolledVisibleDeviceRowRect(
                     rowIndex,
@@ -5369,6 +5581,42 @@ void DeviceGrid::mouseDoubleClickEvent(QMouseEvent* event)
                 rowRect.intersected(deviceListClip);
 
             if (!hitRect.contains(event->pos())) {
+                continue;
+            }
+
+            if (row.type == DeviceListRow::Type::Device) {
+                const int deviceIndex = row.deviceIndex;
+                if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
+                    continue;
+                }
+
+                m_settingsSelected = false;
+                m_remoteAssistSelected = false;
+                m_localInfoSelected = false;
+                m_selectedDeviceIndexes.clear();
+                m_selectedDeviceIndexes.insert(deviceIndex);
+                m_selectionAnchorDeviceIndex = deviceIndex;
+                setDesktopHoverActive(false);
+                clearBottomActionHover();
+                updateAddDeviceControls();
+                updateLocalInfoControls();
+                updateSettingsControls();
+                startDeviceSwitchAnimation(deviceIndex, deviceDisplayName(g_devices.at(deviceIndex))); // wjy: 双击进入桌面前先把当前设备同步到被双击的真实设备。
+
+                if (devicePresenceForIndex(deviceIndex) == platform::DevicePresenceState::Offline) {
+                    if (!devicePoweringOnForIndex(deviceIndex)) {
+                        wakeCurrentDevice(); // wjy: 双击关机/离线设备时复用远程开机流程，成功发包后详情状态会从“离线”进入“正在开机”。
+                    }
+                    event->accept();
+                    return;
+                }
+
+                openRemoteDesktopWindow();
+                event->accept();
+                return;
+            }
+
+            if (row.type != DeviceListRow::Type::Group) {
                 continue;
             }
 
@@ -5413,9 +5661,30 @@ void DeviceGrid::wheelEvent(QWheelEvent* event)
         return;
     }
 
+    const int maxSettingsOffset = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+    if (m_settingsSelected
+        && maxSettingsOffset > 0
+        && settingsScrollViewportRect().contains(event->position().toPoint())) {
+        const int wheelDelta = !event->pixelDelta().isNull()
+            ? event->pixelDelta().y()
+            : event->angleDelta().y() / 3;
+        if (wheelDelta != 0) {
+            const int oldOffset = m_settingsScrollOffset;
+            m_settingsScrollOffset = qBound(0, m_settingsScrollOffset - wheelDelta, maxSettingsOffset);
+            if (m_settingsScrollOffset != oldOffset) {
+                updateSettingsControls();
+                updateAddDeviceControls();
+                updateLocalInfoControls();
+                update();
+                event->accept();
+                return;
+            }
+        }
+    }
+
     const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 只有鼠标位于“我的设备”列表视口内，滚轮才控制设备列表。
     const int maxScrollOffset = maxDeviceListScrollOffset(); // wjy: 为 0 表示内容没有超过视口，不需要滚动。
-    if (m_deviceGroupExpanded && maxScrollOffset > 0 && deviceListClip.contains(event->position().toPoint())) {
+    if (!m_leftSidebarCollapsed && m_deviceGroupExpanded && maxScrollOffset > 0 && deviceListClip.contains(event->position().toPoint())) {
         const int wheelDelta = !event->pixelDelta().isNull()
             ? event->pixelDelta().y()
             : event->angleDelta().y() / 3; // wjy: 普通鼠标一格通常是 120，除以 3 后约等于滚动一行 40 像素。
@@ -5453,35 +5722,40 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         if (m_draggingDevice) { // wjy: 如果本次鼠标操作已经进入设备拖拽状态，松开时只输出落点日志。
             QString targetType = QStringLiteral("none"); // wjy: 默认表示没有落到可识别的分组目标。
             QString targetGroup;
-            if (m_deviceGroupExpanded) {
+            if (!m_leftSidebarCollapsed && m_deviceGroupExpanded) {
                 const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 拖拽落点按当前可见行识别，和 UI 绘制顺序保持一致。
                 const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 拖拽落点只在当前可见滚动视口内识别。
-                for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
-                    const DeviceListRow& row = rows.at(rowIndex);
-                    const QRect rowRect =
-                        scrolledVisibleDeviceRowRect(
-                            rowIndex,
-                            m_deviceListScrollOffset);
+                const QRect ghostRect = deviceDragGhostRect(m_deviceDragCurrentPos, size());
+                if (ghostRect.intersects(rootDeviceDropZoneRect())) {
+                    targetType = QStringLiteral("rootBlank"); // wjy: 移出分组按受限后的拖拽虚影判断，鼠标跑到标题栏上方时仍以可见方框位置为准。
+                } else {
+                    for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
+                        const DeviceListRow& row = rows.at(rowIndex);
+                        const QRect rowRect =
+                            scrolledVisibleDeviceRowRect(
+                                rowIndex,
+                                m_deviceListScrollOffset);
 
-                    const QRect hitRect =
-                        rowRect.intersected(deviceListClip);
+                        const QRect hitRect =
+                            rowRect.intersected(deviceListClip);
 
-                    if (!hitRect.contains(event->pos())) {
-                        continue;
-                    }
-                    if (row.type == DeviceListRow::Type::Group) {
-                        targetType = QStringLiteral("group"); // wjy: 鼠标松开在分组行上，就把设备写入该分组。
-                        targetGroup = g_deviceGroupNames.at(row.groupIndex);
-                        break;
-                    }
-                    if (row.type == DeviceListRow::Type::Device && row.groupIndex >= 0 && row.groupIndex < g_deviceGroupNames.size()) {
-                        targetType = QStringLiteral("group"); // wjy: 鼠标松开在分组内的设备行上，也视为拖入这个设备所属的分组。
-                        targetGroup = g_deviceGroupNames.at(row.groupIndex);
-                        break;
-                    }
-                    if (row.type == DeviceListRow::Type::Device && row.groupIndex < 0) {
-                        targetType = QStringLiteral("rootBlank"); // wjy: 鼠标松开在无分组设备行上，也视为拖回“我的设备”根部。
-                        break;
+                        if (!hitRect.contains(event->pos())) {
+                            continue;
+                        }
+                        if (row.type == DeviceListRow::Type::Group) {
+                            targetType = QStringLiteral("group"); // wjy: 分组标题只代表该分组本身，不再兼作移出分组区域。
+                            targetGroup = g_deviceGroupNames.at(row.groupIndex);
+                            break;
+                        }
+                        if (row.type == DeviceListRow::Type::Device && row.groupIndex >= 0 && row.groupIndex < g_deviceGroupNames.size()) {
+                            targetType = QStringLiteral("group"); // wjy: 鼠标松开在分组内的设备行上，也视为拖入这个设备所属的分组。
+                            targetGroup = g_deviceGroupNames.at(row.groupIndex);
+                            break;
+                        }
+                        if (row.type == DeviceListRow::Type::Device && row.groupIndex < 0) {
+                            targetType = QStringLiteral("rootBlank"); // wjy: 鼠标松开在无分组设备行上，也视为拖回“我的设备”根部。
+                            break;
+                        }
                     }
                 }
                 const QRect blankHitRect =
@@ -5576,6 +5850,16 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         }
 // ===end====
 
+        if (sidebarCollapseButtonRect(m_leftSidebarCollapsed).contains(event->pos())) {
+            m_leftSidebarCollapsed = !m_leftSidebarCollapsed;
+            finishDeviceGroupRename(true);
+            setDesktopHoverActive(false);
+            clearBottomActionHover();
+            update();
+            event->accept();
+            return;
+        }
+
         if (refreshRect().contains(event->pos())) {
             refreshDeviceStatuses();
             event->accept();
@@ -5594,52 +5878,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
             return;
         }
 
-        if (deviceGroupHeaderRect().contains(event->pos())) {
-            m_deviceGroupExpanded = !m_deviceGroupExpanded;
-            update();
-            event->accept();
-            return;
-        }
-
-        if (remoteAssistGroupHeaderRect(m_deviceGroupExpanded).contains(event->pos())) {
-            m_remoteAssistExpanded = !m_remoteAssistExpanded;
-            update();
-            event->accept();
-            return;
-        }
-
-        if (m_remoteAssistExpanded && remoteAssistStartRect(m_deviceGroupExpanded).contains(event->pos())) {
-            m_settingsSelected = false;
-            m_remoteAssistSelected = true;
-            m_localInfoSelected = false;
-            setDesktopHoverActive(false);
-            clearBottomActionHover();
-            m_detailAnimationTimer->stop();
-            updateAddDeviceControls();
-            updateLocalInfoControls();
-            updateSettingsControls();
-            update();
-            event->accept();
-            return;
-        }
-
-        if (m_remoteAssistExpanded && localDeviceInfoRect(m_deviceGroupExpanded).contains(event->pos())) {
-            m_settingsSelected = false;
-            m_remoteAssistSelected = false;
-            m_localInfoSelected = true;
-            refreshLocalDeviceInfo();
-            setDesktopHoverActive(false);
-            clearBottomActionHover();
-            m_detailAnimationTimer->stop();
-            updateAddDeviceControls();
-            updateLocalInfoControls();
-            updateSettingsControls();
-            update();
-            event->accept();
-            return;
-        }
-
-        if (m_deviceGroupExpanded) {
+        if (!m_leftSidebarCollapsed && m_deviceGroupExpanded) {
             const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 普通点击也使用可见行，保证点击位置和绘制出来的行一致。
             const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 普通点击也只命中当前滚动视口内的列表行。
 // =====wjy====
@@ -5816,11 +6055,14 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
 // ===end====
         }
 
-        if (QRect(0, 623, 240, 57).contains(event->pos())) {
+        if (!m_leftSidebarCollapsed && QRect(0, 623, 240, 57).contains(event->pos())) {
             m_settingsSelected = true;
             m_remoteAssistSelected = false;
             m_localInfoSelected = false;
             m_detailAnimationTimer->stop();
+            if (m_settingsLocalInfoExpanded) {
+                refreshLocalDeviceInfo();
+            }
             setDesktopHoverActive(false);
             clearBottomActionHover();
             updateAddDeviceControls();
@@ -5832,19 +6074,42 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         }
 
         if (m_settingsSelected) {
-            if (settingsAutoRunSwitchRect().contains(event->pos())) {
+            if (settingsScrolledRect(settingsLocalInfoHeaderRect(), m_settingsScrollOffset).contains(event->pos())) {
+                m_settingsLocalInfoExpanded = !m_settingsLocalInfoExpanded;
+                if (m_settingsLocalInfoExpanded) {
+                    refreshLocalDeviceInfo();
+                }
+                m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded));
+                updateSettingsControls();
+                updateAddDeviceControls();
+                updateLocalInfoControls();
+                update();
+                event->accept();
+                return;
+            }
+            if (settingsScrolledRect(settingsAddDeviceHeaderRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset).contains(event->pos())) {
+                m_settingsAddDeviceExpanded = !m_settingsAddDeviceExpanded;
+                m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded));
+                updateSettingsControls();
+                updateAddDeviceControls();
+                updateLocalInfoControls();
+                update();
+                event->accept();
+                return;
+            }
+            if (settingsScrolledRect(settingsAutoRunSwitchRect(), m_settingsScrollOffset).contains(event->pos())) {
                 platform::StartupManager::setEnabled(!m_autoRunEnabled);
                 m_autoRunEnabled = platform::StartupManager::isEnabled();
                 update();
                 event->accept();
                 return;
             }
-            if (settingsRemoteWakeupSwitchRect().contains(event->pos())) {
+            if (settingsScrolledRect(settingsRemoteWakeupSwitchRect(), m_settingsScrollOffset).contains(event->pos())) {
                 toggleRemoteWakeup();
                 event->accept();
                 return;
             }
-            if (settingsPreventSleepSwitchRect().contains(event->pos())) {
+            if (settingsScrolledRect(settingsPreventSleepSwitchRect(), m_settingsScrollOffset).contains(event->pos())) {
                 m_preventSleepEnabled = !m_preventSleepEnabled;
                 platform::AppSettings::setPreventSleepEnabled(m_preventSleepEnabled);
                 platform::PowerManager::setPreventSleepEnabled(m_preventSleepEnabled);
@@ -5852,7 +6117,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 event->accept();
                 return;
             }
-            if (settingsAutoRefreshSwitchRect().contains(event->pos())) {
+            if (settingsScrolledRect(settingsAutoRefreshSwitchRect(), m_settingsScrollOffset).contains(event->pos())) {
                 m_statusAutoRefreshEnabled = !m_statusAutoRefreshEnabled;
                 platform::AppSettings::setStatusAutoRefreshEnabled(m_statusAutoRefreshEnabled);
                 applyStatusAutoRefreshSetting(m_statusAutoRefreshEnabled);
@@ -5863,25 +6128,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         }
 
         if (!m_settingsSelected && !m_remoteAssistSelected && !m_localInfoSelected) {
-            const bool isRemoteControlled = deviceBadgeIndexes().contains(m_selectedDeviceIndex);
-            const bool offlineState = devicePresenceForIndex(m_selectedDeviceIndex) == platform::DevicePresenceState::Offline;
-            if (offlineState && wakeButtonRect(isRemoteControlled).contains(event->pos())) {
-                wakeCurrentDevice();
-                event->accept();
-                return;
-            }
-
-            if (!offlineState && desktopImageRect(isRemoteControlled).contains(event->pos())) {
-                openRemoteDesktopWindow();
-                event->accept();
-                return;
-            }
-
-            if (moreActionRect(isRemoteControlled).contains(event->pos())) {
-                showDeviceMenu();
-                event->accept();
-                return;
-            }
+            clearBottomActionHover();
         }
     }
 

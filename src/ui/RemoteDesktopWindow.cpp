@@ -1,5 +1,6 @@
 ﻿#include "ui/RemoteDesktopWindow.h"
 
+#include "system/AppSettings.h"
 #include "stream/StreamRuntime.h"
 #include "ui/D3D11FramePresenter.h"
 
@@ -9,6 +10,7 @@
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QGuiApplication>
 #include <QKeyEvent>
 #include <QMetaObject>
 #include <QMouseEvent>
@@ -18,6 +20,7 @@
 #include <QPixmap>
 #include <QRegion>
 #include <QResizeEvent>
+#include <QScreen>
 #include <QStringList>
 #include <QTextStream>
 #include <QTimer>
@@ -60,6 +63,57 @@ QString zh(const char* utf8)
 QPixmap icon(const QString& name)
 {
     return QPixmap(QStringLiteral(":/UUGuest/resource/images/titlebar/") + name);
+}
+
+QRect normalizedSavedWindowGeometry(const QRect& geometry, const QSize& minimumSize)
+{
+    if (!geometry.isValid()) {
+        return {};
+    }
+
+    QRect result = geometry;
+    result.setWidth(qMax(result.width(), minimumSize.width()));
+    result.setHeight(qMax(result.height(), minimumSize.height()));
+
+    QRect availableRect;
+    const QList<QScreen*> screens = QGuiApplication::screens();
+    for (QScreen* screen : screens) {
+        if (!screen) {
+            continue;
+        }
+        const QRect screenRect = screen->availableGeometry();
+        if (screenRect.intersects(result)) {
+            availableRect = screenRect;
+            break;
+        }
+    }
+
+    if (availableRect.isNull()) {
+        QScreen* primaryScreen = QGuiApplication::primaryScreen();
+        availableRect = primaryScreen ? primaryScreen->availableGeometry() : QRect(0, 0, 1280, 720);
+        result.moveTopLeft(availableRect.topLeft() + QPoint(32, 32));
+    }
+
+    if (result.width() > availableRect.width()) {
+        result.setWidth(availableRect.width());
+    }
+    if (result.height() > availableRect.height()) {
+        result.setHeight(availableRect.height());
+    }
+    if (result.right() > availableRect.right()) {
+        result.moveRight(availableRect.right());
+    }
+    if (result.bottom() > availableRect.bottom()) {
+        result.moveBottom(availableRect.bottom());
+    }
+    if (result.left() < availableRect.left()) {
+        result.moveLeft(availableRect.left());
+    }
+    if (result.top() < availableRect.top()) {
+        result.moveTop(availableRect.top());
+    }
+
+    return result;
 }
 
 // =====wjy====
@@ -331,8 +385,15 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
     // ===end====
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
     setAttribute(Qt::WA_DeleteOnClose);
-    resize(1920, 1120);
     setMinimumSize(520, 360);
+    const QRect savedGeometry = normalizedSavedWindowGeometry(
+        platform::AppSettings::remoteDesktopWindowGeometry(m_hostIp),
+        minimumSize());
+    if (savedGeometry.isValid()) {
+        setGeometry(savedGeometry);
+    } else {
+        resize(1920, 1120);
+    }
     setWindowTitle(m_deviceName);
     setMouseTracking(true);
     setFocusPolicy(Qt::StrongFocus);
@@ -441,6 +502,19 @@ bool RemoteDesktopWindow::normalizedRemotePoint(const QPoint& position, int* x, 
         *y = qBound(0, (position.y() - imageRect.top()) * 65535 / (imageRect.height() - 1), 65535);
     }
     return true;
+}
+
+void RemoteDesktopWindow::setRememberGeometryEnabled(bool enabled)
+{
+    m_rememberGeometry = enabled;
+}
+
+void RemoteDesktopWindow::saveWindowGeometry()
+{
+    if (!m_rememberGeometry || isMinimized()) {
+        return;
+    }
+    platform::AppSettings::setRemoteDesktopWindowGeometry(m_hostIp, frameGeometry());
 }
 
 void RemoteDesktopWindow::sendInputMessage(const QByteArray& message)
@@ -1067,6 +1141,7 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
 
 void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
 {
+    saveWindowGeometry();
     // =====wjy====
     appendViewerDebugLog(QStringLiteral("closeEvent handle=%1 closing=%2")
         .arg(reinterpret_cast<quintptr>(m_viewerHandle))
@@ -1196,9 +1271,14 @@ void RemoteDesktopWindow::mouseMoveEvent(QMouseEvent* event)
 void RemoteDesktopWindow::mouseReleaseEvent(QMouseEvent* event)
 {
     if (event->button() == Qt::LeftButton) {
+        const bool wasDraggingWindow = m_draggingWindow;
+        const bool wasResizingWindow = m_resizingWindow;
         m_draggingWindow = false;
         m_resizingWindow = false;
         m_resizeEdges = ResizeNone;
+        if (wasDraggingWindow || wasResizingWindow) {
+            saveWindowGeometry();
+        }
 
         const TabHit tabHit = hitTestTabs(event->pos());
         if (tabHit.type == TabHitType::Add) {
@@ -1238,6 +1318,7 @@ void RemoteDesktopWindow::mouseReleaseEvent(QMouseEvent* event)
         }
         if (maximizeRect().contains(event->pos())) {
             isMaximized() ? showNormal() : showMaximized();
+            saveWindowGeometry();
             event->accept();
             return;
         }
