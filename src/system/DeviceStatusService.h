@@ -4,6 +4,7 @@
 #include <functional>
 
 #include <QString>
+#include <QtGlobal>
 
 class QTcpServer;
 
@@ -16,6 +17,19 @@ enum class DevicePresenceState {
     Offline,
 };
 
+// =====wjy====
+struct RemoteScriptRuntimeInfo {
+    bool supported = false; // wjy: 区分新版目标端和未携带脚本字段的旧版目标端，避免把“没有字段”误判为“没有运行”。
+    bool statusKnown = false; // wjy: 只有目标端完成清单和进程校验后才为 true，清单损坏或进程无权检查时保持未知。
+    bool running = false; // wjy: 目标端确认脚本控制进程仍存活时为 true，是设备栏运行图标的远端权威来源。
+    QString runId; // wjy: 标识一次唯一执行，用于正常结束或停止时避免旧任务误删新任务的活动清单。
+    QString workName; // wjy: 保存目标 work 子目录名，让控制端重启后仍能定位 PID 文件并停止脚本。
+    QString scriptName; // wjy: 保存正在执行的入口文件名，用于恢复脚本日志标题和提示文字。
+    qint64 controllerPid = 0; // wjy: 目标 PowerShell 控制进程 PID，状态服务会先验证它再上报 running。
+    qint64 startedAtEpochMs = 0; // wjy: 记录目标执行开始时间，并和 Windows 进程创建时间交叉校验，降低 PID 复用误判。
+};
+// ===end====
+
 struct DeviceStatusInfo {
     DevicePresenceState state = DevicePresenceState::Offline;
     QString terminalUser;
@@ -24,6 +38,7 @@ struct DeviceStatusInfo {
     QString subnetMask;
     QString broadcastIp;
     QString mac;
+    RemoteScriptRuntimeInfo scriptRuntime; // wjy: 在现有设备在线状态响应中附带目标脚本运行信息，不额外增加服务端口。
 };
 
 class DeviceStatusServer final {

@@ -156,6 +156,7 @@ private:
     QString currentScriptUiDeviceIp() const; // wjy: Return the IP whose script UI should be shown by the current detail page.
     void saveCurrentScriptUiState(); // wjy: Persist the visible script/editor UI into the per-device state cache before switching devices.
     void loadScriptUiStateForDevice(const QString& deviceIp); // wjy: Restore script/editor UI that belongs to the newly selected device.
+    void applyRemoteScriptRuntimeState(const QString& deviceIp, const QString& loginUser, const platform::RemoteScriptRuntimeInfo& runtime); // wjy: Reconcile target-authoritative script state into the per-device cache after startup or refresh.
     QVector<int> deviceIndexesForGroup(int groupIndex) const;
     QVector<int> contextDeviceIndexesForRightClick(int clickedDeviceIndex) const;
     void batchWakeDevices(const QVector<int>& deviceIndexes);
@@ -167,6 +168,13 @@ private:
         bool outputVisible = false;
         bool outputRunning = false;
         bool outputFailed = false;
+        // =====wjy====
+        bool localLaunchInProgress = false; // wjy: 本控制端仍持有启动 SSH 任务时为 true，避免活动清单刚写入前被一次空闲刷新提前清掉图标。
+        bool remoteStatusConfirmed = false; // wjy: 标识 outputRunning 是否已经被目标状态服务确认，供后续远端空闲响应清理陈旧图标。
+        QString remoteRunId; // wjy: 保存远端唯一运行 ID，停止或正常结束时只清理同一次任务的活动清单。
+        qint64 remoteControllerPid = 0; // wjy: 缓存目标 PowerShell PID，重启恢复时用于诊断和精确显示状态来源。
+        qint64 remoteStartedAtEpochMs = 0; // wjy: 缓存目标开始时间，和状态服务返回的同一次运行保持关联。
+        // ===end====
         int outputScrollOffset = 0;
         bool outputAutoScroll = true;
         bool outputDirty = false;

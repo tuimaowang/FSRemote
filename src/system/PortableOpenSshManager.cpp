@@ -8,6 +8,9 @@
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QSaveFile>
+#include <QUuid>
+
+#include <utility> // wjy: 转移后台取消回调的所有权，避免长脚本执行期间额外复制状态闭包。
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -50,6 +53,16 @@ QStringList sshArguments(const QString& keyPath, uint16_t port, const QString& l
         hostIp,
     };
 }
+
+// =====wjy====
+QString powerShellEncodedCommand(const QString& script)
+{
+    const QByteArray utf16LittleEndian(
+        reinterpret_cast<const char*>(script.utf16()),
+        script.size() * int(sizeof(ushort)));
+    return QString::fromLatin1(utf16LittleEndian.toBase64()); // wjy: 这里只编码很短的“Base64 文件转 ps1”引导脚本，不再把完整业务脚本塞进命令行。
+}
+// ===end====
 
 QString readLogTail(const QString& path, int maxBytes = 4096)
 {
@@ -373,6 +386,145 @@ bool PortableOpenSshManager::runRemoteCommands(const QString& hostIp, const QStr
         return false;
     }
 
+    if (errorMessage) {
+        errorMessage->clear();
+    }
+    return true;
+// ===end====
+}
+
+bool PortableOpenSshManager::runRemotePowerShellScript(
+    const QString& hostIp,
+    const QString& loginUser,
+    const QString& script,
+    QString* outputText,
+    QString* errorMessage,
+    int timeoutMs,
+    std::function<void(const QString&)> outputCallback,
+    std::function<bool()> shouldCancel)
+{
+// =====wjy====
+    if (script.trimmed().isEmpty()) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("remote PowerShell script is empty");
+        }
+        return false; // wjy: 空脚本不创建远端临时文件，避免返回一次看似成功但没有实际执行的任务。
+    }
+
+    QString transferId = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    transferId.remove(QLatin1Char('-')); // wjy: 临时文件名只保留十六进制字符，放入 cmd 和 PowerShell 字符串时无需额外转义。
+    const QString base64FileName = QStringLiteral("fsremote_%1.ps1.b64").arg(transferId);
+    const QString scriptFileName = QStringLiteral("fsremote_%1.ps1").arg(transferId);
+    const QString outputBeginMarker = QStringLiteral("FSREMOTE_SCRIPT_OUTPUT_BEGIN_%1").arg(transferId);
+    const QString outputEndMarker = QStringLiteral("FSREMOTE_SCRIPT_OUTPUT_END_%1").arg(transferId);
+
+    QByteArray scriptBytes("\xEF\xBB\xBF", 3);
+    scriptBytes.append(script.toUtf8()); // wjy: 写入 UTF-8 BOM，让目标 Windows PowerShell 5.1 也能稳定识别中文路径和中文注释。
+    const QByteArray scriptBase64 = scriptBytes.toBase64();
+
+    constexpr qsizetype kBase64ChunkSize = 2048;
+    const qsizetype chunkCount = (scriptBase64.size() + kBase64ChunkSize - 1) / kBase64ChunkSize;
+    QStringList commands;
+    commands.reserve(chunkCount + 8);
+    for (qsizetype offset = 0; offset < scriptBase64.size(); offset += kBase64ChunkSize) {
+        const QString chunk = QString::fromLatin1(scriptBase64.mid(offset, kBase64ChunkSize));
+        const QString redirection = offset == 0 ? QStringLiteral(">") : QStringLiteral(">>");
+        commands.append(QStringLiteral("@%1 \"%TEMP%\\%2\" echo %3")
+            .arg(redirection, base64FileName, chunk)); // wjy: 每行最多约 2KB，远低于 cmd 8191 字符上限；Base64 不含 &、|、% 等 cmd 元字符。
+    }
+
+    const QString decodeScript = QStringLiteral(
+        "$base64Path = Join-Path $env:TEMP '%1'\n"
+        "$scriptPath = Join-Path $env:TEMP '%2'\n"
+        "$bytes = [Convert]::FromBase64String([IO.File]::ReadAllText($base64Path))\n"
+        "[IO.File]::WriteAllBytes($scriptPath, $bytes)")
+        .arg(base64FileName, scriptFileName); // wjy: 短引导脚本只负责把分块 Base64 还原成带 BOM 的 ps1 文件。
+    commands.append(QStringLiteral("@powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand %1")
+        .arg(powerShellEncodedCommand(decodeScript))); // wjy: 引导命令长度固定且很短，不会再次触发 EncodedCommand 截断。
+    commands.append(QStringLiteral("@if errorlevel 1 exit 9008")); // wjy: 临时脚本还原失败时立即把非零退出码传回控制端，不继续执行残缺文件。
+    commands.append(QStringLiteral("@echo %1").arg(outputBeginMarker)); // wjy: 从这个唯一标记之后才把远端输出交给脚本面板，上传 Base64 和 cmd 回显全部丢弃。
+    commands.append(QStringLiteral("@powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"%TEMP%\\%1\"")
+        .arg(scriptFileName)); // wjy: 真正业务脚本从文件执行，脚本再长也不占用 cmd 单条命令长度。
+    commands.append(QStringLiteral("@set \"FSREMOTE_POWERSHELL_EXIT=%ERRORLEVEL%\"")); // wjy: 删除临时文件前保存业务脚本退出码，保证失败不会被 del 命令覆盖。
+    commands.append(QStringLiteral("@del /q \"%TEMP%\\%1\" \"%TEMP%\\%2\" >NUL 2>&1")
+        .arg(base64FileName, scriptFileName)); // wjy: 正常结束后删除本次唯一命名的 Base64 和 ps1 临时文件。
+    commands.append(QStringLiteral("@echo %1").arg(outputEndMarker)); // wjy: 结束标记之后的提示符和 exit 回显不进入脚本日志。
+    commands.append(QStringLiteral("@exit %FSREMOTE_POWERSHELL_EXIT%")); // wjy: 让 ssh.exe 返回业务脚本真实退出码，UI 不再把 PowerShell 解析失败误显示成已完成。
+
+    QString rawOutput;
+    QString rawError;
+    QString pendingLine;
+    QString filteredOutput;
+    bool outputStarted = false;
+    bool outputFinished = false;
+    bool streamedAnyOutput = false;
+    auto filteredCallback = [&](const QString& chunk) {
+        pendingLine += chunk;
+        qsizetype newlineIndex = -1;
+        while ((newlineIndex = pendingLine.indexOf(QLatin1Char('\n'))) >= 0) {
+            const QString line = pendingLine.left(newlineIndex + 1);
+            pendingLine.remove(0, newlineIndex + 1);
+            const bool isBeginMarker = line.contains(outputBeginMarker)
+                && !line.contains(QStringLiteral("echo %1").arg(outputBeginMarker), Qt::CaseInsensitive);
+            const bool isEndMarker = line.contains(outputEndMarker)
+                && !line.contains(QStringLiteral("echo %1").arg(outputEndMarker), Qt::CaseInsensitive);
+            if (!outputStarted) {
+                if (isBeginMarker) {
+                    outputStarted = true; // wjy: 忽略 SSH 欢迎语、远端 prompt、分块上传命令以及它们的 PTY 回显。
+                }
+                continue;
+            }
+            if (isEndMarker) {
+                outputFinished = true;
+                outputStarted = false;
+                continue;
+            }
+            if (!outputFinished) {
+                filteredOutput += line;
+                if (outputCallback) {
+                    outputCallback(line);
+                    streamedAnyOutput = true; // wjy: 标记内容已经实时送到 UI，结束后不再把同一段结果重复推送一次。
+                }
+            }
+        }
+    };
+
+    const bool ok = runRemoteCommands(
+        hostIp,
+        loginUser,
+        commands,
+        &rawOutput,
+        &rawError,
+        timeoutMs,
+        filteredCallback,
+        std::move(shouldCancel)); // wjy: 保留原有 PTY 生命周期和取消语义，只在输出层隔离传输噪声。
+    filteredCallback(QStringLiteral("\n")); // wjy: 命令结束时补一个换行，处理最后一段没有换行符的脚本输出或结束标记。
+
+    if (!outputStarted && filteredOutput.isEmpty()) {
+        const qsizetype beginPosition = rawOutput.lastIndexOf(outputBeginMarker);
+        const qsizetype endPosition = rawOutput.lastIndexOf(outputEndMarker);
+        if (beginPosition >= 0) {
+            const qsizetype contentStart = beginPosition + outputBeginMarker.size();
+            const qsizetype contentLength = endPosition > contentStart ? endPosition - contentStart : -1;
+            filteredOutput = rawOutput.mid(contentStart, contentLength).trimmed(); // wjy: 极端终端控制码破坏分行时，用最后一对标记从完整输出中兜底提取业务内容。
+            if (outputCallback && !streamedAnyOutput && !filteredOutput.isEmpty()) {
+                outputCallback(filteredOutput);
+            }
+        }
+    }
+
+    if (outputText) {
+        *outputText = filteredOutput.trimmed(); // wjy: 调用者只拿到脚本输出，不再看到 Base64、Windows banner、prompt 或完整 powershell 命令。
+    }
+    if (!ok) {
+        if (errorMessage) {
+            const QString cleanError = filteredOutput.trimmed();
+            *errorMessage = cleanError.isEmpty()
+                ? QStringLiteral("remote PowerShell script transfer or execution failed")
+                : cleanError; // wjy: 失败信息也使用过滤后的业务输出，禁止把超长 Base64 再作为错误文本塞进终端面板。
+        }
+        return false;
+    }
     if (errorMessage) {
         errorMessage->clear();
     }

@@ -61,6 +61,7 @@
 #include <QTextStream>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
+#include <QUuid>
 #include <QVector>
 #include <QWheelEvent>
 
@@ -3085,7 +3086,7 @@ void DeviceGrid::saveCurrentScriptUiState()
         return;
     }
 
-    ScriptUiState state;
+    ScriptUiState state = m_scriptUiStates.value(deviceIp); // wjy: 保留远端 runId/PID/确认状态，切换设备时只用当前可见控件覆盖 UI 字段。
     state.outputVisible = m_scriptOutputVisible;
     state.outputRunning = m_scriptOutputRunning;
     state.outputFailed = m_scriptOutputFailed;
@@ -3151,6 +3152,71 @@ void DeviceGrid::loadScriptUiStateForDevice(const QString& deviceIp)
     }
     updateScriptFileEditorControls();
     update(scriptFileEditorRect().adjusted(-2, -2, 2, 2).united(scriptTerminalPanelRect().toAlignedRect().adjusted(-2, -2, 2, 2)));
+// ===end====
+}
+
+void DeviceGrid::applyRemoteScriptRuntimeState(
+    const QString& deviceIp,
+    const QString& loginUser,
+    const platform::RemoteScriptRuntimeInfo& runtime)
+{
+// =====wjy====
+    const QString targetIp = deviceIp.trimmed();
+    if (targetIp.isEmpty() || !runtime.supported || !runtime.statusKnown) {
+        return; // wjy: 旧目标端或无法确认的响应不覆盖本地状态，避免把“未知”错误显示成“未运行”。
+    }
+
+    ScriptUiState state = m_scriptUiStates.value(targetIp);
+    if (runtime.running) {
+        const bool recoveredRun = !state.outputRunning
+            || (!runtime.runId.isEmpty() && state.remoteRunId != runtime.runId); // wjy: 新进程首次发现运行或 runId 变化时重建本设备的日志提示。
+        state.outputVisible = true;
+        state.outputRunning = true;
+        state.outputFailed = false;
+        state.remoteStatusConfirmed = true;
+        state.remoteRunId = runtime.runId;
+        state.remoteControllerPid = runtime.controllerPid;
+        state.remoteStartedAtEpochMs = runtime.startedAtEpochMs;
+        state.editorDeviceIp = targetIp;
+        state.editorLoginUser = loginUser.trimmed();
+        state.editorWorkName = runtime.workName;
+        state.cancelRequested = state.cancelRequested
+            ? state.cancelRequested
+            : std::make_shared<std::atomic_bool>(false); // wjy: 控制端重启恢复的任务也创建本地取消标志，停止流程可沿用现有 SSH 退出机制。
+        if (state.outputFilePath.trimmed().isEmpty()) {
+            state.outputFilePath = scriptOutputTempFilePath(); // wjy: 新控制端没有旧临时日志文件时创建独立缓存，避免和其它设备输出混写。
+        }
+        const QString restoredScriptName = runtime.scriptName.trimmed().isEmpty()
+            ? runtime.workName
+            : runtime.scriptName;
+        if (recoveredRun) {
+            state.outputTitle = QString::fromUtf8("已恢复 - %1").arg(restoredScriptName);
+            state.outputText = QString::fromUtf8(
+                "状态: 已从目标设备恢复正在执行的脚本\n脚本: %1\n目标 PID: %2\n")
+                .arg(restoredScriptName)
+                .arg(runtime.controllerPid); // wjy: 明确告诉用户该状态来自远端确认，而不是本控制端刚刚发起的任务。
+            writeScriptOutputFile(state.outputFilePath, state.outputText, QIODevice::Truncate);
+        }
+    } else if (state.outputRunning && !state.localLaunchInProgress) {
+        state.outputRunning = false;
+        state.outputFailed = false;
+        state.remoteRunId.clear();
+        state.remoteControllerPid = 0;
+        state.remoteStartedAtEpochMs = 0;
+        if (!state.outputFilePath.trimmed().isEmpty()) {
+            writeScriptOutputFile(
+                state.outputFilePath,
+                QString::fromUtf8("\n状态: 目标设备已确认脚本不再运行。\n"),
+                QIODevice::Append); // wjy: 目标端确认结束后同步清掉陈旧图标，并在本地恢复日志中留下原因。
+            state.outputText = stripTerminalControlSequences(readScriptOutputFileTail(state.outputFilePath));
+        }
+    }
+
+    m_scriptUiStates.insert(targetIp, state);
+    update(deviceListViewportRect(m_deviceGroupExpanded)); // wjy: 每次远端确认后立即刷新左侧列表，让重启恢复的运行图标无需等待用户切换设备。
+    if (currentScriptUiDeviceIp() == targetIp) {
+        loadScriptUiStateForDevice(targetIp); // wjy: 当前详情设备同时恢复停止所需的 loginUser/workName 和脚本终端提示。
+    }
 // ===end====
 }
 
@@ -3664,6 +3730,7 @@ bool DeviceGrid::stopDeviceScriptForDeviceIndex(int deviceIndex, bool showMessag
 
     const QString loginUser = state.editorLoginUser.trimmed();
     const QString scriptWorkName = state.editorWorkName.trimmed();
+    const QString remoteRunId = state.remoteRunId.trimmed(); // wjy: 恢复任务携带远端 runId，停止清单时只允许删除同一次执行记录。
     const QString outputFilePath = state.outputFilePath;
     const auto cancelRequested = state.cancelRequested;
     if (deviceIp.isEmpty() || loginUser.isEmpty() || scriptWorkName.isEmpty()) {
@@ -3672,6 +3739,7 @@ bool DeviceGrid::stopDeviceScriptForDeviceIndex(int deviceIndex, bool showMessag
         }
         state.outputRunning = false;
         state.outputFailed = false;
+        state.localLaunchInProgress = false; // wjy: 无法定位远端 work 时结束本地启动态，避免后续空闲刷新一直被启动竞态保护挡住。
         m_scriptUiStates.insert(deviceIp, state);
         update(deviceListViewportRect(m_deviceGroupExpanded)); // wjy: 停止状态写回后立即重绘左侧设备列表，让运行图标同步消失。
         if (currentScriptUiDeviceIp() == deviceIp) {
@@ -3682,6 +3750,7 @@ bool DeviceGrid::stopDeviceScriptForDeviceIndex(int deviceIndex, bool showMessag
 
     state.outputRunning = false;
     state.outputFailed = false;
+    state.localLaunchInProgress = false; // wjy: 用户已明确请求停止，先关闭本地启动竞态保护并隐藏运行图标。
     writeScriptOutputFile(outputFilePath, QString::fromUtf8("\n状态: 正在停止目标进程...\n"), QIODevice::Append);
     state.outputText = stripTerminalControlSequences(readScriptOutputFileTail(outputFilePath));
     m_scriptUiStates.insert(deviceIp, state); // wjy: 先把目标设备状态写成停止中，当前 UI 或切回该设备时都能看到停止状态。
@@ -3698,7 +3767,11 @@ if ([string]::IsNullOrWhiteSpace($fsremoteExe)) {
     exit 0
 }
 $fsremoteDir = Split-Path -Parent $fsremoteExe
-$work = Join-Path (Join-Path $fsremoteDir 'work') '%1'
+$workRoot = Join-Path $fsremoteDir 'work'
+$scriptWorkName = '%1'
+$expectedRunId = '%2'
+$work = Join-Path $workRoot $scriptWorkName
+$activeStateFile = Join-Path $workRoot 'fsremote_active_script.json'
 $pidFile = Join-Path $work 'fsremote_script_controller_pid.txt'
 $stopRequestFile = Join-Path $work 'fsremote_script_stop_requested.txt'
 ('Stop requested: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Set-Content -LiteralPath $stopRequestFile -Encoding UTF8
@@ -3719,25 +3792,40 @@ if ($targetPid -le 0) {
 }
 Write-Output ('taskkill remote script tree pid=' + $targetPid)
 & taskkill.exe /PID $targetPid /T /F 2>&1 | ForEach-Object { Write-Output $_ }
+Start-Sleep -Milliseconds 300
+if (Get-Process -Id $targetPid -ErrorAction SilentlyContinue) {
+    Write-Error ('remote script controller is still running pid=' + $targetPid)
+    exit 1
+}
+# wjy: 只有 Windows 已确认控制进程退出后才删除 PID 和活动清单，taskkill 失败时保留远端权威状态供下次刷新恢复。
 Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $activeStateFile) {
+    try {
+        $activeState = Get-Content -LiteralPath $activeStateFile -Raw | ConvertFrom-Json
+        $sameRun = -not [string]::IsNullOrWhiteSpace($expectedRunId) -and [string]$activeState.runId -eq $expectedRunId
+        $sameLegacyRun = [string]::IsNullOrWhiteSpace($expectedRunId) -and [string]$activeState.workName -eq $scriptWorkName -and [int64]$activeState.controllerPid -eq $targetPid
+        if ($sameRun -or $sameLegacyRun) {
+            Remove-Item -LiteralPath $activeStateFile -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Write-Output ('FSRemote active state stop cleanup skipped: ' + $_.Exception.Message)
+    }
+}
 exit 0
-)").arg(escapedPowerShellSingleQuoted(scriptWorkName));
-    const QStringList commands = {
-        QStringLiteral("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand %1 & exit %ERRORLEVEL%")
-            .arg(powerShellEncodedCommand(remotePowerShellScript)),
-    };
-
+)").arg(
+        escapedPowerShellSingleQuoted(scriptWorkName),
+        escapedPowerShellSingleQuoted(remoteRunId)); // wjy: 停止恢复任务后按 runId 清理全局活动清单；旧任务没有 runId 时用 workName 和 PID 双重匹配。
     QPointer<DeviceGrid> self(this);
-    runBackgroundTask([self, deviceIp, loginUser, commands, outputFilePath, cancelRequested] {
+    runBackgroundTask([self, deviceIp, loginUser, remotePowerShellScript, outputFilePath, cancelRequested] {
         QString outputText;
         QString errorMessage;
-        const bool ok = platform::PortableOpenSshManager::instance().runRemoteCommands(
+        const bool ok = platform::PortableOpenSshManager::instance().runRemotePowerShellScript(
             deviceIp,
             loginUser,
-            commands,
+            remotePowerShellScript,
             &outputText,
             &errorMessage,
-            15000);
+            15000); // wjy: 停止脚本也通过临时 ps1 执行，避免停止逻辑增长后再次碰到 EncodedCommand 长度和回显问题。
         if (cancelRequested) {
             cancelRequested->store(true); // wjy: 远端 taskkill 发出后再让原 SSH 执行会话退出，避免只杀本地 ssh 留下目标子进程。
         }
@@ -3757,6 +3845,12 @@ exit 0
             const QString result = ok ? outputText.trimmed() : errorMessage.trimmed();
             if (!result.isEmpty()) {
                 writeScriptOutputFile(outputFilePath, QString::fromUtf8("\n%1\n").arg(stripTerminalControlSequences(result)), QIODevice::Append);
+            }
+            if (ok) {
+                state.remoteStatusConfirmed = true;
+                state.remoteRunId.clear();
+                state.remoteControllerPid = 0;
+                state.remoteStartedAtEpochMs = 0; // wjy: 远端停止命令完成后清除恢复元数据，下一次状态刷新会再次核对目标是否确实空闲。
             }
             state.outputDirty = true;
             grid->m_scriptUiStates.insert(targetIp, state);
@@ -4638,6 +4732,10 @@ void DeviceGrid::refreshDeviceStatuses()
         QHash<QString, QString> remoteDeviceNames; // wjy: 自动刷新时顺便记录远端真实设备名，用来同步 devices.json 的 name 字段。
         QHash<QString, QString> remoteDeviceMacs; // wjy: 状态服务返回 MAC 时用于补齐旧设备记录，避免远程开机仍读到空 MAC。
         QHash<QString, QString> remoteDeviceBroadcastIps; // wjy: 同步记录广播地址，后续远程开机代理可直接使用正确网段。
+        // =====wjy====
+        QHash<QString, platform::RemoteScriptRuntimeInfo> remoteScriptRuntimes; // wjy: 保存每台新版目标端返回的脚本运行信息，UI 线程据此恢复重启前的运行图标。
+        QHash<QString, QString> remoteTerminalUsers; // wjy: 运行状态和登录用户一起回传 UI，恢复任务后停止命令仍能建立 SSH。
+        // ===end====
         std::mutex resultMutex;
         std::atomic_int nextIndex = 0;
         const int workerCount = std::max(1, std::min<int>(8, ips.size()));
@@ -4683,6 +4781,12 @@ void DeviceGrid::refreshDeviceStatuses()
                     if (!info.broadcastIp.trimmed().isEmpty()) {
                         remoteDeviceBroadcastIps.insert(ip, info.broadcastIp.trimmed()); // wjy: 广播地址和 MAC 一起回填，保持远程开机参数完整。
                     }
+                    // =====wjy====
+                    if (info.scriptRuntime.supported) {
+                        remoteScriptRuntimes.insert(ip, info.scriptRuntime); // wjy: 只有响应明确携带新版字段时才参与脚本状态同步，旧目标端不会被当成空闲。
+                        remoteTerminalUsers.insert(ip, info.terminalUser.trimmed()); // wjy: 缓存目标登录用户，控制端重启后无需依赖已丢失的 ScriptUiState。
+                    }
+                    // ===end====
                 }
 // =====wjy====
                 writeDeviceGridStartupLog(QStringLiteral("[wjy-status] worker end worker=%1").arg(worker)); // wjy: worker 结束日志，判断线程是否正常跑完。
@@ -4708,7 +4812,7 @@ void DeviceGrid::refreshDeviceStatuses()
 
 // =====wjy====
         writeDeviceGridStartupLog(QStringLiteral("[wjy-status] invoke ui post begin")); // wjy: 准备把后台探测结果投递回 UI 线程；如果有 begin 没有 end，说明崩在投递附近。
-        const bool invokeQueued = QMetaObject::invokeMethod(self, [self, statuses = std::move(statuses), remoteDeviceNames = std::move(remoteDeviceNames), remoteDeviceMacs = std::move(remoteDeviceMacs), remoteDeviceBroadcastIps = std::move(remoteDeviceBroadcastIps)]() mutable {
+        const bool invokeQueued = QMetaObject::invokeMethod(self, [self, statuses = std::move(statuses), remoteDeviceNames = std::move(remoteDeviceNames), remoteDeviceMacs = std::move(remoteDeviceMacs), remoteDeviceBroadcastIps = std::move(remoteDeviceBroadcastIps), remoteScriptRuntimes = std::move(remoteScriptRuntimes), remoteTerminalUsers = std::move(remoteTerminalUsers)]() mutable { // wjy: 把脚本运行结果和设备在线结果同批投递到 UI 线程，避免跨线程直接写 m_scriptUiStates。
 // =====wjy====
             writeDeviceGridStartupLog(QStringLiteral("[wjy-status] invoke ui begin")); // wjy: 回到 UI 线程前半段日志，判断崩溃是否发生在 UI 更新阶段。
 // ===end====
@@ -4767,6 +4871,14 @@ void DeviceGrid::refreshDeviceStatuses()
                     grid->m_previousDeviceName = grid->m_currentDeviceName;
                 }
             }
+            // =====wjy====
+            for (auto it = remoteScriptRuntimes.cbegin(); it != remoteScriptRuntimes.cend(); ++it) {
+                grid->applyRemoteScriptRuntimeState(
+                    it.key(),
+                    remoteTerminalUsers.value(it.key()),
+                    it.value()); // wjy: 启动首次刷新和定时刷新共用同一恢复入口，确认运行时重建图标/停止元数据，确认空闲时清理陈旧状态。
+            }
+            // ===end====
             for (auto it = grid->m_poweringOnDeviceIps.begin(); it != grid->m_poweringOnDeviceIps.end();) {
                 const platform::DevicePresenceState state = grid->m_deviceStatuses.value(*it, platform::DevicePresenceState::Offline);
                 if (state != platform::DevicePresenceState::Offline) {
@@ -5102,7 +5214,7 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
     const DeviceEntry device = g_devices.at(deviceIndex);
     const QString targetIp = device.ip.trimmed();
     const ScriptUiState existingState = m_scriptUiStates.value(targetIp);
-    if (existingState.outputRunning) {
+    if (existingState.outputRunning && existingState.localLaunchInProgress) {
         if (showMessages) {
             QMessageBox messageBox(
                 QMessageBox::Information,
@@ -5113,9 +5225,43 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
             messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
             messageBox.exec();
         }
-        return false; // wjy: 分组批量执行时跳过正在运行脚本的设备，避免同一设备堆出多套 conhost/cmd/python 进程。
+        return false; // wjy: 本控制端仍在启动/执行 SSH 任务时直接拦截，避免活动清单写入前的短暂空窗触发第二次执行。
     }
-    const QString loginUser = platform::DeviceStatusService::terminalUser(device.ip);
+
+    const platform::DeviceStatusInfo remoteStatus = platform::DeviceStatusService::query(device.ip); // wjy: 执行前沿用原用户名查询的同一次连接，同时取得目标端权威脚本状态，控制端重启后也能防止重复启动。
+    if (remoteStatus.scriptRuntime.supported && remoteStatus.scriptRuntime.statusKnown) {
+        applyRemoteScriptRuntimeState(targetIp, remoteStatus.terminalUser, remoteStatus.scriptRuntime); // wjy: 远端确认运行时恢复 Logo/停止元数据，确认空闲时清理旧控制端留下的陈旧状态。
+    }
+    if (remoteStatus.scriptRuntime.supported && !remoteStatus.scriptRuntime.statusKnown) {
+        if (showMessages) {
+            QMessageBox messageBox(
+                QMessageBox::Warning,
+                QString(),
+                QString::fromUtf8("无法确认目标设备当前脚本状态，请刷新设备状态后重试。"),
+                QMessageBox::NoButton,
+                this);
+            messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+            messageBox.exec(); // wjy: 清单损坏或进程不可检查时阻止新任务，避免在未知状态下叠加第二套脚本进程。
+        }
+        return false;
+    }
+    if (remoteStatus.scriptRuntime.supported && remoteStatus.scriptRuntime.running) {
+        if (showMessages) {
+            QMessageBox messageBox(
+                QMessageBox::Information,
+                QString(),
+                QString::fromUtf8("该设备已有脚本正在执行。"),
+                QMessageBox::NoButton,
+                this);
+            messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+            messageBox.exec();
+        }
+        return false; // wjy: 远端运行状态优先于新进程空白的本地 QHash，杜绝重启后的重复执行。
+    }
+    if (!remoteStatus.scriptRuntime.supported && existingState.outputRunning) {
+        return false; // wjy: 旧目标端没有权威字段时保留原本的本地防重复行为，不因协议兼容而放宽正在执行的设备。
+    }
+    const QString loginUser = remoteStatus.terminalUser;
     if (loginUser.isEmpty()) {
         if (showMessages) {
             QMessageBox messageBox(
@@ -5153,11 +5299,19 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
     const QString targetName = deviceDisplayName(device);
     const QString scriptName = entryScript.fileName();
     const QString scriptWorkName = entryScript.completeBaseName();
+    const QString runId = QUuid::createUuid().toString(QUuid::WithoutBraces); // wjy: 每次执行生成唯一 ID，远端完成/停止只能清理属于本次运行的活动清单。
     const bool targetIsCurrent = currentScriptUiDeviceIp() == targetIp;
     ScriptUiState state;
     state.outputVisible = true;
     state.outputRunning = true;
     state.outputFailed = false;
+    // =====wjy====
+    state.localLaunchInProgress = true;
+    state.remoteStatusConfirmed = false;
+    state.remoteRunId = runId;
+    state.remoteControllerPid = 0;
+    state.remoteStartedAtEpochMs = 0; // wjy: 清单尚未由目标端写入前标记为本地启动中，周期刷新不能把短暂空闲误当成执行结束。
+    // ===end====
     state.outputScrollOffset = 0;
     state.outputAutoScroll = true;
     state.outputDirty = false;
@@ -5258,8 +5412,27 @@ $exitCodeFile = Join-Path $work 'fsremote_script_exit_code.txt'
 $finishedFile = Join-Path $work 'fsremote_script_finished.txt'
 $controllerPidFile = Join-Path $work 'fsremote_script_controller_pid.txt'
 $stopRequestFile = Join-Path $work 'fsremote_script_stop_requested.txt'
+$activeStateFile = Join-Path $workRoot 'fsremote_active_script.json'
+$activeTempFile = Join-Path $workRoot ('fsremote_active_script.' + $PID + '.tmp')
+$runId = '%5'
 Remove-Item -LiteralPath $stopRequestFile -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $finishedFile -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath $exitCodeFile -Force -ErrorAction SilentlyContinue
 ('PID: ' + $PID) | Set-Content -LiteralPath $controllerPidFile -Encoding UTF8
+$startedAtEpochMs = [DateTimeOffset]::new((Get-Process -Id $PID).StartTime).ToUnixTimeMilliseconds()
+# wjy: 清单记录 PowerShell 真实创建时间而不是复制完成时间，脚本目录复制很久时仍能通过 C++ 的 PID 复用校验。
+$activeState = [ordered]@{
+    version = 1
+    state = 'running'
+    runId = $runId
+    workName = $scriptWorkName
+    scriptName = '%2'
+    controllerPid = [int64]$PID
+    startedAtEpochMs = [int64]$startedAtEpochMs
+}
+$activeJson = $activeState | ConvertTo-Json -Compress
+[System.IO.File]::WriteAllText($activeTempFile, $activeJson, (New-Object System.Text.UTF8Encoding($false)))
+Move-Item -LiteralPath $activeTempFile -Destination $activeStateFile -Force
 @(
     'FSRemote script execution started'
     ('Time: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
@@ -5283,26 +5456,32 @@ if ($null -eq $scriptExit) {
 ('Finished: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) | Set-Content -LiteralPath $finishedFile -Encoding UTF8
 ('ExitCode: ' + $scriptExit) | Add-Content -LiteralPath $runLog -Encoding UTF8
 Remove-Item -LiteralPath $controllerPidFile -Force -ErrorAction SilentlyContinue
+if (Test-Path -LiteralPath $activeStateFile) {
+    try {
+        $currentActiveState = Get-Content -LiteralPath $activeStateFile -Raw | ConvertFrom-Json
+        if ([string]$currentActiveState.runId -eq $runId) {
+            Remove-Item -LiteralPath $activeStateFile -Force -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Write-Output ('FSRemote active state cleanup skipped: ' + $_.Exception.Message)
+    }
+}
 Get-Content -LiteralPath $runLog -Tail 80
 exit $scriptExit
 )").arg(
         escapedPowerShellSingleQuoted(sourcePath),
         escapedPowerShellSingleQuoted(scriptName),
         escapedPowerShellSingleQuoted(entryScript.suffix().toLower()),
-        escapedPowerShellSingleQuoted(scriptWorkName));
-    const QStringList commands = {
-        QStringLiteral("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand %1 & exit %ERRORLEVEL%")
-            .arg(powerShellEncodedCommand(remotePowerShellScript)),
-    }; // wjy: 远端复制/执行脚本整体通过 EncodedCommand 传输，避免中文共享路径经过 cmd 输入流后乱码。
-
+        escapedPowerShellSingleQuoted(scriptWorkName),
+        escapedPowerShellSingleQuoted(runId)); // wjy: 目标包装器原子写入全局活动清单，正常结束时按 runId 条件删除，旧任务不会误删新任务状态。
     QPointer<DeviceGrid> self(this);
-    runBackgroundTask([self, deviceIp = device.ip, loginUser, commands, targetName, scriptName, scriptWorkName, outputFilePath = state.outputFilePath, cancelRequested = state.cancelRequested] {
+    runBackgroundTask([self, deviceIp = device.ip, loginUser, remotePowerShellScript, targetName, scriptName, scriptWorkName, outputFilePath = state.outputFilePath, cancelRequested = state.cancelRequested] {
         QString outputText;
         QString runError;
-        const bool ok = platform::PortableOpenSshManager::instance().runRemoteCommands(
+        const bool ok = platform::PortableOpenSshManager::instance().runRemotePowerShellScript(
             deviceIp,
             loginUser,
-            commands,
+            remotePowerShellScript,
             &outputText,
             &runError,
             0,
@@ -5334,7 +5513,7 @@ exit $scriptExit
             },
             [cancelRequested] {
                 return cancelRequested && cancelRequested->load();
-            });
+            }); // wjy: 长业务脚本改为分块写入远端临时 ps1 再执行，避免 EncodedCommand 超过 8191 字符并过滤上传回显。
 
         if (!self) {
             return;
@@ -5365,6 +5544,11 @@ exit $scriptExit
             state.outputVisible = true;
             state.outputRunning = false;
             state.outputFailed = !ok && !canceled;
+            state.localLaunchInProgress = false;
+            state.remoteStatusConfirmed = true;
+            state.remoteRunId.clear();
+            state.remoteControllerPid = 0;
+            state.remoteStartedAtEpochMs = 0; // wjy: SSH 执行回调结束说明本次远端控制进程已退出，本地缓存同步收敛到已结束状态。
             state.outputScrollOffset = 0;
             state.outputAutoScroll = true;
             state.outputDirty = false;

@@ -18,6 +18,7 @@ public:
 
     bool openTerminal(const QString& hostIp, const QString& loginUser, QString* errorMessage = nullptr);
     bool runRemoteCommands(const QString& hostIp, const QString& loginUser, const QStringList& commands, QString* outputText = nullptr, QString* errorMessage = nullptr, int timeoutMs = 120000, std::function<void(const QString&)> outputCallback = {}, std::function<bool()> shouldCancel = {});
+    bool runRemotePowerShellScript(const QString& hostIp, const QString& loginUser, const QString& script, QString* outputText = nullptr, QString* errorMessage = nullptr, int timeoutMs = 120000, std::function<void(const QString&)> outputCallback = {}, std::function<bool()> shouldCancel = {}); // wjy: 将长 PowerShell 分块写入远端临时 ps1 后执行，避开 cmd 单行长度限制和 Base64 命令回显。
     QString clientPublicKey(QString* errorMessage = nullptr);
     bool authorizeClientPublicKey(const QString& publicKey, QString* errorMessage = nullptr);
     QString loginUser() const;
