@@ -62,6 +62,7 @@ protected:
     void paintEvent(QPaintEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
+    void mouseDoubleClickEvent(QMouseEvent* event) override; // wjy: 捕获标题栏非按钮区域双击，并复用右侧最大化按钮的窗口切换逻辑。
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
@@ -74,22 +75,17 @@ protected:
 
 private:
     void startViewerConnection();
-    enum class TabHitType {
-        None,
-        Tab,
-        CloseTab,
-        Add,
-    };
-
-    struct TabHit {
-        TabHitType type = TabHitType::None;
-        int index = -1;
-    };
+    // =====wjy====
+    // wjy: 远控标题栏已删除“虚拟屏”标签和“+”入口，因此不再保留标签命中类型。
+    // ===end====
 
     QRect minimizeRect() const;
     QRect maximizeRect() const;
     QRect closeRect() const;
-    QRect controlCenterRect() const;
+    // =====wjy====
+    bool isTitleBarBlankArea(const QPoint& position) const; // wjy: 统一判断标题栏可拖动/可双击区域，排除右侧窗口控制按钮。
+    void toggleMaximizedState(); // wjy: 最大化图标点击和标题栏双击共用这一段窗口状态切换逻辑。
+    // ===end====
     QRect remoteImageRect() const;
     QSize remoteFrameSize() const;
     bool normalizedRemotePoint(const QPoint& position, int* x, int* y) const;
@@ -102,7 +98,9 @@ private:
     void releasePressedKeys();
     void releaseForwardedKeys();
     int remoteButton(Qt::MouseButton button) const;
-    TabHit hitTestTabs(const QPoint& position) const;
+    // =====wjy====
+    // wjy: 标题栏不再存在虚拟屏标签点击区，因此删除对应的命中测试声明。
+    // ===end====
     int resizeEdgesAt(const QPoint& position) const;
     void updateResizeCursor(const QPoint& position);
     void updateWindowMask();
@@ -125,9 +123,9 @@ private:
     bool m_rememberGeometry = true;
     bool m_textureFrameActive = false;
     std::atomic_bool m_texturePresentFailed = false;
-    QVector<int> m_virtualScreens;
-    int m_nextVirtualScreenNumber = 1;
-    int m_activeTabIndex = 0;
+    // =====wjy====
+    // wjy: 删除仅服务于标题栏虚拟屏标签的编号、列表和当前标签状态。
+    // ===end====
     QPoint m_hoveredPos = QPoint(-1, -1);
     bool m_draggingWindow = false;
     bool m_resizingWindow = false;

@@ -245,6 +245,29 @@ void drawDeviceTileIcon(QPainter& painter, int x, int y, int size = 20)
     drawDeviceTileIcon(painter, x, y, size, QColor(QStringLiteral("#3A7BFC")));
 }
 
+// =====wjy====
+void drawScriptRunningIcon(QPainter& painter, const QRectF& bounds)
+{
+    painter.save(); // wjy: 独立保存绘制状态，避免运行图标的画笔和抗锯齿设置影响设备行其它元素。
+    painter.setRenderHint(QPainter::Antialiasing);
+
+    const QRectF badgeRect = bounds.adjusted(0.55, 0.55, -0.55, -0.55); // wjy: 半像素内缩让 1.1 像素边框在 18 像素徽标内保持清晰。
+    painter.setPen(QPen(QColor(QStringLiteral("#3A7BFC")), 1.1));
+    painter.setBrush(QColor(QStringLiteral("#F8FBFF")));
+    painter.drawRoundedRect(badgeRect, 4, 4); // wjy: 浅色圆角终端外框和现有蓝色设备图标保持同一视觉体系。
+
+    const qreal x = bounds.x();
+    const qreal y = bounds.y();
+    painter.setPen(QPen(QColor(QStringLiteral("#3A7BFC")), 1.6, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    painter.drawLine(QPointF(x + 5.0, y + 5.2), QPointF(x + 8.2, y + 9.0));
+    painter.drawLine(QPointF(x + 8.2, y + 9.0), QPointF(x + 5.0, y + 12.8));
+
+    painter.setPen(QPen(QColor(QStringLiteral("#F5C542")), 2.2, Qt::SolidLine, Qt::RoundCap));
+    painter.drawLine(QPointF(x + 10.2, y + 12.6), QPointF(x + 13.3, y + 12.6)); // wjy: 黄色短光标用于强调“运行中”，并和绿色在线状态点区分语义。
+    painter.restore();
+}
+// ===end====
+
 void drawRemoteBadge(QPainter& painter, int x, int y)
 {
     painter.drawPixmap(
@@ -3650,6 +3673,7 @@ bool DeviceGrid::stopDeviceScriptForDeviceIndex(int deviceIndex, bool showMessag
         state.outputRunning = false;
         state.outputFailed = false;
         m_scriptUiStates.insert(deviceIp, state);
+        update(deviceListViewportRect(m_deviceGroupExpanded)); // wjy: 停止状态写回后立即重绘左侧设备列表，让运行图标同步消失。
         if (currentScriptUiDeviceIp() == deviceIp) {
             loadScriptUiStateForDevice(deviceIp);
         }
@@ -3661,6 +3685,7 @@ bool DeviceGrid::stopDeviceScriptForDeviceIndex(int deviceIndex, bool showMessag
     writeScriptOutputFile(outputFilePath, QString::fromUtf8("\n状态: 正在停止目标进程...\n"), QIODevice::Append);
     state.outputText = stripTerminalControlSequences(readScriptOutputFileTail(outputFilePath));
     m_scriptUiStates.insert(deviceIp, state); // wjy: 先把目标设备状态写成停止中，当前 UI 或切回该设备时都能看到停止状态。
+    update(deviceListViewportRect(m_deviceGroupExpanded)); // wjy: 发起停止时运行状态已经结束，侧栏徽标无需等待远端 taskkill 返回。
     if (currentScriptUiDeviceIp() == deviceIp) {
         loadScriptUiStateForDevice(deviceIp);
     }
@@ -5154,6 +5179,7 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
     state.editorModified = false;
     writeScriptOutputFile(state.outputFilePath, state.outputText, QIODevice::Truncate);
     m_scriptUiStates.insert(targetIp, state); // wjy: 指定设备执行脚本时先写入对应 IP 状态，分组批量执行不会抢当前设备 UI。
+    update(deviceListViewportRect(m_deviceGroupExpanded)); // wjy: 脚本启动后立刻刷新设备列表，单台和分组批量执行都能马上显示运行图标。
     if (targetIsCurrent) {
         m_deviceDetailTab = DeviceDetailTab::ScriptLog;
         m_lastScriptFolderPath = state.lastScriptFolderPath;
@@ -5345,6 +5371,7 @@ exit $scriptExit
             state.outputTitle = QString::fromUtf8("%1 - %2").arg(targetName, scriptName);
             state.outputText = stripTerminalControlSequences(readScriptOutputFileTail(outputFilePath));
             grid->m_scriptUiStates.insert(targetIp, state); // wjy: 结束状态写回目标设备，后台跑完后切回该设备能看到已完成/失败/停止。
+            grid->update(deviceListViewportRect(grid->m_deviceGroupExpanded)); // wjy: 无论目标设备是否是当前详情页，都立即移除它在左侧列表里的运行图标。
 
             const bool targetIsCurrent = grid->currentScriptUiDeviceIp() == targetIp;
             if (targetIsCurrent) {
@@ -6361,6 +6388,9 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                 }
 
                 const bool deviceInsideGroup = row.groupIndex >= 0; // wjy: 分组内设备稍微右移，视觉上表示它属于上方分组。
+                const QString deviceIp = g_devices.at(deviceIndex).ip.trimmed(); // wjy: 运行状态按设备 IP 查询，分组排序或视觉行变化不会串到其它设备。
+                const bool scriptRunning = !deviceIp.isEmpty()
+                    && m_scriptUiStates.value(deviceIp).outputRunning; // wjy: 只有该设备的脚本任务仍处于执行中时才显示右侧状态图标。
                 const bool deviceSelected =
                     m_selectedDeviceIndexes.contains(deviceIndex);
 
@@ -6392,7 +6422,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
 
                 const int iconX = deviceInsideGroup ? 50 : 30;
                 const int textX = deviceInsideGroup ? 76 : 56;
-                const int textWidth = deviceInsideGroup ? 96 : 116; // wjy: 缩进后收窄文字区域，避免碰到右侧角标。
+                const int textWidth = deviceInsideGroup ? 82 : 102; // wjy: 两种设备行的文字右沿统一停在 x=158，为 x=166 的脚本运行图标预留 8 像素间隔。
                 constexpr qreal statusDotSize = 6.0; // wjy: 左侧列表状态点改小，贴近用户示例图里的轻量提示样式。
                 const qreal statusDotX = iconX - 23.0+6.0;
                 const qreal statusDotY = rowY + 9 + (20.0 - statusDotSize) / 2.0; // wjy: 状态点移动到设备图标左侧，并和图标垂直居中。
@@ -6418,6 +6448,9 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                 painter.setPen(QColor(QStringLiteral("#111827")));
                 if (m_renamingDeviceIndex != deviceIndex) {
                     painter.drawText(QRectF(textX, rowY + 7, textWidth, 22), Qt::AlignVCenter | Qt::AlignLeft, deviceDisplayName(g_devices.at(deviceIndex))); // wjy: 显示真实设备名，分组排序变化不会改错名字。
+                }
+                if (scriptRunning) {
+                    drawScriptRunningIcon(painter, QRectF(166, rowY + 9, 18, 18)); // wjy: 在截图框选位置绘制终端运行徽标，未运行时该区域保持空白。
                 }
                 if (badges.contains(deviceIndex)) {
                     drawRemoteBadge(painter, 202, rowY + 12); // wjy: 角标也使用真实设备下标，避免分组行插入后角标错位。

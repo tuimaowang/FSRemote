@@ -594,7 +594,7 @@ bool PortableOpenSshManager::ensureConfig(QString* errorMessage)
         .arg(quoteForSshdConfigPath(hostKeyPath()))
         .arg(quoteForSshdConfigPath(authorizedKeysPath()))
         .arg(quoteForSshdConfigPath(sshdPidPath()))
-        .arg(quoteForSshdConfigPath(shellPath()))
+        .arg(QDir::toNativeSeparators(shellPath()))
         .arg(quoteForSshdConfigPath(sftpServerExePath()));
 
     QFile existingFile(sshdConfigPath());
