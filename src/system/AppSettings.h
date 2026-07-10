@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QKeySequence>
 #include <QRect>
 #include <QString>
 
@@ -15,6 +16,14 @@ public:
     static void setStatusAutoRefreshEnabled(bool enabled);
     static int statusAutoRefreshIntervalSeconds();
     static void setStatusAutoRefreshIntervalSeconds(int seconds);
+    static QKeySequence remoteShortcutFullscreen();
+    static void setRemoteShortcutFullscreen(const QKeySequence& shortcut);
+    static QKeySequence remoteShortcutTile();
+    static void setRemoteShortcutTile(const QKeySequence& shortcut);
+    static QKeySequence remoteShortcutCloseTopmost();
+    static void setRemoteShortcutCloseTopmost(const QKeySequence& shortcut);
+    static QKeySequence remoteShortcutCloseAll();
+    static void setRemoteShortcutCloseAll(const QKeySequence& shortcut);
     static bool hasRemoteDesktopWindowGeometry(const QString& deviceKey);
     static QRect remoteDesktopWindowGeometry(const QString& deviceKey);
     static void setRemoteDesktopWindowGeometry(const QString& deviceKey, const QRect& geometry);

@@ -9,9 +9,11 @@
 #include <QCursor>
 #include <QDateTime>
 #include <QDir>
+#include <QEvent>
 #include <QFile>
 #include <QGuiApplication>
 #include <QKeyEvent>
+#include <QKeySequence>
 #include <QMetaObject>
 #include <QMouseEvent>
 #include <QMutexLocker>
@@ -45,6 +47,7 @@ namespace {
 #if defined(Q_OS_WIN)
 RemoteDesktopWindow* g_keyboardForwardTarget = nullptr;
 HHOOK g_keyboardHook = nullptr;
+QSet<int> g_hookPressedKeys;
 #endif
 
 enum ResizeEdge {
@@ -165,6 +168,211 @@ bool shouldLogInputMessage(const QByteArray& message)
     return true;
 }
 
+// =====wjy====
+bool isShortcutModifierKey(int key)
+{
+    return key == Qt::Key_Control
+        || key == Qt::Key_Shift
+        || key == Qt::Key_Alt
+        || key == Qt::Key_Meta; // wjy: 单独修饰键不触发本地快捷键，等待后续主键组成 Ctrl+D 这类序列。
+}
+
+Qt::KeyboardModifiers shortcutModifiers(Qt::KeyboardModifiers modifiers)
+{
+    return modifiers & (Qt::ShiftModifier | Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier); // wjy: 去掉小键盘等附加标志，确保和设置页保存的快捷键一致。
+}
+
+QKeySequence shortcutSequenceFromKeyEvent(const QKeyEvent* event)
+{
+    if (!event || isShortcutModifierKey(event->key())) {
+        return {};
+    }
+    return QKeySequence(shortcutModifiers(event->modifiers()).toInt() | event->key()); // wjy: Qt 按键事件转成和设置页相同的可比较快捷键序列。
+}
+
+bool matchesShortcut(const QKeySequence& current, const QKeySequence& shortcut)
+{
+    return !current.isEmpty() && !shortcut.isEmpty() && current == shortcut; // wjy: 精确匹配用户自定义快捷键，避免 Ctrl+F4 误触发 F4。
+}
+
+#if defined(Q_OS_WIN)
+int normalizedHookVirtualKey(int virtualKey)
+{
+    switch (virtualKey) {
+    case VK_LCONTROL:
+    case VK_RCONTROL:
+    case VK_CONTROL:
+        return VK_CONTROL;
+    case VK_LSHIFT:
+    case VK_RSHIFT:
+    case VK_SHIFT:
+        return VK_SHIFT;
+    case VK_LMENU:
+    case VK_RMENU:
+    case VK_MENU:
+        return VK_MENU;
+    case VK_LWIN:
+    case VK_RWIN:
+        return VK_LWIN;
+    default:
+        return virtualKey;
+    }
+}
+
+bool isTrackedHookKeyDown(int virtualKey)
+{
+    return g_hookPressedKeys.contains(normalizedHookVirtualKey(virtualKey));
+}
+
+void updateTrackedHookKey(int virtualKey, bool down)
+{
+    const int normalizedKey = normalizedHookVirtualKey(virtualKey);
+    if (down) {
+        g_hookPressedKeys.insert(normalizedKey);
+    } else {
+        g_hookPressedKeys.remove(normalizedKey);
+    }
+}
+
+Qt::KeyboardModifiers trackedHookShortcutModifiers()
+{
+    Qt::KeyboardModifiers modifiers;
+    if (isTrackedHookKeyDown(VK_CONTROL)) {
+        modifiers |= Qt::ControlModifier;
+    }
+    if (isTrackedHookKeyDown(VK_SHIFT)) {
+        modifiers |= Qt::ShiftModifier;
+    }
+    if (isTrackedHookKeyDown(VK_MENU)) {
+        modifiers |= Qt::AltModifier;
+    }
+    if (isTrackedHookKeyDown(VK_LWIN) || isTrackedHookKeyDown(VK_RWIN)) {
+        modifiers |= Qt::MetaModifier;
+    }
+    return modifiers;
+}
+
+int qtKeyFromNativeVirtualKey(int virtualKey)
+{
+    if (virtualKey >= 'A' && virtualKey <= 'Z') {
+        return Qt::Key_A + (virtualKey - 'A');
+    }
+    if (virtualKey >= '0' && virtualKey <= '9') {
+        return Qt::Key_0 + (virtualKey - '0');
+    }
+    if (virtualKey >= VK_F1 && virtualKey <= VK_F24) {
+        return Qt::Key_F1 + (virtualKey - VK_F1);
+    }
+
+    switch (virtualKey) {
+    case VK_ESCAPE: return Qt::Key_Escape;
+    case VK_SPACE: return Qt::Key_Space;
+    case VK_TAB: return Qt::Key_Tab;
+    case VK_BACK: return Qt::Key_Backspace;
+    case VK_RETURN: return Qt::Key_Return;
+    case VK_INSERT: return Qt::Key_Insert;
+    case VK_DELETE: return Qt::Key_Delete;
+    case VK_HOME: return Qt::Key_Home;
+    case VK_END: return Qt::Key_End;
+    case VK_PRIOR: return Qt::Key_PageUp;
+    case VK_NEXT: return Qt::Key_PageDown;
+    case VK_LEFT: return Qt::Key_Left;
+    case VK_RIGHT: return Qt::Key_Right;
+    case VK_UP: return Qt::Key_Up;
+    case VK_DOWN: return Qt::Key_Down;
+    default: return 0;
+    }
+}
+
+bool virtualKeyFromQtKey(int key, int* virtualKey)
+{
+    if (!virtualKey) {
+        return false;
+    }
+    if (key >= Qt::Key_A && key <= Qt::Key_Z) {
+        *virtualKey = 'A' + (key - Qt::Key_A);
+        return true;
+    }
+    if (key >= Qt::Key_0 && key <= Qt::Key_9) {
+        *virtualKey = '0' + (key - Qt::Key_0);
+        return true;
+    }
+    if (key >= Qt::Key_F1 && key <= Qt::Key_F24) {
+        *virtualKey = VK_F1 + (key - Qt::Key_F1);
+        return true;
+    }
+
+    switch (key) {
+    case Qt::Key_Escape: *virtualKey = VK_ESCAPE; return true;
+    case Qt::Key_Space: *virtualKey = VK_SPACE; return true;
+    case Qt::Key_Tab: *virtualKey = VK_TAB; return true;
+    case Qt::Key_Backtab: *virtualKey = VK_TAB; return true;
+    case Qt::Key_Backspace: *virtualKey = VK_BACK; return true;
+    case Qt::Key_Return: *virtualKey = VK_RETURN; return true;
+    case Qt::Key_Enter: *virtualKey = VK_RETURN; return true;
+    case Qt::Key_Insert: *virtualKey = VK_INSERT; return true;
+    case Qt::Key_Delete: *virtualKey = VK_DELETE; return true;
+    case Qt::Key_Home: *virtualKey = VK_HOME; return true;
+    case Qt::Key_End: *virtualKey = VK_END; return true;
+    case Qt::Key_PageUp: *virtualKey = VK_PRIOR; return true;
+    case Qt::Key_PageDown: *virtualKey = VK_NEXT; return true;
+    case Qt::Key_Left: *virtualKey = VK_LEFT; return true;
+    case Qt::Key_Right: *virtualKey = VK_RIGHT; return true;
+    case Qt::Key_Up: *virtualKey = VK_UP; return true;
+    case Qt::Key_Down: *virtualKey = VK_DOWN; return true;
+    default: return false;
+    }
+}
+
+QVector<int> shortcutVirtualKeys(const QKeySequence& shortcut)
+{
+    QVector<int> virtualKeys;
+    if (shortcut.isEmpty()) {
+        return virtualKeys;
+    }
+
+#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+    const int combined = shortcut[0].toCombined();
+#else
+    const int combined = shortcut[0];
+#endif
+    if (combined <= 0) {
+        return virtualKeys;
+    }
+
+    const int modifierMask = static_cast<int>(Qt::KeyboardModifierMask);
+    const Qt::KeyboardModifiers modifiers = Qt::KeyboardModifiers(combined & modifierMask);
+    if (modifiers.testFlag(Qt::ControlModifier)) {
+        virtualKeys.append(VK_CONTROL);
+    }
+    if (modifiers.testFlag(Qt::ShiftModifier)) {
+        virtualKeys.append(VK_SHIFT);
+    }
+    if (modifiers.testFlag(Qt::AltModifier)) {
+        virtualKeys.append(VK_MENU);
+    }
+    if (modifiers.testFlag(Qt::MetaModifier)) {
+        virtualKeys.append(VK_LWIN);
+    }
+
+    int mainVirtualKey = 0;
+    if (virtualKeyFromQtKey(combined & ~modifierMask, &mainVirtualKey) && mainVirtualKey > 0) {
+        virtualKeys.append(mainVirtualKey);
+    }
+    return virtualKeys;
+}
+
+QKeySequence shortcutSequenceFromNativeVirtualKey(int virtualKey, Qt::KeyboardModifiers modifiers)
+{
+    const int key = qtKeyFromNativeVirtualKey(virtualKey);
+    if (key <= 0 || isShortcutModifierKey(key)) {
+        return {};
+    }
+    return QKeySequence(shortcutModifiers(modifiers).toInt() | key); // wjy: Windows 钩子路径也转为 QKeySequence，和设置页自定义值统一比较。
+}
+#endif
+// ===end====
+
 void drawWindowButtonIcon(QPainter& painter, const QRectF& rect, const QString& type)
 {
     painter.save();
@@ -272,7 +480,19 @@ LRESULT CALLBACK keyboardHookProc(int code, WPARAM wParam, LPARAM lParam)
             if (info->flags & LLKHF_INJECTED) {
                 return 1;
             }
-            g_keyboardForwardTarget->forwardNativeKey(static_cast<int>(info->vkCode), down);
+            const int virtualKey = static_cast<int>(info->vkCode);
+            updateTrackedHookKey(virtualKey, down);
+            RemoteDesktopWindow* target = g_keyboardForwardTarget;
+            const bool wasWaitingShortcutRelease = target->isWaitingShortcutRelease();
+            if (wasWaitingShortcutRelease) {
+                target->updateShortcutReleaseGuard();
+                return 1; // wjy: 本地快捷键触发后，直到组合键真正松开之前都不再把任何按键继续转发到远端。
+            }
+            const Qt::KeyboardModifiers modifiers = trackedHookShortcutModifiers();
+            if (down && target->handleLocalShortcutKey(virtualKey, modifiers)) {
+                return 1;
+            }
+            target->forwardNativeKey(virtualKey, down);
             return 1;
         }
     }
@@ -281,6 +501,9 @@ LRESULT CALLBACK keyboardHookProc(int code, WPARAM wParam, LPARAM lParam)
 
 void installKeyboardHook(RemoteDesktopWindow* window)
 {
+    if (g_keyboardForwardTarget != window) {
+        g_hookPressedKeys.clear();
+    }
     g_keyboardForwardTarget = window;
     if (!g_keyboardHook) {
         g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, keyboardHookProc, GetModuleHandleW(nullptr), 0);
@@ -295,6 +518,7 @@ void uninstallKeyboardHook(RemoteDesktopWindow* window)
     if (!g_keyboardForwardTarget && g_keyboardHook) {
         UnhookWindowsHookEx(g_keyboardHook);
         g_keyboardHook = nullptr;
+        g_hookPressedKeys.clear();
     }
 }
 #endif
@@ -385,6 +609,7 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
     // ===end====
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
     setAttribute(Qt::WA_DeleteOnClose);
+    setAttribute(Qt::WA_QuitOnClose, false);
     setMinimumSize(520, 360);
     const QRect savedGeometry = normalizedSavedWindowGeometry(
         platform::AppSettings::remoteDesktopWindowGeometry(m_hostIp),
@@ -441,6 +666,19 @@ RemoteDesktopWindow::~RemoteDesktopWindow()
         m_texturePresenter->reset();
     }
     appendViewerDebugLog(QStringLiteral("RemoteDesktopWindow dtor end")); // wjy: teardown completed.
+}
+
+bool RemoteDesktopWindow::event(QEvent* event)
+{
+    if (event && event->type() == QEvent::WindowActivate) {
+        emit activated(this);
+    }
+    return QWidget::event(event);
+}
+
+bool RemoteDesktopWindow::isWaitingShortcutRelease() const
+{
+    return m_waitingShortcutRelease;
 }
 
 QRect RemoteDesktopWindow::minimizeRect() const
@@ -627,13 +865,58 @@ void RemoteDesktopWindow::recenterRemoteMouseCapture()
 void RemoteDesktopWindow::setKeyboardForwardingActive(bool active)
 {
 #if defined(Q_OS_WIN)
-    if (active && !m_closeInProgress && isActiveWindow()) {
+    if (m_waitingShortcutRelease && !m_closeInProgress) {
+        installKeyboardHook(this); // wjy: 等待组合键松开时保留 hook，但 hook 只记录 keyup，不转发远端。
+    } else if (active && !m_closeInProgress && isActiveWindow()) {
         installKeyboardHook(this);
     } else {
         uninstallKeyboardHook(this);
     }
 #else
     Q_UNUSED(active)
+#endif
+}
+
+void RemoteDesktopWindow::beginShortcutReleaseGuard(const QKeySequence& shortcut)
+{
+    releasePressedKeys();
+#if defined(Q_OS_WIN)
+    m_shortcutReleaseVirtualKeys = shortcutVirtualKeys(shortcut);
+    m_waitingShortcutRelease = true;
+    installKeyboardHook(this); // wjy: 不卸载 hook，否则 Ctrl 按下被吞后就无法可靠观察它何时松开。
+    for (int virtualKey : m_shortcutReleaseVirtualKeys) {
+        updateTrackedHookKey(virtualKey, true); // wjy: Qt 按键路径触发快捷键时，也把这组实际按下的键同步进 hook 状态。
+    }
+#else
+    Q_UNUSED(shortcut)
+#endif
+}
+
+void RemoteDesktopWindow::updateShortcutReleaseGuard()
+{
+#if defined(Q_OS_WIN)
+    if (!m_waitingShortcutRelease) {
+        return;
+    }
+
+    bool allReleased = true;
+    for (int virtualKey : m_shortcutReleaseVirtualKeys) {
+        if (isTrackedHookKeyDown(virtualKey)) {
+            allReleased = false;
+            break;
+        }
+    }
+    if (!allReleased) {
+        return;
+    }
+
+    m_waitingShortcutRelease = false;
+    m_shortcutReleaseVirtualKeys.clear();
+    if (!m_closeInProgress && isActiveWindow()) {
+        setKeyboardForwardingActive(true);
+    } else {
+        setKeyboardForwardingActive(false);
+    }
 #endif
 }
 
@@ -644,6 +927,71 @@ void RemoteDesktopWindow::releasePressedKeys()
     for (int key : keys) {
         sendInputMessage(QByteArray("k ")
             + QByteArray::number(key) + " 0");
+    }
+}
+
+void RemoteDesktopWindow::releaseForwardedShortcutKeys(const QVector<int>& virtualKeys)
+{
+    QSet<int> releasedKeys;
+    for (int key : virtualKeys) {
+        if (key <= 0 || releasedKeys.contains(key)) {
+            continue;
+        }
+        releasedKeys.insert(key);
+        m_pressedKeys.remove(key);
+        sendInputMessage(QByteArray("k ")
+            + QByteArray::number(key) + " 0");
+    }
+}
+
+void RemoteDesktopWindow::releaseForwardedKeys()
+{
+    releasePressedKeys();
+#if defined(Q_OS_WIN)
+    const int modifierKeys[] = {
+        VK_CONTROL,
+        VK_LCONTROL,
+        VK_RCONTROL,
+        VK_SHIFT,
+        VK_LSHIFT,
+        VK_RSHIFT,
+        VK_MENU,
+        VK_LMENU,
+        VK_RMENU,
+        VK_LWIN,
+        VK_RWIN,
+    };
+    for (int key : modifierKeys) {
+        sendInputMessage(QByteArray("k ")
+            + QByteArray::number(key) + " 0");
+    }
+#endif
+}
+
+void RemoteDesktopWindow::shutdownForApplicationExit()
+{
+    saveWindowGeometry();
+    m_closeInProgress = true;
+    m_waitingShortcutRelease = false;
+    m_shortcutReleaseVirtualKeys.clear();
+    hide();
+    setRemoteMouseCaptureActive(false);
+    releaseForwardedKeys();
+    setKeyboardForwardingActive(false);
+    if (m_framePresentTimer) {
+        m_framePresentTimer->stop();
+    }
+    if (m_sessionTimer) {
+        m_sessionTimer->stop();
+    }
+    if (m_texturePresenter) {
+        m_texturePresenter->reset();
+    }
+
+    const FsRemoteStreamHandle handle = m_viewerHandle;
+    m_viewerHandle = nullptr;
+    if (handle) {
+        stream::StreamRuntime::instance().stop(handle);
     }
 }
 
@@ -921,6 +1269,40 @@ bool RemoteDesktopWindow::forwardNativeKey(int virtualKey, bool down)
     return true;
 }
 
+bool RemoteDesktopWindow::handleLocalShortcutKey(int virtualKey, Qt::KeyboardModifiers modifiers)
+{
+#if defined(Q_OS_WIN)
+    if (m_closeInProgress) {
+        return false;
+    }
+    const QKeySequence current = shortcutSequenceFromNativeVirtualKey(virtualKey, modifiers); // wjy: 低级键盘钩子路径同样使用用户保存的快捷键设置。
+    if (matchesShortcut(current, platform::AppSettings::remoteShortcutFullscreen())) {
+        beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutFullscreen());
+        emit shortcutFullscreenRequested();
+        return true;
+    }
+    if (matchesShortcut(current, platform::AppSettings::remoteShortcutTile())) {
+        beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutTile());
+        emit shortcutTileRequested();
+        return true;
+    }
+    if (matchesShortcut(current, platform::AppSettings::remoteShortcutCloseAll())) {
+        beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutCloseAll());
+        emit shortcutCloseAllRequested();
+        return true;
+    }
+    if (matchesShortcut(current, platform::AppSettings::remoteShortcutCloseTopmost())) {
+        beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutCloseTopmost());
+        emit shortcutCloseTopmostRequested();
+        return true;
+    }
+#else
+    Q_UNUSED(virtualKey)
+    Q_UNUSED(modifiers)
+#endif
+    return false;
+}
+
 void RemoteDesktopWindow::startViewerConnection()
 {
     // =====wjy====
@@ -1173,6 +1555,7 @@ void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
 
 void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
 {
+    emit activated(this);
     if (event->button() == Qt::LeftButton) {
         m_resizeEdges = resizeEdgesAt(event->pos());
         if (m_resizeEdges != ResizeNone) {
@@ -1361,6 +1744,41 @@ void RemoteDesktopWindow::wheelEvent(QWheelEvent* event)
 
 void RemoteDesktopWindow::keyPressEvent(QKeyEvent* event)
 {
+#if defined(Q_OS_WIN)
+    updateShortcutReleaseGuard();
+    if (m_waitingShortcutRelease) {
+        event->accept();
+        return;
+    }
+#endif
+// =====wjy====
+    const QKeySequence current = shortcutSequenceFromKeyEvent(event); // wjy: 普通 Qt 按键路径也读取设置页自定义快捷键。
+    if (matchesShortcut(current, platform::AppSettings::remoteShortcutFullscreen())) {
+        beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutFullscreen());
+        emit shortcutFullscreenRequested();
+        event->accept();
+        return;
+    }
+    if (matchesShortcut(current, platform::AppSettings::remoteShortcutTile())) {
+        beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutTile());
+        emit shortcutTileRequested();
+        event->accept();
+        return;
+    }
+    if (matchesShortcut(current, platform::AppSettings::remoteShortcutCloseAll())) {
+        beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutCloseAll());
+        emit shortcutCloseAllRequested();
+        event->accept();
+        return;
+    }
+    if (matchesShortcut(current, platform::AppSettings::remoteShortcutCloseTopmost())) {
+        beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutCloseTopmost());
+        emit shortcutCloseTopmostRequested();
+        event->accept();
+        return;
+    }
+// ===end====
+
     if (event->nativeVirtualKey() > 0) {
         m_pressedKeys.insert(event->nativeVirtualKey());
         sendInputMessage(QByteArray("k ")
@@ -1373,6 +1791,14 @@ void RemoteDesktopWindow::keyPressEvent(QKeyEvent* event)
 
 void RemoteDesktopWindow::keyReleaseEvent(QKeyEvent* event)
 {
+#if defined(Q_OS_WIN)
+    const bool wasWaitingShortcutRelease = m_waitingShortcutRelease;
+    updateShortcutReleaseGuard();
+    if (wasWaitingShortcutRelease || m_waitingShortcutRelease) {
+        event->accept();
+        return;
+    }
+#endif
     if (event->nativeVirtualKey() > 0) {
         m_pressedKeys.remove(event->nativeVirtualKey());
         sendInputMessage(QByteArray("k ")
@@ -1385,6 +1811,7 @@ void RemoteDesktopWindow::keyReleaseEvent(QKeyEvent* event)
 
 void RemoteDesktopWindow::focusInEvent(QFocusEvent* event)
 {
+    emit activated(this);
     setKeyboardForwardingActive(true);
     QWidget::focusInEvent(event);
 }

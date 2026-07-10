@@ -10,6 +10,7 @@
 #include <QHash>
 #include <QPoint>
 #include <QPointer>
+#include <QRect>
 #include <QSet>
 #include <QString>
 #include <QVector>
@@ -21,12 +22,17 @@
 #include <vector>
 
 class QEvent;
+class QByteArray;
+class QKeyEvent;
 class QLineEdit;
 class QMouseEvent;
 class QPaintEvent;
 class QPushButton;
+class QResizeEvent;
 class QTextEdit;
 class QTimer;
+class QTreeWidget;
+class QTreeWidgetItem;
 class QWheelEvent;
 
 namespace ui {
@@ -45,6 +51,7 @@ class DeviceGrid final : public QFrame {
 public:
     explicit DeviceGrid(QWidget* parent = nullptr);
     ~DeviceGrid() override; // wjy: Used to record DeviceGrid destroy timing and wait background threads safely.
+    void prepareForApplicationExit();
 
 protected:
     void paintEvent(QPaintEvent* event) override;
@@ -53,10 +60,27 @@ protected:
     void mouseDoubleClickEvent(QMouseEvent* event) override; // wjy: Double click device or group rows to rename in place.
     void mouseReleaseEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override; // wjy: The hand-painted device list handles scrolling here.
+    void keyPressEvent(QKeyEvent* event) override;
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override;
+    void resizeEvent(QResizeEvent* event) override;
     void leaveEvent(QEvent* event) override;
 
 private:
+    enum class SettingsTab {
+        General,
+        Keyboard,
+    };
+
+    enum class DeviceDetailTab {
+        Config,
+        ScriptLog,
+    };
+
     void startDeviceSwitchAnimation(int newIndex, const QString& newName);
+    void syncResponsiveLayoutState() const;
+    void beginWindowResize(const QPoint& position, const QPoint& globalPosition);
+    void updateWindowResize(const QPoint& globalPosition);
+    void finishWindowResize();
     void setDesktopHoverActive(bool active);
     void updateDesktopHover(const QPoint& position);
     void updateBottomActionHover(const QPoint& position);
@@ -69,6 +93,7 @@ private:
     void cancelNewDevice();
     void showDeviceMenu();
     void openCurrentDeviceTerminal();
+    bool openTerminalForDeviceIndex(int deviceIndex, bool showMessages);
     void executeCurrentDeviceScriptFolder(const QString& scriptFolderPath); // wjy: Copy one shared script folder to remote work directory and run its entry script.
     bool executeDeviceScriptFolder(int deviceIndex, const QString& scriptFolderPath, bool showMessages); // wjy: Run one shared script folder on a specified device without forcing the current selection.
     void executeDeviceGroupScriptFolder(int groupIndex, const QString& scriptFolderPath); // wjy: Run one selected script folder for every device in a group.
@@ -76,13 +101,23 @@ private:
     void openRemoteDesktopWindowForDevice(int deviceIndex, const QPoint& fallbackOffset);
     void launchSelectedRemoteDesktopWindows();
     void openDeviceGroupTiledWindows(int groupIndex); // wjy: Open all devices in one group and tile remote windows.
+    QVector<QPointer<RemoteDesktopWindow>> openedRemoteWindows() const;
+    void rememberRemoteWindowActivation(RemoteDesktopWindow* window);
+    RemoteDesktopWindow* topmostRemoteWindow() const;
+    void toggleTopmostRemoteWindowFullscreen();
+    void toggleRemoteWindowTiling();
+    void closeTopmostRemoteWindow();
+    void closeAllRemoteWindows();
     void refreshLocalDeviceInfo();
     void shutdownCurrentDevice();
     void restartCurrentDevice();
+    bool shutdownDeviceForIndex(int deviceIndex, bool showMessages);
+    bool restartDeviceForIndex(int deviceIndex, bool showMessages);
     void renameCurrentDevice();
     void deleteCurrentDevice();
     void startDeviceWakeVisual(const QString& ip);
     void wakeCurrentDevice();
+    bool wakeDeviceForIndex(int deviceIndex, bool showMessages);
     void startCurrentDeviceWakeVisual();
     void toggleRemoteWakeup();
     void refreshDeviceStatuses();
@@ -92,6 +127,11 @@ private:
     int devicePoweringOnRemainingSecondsForIndex(int index) const;
     void setupSettingsControls();
     void updateSettingsControls();
+    void saveShortcutKeySetting(int shortcutIndex, const QString& shortcutText); // wjy: Save one keyboard shortcut when its editor loses focus or receives Enter.
+    void registerGlobalShortcuts();
+    void unregisterGlobalShortcuts();
+    void triggerShortcutAction(int shortcutIndex);
+    void releaseRemoteShortcutKeyState(int shortcutIndex);
     void applyStatusAutoRefreshSetting(bool refreshImmediately);
     void startBatchAddDevices(); // wjy: 从设置页网段输入框启动批量扫描并追加在线设备。
     void beginDeviceGroupRename(int groupIndex); // wjy: Show the group rename editor in place.
@@ -102,6 +142,11 @@ private:
     void pruneHiddenDeviceSelections(); // wjy: Remove collapsed hidden devices from multi-selection state.
     void runBackgroundTask(std::function<void()> task); // wjy: Keep background tasks joinable until DeviceGrid is destroyed.
     void setupScriptFileEditor();
+    void setupScriptFolderTree();
+    void populateScriptFolderTree();
+    void addScriptFolderTreeChildren(QTreeWidgetItem* parentItem, const QString& folderPath);
+    void selectScriptFolderTreeItem(QTreeWidgetItem* item);
+    void syncScriptFolderTreeSelection();
     void updateScriptFileEditorControls();
     void loadScriptFileEditor(const QString& deviceIp, const QString& loginUser, const QString& scriptWorkName);
     void saveScriptFileEditor();
@@ -111,6 +156,12 @@ private:
     QString currentScriptUiDeviceIp() const; // wjy: Return the IP whose script UI should be shown by the current detail page.
     void saveCurrentScriptUiState(); // wjy: Persist the visible script/editor UI into the per-device state cache before switching devices.
     void loadScriptUiStateForDevice(const QString& deviceIp); // wjy: Restore script/editor UI that belongs to the newly selected device.
+    QVector<int> deviceIndexesForGroup(int groupIndex) const;
+    QVector<int> contextDeviceIndexesForRightClick(int clickedDeviceIndex) const;
+    void batchWakeDevices(const QVector<int>& deviceIndexes);
+    void batchShutdownDevices(const QVector<int>& deviceIndexes);
+    void batchRestartDevices(const QVector<int>& deviceIndexes);
+    void batchOpenDeviceTerminals(const QVector<int>& deviceIndexes);
 
     struct ScriptUiState {
         bool outputVisible = false;
@@ -160,6 +211,9 @@ private:
     QLineEdit* m_statusRefreshIntervalEdit = nullptr; // wjy: Auto refresh interval edit.
     QLineEdit* m_batchSubnetEdit = nullptr; // wjy: 批量新增网段输入框，支持 192.168.3.* 格式。
     QPushButton* m_batchAddButton = nullptr; // wjy: 批量新增按钮，扫描期间禁用避免重复启动。
+    QVector<QLineEdit*> m_shortcutKeyEdits; // wjy: Keyboard settings shortcut editors, one per remote-window action.
+    QSet<int> m_registeredGlobalShortcutIds;
+    quintptr m_globalShortcutWindowHandle = 0;
     QLineEdit* m_deviceIpEdit = nullptr;
     QLineEdit* m_deviceNameEdit = nullptr;
     QLineEdit* m_deviceMacEdit = nullptr;
@@ -168,11 +222,16 @@ private:
     QLineEdit* m_deviceListNameEdit = nullptr; // wjy: Device rename editor shown directly on the left list row.
     QTextEdit* m_scriptFileEdit = nullptr;
     QPushButton* m_scriptFileSaveButton = nullptr;
+    QTreeWidget* m_scriptFolderTree = nullptr; // wjy: Script Log tab tree used to choose a shared script folder before execution.
     QPushButton* m_saveDeviceButton = nullptr;
     QPushButton* m_cancelDeviceButton = nullptr;
     QVector<QPushButton*> m_localInfoCopyButtons;
     bool m_draggingWindow = false;
+    bool m_resizingWindow = false;
+    int m_resizeEdges = 0;
     QPoint m_dragOffset;
+    QPoint m_resizeStartGlobal;
+    QRect m_resizeStartGeometry;
     bool m_deviceDragCandidateActive = false; // wjy: Mouse-down device row is a drag candidate before crossing threshold.
     bool m_draggingDevice = false; // wjy: True while dragging devices.
     int m_draggingDeviceIndex = -1; // wjy: Current dragged device index, -1 means none.
@@ -190,6 +249,8 @@ private:
     bool m_remoteAssistSelected = false;
     bool m_localInfoSelected = false;
     bool m_settingsSelected = false;
+    SettingsTab m_settingsTab = SettingsTab::General;
+    DeviceDetailTab m_deviceDetailTab = DeviceDetailTab::Config;
     bool m_leftSidebarCollapsed = false;
     bool m_settingsLocalInfoExpanded = false;
     bool m_settingsAddDeviceExpanded = false;
@@ -245,6 +306,11 @@ private:
     QHash<QString, QString> m_pendingRemoteRenameNames; // wjy: 记录远端改名等待重启生效的设备，避免自动刷新立刻用旧电脑名覆盖手动新名字。
     platform::DeviceInfo m_localDeviceInfo;
     QVector<QPointer<RemoteDesktopWindow>> m_tiledRemoteWindows; // wjy: 记录设备平铺创建的窗口，下次平铺前先关闭旧窗口再重新排列。
+    QVector<QPointer<RemoteDesktopWindow>> m_remoteWindowActivationOrder;
+    QHash<RemoteDesktopWindow*, QRect> m_remoteTileRestoreGeometries;
+    bool m_remoteWindowsTiled = false;
+    int m_lastShortcutActionIndex = -1;
+    qint64 m_lastShortcutActionAtMs = 0;
 };
 
 } // namespace ui

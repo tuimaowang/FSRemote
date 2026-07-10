@@ -18,6 +18,7 @@ class QEvent;
 class QCloseEvent;
 class QFocusEvent;
 class QKeyEvent;
+class QKeySequence;
 class QMouseEvent;
 class QPaintEvent;
 class QResizeEvent;
@@ -43,8 +44,21 @@ public:
     void setRememberGeometryEnabled(bool enabled);
     bool isClosingConnection() const;
     bool forwardNativeKey(int virtualKey, bool down);
+    bool handleLocalShortcutKey(int virtualKey, Qt::KeyboardModifiers modifiers);
+    void releaseForwardedShortcutKeys(const QVector<int>& virtualKeys);
+    void shutdownForApplicationExit();
+    bool isWaitingShortcutRelease() const;
+    void updateShortcutReleaseGuard();
+
+signals:
+    void activated(RemoteDesktopWindow* window);
+    void shortcutFullscreenRequested();
+    void shortcutTileRequested();
+    void shortcutCloseTopmostRequested();
+    void shortcutCloseAllRequested();
 
 protected:
+    bool event(QEvent* event) override;
     void paintEvent(QPaintEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
@@ -84,7 +98,9 @@ private:
     bool sendRemoteMouseRelativeMove(const QPoint& position, Qt::MouseButtons buttons);
     void recenterRemoteMouseCapture();
     void setKeyboardForwardingActive(bool active);
+    void beginShortcutReleaseGuard(const QKeySequence& shortcut);
     void releasePressedKeys();
+    void releaseForwardedKeys();
     int remoteButton(Qt::MouseButton button) const;
     TabHit hitTestTabs(const QPoint& position) const;
     int resizeEdgesAt(const QPoint& position) const;
@@ -135,6 +151,8 @@ private:
     bool m_remoteMouseCaptureActive = false;
     QTimer* m_framePresentTimer = nullptr; // wjy: Presents the newest pending frame at a fixed UI pace instead of posting one UI task per decoded frame.
     QTimer* m_sessionTimer = nullptr;
+    bool m_waitingShortcutRelease = false;
+    QVector<int> m_shortcutReleaseVirtualKeys;
     QSet<int> m_pressedKeys;
     D3D11FramePresenter* m_texturePresenter = nullptr;
 };

@@ -26,6 +26,13 @@ QString quoteForCmd(const QString& value)
     return QStringLiteral("\"%1\"").arg(escaped);
 }
 
+QString quoteForSshdConfigPath(const QString& path)
+{
+    QString normalized = QDir::fromNativeSeparators(QFileInfo(path).absoluteFilePath());
+    normalized.replace(QLatin1Char('"'), QStringLiteral("\\\""));
+    return QStringLiteral("\"%1\"").arg(normalized); // wjy: sshd_config 按空格切分参数，目录名带空格或括号时必须给路径加引号。
+}
+
 QStringList sshArguments(const QString& keyPath, uint16_t port, const QString& loginUser, const QString& hostIp)
 {
     return {
@@ -36,6 +43,7 @@ QStringList sshArguments(const QString& keyPath, uint16_t port, const QString& l
         QStringLiteral("-o"), QStringLiteral("PubkeyAuthentication=yes"),
         QStringLiteral("-o"), QStringLiteral("BatchMode=yes"),
         QStringLiteral("-o"), QStringLiteral("ConnectTimeout=5"),
+        QStringLiteral("-o"), QStringLiteral("ConnectionAttempts=3"),
         QStringLiteral("-i"), keyPath,
         QStringLiteral("-p"), QString::number(port),
         QStringLiteral("-l"), loginUser,
@@ -583,11 +591,11 @@ bool PortableOpenSshManager::ensureConfig(QString* errorMessage)
         "ForceCommand %5\n"
         "Subsystem sftp %6\n")
         .arg(serverPort())
-        .arg(QDir::toNativeSeparators(hostKeyPath()))
-        .arg(QDir::toNativeSeparators(authorizedKeysPath()))
-        .arg(QDir::toNativeSeparators(sshdPidPath()))
-        .arg(QDir::toNativeSeparators(shellPath()))
-        .arg(QDir::toNativeSeparators(sftpServerExePath()));
+        .arg(quoteForSshdConfigPath(hostKeyPath()))
+        .arg(quoteForSshdConfigPath(authorizedKeysPath()))
+        .arg(quoteForSshdConfigPath(sshdPidPath()))
+        .arg(quoteForSshdConfigPath(shellPath()))
+        .arg(quoteForSshdConfigPath(sftpServerExePath()));
 
     QFile existingFile(sshdConfigPath());
     if (existingFile.open(QIODevice::ReadOnly | QIODevice::Text)) {

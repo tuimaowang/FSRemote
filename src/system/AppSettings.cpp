@@ -4,6 +4,7 @@
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QKeySequence>
 #include <QSettings>
 #include <QStandardPaths>
 
@@ -29,6 +30,22 @@ QString remoteDesktopWindowGeometryPath()
 {
     return QDir(configDirectoryPath()).filePath(QStringLiteral("remote_desktop_window.json"));
 }
+
+// =====wjy====
+QKeySequence shortcutFromSettings(const QString& key, const QKeySequence& fallback)
+{
+    const QString value = settings().value(key, fallback.toString(QKeySequence::PortableText)).toString().trimmed(); // wjy: 快捷键统一用 QSettings 保存字符串，便于跨启动恢复。
+    const QKeySequence shortcut(value, QKeySequence::PortableText);
+    return shortcut.isEmpty() ? fallback : shortcut; // wjy: 旧配置为空或解析失败时回退到原来的默认快捷键，避免用户无法操作远程窗口。
+}
+
+void setShortcutToSettings(const QString& key, const QKeySequence& shortcut, const QKeySequence& fallback)
+{
+    const QKeySequence normalized = shortcut.isEmpty() ? fallback : shortcut; // wjy: 不保存空快捷键，始终保留一个可触发的按键组合。
+    QSettings appSettings = settings();
+    appSettings.setValue(key, normalized.toString(QKeySequence::PortableText)); // wjy: PortableText 不受系统语言影响，后续解析更稳定。
+}
+// ===end====
 
 QRect geometryFromJsonObject(const QJsonObject& object)
 {
@@ -136,6 +153,48 @@ void AppSettings::setStatusAutoRefreshIntervalSeconds(int seconds)
     QSettings appSettings = settings();
     appSettings.setValue(QStringLiteral("statusAutoRefreshIntervalSeconds"), seconds > 0 ? seconds : 60);
 }
+
+// =====wjy====
+QKeySequence AppSettings::remoteShortcutFullscreen()
+{
+    return shortcutFromSettings(QStringLiteral("remoteShortcutFullscreen"), QKeySequence(QStringLiteral("Ctrl+D"))); // wjy: 默认保持现有全屏切换快捷键。
+}
+
+void AppSettings::setRemoteShortcutFullscreen(const QKeySequence& shortcut)
+{
+    setShortcutToSettings(QStringLiteral("remoteShortcutFullscreen"), shortcut, QKeySequence(QStringLiteral("Ctrl+D"))); // wjy: 保存设置页录入的全屏快捷键。
+}
+
+QKeySequence AppSettings::remoteShortcutTile()
+{
+    return shortcutFromSettings(QStringLiteral("remoteShortcutTile"), QKeySequence(QStringLiteral("Ctrl+P"))); // wjy: 默认保持现有平铺切换快捷键。
+}
+
+void AppSettings::setRemoteShortcutTile(const QKeySequence& shortcut)
+{
+    setShortcutToSettings(QStringLiteral("remoteShortcutTile"), shortcut, QKeySequence(QStringLiteral("Ctrl+P"))); // wjy: 保存设置页录入的平铺快捷键。
+}
+
+QKeySequence AppSettings::remoteShortcutCloseTopmost()
+{
+    return shortcutFromSettings(QStringLiteral("remoteShortcutCloseTopmost"), QKeySequence(QStringLiteral("F4"))); // wjy: 默认保持现有关闭最上方窗口快捷键。
+}
+
+void AppSettings::setRemoteShortcutCloseTopmost(const QKeySequence& shortcut)
+{
+    setShortcutToSettings(QStringLiteral("remoteShortcutCloseTopmost"), shortcut, QKeySequence(QStringLiteral("F4"))); // wjy: 保存设置页录入的关闭单个窗口快捷键。
+}
+
+QKeySequence AppSettings::remoteShortcutCloseAll()
+{
+    return shortcutFromSettings(QStringLiteral("remoteShortcutCloseAll"), QKeySequence(QStringLiteral("Ctrl+F4"))); // wjy: 默认保持现有关闭全部窗口快捷键。
+}
+
+void AppSettings::setRemoteShortcutCloseAll(const QKeySequence& shortcut)
+{
+    setShortcutToSettings(QStringLiteral("remoteShortcutCloseAll"), shortcut, QKeySequence(QStringLiteral("Ctrl+F4"))); // wjy: 保存设置页录入的关闭全部窗口快捷键。
+}
+// ===end====
 
 bool AppSettings::hasRemoteDesktopWindowGeometry(const QString& deviceKey)
 {
