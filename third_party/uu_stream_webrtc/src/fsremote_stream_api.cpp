@@ -1197,6 +1197,9 @@ public:
 
     virtual bool sendInput(const char*) { return false; }
     virtual bool isBusy() const { return false; }
+    // =====wjy====
+    virtual uint32_t activeSessionCount() const { return 0; } // wjy: Viewer 无会话表；Host 覆盖为当前登记会话数。
+    // ===end====
 
 protected:
     std::atomic_bool running_ = true;
@@ -1255,9 +1258,23 @@ public:
 
     bool isBusy() const override
     {
-        std::lock_guard lock(sessions_mutex_);
-        return !sessions_.empty();
+        return activeSessionCount() > 0;
     }
+
+    // =====wjy====
+    uint32_t activeSessionCount() const override
+    {
+        std::lock_guard lock(sessions_mutex_);
+        // wjy: 仅统计尚未完成的会话，避免已断开但未 reap 的条目把远控人数卡在旧值。
+        uint32_t count = 0;
+        for (const auto& [id, session] : sessions_) {
+            if (session && !session->completed) {
+                ++count;
+            }
+        }
+        return count;
+    }
+    // ===end====
 
 private:
     uintptr_t createListener(uint16_t port, std::string* error)
@@ -1868,6 +1885,16 @@ int FSREMOTE_STREAM_CALL fsremote_stream_is_busy(FsRemoteStreamHandle handle)
     }
     return static_cast<StreamInstance*>(handle)->isBusy() ? 1 : 0;
 }
+
+// =====wjy====
+uint32_t FSREMOTE_STREAM_CALL fsremote_stream_active_session_count(FsRemoteStreamHandle handle)
+{
+    if (!handle) {
+        return 0;
+    }
+    return static_cast<StreamInstance*>(handle)->activeSessionCount(); // wjy: 状态服务用真实会话数填充远控人数字段。
+}
+// ===end====
 
 const char* FSREMOTE_STREAM_CALL fsremote_stream_last_error(void)
 {

@@ -94,6 +94,9 @@ StreamRuntime::StreamRuntime()
     m_stop = reinterpret_cast<StopFn>(library->resolve("fsremote_stream_stop"));
     m_sendInput = reinterpret_cast<SendInputFn>(library->resolve("fsremote_stream_send_input"));
     m_isBusy = reinterpret_cast<IsBusyFn>(library->resolve("fsremote_stream_is_busy"));
+    // =====wjy====
+    m_activeSessionCount = reinterpret_cast<ActiveSessionCountFn>(library->resolve("fsremote_stream_active_session_count")); // wjy: 新 DLL 导出真实会话数；旧 DLL 缺失时状态服务回退 busy 布尔。
+    // ===end====
     m_lastError = reinterpret_cast<LastErrorFn>(library->resolve("fsremote_stream_last_error"));
     m_loaded = m_startHost && m_startViewer && m_stop && m_lastError;
     if (!m_loaded) {
@@ -205,5 +208,15 @@ bool StreamRuntime::isBusy(FsRemoteStreamHandle handle) const
 {
     return m_isBusy && handle && m_isBusy(handle) != 0;
 }
+
+// =====wjy====
+uint32_t StreamRuntime::activeSessionCount(FsRemoteStreamHandle handle) const
+{
+    if (m_activeSessionCount && handle) {
+        return m_activeSessionCount(handle); // wjy: 优先使用 DLL 真实会话计数。
+    }
+    return isBusy(handle) ? 1u : 0u; // wjy: 旧 DLL 没有计数导出时，busy 视为至少 1 路，保持徽标可见。
+}
+// ===end====
 
 } // namespace stream

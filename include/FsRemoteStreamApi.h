@@ -110,6 +110,9 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_text
 void FSREMOTE_STREAM_CALL fsremote_stream_stop(FsRemoteStreamHandle handle);
 int FSREMOTE_STREAM_CALL fsremote_stream_send_input(FsRemoteStreamHandle handle, const char* message);
 int FSREMOTE_STREAM_CALL fsremote_stream_is_busy(FsRemoteStreamHandle handle);
+// =====wjy====
+uint32_t FSREMOTE_STREAM_CALL fsremote_stream_active_session_count(FsRemoteStreamHandle handle); // wjy: 返回主机当前已登记会话数，供状态服务上报远控人数徽标。
+// ===end====
 const char* FSREMOTE_STREAM_CALL fsremote_stream_last_error(void);
 
 #ifdef __cplusplus

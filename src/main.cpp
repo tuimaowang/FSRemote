@@ -55,9 +55,15 @@ int main(int argc, char* argv[])
     // ===end====
     writeStartupLog(QStringLiteral("[wjy-main] after StreamRuntime::startHost handle=%1").arg(hostHandle ? 1 : 0)); // wjy: Record whether the native stream host returned a valid handle.
 
+    // =====wjy====
     platform::DeviceStatusServer statusServer([hostHandle] {
-        return hostHandle && stream::StreamRuntime::instance().isBusy(hostHandle); // wjy: Report busy when the stream host is currently occupied.
+        if (!hostHandle) {
+            return 0;
+        }
+        // wjy: 返回真实活动会话数，状态协议与设备行远控数字徽标共用同一来源。
+        return static_cast<int>(stream::StreamRuntime::instance().activeSessionCount(hostHandle));
     });
+    // ===end====
     writeStartupLog(QStringLiteral("[wjy-main] status server object created"));
 
     platform::DeviceCommandServer commandServer;

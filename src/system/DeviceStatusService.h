@@ -39,18 +39,25 @@ struct DeviceStatusInfo {
     QString broadcastIp;
     QString mac;
     RemoteScriptRuntimeInfo scriptRuntime; // wjy: 在现有设备在线状态响应中附带目标脚本运行信息，不额外增加服务端口。
+    // =====wjy====
+    int remoteSessionCount = 0; // wjy: 目标端当前远控会话数 0-10，驱动设备行数字徽标；旧协议缺失时保持 0。
+    // ===end====
 };
 
 class DeviceStatusServer final {
 public:
-    explicit DeviceStatusServer(std::function<bool()> busyProvider);
+    // =====wjy====
+    explicit DeviceStatusServer(std::function<int()> sessionCountProvider); // wjy: 返回当前远控会话数；>0 时状态前缀为 busy。
+    // ===end====
     ~DeviceStatusServer();
 
     bool start(uint16_t port = 49101);
     void stop();
 
 private:
-    std::function<bool()> m_busyProvider;
+    // =====wjy====
+    std::function<int()> m_sessionCountProvider;
+    // ===end====
     QTcpServer* m_server = nullptr;
 };
 

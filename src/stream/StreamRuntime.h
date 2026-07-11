@@ -60,6 +60,9 @@ public:
     void stop(FsRemoteStreamHandle handle);
     bool sendInput(FsRemoteStreamHandle handle, const QByteArray& message);
     bool isBusy(FsRemoteStreamHandle handle) const;
+    // =====wjy====
+    uint32_t activeSessionCount(FsRemoteStreamHandle handle) const; // wjy: 查询主机当前活动远控会话数，驱动设备行人数徽标。
+    // ===end====
 
 private:
     StreamRuntime();
@@ -88,6 +91,9 @@ private:
     using StopFn = void(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
     using SendInputFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, const char*);
     using IsBusyFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
+    // =====wjy====
+    using ActiveSessionCountFn = uint32_t(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
+    // ===end====
     using LastErrorFn = const char*(FSREMOTE_STREAM_CALL*)();
 
     bool m_loaded = false;
@@ -101,6 +107,9 @@ private:
     StopFn m_stop = nullptr;
     SendInputFn m_sendInput = nullptr;
     IsBusyFn m_isBusy = nullptr;
+    // =====wjy====
+    ActiveSessionCountFn m_activeSessionCount = nullptr;
+    // ===end====
     LastErrorFn m_lastError = nullptr;
 };
 

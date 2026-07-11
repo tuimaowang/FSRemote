@@ -290,6 +290,9 @@ private:
     std::vector<std::thread> m_backgroundThreads; // wjy: Joined in destructor to avoid late UI callbacks.
     bool m_shuttingDown = false; // wjy: No new background tasks after destruction begins.
     QHash<QString, platform::DevicePresenceState> m_deviceStatuses;
+    // =====wjy====
+    QHash<QString, int> m_deviceRemoteSessionCounts; // wjy: 目标端远控会话数 0-10，设备行数字徽标的权威缓存。
+    // ===end====
     QTimer* m_detailAnimationTimer = nullptr;
     QTimer* m_desktopHoverTimer = nullptr;
     QTimer* m_refreshTimer = nullptr;

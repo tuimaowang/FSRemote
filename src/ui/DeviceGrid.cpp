@@ -267,6 +267,69 @@ void drawScriptRunningIcon(QPainter& painter, const QRectF& bounds)
     painter.drawLine(QPointF(x + 10.2, y + 12.6), QPointF(x + 13.3, y + 12.6)); // wjy: 黄色短光标用于强调“运行中”，并和绿色在线状态点区分语义。
     painter.restore();
 }
+
+QColor remoteControlCountAccent(int count)
+{
+    // wjy: 1 至 10 路控制端各用一档色相，从产品主蓝逐步升温到深红，一眼区分占用强度。
+    switch (qBound(1, count, 10)) {
+    case 1: return QColor(QStringLiteral("#3A7BFC"));
+    case 2: return QColor(QStringLiteral("#2563EB"));
+    case 3: return QColor(QStringLiteral("#0B66DD"));
+    case 4: return QColor(QStringLiteral("#0891B2"));
+    case 5: return QColor(QStringLiteral("#0D9488"));
+    case 6: return QColor(QStringLiteral("#16A34A"));
+    case 7: return QColor(QStringLiteral("#CA8A04"));
+    case 8: return QColor(QStringLiteral("#EA580C"));
+    case 9: return QColor(QStringLiteral("#DC2626"));
+    case 10:
+    default: return QColor(QStringLiteral("#991B1B"));
+    }
+}
+
+QColor remoteControlCountFill(int count)
+{
+    // wjy: 低并发保持近白底；高并发改用浅色底，避免只有描边变化、人数难辨。
+    switch (qBound(1, count, 10)) {
+    case 1: return QColor(QStringLiteral("#F8FBFF"));
+    case 2: return QColor(QStringLiteral("#EEF4FF"));
+    case 3: return QColor(QStringLiteral("#E8F1FF"));
+    case 4: return QColor(QStringLiteral("#E6F8FB"));
+    case 5: return QColor(QStringLiteral("#E6F7F4"));
+    case 6: return QColor(QStringLiteral("#EAF8EE"));
+    case 7: return QColor(QStringLiteral("#FFF8E6"));
+    case 8: return QColor(QStringLiteral("#FFF1E8"));
+    case 9: return QColor(QStringLiteral("#FEECEC"));
+    case 10:
+    default: return QColor(QStringLiteral("#FCE8E8"));
+    }
+}
+
+void drawRemoteControlCountIcon(QPainter& painter, const QRectF& bounds, int controllerCount)
+{
+    const int count = qBound(1, controllerCount, 10);
+    const QColor accent = remoteControlCountAccent(count);
+    const QColor fill = remoteControlCountFill(count);
+
+    painter.save(); // wjy: 与脚本运行徽标一样隔离画笔状态，保证设备行其它元素不受影响。
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setRenderHint(QPainter::TextAntialiasing);
+
+    const QRectF badgeRect = bounds.adjusted(0.55, 0.55, -0.55, -0.55);
+    // wjy: 1-10 统一圆角徽标外形；人数只用数字区分，色相随人数升温辅助扫读。
+    painter.setPen(QPen(accent, count >= 8 ? 1.35 : 1.1));
+    painter.setBrush(fill);
+    painter.drawRoundedRect(badgeRect, 4, 4);
+
+    QFont countFont(QStringLiteral("Microsoft YaHei UI"));
+    // wjy: 单位数 1-9 用 11px 居中；10 用 9px 保证两位数仍完整落在 18px 徽标内。
+    countFont.setPixelSize(count >= 10 ? 9 : 11);
+    countFont.setBold(true);
+    painter.setFont(countFont);
+    painter.setPen(accent);
+    painter.drawText(badgeRect, Qt::AlignCenter, QString::number(count));
+
+    painter.restore();
+}
 // ===end====
 
 void drawRemoteBadge(QPainter& painter, int x, int y)
@@ -4595,6 +4658,7 @@ void DeviceGrid::saveNewDevice()
     g_devices.append({name, ip, mac, {}, m_deviceRemarkEdit->text().trimmed(), {}}); // wjy: 新增设备默认无分组，只有后续拖入具体分组时才写 group。
     saveDevices();
     m_deviceStatuses.remove(ip);
+    m_deviceRemoteSessionCounts.remove(ip); // wjy: 新增同 IP 前清掉旧远控人数，避免误显示上一次会话徽标。
     m_deviceIpEdit->clear();
     m_deviceNameEdit->clear();
     m_deviceMacEdit->clear();
@@ -4726,8 +4790,13 @@ void DeviceGrid::refreshDeviceStatuses()
 // ===end====
         QHash<QString, platform::DevicePresenceState> statuses;
         statuses.reserve(ips.size());
+        // =====wjy====
+        QHash<QString, int> remoteSessionCounts;
+        remoteSessionCounts.reserve(ips.size());
+        // ===end====
         for (const QString& ip : ips) {
             statuses.insert(ip, platform::DevicePresenceState::Offline); // wjy: 每轮刷新先默认离线，只有状态服务明确返回 online/busy 时才覆盖，避免沿用旧在线状态。
+            remoteSessionCounts.insert(ip, 0); // wjy: 默认无远控会话，只有状态服务返回人数后才显示数字徽标。
         }
         QHash<QString, QString> remoteDeviceNames; // wjy: 自动刷新时顺便记录远端真实设备名，用来同步 devices.json 的 name 字段。
         QHash<QString, QString> remoteDeviceMacs; // wjy: 状态服务返回 MAC 时用于补齐旧设备记录，避免远程开机仍读到空 MAC。
@@ -4772,6 +4841,9 @@ void DeviceGrid::refreshDeviceStatuses()
 // ===end====
                     std::lock_guard lock(resultMutex);
                     statuses.insert(ip, info.state);
+                    // =====wjy====
+                    remoteSessionCounts.insert(ip, qBound(0, info.remoteSessionCount, 10)); // wjy: 同步缓存远控人数，驱动设备行 1-10 数字徽标。
+                    // ===end====
                     if (!info.deviceName.trimmed().isEmpty()) {
                         remoteDeviceNames.insert(ip, info.deviceName.trimmed()); // wjy: 只有新版远端返回了真实设备名时才参与本地 JSON 同步。
                     }
@@ -4812,7 +4884,7 @@ void DeviceGrid::refreshDeviceStatuses()
 
 // =====wjy====
         writeDeviceGridStartupLog(QStringLiteral("[wjy-status] invoke ui post begin")); // wjy: 准备把后台探测结果投递回 UI 线程；如果有 begin 没有 end，说明崩在投递附近。
-        const bool invokeQueued = QMetaObject::invokeMethod(self, [self, statuses = std::move(statuses), remoteDeviceNames = std::move(remoteDeviceNames), remoteDeviceMacs = std::move(remoteDeviceMacs), remoteDeviceBroadcastIps = std::move(remoteDeviceBroadcastIps), remoteScriptRuntimes = std::move(remoteScriptRuntimes), remoteTerminalUsers = std::move(remoteTerminalUsers)]() mutable { // wjy: 把脚本运行结果和设备在线结果同批投递到 UI 线程，避免跨线程直接写 m_scriptUiStates。
+        const bool invokeQueued = QMetaObject::invokeMethod(self, [self, statuses = std::move(statuses), remoteSessionCounts = std::move(remoteSessionCounts), remoteDeviceNames = std::move(remoteDeviceNames), remoteDeviceMacs = std::move(remoteDeviceMacs), remoteDeviceBroadcastIps = std::move(remoteDeviceBroadcastIps), remoteScriptRuntimes = std::move(remoteScriptRuntimes), remoteTerminalUsers = std::move(remoteTerminalUsers)]() mutable { // wjy: 把脚本运行、远控人数和设备在线结果同批投递到 UI 线程，避免跨线程直接写缓存。
 // =====wjy====
             writeDeviceGridStartupLog(QStringLiteral("[wjy-status] invoke ui begin")); // wjy: 回到 UI 线程前半段日志，判断崩溃是否发生在 UI 更新阶段。
 // ===end====
@@ -4824,6 +4896,9 @@ void DeviceGrid::refreshDeviceStatuses()
             }
             DeviceGrid* grid = self.data();
             grid->m_deviceStatuses = std::move(statuses);
+            // =====wjy====
+            grid->m_deviceRemoteSessionCounts = std::move(remoteSessionCounts); // wjy: 刷新完成后整表替换远控人数缓存，设备行徽标立即反映 1-10 路变化。
+            // ===end====
             bool deviceRecordChanged = false;
             for (DeviceEntry& device : g_devices) {
                 const QString ip = device.ip.trimmed();
@@ -6003,6 +6078,7 @@ bool DeviceGrid::shutdownDeviceForIndex(int deviceIndex, bool showMessages)
     const DeviceEntry& device = g_devices.at(deviceIndex);
     if (platform::DeviceCommandService::send(device.ip, platform::DeviceControlAction::Shutdown)) {
         m_deviceStatuses.insert(device.ip.trimmed(), platform::DevicePresenceState::Offline);
+        m_deviceRemoteSessionCounts.insert(device.ip.trimmed(), 0); // wjy: 关机后远控人数归零，徽标立即消失。
         update();
         return true;
     }
@@ -6038,6 +6114,7 @@ bool DeviceGrid::restartDeviceForIndex(int deviceIndex, bool showMessages)
     const DeviceEntry& device = g_devices.at(deviceIndex);
     if (platform::DeviceCommandService::send(device.ip, platform::DeviceControlAction::Restart)) {
         m_deviceStatuses.insert(device.ip.trimmed(), platform::DevicePresenceState::Offline);
+        m_deviceRemoteSessionCounts.insert(device.ip.trimmed(), 0); // wjy: 重启后远控人数归零，徽标立即消失。
         update();
         return true;
     }
@@ -6159,6 +6236,7 @@ void DeviceGrid::deleteCurrentDevice()
     g_devices.removeAt(m_selectedDeviceIndex);
     saveDevices();
     m_deviceStatuses.remove(removedIp);
+    m_deviceRemoteSessionCounts.remove(removedIp); // wjy: 删除设备时同步清掉远控人数缓存。
     m_poweringOnDeviceIps.remove(removedIp);
     m_poweringOnStartedAtMs.remove(removedIp);
     m_scriptUiStates.remove(removedIp); // wjy: 被删除设备的脚本 UI 不再保留，避免后续同 IP 之外的设备误用旧状态。
@@ -6606,12 +6684,21 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
 
                 const int iconX = deviceInsideGroup ? 50 : 30;
                 const int textX = deviceInsideGroup ? 76 : 56;
-                const int textWidth = deviceInsideGroup ? 82 : 102; // wjy: 两种设备行的文字右沿统一停在 x=158，为 x=166 的脚本运行图标预留 8 像素间隔。
+                // =====wjy====
+                const platform::DevicePresenceState deviceState = devicePresenceForIndex(deviceIndex);
+                // wjy: 远控人数来自状态刷新缓存；无字段的旧目标在 busy 时回退为 1。
+                int remoteControllerCount = qBound(0, m_deviceRemoteSessionCounts.value(deviceIp, 0), 10);
+                if (remoteControllerCount <= 0 && deviceState == platform::DevicePresenceState::Busy) {
+                    remoteControllerCount = 1;
+                }
+                const bool showRemoteControlIcon = remoteControllerCount > 0;
+                // wjy: 脚本 logo 固定 x=166，远控数字 logo 固定 x=186，两格并排不随是否显示互换位置。
+                const int textWidth = deviceInsideGroup ? 62 : 82;
+                // ===end====
                 constexpr qreal statusDotSize = 6.0; // wjy: 左侧列表状态点改小，贴近用户示例图里的轻量提示样式。
                 const qreal statusDotX = iconX - 23.0+6.0;
                 const qreal statusDotY = rowY + 9 + (20.0 - statusDotSize) / 2.0; // wjy: 状态点移动到设备图标左侧，并和图标垂直居中。
 
-                const platform::DevicePresenceState deviceState = devicePresenceForIndex(deviceIndex);
                 const bool deviceOnlineLike = deviceState == platform::DevicePresenceState::Online
                     || deviceState == platform::DevicePresenceState::Busy; // wjy: 左侧列表只有在线/占用才显示状态圆点；离线和未检测不再画灰色圆点。
                 painter.setPen(Qt::NoPen);
@@ -6633,11 +6720,16 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                 if (m_renamingDeviceIndex != deviceIndex) {
                     painter.drawText(QRectF(textX, rowY + 7, textWidth, 22), Qt::AlignVCenter | Qt::AlignLeft, deviceDisplayName(g_devices.at(deviceIndex))); // wjy: 显示真实设备名，分组排序变化不会改错名字。
                 }
+                // =====wjy====
                 if (scriptRunning) {
-                    drawScriptRunningIcon(painter, QRectF(166, rowY + 9, 18, 18)); // wjy: 在截图框选位置绘制终端运行徽标，未运行时该区域保持空白。
+                    drawScriptRunningIcon(painter, QRectF(166, rowY + 9, 18, 18)); // wjy: 脚本状态固定左侧槽位。
                 }
+                if (showRemoteControlIcon) {
+                    drawRemoteControlCountIcon(painter, QRectF(186, rowY + 9, 18, 18), remoteControllerCount); // wjy: 远控人数固定右侧槽位，与脚本 logo 并排。
+                }
+                // ===end====
                 if (badges.contains(deviceIndex)) {
-                    drawRemoteBadge(painter, 202, rowY + 12); // wjy: 角标也使用真实设备下标，避免分组行插入后角标错位。
+                    drawRemoteBadge(painter, 208, rowY + 12); // wjy: Wi-Fi 角标固定在双状态徽标右侧。
                 }
                 continue;
             }

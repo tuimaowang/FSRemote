@@ -231,9 +231,10 @@ QString decodedStatusText(const QByteArray& text)
 }
 // ===end====
 
-QByteArray statusPayload(bool busy)
+QByteArray statusPayload(int remoteSessionCount)
 {
-    QByteArray payload = busy ? QByteArrayLiteral("busy") : QByteArrayLiteral("online");
+    const int sessionCount = qBound(0, remoteSessionCount, 10); // wjy: 状态协议人数夹在 0-10，与设备行徽标档位一致。
+    QByteArray payload = sessionCount > 0 ? QByteArrayLiteral("busy") : QByteArrayLiteral("online");
     const QString loginUser = PortableOpenSshManager::instance().loginUser();
     const DeviceInfo localInfo = DeviceInfoService::local();
     payload.append('|');
@@ -266,6 +267,8 @@ QByteArray statusPayload(bool busy)
     payload.append(QByteArray::number(scriptRuntime.controllerPid));
     payload.append('|');
     payload.append(QByteArray::number(scriptRuntime.startedAtEpochMs)); // wjy: 新字段全部追加在旧 MAC 字段之后，旧控制端会自然忽略，保持协议向后兼容。
+    payload.append('|');
+    payload.append(QByteArray::number(sessionCount)); // wjy: 第 16 字段为远控会话数；旧控制端忽略，新控制端驱动数字徽标。
     // ===end====
     payload.append('\n');
     return payload;
@@ -323,8 +326,21 @@ DeviceStatusInfo queryStatusInfo(const QString& hostIp, uint16_t port, int timeo
             info.scriptRuntime.controllerPid = parts.at(13).trimmed().toLongLong();
             info.scriptRuntime.startedAtEpochMs = parts.at(14).trimmed().toLongLong(); // wjy: 仅在完整新版字段存在时声明支持，截断响应不会被误判为远端空闲。
         }
+        // wjy: 远控会话数追加在脚本字段之后；缺失时 busy 回退为 1，online 为 0。
+        if (parts.size() > 15) {
+            bool ok = false;
+            const int parsed = parts.at(15).trimmed().toInt(&ok);
+            info.remoteSessionCount = ok ? qBound(0, parsed, 10) : (info.state == DevicePresenceState::Busy ? 1 : 0);
+        } else if (info.state == DevicePresenceState::Busy) {
+            info.remoteSessionCount = 1;
+        }
         // ===end====
     } else {
+        // =====wjy====
+        if (info.state == DevicePresenceState::Busy) {
+            info.remoteSessionCount = 1; // wjy: 极旧协议没有会话数字段时，busy 至少显示 1 路远控。
+        }
+        // ===end====
         if (parts.size() > 2) {
             info.localIp = QString::fromUtf8(parts.at(2)).trimmed(); // wjy: 兼容旧状态协议，旧客户端没有 deviceName 字段。
         }
@@ -343,8 +359,8 @@ DeviceStatusInfo queryStatusInfo(const QString& hostIp, uint16_t port, int timeo
 
 } // namespace
 
-DeviceStatusServer::DeviceStatusServer(std::function<bool()> busyProvider)
-    : m_busyProvider(std::move(busyProvider))
+DeviceStatusServer::DeviceStatusServer(std::function<int()> sessionCountProvider)
+    : m_sessionCountProvider(std::move(sessionCountProvider))
 {
 }
 
@@ -373,7 +389,8 @@ bool DeviceStatusServer::start(uint16_t port)
                 continue;
             }
 
-            socket->write(statusPayload(m_busyProvider && m_busyProvider()));
+            const int sessionCount = m_sessionCountProvider ? m_sessionCountProvider() : 0;
+            socket->write(statusPayload(sessionCount));
             socket->flush();
             QObject::connect(socket, &QAbstractSocket::disconnected, socket, &QObject::deleteLater);
             socket->disconnectFromHost();
