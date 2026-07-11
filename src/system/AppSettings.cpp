@@ -157,7 +157,7 @@ void AppSettings::setStatusAutoRefreshIntervalSeconds(int seconds)
 // =====wjy====
 int AppSettings::remoteHostMaxSessions()
 {
-    return qBound(1, settings().value(QStringLiteral("remoteHostMaxSessions"), 1).toInt(), 3); // wjy: 迁移阶段默认和有效值均从单会话起步，上限预留到首版计划的三会话。
+    return qBound(1, settings().value(QStringLiteral("remoteHostMaxSessions"), 3).toInt(), 3); // wjy: 注册表没有该项时直接返回 3，新设备复制程序后无需额外配置即可使用三路会话。
 }
 
 void AppSettings::setRemoteHostMaxSessions(int sessions)

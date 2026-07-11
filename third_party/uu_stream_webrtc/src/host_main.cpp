@@ -1,3 +1,4 @@
+#include "host_media_pipeline.h"
 #include "native_webrtc_runtime.h"
 #include "signaling.h"
 #include "webrtc_session.h"
@@ -102,6 +103,18 @@ int main(int argc, char** argv)
     config.target_bitrate_kbps = bitrate_kbps;
     config.fps = fps;
 
+    // =====wjy====
+    uu::HostMediaPipeline media_pipeline(fps); // wjy: standalone host 也遵守 manager-owned capture，不让 WebrtcSession 隐式创建桌面源。
+    auto media_subscription = media_pipeline.subscribe(&error);
+    if (!media_subscription) {
+        std::cerr << "host media init failed: " << error << "\n";
+        uu::close_socket(socket);
+        return 3;
+    }
+    config.host_video_source = media_subscription->source();
+    config.media_id = "standalone";
+    // ===end====
+
     uu::WebrtcSession session(&runtime, config);
     session.set_signal_callback([&](const std::string& kind, const std::string& body) {
         std::cout << "send signaling kind=" << kind << " size=" << body.size() << "\n";
@@ -110,12 +123,12 @@ int main(int argc, char** argv)
     if (!session.initialize(&error)) {
         std::cerr << "session init failed: " << error << "\n";
         uu::close_socket(socket);
-        return 3;
+        return 4;
     }
     if (!session.start_offer(&error)) {
         std::cerr << "offer failed: " << error << "\n";
         uu::close_socket(socket);
-        return 4;
+        return 5;
     }
 
     std::thread recv_thread([&] {

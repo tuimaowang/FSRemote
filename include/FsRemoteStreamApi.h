@@ -58,15 +58,16 @@ enum FsRemoteStreamStatusCode {
 
 enum FsRemoteOwnershipPolicy {
     FSREMOTE_OWNERSHIP_EXCLUSIVE = 1,
+    FSREMOTE_OWNERSHIP_SHARED = 2, // wjy: 默认协同策略允许所有已认证且协商 control 能力的会话同时发送键鼠输入。
 };
 
 typedef struct FsRemoteHostConfig {
     uint32_t struct_size; // wjy: 调用方填写结构体大小，使未来追加字段时仍能兼容旧二进制。
     uint32_t version; // wjy: 当前主机配置结构版本固定为 1。
-    uint32_t max_sessions; // wjy: 请求的并发会话上限；迁移阶段 DLL 内部仍强制有效值为 1。
+    uint32_t max_sessions; // wjy: 实际并发视频会话上限，DLL 会把调用方配置夹紧到 1 至 3。
     uint32_t max_aggregate_video_kbps; // wjy: 所有发送会话共享的视频码率预算。
     uint32_t handshake_timeout_ms; // wjy: 未认证连接完成准入握手的最长时间。
-    uint32_t ownership_policy; // wjy: 首版仅支持单控制权独占策略。
+    uint32_t ownership_policy; // wjy: 共享策略为默认值；保留独占枚举用于旧调用方 ABI 与后续兼容开关。
 } FsRemoteHostConfig;
 
 typedef uint32_t(FSREMOTE_STREAM_CALL* FsRemoteReadPublicKeyCallback)(void* user, uint8_t* output, uint32_t output_capacity);

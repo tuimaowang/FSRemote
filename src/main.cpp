@@ -43,10 +43,10 @@ int main(int argc, char* argv[])
     FsRemoteHostConfig hostConfig = {}; // wjy: 在 Qt 层汇总可持久化配置，再通过稳定 C ABI 一次性复制到原生 DLL。
     hostConfig.struct_size = sizeof(hostConfig);
     hostConfig.version = 1;
-    hostConfig.max_sessions = static_cast<uint32_t>(platform::AppSettings::remoteHostMaxSessions()); // wjy: 当前 DLL 仍强制有效会话数为 1，配置先为后续多会话开放做好接口。
+    hostConfig.max_sessions = static_cast<uint32_t>(platform::AppSettings::remoteHostMaxSessions()); // wjy: 默认值已按用户要求设为 3；仅当本机已有显式设置时才使用保存的 1 至 3 配置。
     hostConfig.max_aggregate_video_kbps = static_cast<uint32_t>(platform::AppSettings::remoteHostAggregateVideoKbps());
     hostConfig.handshake_timeout_ms = static_cast<uint32_t>(platform::AppSettings::remoteHostHandshakeTimeoutMs());
-    hostConfig.ownership_policy = FSREMOTE_OWNERSHIP_EXCLUSIVE; // wjy: 首版只允许一个远端持有键鼠控制权。
+    hostConfig.ownership_policy = FSREMOTE_OWNERSHIP_SHARED; // wjy: 用户确认默认所有已认证控制端都可同时控制，目标端统一串行化键鼠输入。
     writeStartupLog(QStringLiteral("[wjy-main] before StreamRuntime::startHost maxSessions=%1 aggregateKbps=%2 handshakeMs=%3")
         .arg(hostConfig.max_sessions)
         .arg(hostConfig.max_aggregate_video_kbps)

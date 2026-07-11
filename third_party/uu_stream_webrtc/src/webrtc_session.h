@@ -15,7 +15,6 @@ namespace uu {
 
 class NativeWebrtcRuntime;
 class ControlDataObserver;
-class ParsecVddSession;
 
 enum class SessionRole {
     Host,
@@ -27,6 +26,10 @@ struct SessionConfig {
     uint32_t min_bitrate_kbps = 9000; // wjy: Keep the compressed video target above 20 Mbps so static desktop frames do not collapse into low-quality refreshes.
     uint32_t target_bitrate_kbps = 120000; // wjy: Treat this value as the adaptive bitrate ceiling, currently 120 Mbps for high-quality remote-control testing.
     uint32_t fps = 60;
+    // =====wjy====
+    webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> host_video_source; // wjy: host 会话只消费 manager 管理的共享帧源，不再创建或停止桌面捕获器。
+    std::string media_id; // wjy: 每个会话用独立 ID 创建 track/stream，避免多 PeerConnection 诊断与 SDP 标识混淆。
+    // ===end====
 };
 
 class WebrtcSession final : public webrtc::PeerConnectionObserver {
@@ -84,7 +87,6 @@ private:
     std::mutex callback_mutex_;
     webrtc::scoped_refptr<webrtc::DataChannelInterface> control_channel_;
     std::unique_ptr<ControlDataObserver> control_observer_;
-    std::unique_ptr<ParsecVddSession> host_virtual_display_;
     webrtc::scoped_refptr<webrtc::VideoTrackInterface> local_video_track_;
     webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> local_video_source_;
     webrtc::scoped_refptr<webrtc::VideoTrackInterface> remote_video_track_;

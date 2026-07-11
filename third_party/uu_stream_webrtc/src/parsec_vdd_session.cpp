@@ -357,9 +357,14 @@ public:
     void release()
     {
         std::lock_guard lock(mutex_);
+        // =====wjy====
         if (ref_count_ > 0) {
             --ref_count_;
         }
+        if (ref_count_ == 0 && ready_) {
+            stop_locked(); // wjy: 最后一个 HostMediaPipeline 订阅释放后立即移除虚拟显示器，不把空闲 VDD 留到进程退出。
+        }
+        // ===end====
     }
 
 private:

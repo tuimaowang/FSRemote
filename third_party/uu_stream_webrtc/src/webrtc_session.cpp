@@ -1,7 +1,6 @@
 #include "webrtc_session.h"
 
 #include "native_webrtc_runtime.h"
-#include "parsec_vdd_session.h"
 #include "sdp_guard.h"
 #include "uu_profile.h"
 
@@ -10,22 +9,11 @@
 #include <api/data_channel_interface.h>
 #include <api/field_trials.h>
 #include <api/rtp_transceiver_interface.h>
-#include <api/video/i420_buffer.h>
 #include <api/video/video_frame.h>
 #include <api/video_codecs/sdp_video_format.h>
-#include <common_video/libyuv/include/webrtc_libyuv.h>
-#include <media/base/adapted_video_track_source.h>
-#include <modules/desktop_capture/desktop_capture_options.h>
-#include <modules/desktop_capture/desktop_capturer.h>
-#include <modules/desktop_capture/desktop_frame.h>
-#include <rtc_base/time_utils.h>
 #include <rtc_base/ref_counted_object.h>
-#include <libyuv/convert.h>
 
 #include <algorithm>
-#include <atomic>
-#include <cctype>
-#include <chrono>
 #include <cstdio>
 #include <iostream>
 #include <map>
@@ -33,7 +21,6 @@
 #include <set>
 #include <sstream>
 #include <span>
-#include <thread>
 #include <vector>
 #include <windows.h>
 
@@ -125,184 +112,6 @@ webrtc::CreateSessionDescriptionObserver* new_create_description_observer(Webrtc
 {
     return new webrtc::RefCountedObject<CreateDescriptionObserver>(session);
 }
-
-std::string to_lower_copy(std::string value)
-{
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    return value;
-}
-
-class DesktopVideoSource : public webrtc::AdaptedVideoTrackSource,
-                           public webrtc::DesktopCapturer::Callback {
-public:
-    DesktopVideoSource(uint32_t fps, int64_t preferredSourceId, std::string preferredDeviceName, bool preferVirtualDisplayPath)
-        : fps_(fps ? fps : 60)
-        , preferred_source_id_(preferredSourceId)
-        , preferred_device_name_(to_lower_copy(std::move(preferredDeviceName)))
-        , prefer_virtual_display_path_(preferVirtualDisplayPath)
-    {
-    }
-
-    ~DesktopVideoSource() override { stop(); }
-
-    bool start(std::string* error)
-    {
-        auto options = webrtc::DesktopCaptureOptions::CreateDefault();
-#if defined(WEBRTC_WIN)
-        options.set_allow_directx_capturer(true);
-        options.set_allow_wgc_screen_capturer(!prefer_virtual_display_path_);
-        options.set_allow_wgc_using_texture(false);
-#endif
-        capturer_ = webrtc::DesktopCapturer::CreateScreenCapturer(options);
-        if (!capturer_) {
-            if (error) *error = "DesktopCapturer::CreateScreenCapturer failed";
-            return false;
-        }
-        webrtc::DesktopCapturer::SourceList sources;
-        if (capturer_->GetSourceList(&sources) && !sources.empty()) {
-            std::cout << "desktop sources:";
-            for (const auto& source : sources) {
-                std::cout << " [" << source.id << " '" << source.title << "' display=" << source.display_id << "]";
-            }
-            std::cout << "\n";
-
-            auto chosen = sources.front();
-            const auto choose_parsec_fallback = [&sources]() -> webrtc::DesktopCapturer::Source {
-                for (const auto& source : sources) {
-                    const std::string title = to_lower_copy(source.title);
-                    if (title.find("parsec") != std::string::npos || title.find("psccdd0") != std::string::npos) {
-                        return source;
-                    }
-                }
-                return sources.front();
-            };
-
-            bool matched = false;
-            if (preferred_source_id_ != 0) {
-                for (const auto& source : sources) {
-                    if (static_cast<int64_t>(source.id) == preferred_source_id_
-                        || static_cast<int64_t>(source.display_id) == preferred_source_id_) {
-                        chosen = source;
-                        matched = true;
-                        break;
-                    }
-                }
-            }
-            if (!matched && !preferred_device_name_.empty()) {
-                for (const auto& source : sources) {
-                    const std::string title = to_lower_copy(source.title);
-                    if (title == preferred_device_name_ || title.find(preferred_device_name_) != std::string::npos) {
-                        chosen = source;
-                        matched = true;
-                        break;
-                    }
-                }
-            }
-            if (!matched && (preferred_source_id_ != 0 || !preferred_device_name_.empty())) {
-                chosen = choose_parsec_fallback();
-            }
-
-            if (!capturer_->SelectSource(chosen.id)) {
-                if (error) *error = "DesktopCapturer::SelectSource failed";
-                return false;
-            }
-            std::cout << "desktop selected source id=" << chosen.id
-                      << " preferred=" << preferred_source_id_
-                      << " name='" << preferred_device_name_ << "'\n";
-        }
-        capturer_->SetMaxFrameRate(fps_);
-        capturer_->Start(this);
-        running_ = true;
-        thread_ = std::thread([this] { capture_loop(); });
-        return true;
-    }
-
-    void stop()
-    {
-        running_ = false;
-        if (thread_.joinable()) thread_.join();
-        capturer_.reset();
-    }
-
-    webrtc::MediaSourceInterface::SourceState state() const override
-    {
-        return running_ ? kLive : kEnded;
-    }
-
-    bool remote() const override { return false; }
-    bool is_screencast() const override { return true; }
-    std::optional<bool> needs_denoising() const override { return false; }
-
-    void OnCaptureResult(webrtc::DesktopCapturer::Result result,
-                         std::unique_ptr<webrtc::DesktopFrame> frame) override
-    {
-        if (result != webrtc::DesktopCapturer::Result::SUCCESS || !frame || !frame->data()) {
-            OnFrameDropped();
-            return;
-        }
-
-        const int width = frame->size().width();
-        const int height = frame->size().height();
-        int out_width = width;
-        int out_height = height;
-        int crop_width = width;
-        int crop_height = height;
-        int crop_x = 0;
-        int crop_y = 0;
-        const int64_t now_us = webrtc::TimeMicros();
-        if (!AdaptFrame(width, height, now_us, &out_width, &out_height,
-                        &crop_width, &crop_height, &crop_x, &crop_y)) {
-            return;
-        }
-
-        auto buffer = webrtc::I420Buffer::Create(width, height);
-        const int converted = libyuv::ARGBToI420(
-            frame->data(), frame->stride(),
-            buffer->MutableDataY(), buffer->StrideY(),
-            buffer->MutableDataU(), buffer->StrideU(),
-            buffer->MutableDataV(), buffer->StrideV(),
-            width, height);
-        if (converted != 0) {
-            OnFrameDropped();
-            return;
-        }
-
-        webrtc::scoped_refptr<webrtc::VideoFrameBuffer> final_buffer = buffer;
-        if (out_width != width || out_height != height || crop_width != width || crop_height != height) {
-            final_buffer = buffer->CropAndScale(crop_x, crop_y, crop_width, crop_height, out_width, out_height);
-        }
-
-        auto video_frame = webrtc::VideoFrame::Builder()
-            .set_video_frame_buffer(final_buffer)
-            .set_timestamp_us(now_us)
-            .set_rotation(webrtc::kVideoRotation_0)
-            .set_content_type(webrtc::VideoContentType::SCREENSHARE)
-            .build();
-        OnFrame(video_frame);
-    }
-
-private:
-    void capture_loop()
-    {
-        const auto interval = std::chrono::microseconds(1000000 / fps_);
-        auto next = std::chrono::steady_clock::now();
-        while (running_) {
-            next += interval;
-            if (capturer_) capturer_->CaptureFrame();
-            std::this_thread::sleep_until(next);
-        }
-    }
-
-    uint32_t fps_ = 60;
-    int64_t preferred_source_id_ = 0;
-    std::string preferred_device_name_;
-    bool prefer_virtual_display_path_ = false;
-    std::atomic_bool running_ = false;
-    std::unique_ptr<webrtc::DesktopCapturer> capturer_;
-    std::thread thread_;
-};
 
 class CallbackVideoSink final : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
 public:
@@ -543,7 +352,6 @@ WebrtcSession::~WebrtcSession()
     // ===end====
     local_video_track_ = nullptr;
     local_video_source_ = nullptr;
-    host_virtual_display_.reset();
     if (pc_) {
         pc_->Close();
     }
@@ -737,37 +545,26 @@ bool WebrtcSession::configure_host_media(std::string* error)
     control_observer_ = std::make_unique<ControlDataObserver>(this);
     control_channel_->RegisterObserver(control_observer_.get());
 
-    host_virtual_display_ = std::make_unique<ParsecVddSession>();
-    std::string vdd_error;
-    if (!host_virtual_display_->start(&vdd_error)) {
-        std::cout << "host media: parsec-vdd unavailable: " << vdd_error << "\n";
-        host_virtual_display_.reset();
-    } else {
-        std::cout << "host media: parsec-vdd source prepared id="
-                  << host_virtual_display_->preferred_source_id()
-                  << " name='" << host_virtual_display_->preferred_device_name() << "'\n";
+    // =====wjy====
+    if (!config_.host_video_source) {
+        if (error) *error = "host video source subscription is missing";
+        return false; // wjy: host 必须先从 HostMediaPipeline 取得订阅，WebrtcSession 不再隐式启动第二套捕获资源。
     }
-
-    std::cout << "host media: create desktop source\n";
-    auto source = webrtc::make_ref_counted<DesktopVideoSource>(
-        config_.fps,
-        host_virtual_display_ ? host_virtual_display_->preferred_source_id() : 0,
-        host_virtual_display_ ? host_virtual_display_->preferred_device_name() : std::string(),
-        host_virtual_display_ != nullptr);
-    std::cout << "host media: start desktop source\n";
-    if (!source->start(error)) return false;
+    // ===end====
 
     auto factory = runtime_->factory();
     const auto send_caps = factory->GetRtpSenderCapabilities(webrtc::MediaType::VIDEO);
     log_video_capabilities("host sender", send_caps);
-    local_video_source_ = source;
+    // =====wjy====
+    local_video_source_ = config_.host_video_source; // wjy: 多个 host 会话保存同一 source 引用，各自 track/sender 仍完全独立。
+    const std::string media_suffix = config_.media_id.empty() ? std::string("0") : config_.media_id;
     std::cout << "host media: create video track\n";
-    local_video_track_ = factory->CreateVideoTrack(local_video_source_, "video0");
+    local_video_track_ = factory->CreateVideoTrack(local_video_source_, "video-" + media_suffix); // wjy: track ID 绑定会话，便于定位单个发送端失败。
     std::cout << "host media: AddTrack\n";
-    auto result = pc_->AddTrack(local_video_track_, {"stream0"});
+    auto result = pc_->AddTrack(local_video_track_, {"stream-" + media_suffix});
+    // ===end====
     if (!result.ok()) {
         if (error) *error = result.error().message();
-        source->stop();
         local_video_source_ = nullptr;
         local_video_track_ = nullptr;
         return false;
@@ -776,7 +573,6 @@ bool WebrtcSession::configure_host_media(std::string* error)
     auto transceivers = pc_->GetTransceivers();
     if (!transceivers.empty()) {
         if (!apply_uu_codec_preferences(transceivers.back().get(), send_caps, "host", error)) {
-            source->stop();
             local_video_source_ = nullptr;
             local_video_track_ = nullptr;
             return false;

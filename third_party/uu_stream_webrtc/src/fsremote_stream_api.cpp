@@ -9,6 +9,11 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include "host_media_pipeline.h"
+// =====wjy====
+#include "control_admission_policy.h"
+#include "shared_input_state.h"
+// ===end====
 #include "native_webrtc_runtime.h"
 #include "session_protocol.h"
 #include "signaling.h"
@@ -22,6 +27,9 @@
 #include <exception>
 #include <cstdlib>
 #include <cstdio>
+// =====wjy====
+#include <functional>
+// ===end====
 #include <memory>
 #include <mutex>
 #include <random>
@@ -43,24 +51,26 @@ FsRemoteIdentityCallbacks g_identity_callbacks = {};
 
 // =====wjy====
 struct HostRuntimeConfig {
-    uint32_t requested_max_sessions = 1; // wjy: 保存用户配置用于日志和后续阶段，当前有效上限仍固定为 1。
-    uint32_t effective_max_sessions = 1; // wjy: 单会话安全重构验证完成前禁止提前开放多连接。
+    uint32_t requested_max_sessions = 3; // wjy: 用户明确要求全新设备无需注册表即可启用三路会话，因此 DLL 无配置入口默认请求 3。
+    uint32_t effective_max_sessions = 3; // wjy: 无配置或旧入口直接采用三路有效上限，复制 Release 目录到其他设备即可生效。
     uint32_t max_aggregate_video_kbps = 120000; // wjy: 首阶段把总预算直接用于唯一 WebRTC 发送端。
     uint32_t handshake_timeout_ms = 5000; // wjy: 后续认证状态机直接复用该超时配置。
-    uint32_t ownership_policy = FSREMOTE_OWNERSHIP_EXCLUSIVE; // wjy: 只接受独占控制权策略。
+    uint32_t ownership_policy = FSREMOTE_OWNERSHIP_SHARED; // wjy: 默认授予全部已认证 control 会话协同输入权限，无需目标设备额外配置。
 };
 
 HostRuntimeConfig normalized_host_config(const FsRemoteHostConfig* config)
 {
     HostRuntimeConfig normalized;
     if (!config || config->struct_size < sizeof(FsRemoteHostConfig) || config->version != 1) {
-        return normalized; // wjy: 空配置、短结构或未知版本全部安全回退到原有单会话默认值。
+        return normalized; // wjy: 空配置、短结构或未知版本统一回退到新的三会话默认值，避免不同启动入口产生容量差异。
     }
     normalized.requested_max_sessions = std::clamp(config->max_sessions, 1u, 3u);
-    normalized.effective_max_sessions = 1; // wjy: OpenSpec 迁移计划要求先在 maxSessions=1 下完成回归再开放并发。
+    normalized.effective_max_sessions = normalized.requested_max_sessions; // wjy: 3.5 实机回归通过后正式启用调用方配置的并发上限，异常值仍已被限制在 1 到 3。
     normalized.max_aggregate_video_kbps = std::clamp(config->max_aggregate_video_kbps, 9000u, 240000u);
     normalized.handshake_timeout_ms = std::clamp(config->handshake_timeout_ms, 1000u, 30000u);
-    normalized.ownership_policy = FSREMOTE_OWNERSHIP_EXCLUSIVE;
+    normalized.ownership_policy = config->ownership_policy == FSREMOTE_OWNERSHIP_EXCLUSIVE
+        ? FSREMOTE_OWNERSHIP_EXCLUSIVE
+        : FSREMOTE_OWNERSHIP_SHARED; // wjy: 旧调用方仍可显式请求独占；未知值安全归一为产品默认的协同控制策略。
     return normalized;
 }
 // ===end====
@@ -285,6 +295,8 @@ struct SessionAdmission {
     std::string capabilities; // wjy: 仅保存主机与客户端都支持的能力交集。
     uint32_t protocol_version = 0; // wjy: 保存实际选中的协议版本，后续消息必须沿用同一版本。
     std::string ownership = "view_only"; // wjy: 默认无输入权限，只有明确请求 control 且认证通过才授予控制权。
+    bool exclusive_control_slot = false; // wjy: 仅兼容独占策略时记录本会话是否取得原子槽，协同策略不会占用该槽。
+    bool audio_primary = false; // wjy: 单客户端音频重构完成前独立记录首个音频会话，禁止再把音频资格与键鼠权限绑定。
 };
 
 struct AudioTokenRecord {
@@ -486,6 +498,8 @@ bool sign_identity_challenge(const FsRemoteIdentityCallbacks& callbacks, const s
 bool perform_host_admission(
     uintptr_t socket,
     const HostRuntimeConfig& config,
+    std::atomic_bool* exclusive_control_claimed,
+    std::atomic_bool* audio_primary_claimed,
     SessionAdmission* admission,
     std::string* error)
 {
@@ -561,14 +575,30 @@ bool perform_host_admission(
     }
 
     if (admission->session_id.empty()) admission->session_id = random_hex(16); // wjy: HostSessionManager 可在启动工作线程前预留稳定 ID，旧调用方仍由握手生成。
-    admission->audio_token = issue_audio_token(admission->session_id);
+    // =====wjy====
+    const uu::ControlAdmissionDecision control_decision = uu::decideControlAdmission(
+        requested_role == "control",
+        has_capability(negotiated_capabilities, "control"),
+        config.ownership_policy == FSREMOTE_OWNERSHIP_EXCLUSIVE,
+        exclusive_control_claimed); // wjy: 认证完成后统一由可测试策略决定本会话是协同控制还是只读。
+    const bool control_granted = control_decision.granted;
+    admission->exclusive_control_slot = control_decision.claimed_exclusive_slot;
+    if (control_granted && has_capability(negotiated_capabilities, "audio") && audio_primary_claimed) {
+        bool expected = false;
+        admission->audio_primary = audio_primary_claimed->compare_exchange_strong(expected, true); // wjy: 音频仍是单客户端实现，因此单独选出首个音频会话，不再限制其他会话的控制权限。
+    }
+    std::string admitted_capabilities = "video";
+    if (admission->audio_primary) admitted_capabilities += ",audio";
+    if (control_granted) admitted_capabilities += ",control"; // wjy: 后续协同控制端得到 video,control；只有音频主会话额外得到 audio。
+    admission->audio_token = issue_audio_token(admission->session_id); // wjy: AdmissionAccepted 协议要求令牌非空；只读会话也取得独立短期令牌，但因 capabilities 不含 audio，Viewer 不会连接音频端口。
+    // ===end====
     admission->client_id = hello.fields.at("client_id");
     admission->public_key = public_key;
     admission->host_id = host_id;
     admission->requested_role = requested_role;
-    admission->capabilities = negotiated_capabilities;
+    admission->capabilities = admitted_capabilities; // wjy: 把服务端最终授予的能力返回给 Viewer，不能沿用客户端自行声明的能力集合。
     admission->protocol_version = hello.version;
-    admission->ownership = requested_role == "control" ? "control_granted" : "view_only"; // wjy: 视图请求永不隐式升级为控制请求。
+    admission->ownership = control_granted ? "control_granted" : "view_only"; // wjy: control_granted 在共享策略中表示“本会话具有协同控制权限”，不再表示全局唯一拥有者。
     uu::SessionMessage accepted;
     accepted.type = uu::SessionMessageType::AdmissionAccepted;
     accepted.fields = {
@@ -614,7 +644,11 @@ bool perform_viewer_admission(
     if (!send_session_message(socket, hello, error)) return false;
 
     uu::SessionMessage challenge;
-    if (!recv_session_message(socket, &challenge, error)) return false;
+    if (!recv_session_message(socket, &challenge, error)) {
+        const char* detail = error && !error->empty() ? error->c_str() : "Failed to receive admission challenge"; // wjy: 传输超时或主机提前关闭时提供可见错误，不再让窗口永久停在 TCP 已连接。
+        report_status(status_callback, user, FSREMOTE_STATUS_ERROR, detail); // wjy: 准入第一阶段失败立即覆盖最后一次 TCP 状态，便于定位服务端握手问题。
+        return false;
+    }
     if (challenge.type == uu::SessionMessageType::AdmissionRejected) {
         const std::string reason = challenge.fields.at("reason");
         const int code = reason == "unsupported_version" ? FSREMOTE_STATUS_INCOMPATIBLE_PROTOCOL
@@ -654,7 +688,11 @@ bool perform_viewer_admission(
     if (!send_session_message(socket, proof, error)) return false;
 
     uu::SessionMessage accepted;
-    if (!recv_session_message(socket, &accepted, error)) return false;
+    if (!recv_session_message(socket, &accepted, error)) {
+        const char* detail = error && !error->empty() ? error->c_str() : "Failed to receive admission result"; // wjy: 已发送证明却收不到最终结果时显示真实传输错误。
+        report_status(status_callback, user, FSREMOTE_STATUS_ERROR, detail); // wjy: 防止第二会话准入回包失败后 UI 仍误显示 TCP 已连接。
+        return false;
+    }
     if (accepted.type == uu::SessionMessageType::AdmissionRejected) {
         report_status(status_callback, user, FSREMOTE_STATUS_AUTHORIZATION_REJECTED, accepted.fields.at("detail").c_str());
         if (error) *error = accepted.fields.at("detail");
@@ -761,16 +799,22 @@ void move_mouse_relative(int dx, int dy, bool log_result)
     }
 }
 
+// =====wjy====
 struct MouseInputModeState {
     bool game_relative_mode = false;
-    bool has_last_viewer_pos = false;
-    int last_viewer_x = 0;
-    int last_viewer_y = 0;
     int lock_score = 0;
     int unlock_score = 0;
+    uint64_t relative_generation = 0; // wjy: 每次进入相对模式递增，保证每个控制端都先建立自己的坐标基线。
 };
 
 MouseInputModeState g_mouse_input_mode;
+
+struct SessionPointerState {
+    bool has_last_viewer_pos = false;
+    int last_viewer_x = 0;
+    int last_viewer_y = 0;
+    uint64_t relative_generation = 0;
+}; // wjy: 相对鼠标坐标必须按会话隔离，否则两个控制端交替移动会把彼此的绝对坐标误算成巨大位移。
 
 bool get_cursor_center_distance(int& dx, int& dy, int& screen_w, int& screen_h)
 {
@@ -824,7 +868,9 @@ void reset_mouse_relative_mode(const char* reason, bool log_result, uu::WebrtcSe
 {
     (void)log_result;
     const bool was_relative = g_mouse_input_mode.game_relative_mode;
+    const uint64_t generation = g_mouse_input_mode.relative_generation;
     g_mouse_input_mode = {};
+    g_mouse_input_mode.relative_generation = generation; // wjy: 退出相对模式保留代次，下一次进入时继续递增并让所有会话重新校准。
     if (was_relative) {
         append_input_debug_log(std::string("host mouse mode desktop reason=") + reason + cursor_lock_probe_text());
         publish_mouse_mode(session, false, reason);
@@ -878,7 +924,7 @@ bool should_use_relative_mouse_for_move(int x, int y, bool log_result, uu::Webrt
 
     if (!g_mouse_input_mode.game_relative_mode && g_mouse_input_mode.lock_score >= 3) {
         g_mouse_input_mode.game_relative_mode = true;
-        g_mouse_input_mode.has_last_viewer_pos = false;
+        ++g_mouse_input_mode.relative_generation;
         g_mouse_input_mode.unlock_score = 0;
         append_input_debug_log("host mouse mode relative reason=center-lock" + cursor_lock_probe_text());
         publish_mouse_mode(session, true, "center-lock");
@@ -899,20 +945,23 @@ bool should_use_relative_mouse_for_move(int x, int y, bool log_result, uu::Webrt
     return g_mouse_input_mode.game_relative_mode;
 }
 
-void move_mouse_auto(int x, int y, bool log_result, uu::WebrtcSession* session)
+void move_mouse_auto(int x, int y, bool log_result, uu::WebrtcSession* session, SessionPointerState* pointer)
 {
+    if (!pointer) return;
     if (!should_use_relative_mouse_for_move(x, y, log_result, session)) {
-        g_mouse_input_mode.has_last_viewer_pos = true;
-        g_mouse_input_mode.last_viewer_x = x;
-        g_mouse_input_mode.last_viewer_y = y;
+        pointer->has_last_viewer_pos = true;
+        pointer->last_viewer_x = x;
+        pointer->last_viewer_y = y;
         move_mouse_absolute(x, y, log_result);
         return;
     }
 
-    if (!g_mouse_input_mode.has_last_viewer_pos) {
-        g_mouse_input_mode.has_last_viewer_pos = true;
-        g_mouse_input_mode.last_viewer_x = x;
-        g_mouse_input_mode.last_viewer_y = y;
+    if (!pointer->has_last_viewer_pos
+        || pointer->relative_generation != g_mouse_input_mode.relative_generation) {
+        pointer->has_last_viewer_pos = true;
+        pointer->last_viewer_x = x;
+        pointer->last_viewer_y = y;
+        pointer->relative_generation = g_mouse_input_mode.relative_generation; // wjy: 新进入相对模式或新控制端首次移动只记录基线，不制造跨会话跳变。
         if (log_result) {
             append_input_debug_log("host SendInput rel skipped reason=prime-last-viewer-pos" + cursor_lock_probe_text());
         }
@@ -928,10 +977,10 @@ void move_mouse_auto(int x, int y, bool log_result, uu::WebrtcSession* session)
         screen_h = 1080;
     }
 
-    const int raw_dx = x - g_mouse_input_mode.last_viewer_x;
-    const int raw_dy = y - g_mouse_input_mode.last_viewer_y;
-    g_mouse_input_mode.last_viewer_x = x;
-    g_mouse_input_mode.last_viewer_y = y;
+    const int raw_dx = x - pointer->last_viewer_x;
+    const int raw_dy = y - pointer->last_viewer_y;
+    pointer->last_viewer_x = x;
+    pointer->last_viewer_y = y;
 
     int rel_dx = (raw_dx * screen_w) / 65535;
     int rel_dy = (raw_dy * screen_h) / 65535;
@@ -966,8 +1015,14 @@ void send_key(int vk, bool down)
     SendInput(1, &input, sizeof(input));
 }
 
-void inject_input_message(const std::string& message, uu::WebrtcSession* session)
+void inject_input_message(
+    const std::string& session_id,
+    const std::string& message,
+    uu::WebrtcSession* session,
+    SessionPointerState* pointer,
+    uu::SharedInputState* held_input)
 {
+    if (!pointer || !held_input) return;
     const bool log_message = should_log_input_message(message);
     if (log_message) {
         append_input_debug_log("host recv msg=\"" + message + "\"" + cursor_lock_probe_text());
@@ -981,7 +1036,7 @@ void inject_input_message(const std::string& message, uu::WebrtcSession* session
         int y = 0;
         int buttons = 0;
         if (input >> x >> y >> buttons) {
-            move_mouse_auto(x, y, log_message, session);
+            move_mouse_auto(x, y, log_message, session, pointer);
         }
         return;
     }
@@ -1010,14 +1065,17 @@ void inject_input_message(const std::string& message, uu::WebrtcSession* session
         int y = 0;
         if (!(input >> button >> x >> y)) return;
         if (g_mouse_input_mode.game_relative_mode) {
-            g_mouse_input_mode.has_last_viewer_pos = false;
+            pointer->has_last_viewer_pos = false;
         } else {
             move_mouse_absolute(x, y, log_message);
         }
         const bool down = kind == "d";
-        if (button == 1) send_mouse_button(down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP);
-        if (button == 2) send_mouse_button(down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP);
-        if (button == 4) send_mouse_button(down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP);
+        const uu::SharedInputTransition transition = held_input->updateButton(session_id, button, down);
+        const bool inject_down = transition == uu::SharedInputTransition::InjectDown;
+        const bool inject_up = transition == uu::SharedInputTransition::InjectUp;
+        if (button == 1 && (inject_down || inject_up)) send_mouse_button(inject_down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP);
+        if (button == 2 && (inject_down || inject_up)) send_mouse_button(inject_down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP);
+        if (button == 4 && (inject_down || inject_up)) send_mouse_button(inject_down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP); // wjy: 同一按钮由多人持有时只注入首次 down 和最终 up。
         return;
     }
     if (kind == "w") {
@@ -1036,13 +1094,86 @@ void inject_input_message(const std::string& message, uu::WebrtcSession* session
         int vk = 0;
         int down = 0;
         if (input >> vk >> down) {
-            if (vk == VK_ESCAPE && down != 0) {
+            const uu::SharedInputTransition transition = held_input->updateKey(session_id, vk, down != 0);
+            if (vk == VK_ESCAPE && down != 0 && transition != uu::SharedInputTransition::None) {
                 reset_mouse_relative_mode("escape", log_message, session);
             }
-            send_key(vk, down != 0);
+            if (transition == uu::SharedInputTransition::InjectDown
+                || transition == uu::SharedInputTransition::InjectRepeat) {
+                send_key(vk, true);
+            } else if (transition == uu::SharedInputTransition::InjectUp) {
+                send_key(vk, false); // wjy: 非持有者的抬键被忽略，最后一个持有者才真正释放系统按键。
+            }
         }
     }
 }
+
+class InputDispatcher final {
+public:
+    using MouseModeCallback = std::function<void(bool relative, const char* reason)>;
+
+    void registerSession(const std::string& session_id, MouseModeCallback callback)
+    {
+        std::lock_guard lock(mutex_);
+        mouse_mode_callbacks_[session_id] = std::move(callback); // wjy: 每个已授权会话登记弱引用通知，鼠标模式变化时所有控制窗口保持一致。
+    }
+
+    void dispatch(const std::string& session_id, const std::string& message)
+    {
+        std::vector<MouseModeCallback> mode_callbacks;
+        bool relative = false;
+        {
+            std::lock_guard lock(mutex_); // wjy: 所有 WebRTC data-channel 回调在这里汇合，SendInput 与全局鼠标模式按唯一顺序执行。
+            const bool was_relative = g_mouse_input_mode.game_relative_mode;
+            inject_input_message(session_id, message, nullptr, &pointer_by_session_[session_id], &held_input_);
+            relative = g_mouse_input_mode.game_relative_mode;
+            if (was_relative != relative) {
+                for (const auto& [id, callback] : mouse_mode_callbacks_) {
+                    if (callback) mode_callbacks.push_back(callback);
+                }
+            }
+        }
+        for (const auto& callback : mode_callbacks) callback(relative, "shared-dispatcher"); // wjy: 模式通知在互斥区外发送，避免 WebRTC 回调反向阻塞其他控制端输入。
+    }
+
+    void releaseSession(const std::string& session_id)
+    {
+        std::lock_guard lock(mutex_);
+        const uu::SharedInputReleaseBatch released = held_input_.releaseSession(session_id);
+        for (const int key : released.keys) send_key(key, false);
+        for (const int button : released.buttons) send_button_up(button); // wjy: 断线只补发该会话最后持有的输入，其他控制端的按住状态继续有效。
+        pointer_by_session_.erase(session_id);
+        mouse_mode_callbacks_.erase(session_id);
+        if (mouse_mode_callbacks_.empty()) reset_mouse_relative_mode("last-controller-left", false, nullptr);
+    }
+
+    void shutdown()
+    {
+        std::lock_guard lock(mutex_);
+        for (const auto& [session_id, callback] : mouse_mode_callbacks_) {
+            const uu::SharedInputReleaseBatch released = held_input_.releaseSession(session_id);
+            for (const int key : released.keys) send_key(key, false);
+            for (const int button : released.buttons) send_button_up(button);
+        }
+        pointer_by_session_.clear();
+        mouse_mode_callbacks_.clear();
+        reset_mouse_relative_mode("host-shutdown", false, nullptr); // wjy: Host 资源销毁前兜底清空所有会话输入与相对鼠标状态。
+    }
+
+private:
+    static void send_button_up(int button)
+    {
+        if (button == 1) send_mouse_button(MOUSEEVENTF_LEFTUP);
+        if (button == 2) send_mouse_button(MOUSEEVENTF_RIGHTUP);
+        if (button == 4) send_mouse_button(MOUSEEVENTF_MIDDLEUP);
+    }
+
+    std::mutex mutex_;
+    uu::SharedInputState held_input_;
+    std::unordered_map<std::string, SessionPointerState> pointer_by_session_;
+    std::unordered_map<std::string, MouseModeCallback> mouse_mode_callbacks_;
+};
+// ===end====
 
 class StreamInstance {
 public:
@@ -1098,9 +1229,11 @@ struct HostClientSession {
 
     std::atomic_uintptr_t socket = 0;
     std::mutex send_mutex;
+    std::mutex webrtc_mutex; // wjy: 共享鼠标模式通知可能来自其他会话线程，销毁 PeerConnection 时用同一把锁阻止悬空访问。
     std::atomic_bool cancelled = false;
     std::atomic_bool completed = false;
     SessionAdmission admission;
+    std::unique_ptr<uu::HostMediaPipeline::Subscription> media_subscription; // wjy: 会话只持订阅令牌，最后一个令牌释放时由共享管线停止捕获/VDD。
     std::unique_ptr<uu::WebrtcSession> webrtc; // wjy: 每个客户端独占 PeerConnection、track、sender 和编码器状态。
     std::thread worker; // wjy: 工作线程始终可 join，禁止 detached 生命周期越过 HostInstance。
 };
@@ -1201,26 +1334,54 @@ private:
     {
         const uintptr_t socket = context->socket.load();
         std::string error;
-        if (!perform_host_admission(socket, config_, &context->admission, &error)) {
+        if (!perform_host_admission(socket, config_, &exclusive_control_claimed_, &audio_primary_claimed_, &context->admission, &error)) {
             append_log("host admission rejected session=" + context->admission.session_id + " error=" + error);
+            releaseAdmissionClaims(context); // wjy: 最终准入回包失败时归还兼容独占槽和单路音频槽，不影响其他协同控制端。
             context->cancel();
             context->completed = true;
             return; // wjy: 认证失败路径不会触碰音频、PeerConnection、桌面采集或编码器。
         }
         append_log("host admission accepted session=" + context->admission.session_id + " client=" + context->admission.client_id);
-        startAudioForSingleSession();
+        // =====wjy====
+        context->media_subscription = media_pipeline_.subscribe(&error); // wjy: 认证成功后才加入共享桌面源，未授权连接不会启动或占用采集资源。
+        if (!context->media_subscription) {
+            append_log("host media subscribe failed session=" + context->admission.session_id + " error=" + error);
+            releaseAdmissionClaims(context); // wjy: 新会话媒体创建失败只回收自己的兼容槽和音频槽，不影响现有控制与视频订阅者。
+            context->cancel();
+            context->completed = true;
+            return;
+        }
+        // ===end====
+        const bool has_control = context->admission.ownership == "control_granted";
+        const bool owns_audio = context->admission.audio_primary;
+        if (owns_audio && has_capability(context->admission.capabilities, "audio")) {
+            startAudioForSingleSession(); // wjy: 单路音频拥有者与协同控制权限完全解耦，第二、第三控制端不会因没有音频而降为只读。
+        }
 
         uu::SessionConfig sessionConfig;
         sessionConfig.role = uu::SessionRole::Host;
         sessionConfig.target_bitrate_kbps = config_.max_aggregate_video_kbps;
+        // =====wjy====
+        sessionConfig.host_video_source = context->media_subscription->source(); // wjy: 每个 PeerConnection 使用同一帧源，但后续仍创建独立 track、sender 和编码器。
+        sessionConfig.media_id = context->admission.session_id; // wjy: 生成会话唯一的 WebRTC track/stream 标识。
+        // ===end====
         context->webrtc = std::make_unique<uu::WebrtcSession>(&runtime_, sessionConfig);
         context->webrtc->set_signal_callback([weak = std::weak_ptr<HostClientSession>(context)](const std::string& kind, const std::string& body) {
             if (const auto locked = weak.lock()) locked->send(kind + "\n" + body); // wjy: 回调只持弱引用，会话销毁后不会访问悬空 socket。
         });
-        uu::WebrtcSession* const webrtc = context->webrtc.get();
-        context->webrtc->set_control_callback([weak = std::weak_ptr<HostClientSession>(context), webrtc](const std::string& message) {
-            if (const auto locked = weak.lock(); locked && !locked->cancelled) inject_input_message(message, webrtc);
-        });
+        if (has_control) {
+            input_dispatcher_.registerSession(context->admission.session_id, [weak = std::weak_ptr<HostClientSession>(context)](bool relative, const char* reason) {
+                if (const auto locked = weak.lock(); locked && !locked->cancelled) {
+                    std::lock_guard webrtc_lock(locked->webrtc_mutex);
+                    publish_mouse_mode(locked->webrtc.get(), relative, reason); // wjy: 任一控制端触发鼠标模式切换后安全广播给全部仍存活的协同控制窗口。
+                }
+            });
+            context->webrtc->set_control_callback([this, weak = std::weak_ptr<HostClientSession>(context)](const std::string& message) {
+                if (const auto locked = weak.lock(); locked && !locked->cancelled) {
+                    input_dispatcher_.dispatch(locked->admission.session_id, message); // wjy: 每个授权会话都可提交输入，但实际 SendInput 统一经过主机级串行调度器。
+                }
+            });
+        } // wjy: view_only 会话不登记回调，即使发送 data-channel 输入也无法到达系统注入路径。
         if (context->webrtc->initialize(&error) && context->webrtc->start_offer(&error)) {
             std::string message;
             while (running_ && !context->cancelled && uu::recv_message(socket, &message)) {
@@ -1229,11 +1390,35 @@ private:
         } else {
             append_log("host session init/start failed session=" + context->admission.session_id + " error=" + error);
         }
-        context->webrtc.reset(); // wjy: session worker 退出前销毁独占媒体对象，manager 最后才会销毁共享 runtime。
+        std::unique_ptr<uu::WebrtcSession> retiring_webrtc;
+        {
+            std::lock_guard webrtc_lock(context->webrtc_mutex);
+            retiring_webrtc = std::move(context->webrtc); // wjy: 先在锁内摘除可广播指针，让后续模式通知立即跳过该会话。
+        }
+        retiring_webrtc.reset(); // wjy: 在锁外执行 PeerConnection 析构，避免析构等待 data-channel 回调时与模式通知锁形成互等。
+        if (has_control) input_dispatcher_.releaseSession(context->admission.session_id); // wjy: 销毁输入回调后释放该会话独有的键、按钮和相对坐标状态。
+        context->media_subscription.reset(); // wjy: 先销毁 PeerConnection/track，再减少共享 source 订阅计数，避免捕获线程提前停止。
         context->cancel();
-        stopAudioForSingleSession();
+        if (owns_audio) stopAudioForSingleSession(); // wjy: 非音频主会话退出不能停止首个会话仍在使用的音频连接。
+        releaseAdmissionClaims(context);
         context->completed = true;
         append_log("host client worker completed session=" + context->admission.session_id);
+    }
+
+    void releaseAdmissionClaims(const std::shared_ptr<HostClientSession>& context)
+    {
+        if (!context) return;
+        if (context->admission.exclusive_control_slot) {
+            bool expected = true;
+            exclusive_control_claimed_.compare_exchange_strong(expected, false);
+            context->admission.exclusive_control_slot = false; // wjy: 只有显式独占策略会归还该槽，协同会话之间没有全局控制者竞争。
+        }
+        if (context->admission.audio_primary) {
+            bool expected = true;
+            audio_primary_claimed_.compare_exchange_strong(expected, false);
+            context->admission.audio_primary = false; // wjy: 单路音频槽独立归还，不能顺带撤销其他会话的键鼠权限。
+        }
+        context->admission.ownership = "view_only"; // wjy: 本会话结束后本地状态降为只读，防止重复清理。
     }
 
     void reapCompletedSessions()
@@ -1261,7 +1446,7 @@ private:
         if (audio_streamer_) return;
         std::string ignored;
         audio_streamer_ = std::make_unique<uu::HostAudioStreamer>();
-        audio_streamer_->start(49105, &ignored); // wjy: maxSessions=1 迁移阶段仍沿用单客户端音频，后续由 HostAudioHub 替换。
+        audio_streamer_->start(49105, &ignored); // wjy: 并发控制阶段仅为独立选出的音频主会话沿用单客户端音频，后续由 HostAudioHub 替换。
     }
 
     void stopAudioForSingleSession()
@@ -1289,8 +1474,12 @@ private:
             if (session->worker.joinable()) session->worker.join(); // wjy: manager 线程是剩余会话 worker 的唯一 join 所有者。
         }
         append_log("host manager session shutdown joined");
+        input_dispatcher_.shutdown(); // wjy: 所有会话 worker 结束后再次兜底释放残留输入，随后才销毁媒体和 WebRTC 资源。
+        append_log("host manager input dispatcher shutdown");
         stopAudioForSingleSession();
         append_log("host manager session shutdown audio stopped");
+        media_pipeline_.shutdown(); // wjy: 全部会话 worker 已 join、订阅已释放后，禁止新订阅并确认共享桌面管线停止。
+        append_log("host manager media pipeline shutdown");
         append_log("host manager resources shutdown");
     }
 
@@ -1309,10 +1498,14 @@ private:
 
     HostRuntimeConfig config_;
     uu::NativeWebrtcRuntime runtime_; // wjy: 全部 HostClientSession 共用一个进程内 WebRTC runtime。
+    uu::HostMediaPipeline media_pipeline_; // wjy: manager 独占 VDD/桌面捕获启停权，会话只能通过订阅令牌引用共享 source。
+    InputDispatcher input_dispatcher_; // wjy: HostInstance 唯一持有输入调度器，三个会话共享同一确定性 SendInput 顺序。
     mutable std::mutex sessions_mutex_;
     std::unordered_map<std::string, std::shared_ptr<HostClientSession>> sessions_;
     std::mutex audio_mutex_;
     std::unique_ptr<uu::HostAudioStreamer> audio_streamer_;
+    std::atomic_bool exclusive_control_claimed_ = false; // wjy: 仅供显式旧独占策略兼容使用，默认协同策略不会占用。
+    std::atomic_bool audio_primary_claimed_ = false; // wjy: HostAudioHub 完成前限制单路音频客户端，但不限制协同键鼠控制。
 };
 // ===end====
 
@@ -1347,7 +1540,7 @@ public:
 
     bool sendInput(const char* message) override
     {
-        if (!message || !*message) {
+        if (!message || !*message || !control_allowed_) { // wjy: view_only 客户端在进入 WebRTC 发送路径前直接拒绝本地键鼠消息。
             return false;
         }
         std::lock_guard lock(session_mutex_);
@@ -1409,6 +1602,7 @@ private:
             append_viewer_log("viewer admission failed error=" + error); // wjy: 认证失败不启动音频、不初始化 WebRTC，UI 保留具体拒绝状态。
             return;
         }
+        control_allowed_ = admission_.ownership == "control_granted"; // wjy: Viewer 本地同步执行准入权限，view_only 窗口不再向 data channel 转发键鼠消息。
         set_socket_timeout(socket, 0);
         append_viewer_log("viewer admitted session=" + admission_.session_id
             + " version=" + std::to_string(admission_.protocol_version)
@@ -1519,6 +1713,7 @@ private:
     FsRemoteStatusCallback status_callback_ = nullptr;
     void* user_ = nullptr;
     SessionAdmission admission_; // wjy: 准入结果生命周期覆盖整个 ViewerInstance，供后续音频令牌、控制权和状态处理复用。
+    std::atomic_bool control_allowed_ = false; // wjy: 原子权限位跨 UI 与 viewer worker 线程读取，避免直接并发访问 admission_ 字符串。
     std::mutex session_mutex_;
     uu::WebrtcSession* active_session_ = nullptr;
     uint64_t last_stats_status_ms_ = 0;
@@ -1534,7 +1729,7 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_host(uint16_t po
     append_viewer_log("api start_host port=" + std::to_string(port));
     // ===end====
     try {
-        return new HostInstance(port, normalized_host_config(nullptr)); // wjy: 旧入口继续提供稳定的单会话默认行为。
+        return new HostInstance(port, normalized_host_config(nullptr)); // wjy: 旧入口与 Qt 配置入口保持一致，无额外配置时默认允许三路视频会话。
     } catch (const std::exception& ex) {
         set_error(ex.what());
         return nullptr;

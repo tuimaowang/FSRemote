@@ -12,9 +12,21 @@ option(FSREMOTE_BUILD_UU_STREAM_WEBRTC "Build the vendored UU native WebRTC stre
 if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
     add_subdirectory(third_party/uu_stream_webrtc)
     # =====wjy====
+    target_sources(uu_stream_common PRIVATE
+        third_party/uu_stream_webrtc/src/host_media_pipeline.cpp
+        third_party/uu_stream_webrtc/src/host_media_pipeline.h
+    ) # wjy: 子项目 CMake 含历史非 UTF-8 字节，顶层显式登记共享媒体管线可避免整文件转码破坏既有配置。
+    target_sources(fsremote_stream PRIVATE
+        third_party/uu_stream_webrtc/src/control_admission_policy.h
+        third_party/uu_stream_webrtc/src/shared_input_state.h
+    ) # wjy: DLL 的协同准入与输入调度器复用可独立测试的策略和逐会话按键/按钮状态。
     if(MSVC)
         target_compile_options(uu_stream_common PRIVATE /utf-8) # wjy: 原生公共库已有中文 WJY 注释，统一 UTF-8 可避免系统代码页把多字节尾部误判为续行反斜杠。
         target_compile_options(fsremote_stream PRIVATE /utf-8) # wjy: DLL API 和实现新增中文说明后也必须按 UTF-8 编译，否则可能破坏 extern "C" 边界。
+        if(TARGET uu_webrtc_host)
+            target_compile_options(uu_webrtc_host PRIVATE /utf-8) # wjy: 可选 standalone host 引入共享管线头后也必须按 UTF-8 读取中文所有权说明。
+            set_property(TARGET uu_webrtc_host PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded") # wjy: 与 uu_stream_common 的 /MT 保持一致，避免 Debug 默认 /MDd 造成标准库重复定义。
+        endif()
     endif()
     add_library(uu_session_protocol STATIC
         third_party/uu_stream_webrtc/src/session_protocol.cpp
@@ -52,6 +64,29 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
             set_property(TARGET uu_host_session_manager_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
         endif()
         add_test(NAME uu_host_session_manager_tests COMMAND uu_host_session_manager_tests)
+
+        add_executable(uu_host_media_pipeline_tests
+            third_party/uu_stream_webrtc/tests/host_media_pipeline_tests.cpp
+        ) # wjy: 用无显卡假 source 验证共享管线的单次启动、复用、最后订阅者清理和关闭门禁。
+        target_link_libraries(uu_host_media_pipeline_tests PRIVATE uu_stream_common)
+        set_target_properties(uu_host_media_pipeline_tests PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/third_party/uu_stream_webrtc"
+        )
+        if(MSVC)
+            target_compile_options(uu_host_media_pipeline_tests PRIVATE /utf-8)
+            set_property(TARGET uu_host_media_pipeline_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+        endif()
+        add_test(NAME uu_host_media_pipeline_tests COMMAND uu_host_media_pipeline_tests)
+
+        add_executable(uu_shared_input_state_tests
+            third_party/uu_stream_webrtc/tests/shared_input_state_tests.cpp
+        ) # wjy: 无需启动 WebRTC 或真实 SendInput 即可覆盖多人同键、错误抬键和断线清理语义。
+        target_include_directories(uu_shared_input_state_tests PRIVATE third_party/uu_stream_webrtc/src)
+        if(MSVC)
+            target_compile_options(uu_shared_input_state_tests PRIVATE /utf-8)
+            set_property(TARGET uu_shared_input_state_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+        endif()
+        add_test(NAME uu_shared_input_state_tests COMMAND uu_shared_input_state_tests)
     endif()
     # ===end====
 endif()
