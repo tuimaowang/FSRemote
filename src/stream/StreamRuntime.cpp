@@ -1,7 +1,72 @@
 #include "stream/StreamRuntime.h"
 
+#include "system/PortableOpenSshManager.h"
+
 #include <QCoreApplication>
 #include <QLibrary>
+
+#include <cstring>
+
+namespace {
+
+// =====wjy====
+uint32_t copyIdentityBytes(const QByteArray& source, uint8_t* output, uint32_t outputCapacity)
+{
+    const uint32_t required = static_cast<uint32_t>(source.size());
+    if (!output || outputCapacity < required) return required; // wjy: DLL 可先查询长度或使用固定上限，容量不足时不写半截密钥/签名。
+    if (required > 0) std::memcpy(output, source.constData(), required);
+    return required;
+}
+
+uint32_t FSREMOTE_STREAM_CALL readSessionPublicKey(void*, uint8_t* output, uint32_t outputCapacity)
+{
+    QString error;
+    const QByteArray key = platform::PortableOpenSshManager::instance().clientPublicKey(&error).toUtf8();
+    return error.isEmpty() ? copyIdentityBytes(key, output, outputCapacity) : 0;
+}
+
+uint32_t FSREMOTE_STREAM_CALL signSessionChallenge(
+    void*,
+    const uint8_t* challenge,
+    uint32_t challengeSize,
+    uint8_t* output,
+    uint32_t outputCapacity)
+{
+    if (!challenge || challengeSize == 0) return 0;
+    QString error;
+    const QByteArray signature = platform::PortableOpenSshManager::instance().signSessionChallenge(
+        QByteArray(reinterpret_cast<const char*>(challenge), static_cast<int>(challengeSize)), &error);
+    return error.isEmpty() ? copyIdentityBytes(signature, output, outputCapacity) : 0;
+}
+
+int FSREMOTE_STREAM_CALL isSessionPublicKeyAuthorized(void*, const uint8_t* publicKey, uint32_t publicKeySize)
+{
+    if (!publicKey || publicKeySize == 0) return 0;
+    QString error;
+    return platform::PortableOpenSshManager::instance().isSessionPublicKeyAuthorized(
+        QString::fromUtf8(reinterpret_cast<const char*>(publicKey), static_cast<int>(publicKeySize)), &error) ? 1 : 0;
+}
+
+int FSREMOTE_STREAM_CALL verifySessionChallenge(
+    void*,
+    const uint8_t* publicKey,
+    uint32_t publicKeySize,
+    const uint8_t* challenge,
+    uint32_t challengeSize,
+    const uint8_t* signature,
+    uint32_t signatureSize)
+{
+    if (!publicKey || !challenge || !signature || publicKeySize == 0 || challengeSize == 0 || signatureSize == 0) return 0;
+    QString error;
+    return platform::PortableOpenSshManager::instance().verifySessionChallenge(
+        QString::fromUtf8(reinterpret_cast<const char*>(publicKey), static_cast<int>(publicKeySize)),
+        QByteArray(reinterpret_cast<const char*>(challenge), static_cast<int>(challengeSize)),
+        QByteArray(reinterpret_cast<const char*>(signature), static_cast<int>(signatureSize)),
+        &error) ? 1 : 0;
+}
+// ===end====
+
+} // namespace
 
 namespace stream {
 
@@ -21,6 +86,8 @@ StreamRuntime::StreamRuntime()
     }
 
     m_startHost = reinterpret_cast<StartHostFn>(library->resolve("fsremote_stream_start_host"));
+    m_setIdentityCallbacks = reinterpret_cast<SetIdentityCallbacksFn>(library->resolve("fsremote_stream_set_identity_callbacks"));
+    m_startHostWithConfig = reinterpret_cast<StartHostWithConfigFn>(library->resolve("fsremote_stream_start_host_with_config")); // wjy: 新 DLL 优先接收容量和握手配置，旧 DLL 仍可走原始入口。
     m_startViewer = reinterpret_cast<StartViewerFn>(library->resolve("fsremote_stream_start_viewer"));
     m_startViewerWithStatus = reinterpret_cast<StartViewerWithStatusFn>(library->resolve("fsremote_stream_start_viewer_with_status"));
     m_startViewerWithTexture = reinterpret_cast<StartViewerWithTextureFn>(library->resolve("fsremote_stream_start_viewer_with_texture"));
@@ -32,6 +99,18 @@ StreamRuntime::StreamRuntime()
     if (!m_loaded) {
         m_error = QStringLiteral("fsremote_stream.dll exports are incomplete");
     }
+    // =====wjy====
+    if (m_setIdentityCallbacks) {
+        FsRemoteIdentityCallbacks callbacks = {};
+        callbacks.struct_size = sizeof(callbacks);
+        callbacks.version = 1;
+        callbacks.read_public_key = &readSessionPublicKey;
+        callbacks.sign_challenge = &signSessionChallenge;
+        callbacks.is_public_key_authorized = &isSessionPublicKeyAuthorized;
+        callbacks.verify_challenge = &verifySessionChallenge;
+        m_setIdentityCallbacks(&callbacks); // wjy: DLL 立即复制函数表，后续工作线程通过 Qt 现有 OpenSSH 管理器完成签名和验签。
+    }
+    // ===end====
 }
 
 bool StreamRuntime::isLoaded() const
@@ -54,6 +133,16 @@ FsRemoteStreamHandle StreamRuntime::startHost(uint16_t port)
 {
     return m_startHost ? m_startHost(port) : nullptr;
 }
+
+// =====wjy====
+FsRemoteStreamHandle StreamRuntime::startHost(uint16_t port, const FsRemoteHostConfig& config)
+{
+    if (m_startHostWithConfig) {
+        return m_startHostWithConfig(port, &config); // wjy: 配置结构在同步 DLL 调用期间保持有效，DLL 会立即复制并规范化字段。
+    }
+    return startHost(port); // wjy: 兼容尚未导出配置入口的旧版 fsremote_stream.dll，保持单会话行为。
+}
+// ===end====
 
 FsRemoteStreamHandle StreamRuntime::startViewer(
     const QString& hostIp,

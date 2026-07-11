@@ -24,6 +24,7 @@ struct NativeWebrtcRuntime::Impl {
     webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
     DecodedBgraCallback decoded_bgra_callback;
     DecodedTextureCallback decoded_texture_callback;
+    bool ssl_initialized = false; // wjy: 记录本 runtime 是否成功执行 InitializeSSL，确保 CleanupSSL 只配对调用一次。
 };
 
 NativeWebrtcRuntime::NativeWebrtcRuntime() = default;
@@ -46,6 +47,7 @@ bool NativeWebrtcRuntime::initialize(std::string* error)
         }
 
         impl_ = std::make_unique<Impl>();
+        impl_->ssl_initialized = true; // wjy: 从此处起任一失败路径都由 shutdown 配对清理本次 SSL 初始化。
         impl_->decoded_bgra_callback = std::move(decoded_bgra_callback); // wjy: pass this viewer's callback into its decoder factory.
         impl_->decoded_texture_callback = std::move(decoded_texture_callback);
         std::cout << "webrtc runtime: create threads\n";
@@ -101,14 +103,17 @@ bool NativeWebrtcRuntime::initialize(std::string* error)
 
 void NativeWebrtcRuntime::shutdown()
 {
+    // =====wjy====
     if (impl_) {
-        impl_->factory = nullptr;
-        if (impl_->signaling_thread) impl_->signaling_thread->Stop();
-        if (impl_->worker_thread) impl_->worker_thread->Stop();
-        if (impl_->network_thread) impl_->network_thread->Stop();
+        const bool cleanup_ssl = impl_->ssl_initialized; // wjy: 保存后再 reset，避免析构或重复 shutdown 二次清理全局 SSL。
+        impl_->factory = nullptr; // wjy: 先同步销毁 factory；其代理会在 signaling 上析构内部对象，并调用仍存活的 worker 完成媒体清理。
+        if (impl_->worker_thread) impl_->worker_thread->Stop(); // wjy: factory 已同步完成析构后先停 worker，期间保留 signaling 处理可能的退出回投。
+        if (impl_->network_thread) impl_->network_thread->Stop(); // wjy: 网络线程排在 signaling 前停止，避免其退出路径访问已经销毁的信令队列。
+        if (impl_->signaling_thread) impl_->signaling_thread->Stop(); // wjy: signaling 最后停止，为其他 WebRTC 线程的清理保留依赖线程。
         impl_.reset();
+        if (cleanup_ssl) webrtc::CleanupSSL(); // wjy: 当前 WebRTC 后端的 CleanupSSL 是幂等空操作，但仍与成功初始化保持明确配对。
     }
-    webrtc::CleanupSSL();
+    // ===end====
 }
 
 void NativeWebrtcRuntime::set_decoded_bgra_callback(DecodedBgraCallback callback)

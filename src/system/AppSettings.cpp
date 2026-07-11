@@ -155,6 +155,54 @@ void AppSettings::setStatusAutoRefreshIntervalSeconds(int seconds)
 }
 
 // =====wjy====
+int AppSettings::remoteHostMaxSessions()
+{
+    return qBound(1, settings().value(QStringLiteral("remoteHostMaxSessions"), 1).toInt(), 3); // wjy: 迁移阶段默认和有效值均从单会话起步，上限预留到首版计划的三会话。
+}
+
+void AppSettings::setRemoteHostMaxSessions(int sessions)
+{
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("remoteHostMaxSessions"), qBound(1, sessions, 3)); // wjy: 配置落盘前夹紧范围，避免异常值传入原生监听器。
+}
+
+int AppSettings::remoteHostAggregateVideoKbps()
+{
+    return qBound(9000, settings().value(QStringLiteral("remoteHostAggregateVideoKbps"), 120000).toInt(), 240000); // wjy: 总预算默认沿用当前单流上限，允许后续按实测结果调整。
+}
+
+void AppSettings::setRemoteHostAggregateVideoKbps(int kbps)
+{
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("remoteHostAggregateVideoKbps"), qBound(9000, kbps, 240000)); // wjy: 至少保留一个可用视频流的最低预算并限制误配置峰值。
+}
+
+int AppSettings::remoteHostHandshakeTimeoutMs()
+{
+    return qBound(1000, settings().value(QStringLiteral("remoteHostHandshakeTimeoutMs"), 5000).toInt(), 30000); // wjy: 未认证连接最多等待 5 秒，避免长期占住准入槽位。
+}
+
+void AppSettings::setRemoteHostHandshakeTimeoutMs(int timeoutMs)
+{
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("remoteHostHandshakeTimeoutMs"), qBound(1000, timeoutMs, 30000)); // wjy: 超时范围兼顾局域网响应和较慢设备签名工具启动。
+}
+
+QString AppSettings::remoteHostOwnershipPolicy()
+{
+    const QString policy = settings().value(QStringLiteral("remoteHostOwnershipPolicy"), QStringLiteral("exclusive")).toString().trimmed().toLower();
+    return policy == QStringLiteral("exclusive") ? policy : QStringLiteral("exclusive"); // wjy: 首版只允许独占控制权，未知旧配置统一回退到安全策略。
+}
+
+void AppSettings::setRemoteHostOwnershipPolicy(const QString& policy)
+{
+    Q_UNUSED(policy)
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("remoteHostOwnershipPolicy"), QStringLiteral("exclusive")); // wjy: 为未来策略扩展保留设置接口，但当前禁止写入协同输入模式。
+}
+// ===end====
+
+// =====wjy====
 QKeySequence AppSettings::remoteShortcutFullscreen()
 {
     return shortcutFromSettings(QStringLiteral("remoteShortcutFullscreen"), QKeySequence(QStringLiteral("Ctrl+D"))); // wjy: 默认保持现有全屏切换快捷键。

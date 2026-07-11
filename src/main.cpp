@@ -1,6 +1,7 @@
 #include "ui/MainWindow.h"
 
 #include "stream/StreamRuntime.h"
+#include "system/AppSettings.h"
 #include "system/DeviceCommandService.h"
 #include "system/DeviceStatusService.h"
 #include "system/ParsecVddInstaller.h"
@@ -38,8 +39,20 @@ int main(int argc, char* argv[])
     platform::ParsecVddInstaller::ensureInstalled(); // wjy: Ensure the Parsec VDD driver exists; if missing, the installer may request elevation.
     writeStartupLog(QStringLiteral("[wjy-main] after ParsecVddInstaller::ensureInstalled")); // wjy: Continue even if the installer did not run, matching the previous non-blocking startup style.
 
-    writeStartupLog(QStringLiteral("[wjy-main] before StreamRuntime::startHost")); // wjy: Start the desktop stream host used by remote desktop connections.
-    FsRemoteStreamHandle hostHandle = stream::StreamRuntime::instance().startHost(49100); // wjy: Host port 49100 serves desktop video/input via fsremote_stream.dll.
+    // =====wjy====
+    FsRemoteHostConfig hostConfig = {}; // wjy: 在 Qt 层汇总可持久化配置，再通过稳定 C ABI 一次性复制到原生 DLL。
+    hostConfig.struct_size = sizeof(hostConfig);
+    hostConfig.version = 1;
+    hostConfig.max_sessions = static_cast<uint32_t>(platform::AppSettings::remoteHostMaxSessions()); // wjy: 当前 DLL 仍强制有效会话数为 1，配置先为后续多会话开放做好接口。
+    hostConfig.max_aggregate_video_kbps = static_cast<uint32_t>(platform::AppSettings::remoteHostAggregateVideoKbps());
+    hostConfig.handshake_timeout_ms = static_cast<uint32_t>(platform::AppSettings::remoteHostHandshakeTimeoutMs());
+    hostConfig.ownership_policy = FSREMOTE_OWNERSHIP_EXCLUSIVE; // wjy: 首版只允许一个远端持有键鼠控制权。
+    writeStartupLog(QStringLiteral("[wjy-main] before StreamRuntime::startHost maxSessions=%1 aggregateKbps=%2 handshakeMs=%3")
+        .arg(hostConfig.max_sessions)
+        .arg(hostConfig.max_aggregate_video_kbps)
+        .arg(hostConfig.handshake_timeout_ms));
+    FsRemoteStreamHandle hostHandle = stream::StreamRuntime::instance().startHost(49100, hostConfig); // wjy: 配置入口缺失时 StreamRuntime 会自动回退到旧版单会话启动函数。
+    // ===end====
     writeStartupLog(QStringLiteral("[wjy-main] after StreamRuntime::startHost handle=%1").arg(hostHandle ? 1 : 0)); // wjy: Record whether the native stream host returned a valid handle.
 
     platform::DeviceStatusServer statusServer([hostHandle] {

@@ -1,7 +1,9 @@
 #pragma once
 
 #include <functional>
+#include <mutex>
 
+#include <QByteArray>
 #include <QString>
 #include <QStringList>
 
@@ -21,6 +23,11 @@ public:
     bool runRemotePowerShellScript(const QString& hostIp, const QString& loginUser, const QString& script, QString* outputText = nullptr, QString* errorMessage = nullptr, int timeoutMs = 120000, std::function<void(const QString&)> outputCallback = {}, std::function<bool()> shouldCancel = {}); // wjy: 将长 PowerShell 分块写入远端临时 ps1 后执行，避开 cmd 单行长度限制和 Base64 命令回显。
     QString clientPublicKey(QString* errorMessage = nullptr);
     bool authorizeClientPublicKey(const QString& publicKey, QString* errorMessage = nullptr);
+    // =====wjy====
+    QByteArray signSessionChallenge(const QByteArray& challenge, QString* errorMessage = nullptr);
+    bool verifySessionChallenge(const QString& publicKey, const QByteArray& challenge, const QByteArray& signature, QString* errorMessage = nullptr);
+    bool isSessionPublicKeyAuthorized(const QString& publicKey, QString* errorMessage = nullptr);
+    // ===end====
     QString loginUser() const;
     uint16_t serverPort() const;
 
@@ -35,6 +42,7 @@ private:
     bool ensurePrivateKeyPermissions(const QString& keyPath, QString* errorMessage) const;
     bool cleanupResidualServerProcesses(QString* errorMessage) const;
     bool runTool(const QString& program, const QStringList& arguments, int timeoutMs, QString* errorMessage) const;
+    bool runToolWithStandardInput(const QString& program, const QStringList& arguments, const QString& inputPath, int timeoutMs, QString* errorMessage) const;
 
     QString appDir() const;
     QString opensshDir() const;
@@ -57,6 +65,7 @@ private:
     QString shellPath() const;
 
     bool m_prepared = false;
+    std::recursive_mutex m_identityMutex; // wjy: DLL 的主机和 Viewer 工作线程可能同时签名/验签，串行保护 OpenSSH 准备和临时工具调用。
     QProcess* m_sshdProcess = nullptr;
 };
 

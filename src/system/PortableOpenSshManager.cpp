@@ -8,6 +8,7 @@
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QSaveFile>
+#include <QTemporaryDir>
 #include <QUuid>
 
 #include <utility> // wjy: 转移后台取消回调的所有权，避免长脚本执行期间额外复制状态闭包。
@@ -21,6 +22,20 @@ namespace platform {
 namespace {
 
 constexpr uint16_t kPortableSshPort = 49103;
+
+// =====wjy====
+QString currentProcessAccount()
+{
+#if !defined(_WIN32)
+    return qEnvironmentVariable("USER").trimmed();
+#else
+    wchar_t account[256] = {};
+    DWORD accountSize = static_cast<DWORD>(std::size(account));
+    if (!GetUserNameW(account, &accountSize) || accountSize <= 1) return {};
+    return QString::fromWCharArray(account, static_cast<qsizetype>(accountSize - 1)).trimmed(); // wjy: ACL 必须授予实际进程令牌账户，不能假设 USERNAME 环境变量与运行身份相同。
+#endif
+}
+// ===end====
 
 QString quoteForCmd(const QString& value)
 {
@@ -535,6 +550,7 @@ bool PortableOpenSshManager::runRemotePowerShellScript(
 QString PortableOpenSshManager::clientPublicKey(QString* errorMessage)
 {
 // =====wjy====
+    std::lock_guard identityLock(m_identityMutex); // wjy: 读取公钥前和其它签名/验签操作串行，避免首次准备目录和密钥时发生竞态。
     if (!ensurePrepared(errorMessage)) {
         return {}; // wjy: 取公钥前先完成 OpenSSH 布局、密钥和权限准备，保证后续发给目标设备的 key 是当前可用的。
     }
@@ -558,6 +574,7 @@ QString PortableOpenSshManager::clientPublicKey(QString* errorMessage)
 bool PortableOpenSshManager::authorizeClientPublicKey(const QString& publicKey, QString* errorMessage)
 {
 // =====wjy====
+    std::lock_guard identityLock(m_identityMutex); // wjy: 写 authorized_keys 时阻止并发验签读取到半次更新。
     if (!ensurePrepared(errorMessage)) {
         return false; // wjy: 写 authorized_keys 前确保 data/openssh 目录和基础配置已经创建完成。
     }
@@ -603,6 +620,119 @@ bool PortableOpenSshManager::authorizeClientPublicKey(const QString& publicKey, 
     return true;
 // ===end====
 }
+
+// =====wjy====
+QByteArray PortableOpenSshManager::signSessionChallenge(const QByteArray& challenge, QString* errorMessage)
+{
+    std::lock_guard identityLock(m_identityMutex);
+    if (challenge.isEmpty() || challenge.size() > 16 * 1024) {
+        if (errorMessage) *errorMessage = QStringLiteral("invalid session challenge size");
+        return {}; // wjy: 只签名协议定义的小型上下文，拒绝空数据和异常超长输入。
+    }
+    if (!ensurePrepared(errorMessage)) return {};
+
+    QTemporaryDir temporaryDir(QDir(dataDir()).filePath(QStringLiteral("session-sign-XXXXXX")));
+    if (!temporaryDir.isValid()) {
+        if (errorMessage) *errorMessage = QStringLiteral("failed to create session signing directory");
+        return {};
+    }
+    const QString challengePath = temporaryDir.filePath(QStringLiteral("challenge.bin"));
+    QFile challengeFile(challengePath);
+    if (!challengeFile.open(QIODevice::WriteOnly) || challengeFile.write(challenge) != challenge.size()) {
+        if (errorMessage) *errorMessage = QStringLiteral("failed to write session challenge");
+        return {};
+    }
+    challengeFile.close();
+
+    if (!runTool(sshKeygenExePath(), {
+            QStringLiteral("-Y"), QStringLiteral("sign"),
+            QStringLiteral("-f"), effectiveClientKeyPath(),
+            QStringLiteral("-n"), QStringLiteral("fsremote-session"),
+            challengePath,
+        }, 8000, errorMessage)) {
+        return {};
+    }
+
+    QFile signatureFile(challengePath + QStringLiteral(".sig"));
+    if (!signatureFile.open(QIODevice::ReadOnly)) {
+        if (errorMessage) *errorMessage = QStringLiteral("failed to read session signature");
+        return {};
+    }
+    const QByteArray signature = signatureFile.readAll();
+    if (signature.isEmpty() || signature.size() > 16 * 1024) {
+        if (errorMessage) *errorMessage = QStringLiteral("invalid session signature size");
+        return {};
+    }
+    if (errorMessage) errorMessage->clear();
+    return signature; // wjy: 返回 OpenSSH armored SSH signature，协议层会百分号转义后发送。
+}
+
+bool PortableOpenSshManager::isSessionPublicKeyAuthorized(const QString& publicKey, QString* errorMessage)
+{
+    std::lock_guard identityLock(m_identityMutex);
+    if (!ensurePrepared(errorMessage)) return false;
+    const QByteArray normalizedKey = normalizedPublicKeyLine(publicKey.toUtf8());
+    if (normalizedKey.isEmpty()) {
+        if (errorMessage) *errorMessage = QStringLiteral("session public key is empty");
+        return false;
+    }
+    QFile file(authorizedKeysPath());
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        if (errorMessage) *errorMessage = QStringLiteral("failed to read authorized_keys");
+        return false;
+    }
+    const bool authorized = authorizedKeysContain(file.readAll(), normalizedKey); // wjy: 必须命中受控设备已经登记的完整公钥行，不能只信任客户端自报指纹。
+    if (errorMessage) {
+        *errorMessage = authorized ? QString() : QStringLiteral("session public key is not authorized");
+    }
+    return authorized;
+}
+
+bool PortableOpenSshManager::verifySessionChallenge(
+    const QString& publicKey,
+    const QByteArray& challenge,
+    const QByteArray& signature,
+    QString* errorMessage)
+{
+    std::lock_guard identityLock(m_identityMutex);
+    if (challenge.isEmpty() || challenge.size() > 16 * 1024 || signature.isEmpty() || signature.size() > 16 * 1024) {
+        if (errorMessage) *errorMessage = QStringLiteral("invalid session proof size");
+        return false;
+    }
+    if (!isSessionPublicKeyAuthorized(publicKey, errorMessage)) return false;
+
+    QTemporaryDir temporaryDir(QDir(dataDir()).filePath(QStringLiteral("session-verify-XXXXXX")));
+    if (!temporaryDir.isValid()) {
+        if (errorMessage) *errorMessage = QStringLiteral("failed to create session verification directory");
+        return false;
+    }
+    const QString challengePath = temporaryDir.filePath(QStringLiteral("challenge.bin"));
+    const QString signaturePath = temporaryDir.filePath(QStringLiteral("challenge.sig"));
+    const QString allowedSignersPath = temporaryDir.filePath(QStringLiteral("allowed_signers"));
+    QFile challengeFile(challengePath);
+    QFile signatureFile(signaturePath);
+    QFile allowedSignersFile(allowedSignersPath);
+    if (!challengeFile.open(QIODevice::WriteOnly)
+        || challengeFile.write(challenge) != challenge.size()
+        || !signatureFile.open(QIODevice::WriteOnly)
+        || signatureFile.write(signature) != signature.size()
+        || !allowedSignersFile.open(QIODevice::WriteOnly | QIODevice::Text)
+        || allowedSignersFile.write("fsremote-session " + normalizedPublicKeyLine(publicKey.toUtf8()) + "\n") <= 0) {
+        if (errorMessage) *errorMessage = QStringLiteral("failed to prepare session verification files");
+        return false;
+    }
+    challengeFile.close();
+    signatureFile.close();
+    allowedSignersFile.close();
+    return runToolWithStandardInput(sshKeygenExePath(), {
+        QStringLiteral("-Y"), QStringLiteral("verify"),
+        QStringLiteral("-f"), allowedSignersPath,
+        QStringLiteral("-I"), QStringLiteral("fsremote-session"),
+        QStringLiteral("-n"), QStringLiteral("fsremote-session"),
+        QStringLiteral("-s"), signaturePath,
+    }, challengePath, 8000, errorMessage); // wjy: ssh-keygen 从标准输入读取原挑战，并验证命名空间、身份、公钥和签名四项绑定。
+}
+// ===end====
 
 QString PortableOpenSshManager::loginUser() const
 {
@@ -784,8 +914,9 @@ bool PortableOpenSshManager::ensurePrivateKeyPermissions(const QString& keyPath,
     return true; // wjy: 非 Windows 平台暂不需要 icacls 修复，保持原有行为。
 #else
     const QString normalizedKeyPath = QDir::toNativeSeparators(QFileInfo(keyPath).absoluteFilePath());
-    const QString user = currentLoginUser();
-    if (normalizedKeyPath.isEmpty() || user.isEmpty()) {
+    const QString aclUser = currentProcessAccount();
+    const QString loginUser = currentLoginUser();
+    if (normalizedKeyPath.isEmpty() || aclUser.isEmpty()) {
         if (errorMessage) {
             *errorMessage = QStringLiteral("failed to prepare OpenSSH key permission context");
         }
@@ -799,13 +930,19 @@ bool PortableOpenSshManager::ensurePrivateKeyPermissions(const QString& keyPath,
     if (!runIcacls({normalizedKeyPath, QStringLiteral("/inheritance:r")})) {
         return false; // wjy: 关闭继承，避免 Users/Everyone 等宽权限让 OpenSSH 拒绝加载私钥。
     }
-    return runIcacls({
+    if (!runIcacls({
         normalizedKeyPath,
         QStringLiteral("/grant:r"),
-        user + QStringLiteral(":(F)"),
+        aclUser + QStringLiteral(":(F)"),
         QStringLiteral("*S-1-5-18:(F)"),
         QStringLiteral("*S-1-5-32-544:(F)"),
-    }); // wjy: 仅保留当前登录用户、SYSTEM、Administrators 的完全控制权限，匹配 Windows OpenSSH 对私钥 ACL 的要求。
+    })) {
+        return false; // wjy: 当前进程账户、SYSTEM 和 Administrators 获得完全控制，OpenSSH 才会接受该私钥。
+    }
+    if (!loginUser.isEmpty() && QString::compare(loginUser, aclUser, Qt::CaseInsensitive) != 0) {
+        return runIcacls({normalizedKeyPath, QStringLiteral("/remove:g"), loginUser}); // wjy: 沙箱/服务账户运行时移除环境登录用户的旧显式权限，避免 OpenSSH 判定私钥过度开放。
+    }
+    return true;
 #endif
 // ===end====
 }
@@ -895,6 +1032,47 @@ bool PortableOpenSshManager::runTool(const QString& program, const QStringList& 
     }
     return true;
 }
+
+// =====wjy====
+bool PortableOpenSshManager::runToolWithStandardInput(
+    const QString& program,
+    const QStringList& arguments,
+    const QString& inputPath,
+    int timeoutMs,
+    QString* errorMessage) const
+{
+    QProcess process;
+    process.setProgram(program);
+    process.setArguments(arguments);
+    process.setWorkingDirectory(opensshDir());
+    process.setStandardInputFile(inputPath); // wjy: `ssh-keygen -Y verify` 只从标准输入接收被签名内容，避免命令行转义改变原始字节。
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    const QString pathKey = environment.contains(QStringLiteral("Path")) ? QStringLiteral("Path") : QStringLiteral("PATH");
+    environment.insert(pathKey, opensshDir() + QLatin1Char(';') + environment.value(pathKey));
+    process.setProcessEnvironment(environment);
+    process.start();
+    if (!process.waitForStarted(2000)) {
+        if (errorMessage) *errorMessage = QStringLiteral("failed to start %1").arg(QFileInfo(program).fileName());
+        return false;
+    }
+    if (!process.waitForFinished(timeoutMs)) {
+        process.kill();
+        process.waitForFinished(2000);
+        if (errorMessage) *errorMessage = QStringLiteral("%1 timed out").arg(QFileInfo(program).fileName());
+        return false;
+    }
+    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
+        if (errorMessage) {
+            QString detail = QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
+            if (detail.isEmpty()) detail = QString::fromLocal8Bit(process.readAllStandardOutput()).trimmed();
+            *errorMessage = detail.isEmpty() ? QStringLiteral("session signature verification failed") : detail;
+        }
+        return false;
+    }
+    if (errorMessage) errorMessage->clear();
+    return true;
+}
+// ===end====
 
 QString PortableOpenSshManager::appDir() const
 {

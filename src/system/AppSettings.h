@@ -16,6 +16,16 @@ public:
     static void setStatusAutoRefreshEnabled(bool enabled);
     static int statusAutoRefreshIntervalSeconds();
     static void setStatusAutoRefreshIntervalSeconds(int seconds);
+    // =====wjy====
+    static int remoteHostMaxSessions();
+    static void setRemoteHostMaxSessions(int sessions);
+    static int remoteHostAggregateVideoKbps();
+    static void setRemoteHostAggregateVideoKbps(int kbps);
+    static int remoteHostHandshakeTimeoutMs();
+    static void setRemoteHostHandshakeTimeoutMs(int timeoutMs);
+    static QString remoteHostOwnershipPolicy();
+    static void setRemoteHostOwnershipPolicy(const QString& policy);
+    // ===end====
     static QKeySequence remoteShortcutFullscreen();
     static void setRemoteShortcutFullscreen(const QKeySequence& shortcut);
     static QKeySequence remoteShortcutTile();
