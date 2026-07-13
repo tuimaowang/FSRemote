@@ -11,6 +11,9 @@
 #include <QSystemTrayIcon>
 #include <QTimer>
 
+#include <chrono>
+#include <thread>
+
 #if defined(Q_OS_WIN)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -56,9 +59,7 @@ MainWindow::MainWindow(QWidget* parent)
 // =====wjy====
 MainWindow::~MainWindow()
 {
-    if (m_trayIcon) {
-        m_trayIcon->hide();
-    }
+    removeTrayIcon(); // wjy: 正常析构也复用同步注销逻辑，保证所有退出路径都向系统托盘发送删除消息。
     // wjy: 托盘菜单未挂到 this，需手动释放。
     delete m_trayMenu;
     m_trayMenu = nullptr;
@@ -66,6 +67,9 @@ MainWindow::~MainWindow()
 
 void MainWindow::setupTrayIcon()
 {
+    if (m_trayIcon) {
+        return; // wjy: 防止未来重复调用初始化时创建第二个 QSystemTrayIcon。
+    }
     if (!QSystemTrayIcon::isSystemTrayAvailable()) {
         writeWindowStartupLog(QStringLiteral("[wjy-window] system tray unavailable"));
         return;
@@ -76,25 +80,33 @@ void MainWindow::setupTrayIcon()
     m_trayMenu->setAttribute(Qt::WA_QuitOnClose, false);
     m_trayShowAction = m_trayMenu->addAction(QString::fromUtf8("打开主窗口"));
     m_trayQuitAction = m_trayMenu->addAction(QString::fromUtf8("退出"));
-    connect(m_trayShowAction, &QAction::triggered, this, &MainWindow::showFromTray, Qt::UniqueConnection);
-    connect(m_trayQuitAction, &QAction::triggered, this, [this] {
-        // wjy: 直接强制退出，不走“关闭进托盘”分支。
-        m_forceQuit = true;
-        if (m_trayIcon) {
-            m_trayIcon->hide();
+    // =====wjy====
+    connect(m_trayMenu, &QMenu::triggered, this, [this](QAction* action) {
+        writeWindowStartupLog(QStringLiteral("[wjy-tray] menu triggered action=%1 ptr=%2")
+            .arg(action ? action->text() : QStringLiteral("<null>"))
+            .arg(reinterpret_cast<quintptr>(action))); // wjy: 统一监听菜单级 triggered，绕开当前设备上单个 QAction 回调未送达的问题。
+        if (action == m_trayQuitAction) {
+            writeWindowStartupLog(QStringLiteral("[wjy-exit] tray quit action triggered"));
+            requestApplicationExit(); // wjy: 只有精确匹配“退出”动作时进入统一退出流程，避免菜单关闭等事件误触发。
+            return;
         }
-        if (auto* deviceGrid = qobject_cast<DeviceGrid*>(centralWidget())) {
-            deviceGrid->prepareForApplicationExit();
+        if (action == m_trayShowAction) {
+            showFromTray(); // wjy: “打开主窗口”也由同一个菜单分发入口处理，保证两项行为一致可诊断。
         }
-        QApplication::quit();
-    }, Qt::UniqueConnection);
+    });
+    // ===end====
 
     m_trayIcon = new QSystemTrayIcon(this);
     m_trayIcon->setIcon(windowIcon());
     m_trayIcon->setToolTip(windowTitle());
-    m_trayIcon->setContextMenu(m_trayMenu);
+    m_trayIcon->setContextMenu(m_trayMenu); // wjy: 恢复 Windows/Qt 原生右键菜单显示；动作执行仍由上面的 QMenu::triggered 统一接管。
     connect(m_trayIcon, &QSystemTrayIcon::activated, this, [this](QSystemTrayIcon::ActivationReason reason) {
-        // wjy: Windows 上单击/双击都恢复主窗口；右键交给系统托盘菜单。
+        writeWindowStartupLog(QStringLiteral("[wjy-tray] activated reason=%1").arg(static_cast<int>(reason))); // wjy: 记录 Windows 实际回传的托盘点击类型，右键应为 Context。
+        if (reason == QSystemTrayIcon::Context) {
+            writeWindowStartupLog(QStringLiteral("[wjy-tray] native context menu requested")); // wjy: 菜单显示由 setContextMenu 负责，避免手动 popup 在部分 Qt/Windows 组合下完全收不到右键事件。
+            return; // wjy: 右键只负责菜单，不执行打开主窗口逻辑。
+        }
+        // wjy: Windows 上单击/双击仍恢复主窗口。
         if (reason == QSystemTrayIcon::Trigger
             || reason == QSystemTrayIcon::DoubleClick
             || reason == QSystemTrayIcon::MiddleClick) {
@@ -103,6 +115,57 @@ void MainWindow::setupTrayIcon()
         }
     }, Qt::UniqueConnection);
     m_trayIcon->show();
+    writeWindowStartupLog(QStringLiteral("[wjy-tray] tray icon shown ptr=%1")
+        .arg(reinterpret_cast<quintptr>(m_trayIcon))); // wjy: 每个进程只应出现一条 shown，可据此判断是否重复创建托盘对象。
+}
+
+void MainWindow::removeTrayIcon()
+{
+    writeWindowStartupLog(QStringLiteral("[wjy-exit] remove tray begin ptr=%1 visible=%2")
+        .arg(reinterpret_cast<quintptr>(m_trayIcon))
+        .arg(m_trayIcon && m_trayIcon->isVisible() ? 1 : 0)); // wjy: 记录注销前对象和值，确认幽灵图标是否因未进入 hide/delete 产生。
+    if (m_trayMenu) {
+        m_trayMenu->hide(); // wjy: 退出动作由菜单触发时先收起弹出菜单，避免旧窗口消失后菜单短暂残留。
+    }
+    if (!m_trayIcon) {
+        return;
+    }
+    m_trayIcon->setContextMenu(nullptr); // wjy: 先断开菜单关联，再销毁托盘对象，避免退出信号栈仍引用菜单时发生重入。
+    m_trayIcon->hide(); // wjy: hide 会同步发送 Windows NIM_DELETE，必须在可能阻塞或强杀进程之前执行。
+    delete m_trayIcon; // wjy: 立即析构而不是等待 MainWindow 析构，更新重启前系统托盘已确认移除旧图标。
+    m_trayIcon = nullptr;
+    writeWindowStartupLog(QStringLiteral("[wjy-exit] remove tray end")); // wjy: 有 begin 无 end 表示卡在 Windows 托盘注销或对象析构。
+}
+
+void MainWindow::requestApplicationExit()
+{
+    if (m_exitRequested) {
+        writeWindowStartupLog(QStringLiteral("[wjy-exit] duplicate exit request ignored"));
+        return; // wjy: 多个退出来源同时到达时只允许第一条路径负责清理。
+    }
+    writeWindowStartupLog(QStringLiteral("[wjy-exit] request begin"));
+    m_exitRequested = true;
+    m_forceQuit = true; // wjy: 若退出过程中触发 closeEvent，不再被“隐藏到托盘”逻辑拦截。
+    removeTrayIcon(); // wjy: 第一优先级注销托盘图标，后续即使后台清理卡住也不会产生幽灵图标。
+
+#if defined(Q_OS_WIN)
+    std::thread([] {
+        writeWindowStartupLog(QStringLiteral("[wjy-exit] watchdog thread armed timeoutMs=8000")); // wjy: 确认兜底线程确实创建并开始计时。
+        std::this_thread::sleep_for(std::chrono::seconds(8)); // wjy: 正常清理最多保留 8 秒；托盘退出没有外部更新器，因此需要进程内兜底。
+        writeWindowStartupLog(QStringLiteral("[wjy-exit] watchdog firing TerminateProcess")); // wjy: 若日志以此结尾，说明正常退出链路在此前某一步卡满 8 秒。
+        ::TerminateProcess(::GetCurrentProcess(), 0); // wjy: 若代码还能执行到这里说明主进程仍未退出，强制结束避免托盘“退出”永久无效。
+    }).detach();
+#endif
+
+    QApplication::quit(); // wjy: 事件循环已运行时立即登记退出，即便下面的清理短暂阻塞，返回后也不会重新进入普通运行状态。
+    QTimer::singleShot(0, qApp, &QCoreApplication::quit); // wjy: 启动阶段检查到更新时 app.exec 尚未进入，用零延迟任务保证事件循环启动第一拍就正常退出。
+    writeWindowStartupLog(QStringLiteral("[wjy-exit] quit requested before DeviceGrid prepare"));
+    if (auto* deviceGrid = qobject_cast<DeviceGrid*>(centralWidget())) {
+        writeWindowStartupLog(QStringLiteral("[wjy-exit] DeviceGrid prepare begin"));
+        deviceGrid->prepareForApplicationExit(); // wjy: 在看门狗保护下尝试正常取消后台任务和关闭远控连接。
+        writeWindowStartupLog(QStringLiteral("[wjy-exit] DeviceGrid prepare end"));
+    }
+    writeWindowStartupLog(QStringLiteral("[wjy-exit] request end"));
 }
 
 void MainWindow::showFromTray()
@@ -149,15 +212,9 @@ void MainWindow::closeEvent(QCloseEvent* event)
         return;
     }
     // ===end====
-    if (auto* deviceGrid = qobject_cast<DeviceGrid*>(centralWidget())) {
-        deviceGrid->prepareForApplicationExit();
-    }
-    if (m_trayIcon) {
-        m_trayIcon->hide();
-    }
     event->accept();
     QMainWindow::closeEvent(event);
-    QApplication::quit();
+    requestApplicationExit(); // wjy: 真正关闭也复用托盘菜单和更新流程的统一退出入口。
     writeWindowStartupLog(QStringLiteral("[wjy-window] closeEvent quit requested"));
 }
 

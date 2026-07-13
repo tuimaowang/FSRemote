@@ -2990,7 +2990,9 @@ DeviceGrid::~DeviceGrid()
     }
     for (std::thread& thread : backgroundThreads) {
         if (thread.joinable()) {
+            writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] background thread join begin")); // wjy: 最后一条停在这里可确认进程卡在后台任务汇合。
             thread.join(); // wjy: 等状态刷新/唤醒检测等线程结束，防止 Qt 对象销毁后仍访问 UI 或 Qt 资源。
+            writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] background thread join end"));
         }
     }
     // ===end====
@@ -3000,6 +3002,7 @@ DeviceGrid::~DeviceGrid()
 
 void DeviceGrid::prepareForApplicationExit()
 {
+    writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] DeviceGrid prepareForApplicationExit begin"));
     m_shuttingDown = true; // wjy: 更新退出准备一开始就阻止新增后台任务，避免退出过程中又启动状态探测或 SSH 操作。
     if (m_scriptCancelRequested) {
         m_scriptCancelRequested->store(true); // wjy: 当前可见的无限期脚本 SSH 会话收到取消信号后会杀掉本地 ssh.exe 并结束后台线程。
@@ -3012,14 +3015,20 @@ void DeviceGrid::prepareForApplicationExit()
     unregisterGlobalShortcuts();
 
     const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
+    writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] remote windows count=%1").arg(windows.size()));
     for (const QPointer<RemoteDesktopWindow>& window : windows) {
         RemoteDesktopWindow* remoteWindow = window.data();
         if (!remoteWindow || remoteWindow->isClosingConnection()) {
             continue;
         }
+        writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] remote window shutdown begin ptr=%1")
+            .arg(reinterpret_cast<quintptr>(remoteWindow))); // wjy: 远控流 stop 若阻塞，日志会停在 begin，直接定位到具体窗口关闭阶段。
         remoteWindow->setAttribute(Qt::WA_QuitOnClose, false);
         remoteWindow->shutdownForApplicationExit();
+        writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] remote window shutdown end ptr=%1")
+            .arg(reinterpret_cast<quintptr>(remoteWindow)));
         delete remoteWindow;
+        writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] remote window deleted"));
     }
 
     m_remoteDesktopWindows.clear();
@@ -3027,6 +3036,7 @@ void DeviceGrid::prepareForApplicationExit()
     m_remoteWindowActivationOrder.clear();
     m_remoteTileRestoreGeometries.clear();
     m_remoteWindowsTiled = false;
+    writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] DeviceGrid prepareForApplicationExit end"));
 }
 
 void DeviceGrid::registerGlobalShortcuts()

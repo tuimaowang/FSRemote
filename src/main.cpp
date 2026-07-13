@@ -56,6 +56,8 @@ int main(int argc, char* argv[])
     QApplication::setApplicationName(QStringLiteral("FSRemote"));
     QApplication::setOrganizationName(QStringLiteral("FSRemote"));
     writeStartupLog(QStringLiteral("[wjy-main] app metadata set"));
+    writeStartupLog(QStringLiteral("[wjy-main] executable=%1 args=%2")
+        .arg(QCoreApplication::applicationFilePath(), QCoreApplication::arguments().join(QStringLiteral(" | ")))); // wjy: 日志明确记录实际运行路径，优先排除用户仍启动旧目录 EXE 的情况。
 
     // =====wjy====
     // wjy: 禁止重复启动；二次启动只唤醒已有主窗口。
@@ -137,11 +139,8 @@ int main(int argc, char* argv[])
 
     // =====wjy====
     QObject::connect(&platform::UpdateService::instance(), &platform::UpdateService::updateReadyToQuit,
-        &app, [&app, &window] {
-            if (auto* deviceGrid = qobject_cast<ui::DeviceGrid*>(window.centralWidget())) {
-                deviceGrid->prepareForApplicationExit(); // wjy: 更新器等待前先取消后台任务并同步关闭所有远控窗口，让进程退出时间变得有界。
-            }
-            QTimer::singleShot(0, &app, &QCoreApplication::quit); // wjy: 延迟到事件循环执行退出，让启动阶段发现更新时也能进入既有的服务有序关闭流程。
+        &app, [&window] {
+            window.requestApplicationExit(); // wjy: 更新退出先同步注销旧托盘图标，并与手动退出共享有界清理和强制退出兜底。
         });
     // ===end====
     writeStartupLog(QStringLiteral("[wjy-main] after MainWindow create"));
