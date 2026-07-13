@@ -64,6 +64,7 @@ signals:
     void shortcutCloseAllRequested();
     // =====wjy====
     void shortcutClipboardSyncRequested();
+    void titleBarContextMenuRequested(const QString& hostIp, const QPoint& globalPosition); // wjy: 标题栏右键只上报本窗口绑定的目标 IP 和屏幕坐标，由设备主界面复用统一菜单逻辑。
     // ===end====
 
 protected:

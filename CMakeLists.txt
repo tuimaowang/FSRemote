@@ -233,10 +233,22 @@ endif()
 
 if(FSREMOTE_OPENSSH_RUNTIME_DIR AND EXISTS "${FSREMOTE_OPENSSH_RUNTIME_DIR}/ssh.exe")
     add_custom_command(TARGET FSRemote POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:FSRemote>/openssh"
-        COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${FSREMOTE_OPENSSH_RUNTIME_DIR}"
-            "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/ssh.exe" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/ssh.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/sshd.exe" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/sshd.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/ssh-keygen.exe" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/ssh-keygen.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/sftp-server.exe" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/sftp-server.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/libcrypto.dll" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/libcrypto.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/scp.exe" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/scp.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/sftp.exe" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/sftp.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/ssh-add.exe" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/ssh-add.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/ssh-agent.exe" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/ssh-agent.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/ssh-keyscan.exe" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/ssh-keyscan.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/ssh-pkcs11-helper.exe" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/ssh-pkcs11-helper.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/ssh-shellhost.exe" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/ssh-shellhost.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/ssh-sk-helper.exe" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/ssh-sk-helper.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/sshd-auth.exe" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/sshd-auth.exe"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${FSREMOTE_OPENSSH_RUNTIME_DIR}/sshd-session.exe" "$<TARGET_FILE_DIR:FSRemote>/openssh/OpenSSH-Win64/sshd-session.exe"
         VERBATIM
     ) # wjy: 构建后把 ssh.exe/sshd.exe/ssh-keygen.exe/sftp-server.exe 一起复制到程序固定查找路径。
 endif()
@@ -275,5 +287,40 @@ if(FSREMOTE_BUILD_SESSION_IDENTITY_TESTS)
         ) # wjy: 只复制四个工具程序；测试使用已存在的分发密钥或在 data 目录生成隔离密钥，绝不覆盖已收紧 ACL 的私钥。
     endif()
     add_test(NAME fsremote_session_identity_tests COMMAND fsremote_session_identity_tests)
+endif()
+# ===end====
+
+# =====wjy====
+# wjy: 网络安装器是稳定发布入口，不封装程序载荷；运行时从共享目录当前 release 复制文件，并提供可自定义目录、卸载、快捷方式和每用户开机自启。
+if(WIN32)
+    find_program(FSREMOTE_INNO_SETUP_COMPILER
+        NAMES ISCC.exe ISCC
+        HINTS
+            "$ENV{LOCALAPPDATA}/Programs/Inno Setup 6"
+            "$ENV{ProgramFiles}/Inno Setup 6"
+            "C:/Program Files (x86)/Inno Setup 6" # wjy: CMake 的 ENV 语法不能安全解析带括号的 ProgramFiles(x86) 变量名，使用 Windows 固定候选路径兼容系统级安装。
+        DOC "Path to the Inno Setup command-line compiler"
+    )
+    if(FSREMOTE_INNO_SETUP_COMPILER)
+        set(FSREMOTE_INSTALLER_WORK_DIR "${CMAKE_BINARY_DIR}/installer")
+        set(FSREMOTE_INSTALLER_SCRIPT "${FSREMOTE_INSTALLER_WORK_DIR}/FSRemote.iss")
+        set(FSREMOTE_INSTALLER_OUTPUT_DIR "${FSREMOTE_INSTALLER_WORK_DIR}/output")
+        add_custom_target(FSRemoteInstaller
+            COMMAND ${CMAKE_COMMAND}
+                -D "FSREMOTE_ISS_TEMPLATE=${CMAKE_CURRENT_SOURCE_DIR}/installer/FSRemote.iss.in"
+                -D "FSREMOTE_ISS_OUTPUT=${FSREMOTE_INSTALLER_SCRIPT}"
+                -D "FSREMOTE_INSTALLER_OUTPUT_DIR=${FSREMOTE_INSTALLER_OUTPUT_DIR}"
+                -D "FSREMOTE_SETUP_ICON=${CMAKE_CURRENT_SOURCE_DIR}/resources/app.ico"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/installer/configure_installer.cmake"
+            COMMAND "${FSREMOTE_INNO_SETUP_COMPILER}" /Qp "${FSREMOTE_INSTALLER_SCRIPT}"
+            BYPRODUCTS "${FSREMOTE_INSTALLER_OUTPUT_DIR}/FSRemote安装器.exe"
+            COMMENT "Building network-copy FSRemote installer"
+            VERBATIM
+            USES_TERMINAL
+        ) # wjy: 安装器不依赖主程序重新链接，构建一次即可长期从共享目录安装后续发布版本。
+        add_dependencies(FSRemote FSRemoteInstaller) # wjy: 普通构建或清理后重建 FSRemote 时自动恢复网络安装器，发布按钮不会再因独立目标未手动构建而失败。
+    else()
+        message(STATUS "Inno Setup not found; FSRemoteInstaller target is unavailable")
+    endif()
 endif()
 # ===end====

@@ -161,8 +161,10 @@ int main(int argc, char* argv[])
     });
 
     // wjy: 启动先轻量检查共享目录更新，再决定是否直接进托盘。
-    platform::UpdateService::instance().checkNow(&window, false);
-    platform::UpdateService::instance().startPeriodicCheck(&window);
+    // =====wjy====
+    platform::UpdateService::instance().checkNow(); // wjy: 启动时静默检查一次，只控制标题栏更新按钮是否出现。
+    platform::UpdateService::instance().startPeriodicCheck(); // wjy: 自动检查固定启用，不再受已移除的设置开关影响，也不会自动安装。
+    // ===end====
 
     const QStringList args = QCoreApplication::arguments();
     // =====wjy====

@@ -2,6 +2,7 @@
 
 #include "system/DeviceInfoService.h"
 #include "system/PortableOpenSshManager.h"
+#include "system/UpdateService.h"
 #include "system/WakeOnLanSender.h"
 #include "system/WjyDiagnosticLog.h"
 
@@ -24,6 +25,10 @@
 
 namespace platform {
 namespace {
+
+// =====wjy====
+bool g_remoteUpdateScheduled = false; // wjy: 目标进程退出前只允许排队一个更新任务，避免连续点击启动多个独立更新器。
+// ===end====
 
 // =====wjy====
 void writeCommandServerLog(const QString& message)
@@ -223,6 +228,31 @@ private:
             schedulePowerAction(DeviceControlAction::Restart);
             return;
         }
+// =====wjy====
+        if (command == "update") {
+            UpdateService& updateService = UpdateService::instance();
+            if (!updateService.isUpdateAvailable()) {
+                replyAndClose(QByteArrayLiteral("up_to_date\n"));
+                return; // wjy: 目标端以自己的本地版本和共享版本为准判断，避免控制端版本状态影响目标设备。
+            }
+            if (g_remoteUpdateScheduled) {
+                replyAndClose(QByteArrayLiteral("accepted\n"));
+                return; // wjy: 重复请求视为已受理，防止用户连续点击时误报失败。
+            }
+
+            g_remoteUpdateScheduled = true;
+            replyAndClose(QByteArrayLiteral("accepted\n")); // wjy: 先把受理结果发回控制端，再开始可能耗时的大文件暂存，避免 1.5 秒命令超时。
+            QTimer::singleShot(150, [] {
+                QString errorMessage;
+                if (!UpdateService::instance().applyRemoteUpdate(&errorMessage)) {
+                    g_remoteUpdateScheduled = false;
+                    writeCommandServerLog(QStringLiteral("[wjy-command] remote update prepare failed: %1")
+                        .arg(errorMessage.trimmed())); // wjy: 准备失败时保留当前进程并允许再次请求，原因写入目标端统一诊断日志。
+                }
+            });
+            return;
+        }
+// ===end====
         if (command == "wake_mac") {
             const QString macAddress = QString::fromUtf8(parts.value(1)).trimmed();
             const DeviceInfo localInfo = DeviceInfoService::local();
@@ -421,6 +451,51 @@ bool DeviceCommandService::send(const QString& hostIp, DeviceControlAction actio
     socket.disconnectFromHost();
     return reply == "ok";
 }
+
+// =====wjy====
+RemoteUpdateRequestResult DeviceCommandService::requestUpdate(const QString& hostIp, QString* errorMessage, uint16_t port, int timeoutMs)
+{
+    if (hostIp.trimmed().isEmpty()) {
+        if (errorMessage) *errorMessage = QString::fromUtf8("目标 IP 为空。");
+        return RemoteUpdateRequestResult::Failed;
+    }
+
+    QTcpSocket socket;
+    socket.connectToHost(hostIp.trimmed(), port);
+    if (!socket.waitForConnected(timeoutMs)) {
+        if (errorMessage) *errorMessage = socket.errorString().trimmed();
+        return RemoteUpdateRequestResult::Failed;
+    }
+
+    const QByteArray payload = QByteArrayLiteral("update\n");
+    if (socket.write(payload) != payload.size() || !socket.waitForBytesWritten(timeoutMs)) {
+        if (errorMessage) *errorMessage = socket.errorString().trimmed();
+        socket.disconnectFromHost();
+        return RemoteUpdateRequestResult::Failed;
+    }
+    if (!socket.waitForReadyRead(timeoutMs)) {
+        if (errorMessage) *errorMessage = socket.errorString().trimmed();
+        socket.disconnectFromHost();
+        return RemoteUpdateRequestResult::Failed;
+    }
+
+    const QByteArray reply = socket.readAll().trimmed().toLower();
+    socket.disconnectFromHost();
+    if (reply == "accepted") {
+        if (errorMessage) errorMessage->clear();
+        return RemoteUpdateRequestResult::Accepted;
+    }
+    if (reply == "up_to_date") {
+        if (errorMessage) errorMessage->clear();
+        return RemoteUpdateRequestResult::UpToDate;
+    }
+
+    if (errorMessage) {
+        *errorMessage = QString::fromUtf8("目标设备未受理更新请求；请确认目标设备已安装支持远程更新的版本。");
+    }
+    return RemoteUpdateRequestResult::Failed; // wjy: 旧客户端只会返回 error，这里给出可直接定位版本兼容性的提示。
+}
+// ===end====
 
 bool DeviceCommandService::sendWakeProxy(const QString& hostIp, const QString& macAddress, QString* errorMessage, uint16_t port, int timeoutMs)
 {

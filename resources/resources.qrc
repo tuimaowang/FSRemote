@@ -29,6 +29,11 @@
         <file alias="resource/images/desktop_bk_image.png">uuguest/desktop_bk_image.png</file>
         <file alias="resource/images/menu/terminal.svg">uuguest/menu/terminal.svg</file>
         <file alias="resource/images/menu/power.svg">uuguest/menu/power.svg</file>
+        <!-- =====wjy==== -->
+        <file alias="resource/images/menu/power_on.svg">uuguest/menu/power_on.svg</file> <!-- wjy: 开机菜单使用绿色启动图标，不再和关机共用 power.svg。 -->
+        <file alias="resource/images/menu/shutdown.svg">uuguest/menu/shutdown.svg</file> <!-- wjy: 关机菜单使用红色关闭图标。 -->
+        <file alias="resource/images/menu/update.svg">uuguest/menu/update.svg</file> <!-- wjy: 注册真实存在的菜单更新图标，修复原 refresh.svg 路径为空。 -->
+        <!-- ===end==== -->
         <file alias="resource/images/menu/restart.svg">uuguest/menu/restart.svg</file>
         <file alias="resource/images/menu/rename.svg">uuguest/menu/rename.svg</file>
         <file alias="resource/images/menu/delete.svg">uuguest/menu/delete.svg</file>

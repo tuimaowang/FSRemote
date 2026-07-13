@@ -675,18 +675,17 @@ QRect RemoteDesktopWindow::clipboardSyncRect() const
 
 QRect RemoteDesktopWindow::minimizeRect() const
 {
-    // wjy: 热区 32x28，绘制时按 SVG 原始比例居中，避免图标被压扁裁切。
-    return QRect(width() - 128, 0, 32, titleBarHeight());
+    return QRect(width() - 120, 0, 36, titleBarHeight()); // wjy: 三个窗口按钮改为连续靠右布局，36px 热区比旧 32px 更容易识别和点击。
 }
 
 QRect RemoteDesktopWindow::maximizeRect() const
 {
-    return QRect(width() - 96, 0, 32, titleBarHeight());
+    return QRect(width() - 84, 0, 36, titleBarHeight()); // wjy: 最大化紧接最小化，不再保留视觉上不规则的空档。
 }
 
 QRect RemoteDesktopWindow::closeRect() const
 {
-    return QRect(width() - 48, 0, 32, titleBarHeight());
+    return QRect(width() - 48, 0, 48, titleBarHeight()); // wjy: 关闭热区延伸到窗口最右边，符合常见标题栏操作习惯并保留圆角遮罩。
 }
 
 bool RemoteDesktopWindow::isTitleBarBlankArea(const QPoint& position) const
@@ -1573,12 +1572,19 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     painter.drawRoundedRect(QRectF(clipRect.center().x() - 4, clipRect.center().y() - 5, 8, 10), 1.5, 1.5);
     painter.drawLine(QPointF(clipRect.center().x() - 2, clipRect.center().y() - 2), QPointF(clipRect.center().x() + 2, clipRect.center().y() - 2));
 
-    // wjy: 按钮图标按原始 SVG 比例缩放后居中绘制，不再把 46x40 硬塞进 28px 热区导致裁切。
-    const auto drawTitleButton = [&](const QRect& hitRect, const QString& iconName) {
+    const auto drawTitleButton = [&](const QRect& hitRect, const QString& iconName, bool closeButton) {
+        const bool hovered = hitRect.contains(m_hoveredPos); // wjy: 鼠标进入按钮热区后绘制背景，明确提示当前将操作哪个窗口按钮。
+        if (hovered) {
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(closeButton
+                    ? QColor(QStringLiteral("#FCE8E6"))
+                    : QColor(QStringLiteral("#DCE4EC"))); // wjy: 关闭使用浅红警示，其余按钮使用浅灰蓝，兼顾辨识度和当前标题栏配色。
+            painter.drawRect(hitRect);
+        }
         const QPixmap raw = icon(iconName);
         if (raw.isNull()) return;
-        const int maxH = qMax(12, barH - 8);
-        const int maxW = qMax(12, hitRect.width() - 4);
+        const int maxH = qMax(16, barH - 8); // wjy: 28px 标题栏内固定保留约 20px 图标画布，紧凑 SVG 的主体可显示到 12px 左右。
+        const int maxW = qMax(16, hitRect.width() - 12);
         QSize target = raw.size();
         target.scale(maxW, maxH, Qt::KeepAspectRatio);
         const QRect drawRect(
@@ -1588,9 +1594,9 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
             target.height());
         painter.drawPixmap(drawRect, raw);
     };
-    drawTitleButton(minimizeRect(), QStringLiteral("rd_minimize.svg"));
-    drawTitleButton(maximizeRect(), QStringLiteral("rd_maximize.svg"));
-    drawTitleButton(closeRect(), QStringLiteral("rd_close.svg"));
+    drawTitleButton(minimizeRect(), QStringLiteral("rd_minimize.svg"), false);
+    drawTitleButton(maximizeRect(), QStringLiteral("rd_maximize.svg"), false);
+    drawTitleButton(closeRect(), QStringLiteral("rd_close.svg"), true); // wjy: 三个按钮共用尺寸与居中规则，仅关闭按钮使用警示悬停色。
     // ===end====
 }
 
@@ -1629,6 +1635,13 @@ void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
 void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
 {
     emit activated(this);
+    // =====wjy====
+    if (event->button() == Qt::RightButton && isTitleBarBlankArea(event->pos())) {
+        emit titleBarContextMenuRequested(m_hostIp, event->globalPosition().toPoint()); // wjy: 使用窗口构造时固定保存的 IP，菜单目标不跟随主界面当前选中设备变化。
+        event->accept();
+        return; // wjy: 仅截获普通窗口标题栏空白区域；远控画面内的右键继续走下面的输入转发逻辑。
+    }
+    // ===end====
     if (event->button() == Qt::LeftButton) {
         m_resizeEdges = resizeEdgesAt(event->pos());
         if (m_resizeEdges != ResizeNone) {

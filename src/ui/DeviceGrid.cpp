@@ -201,6 +201,13 @@ QRect titlebarSettingsRect()
 {
     return QRect(shellWidth() - 180, 0, 48, kTitleBarHeight); // wjy: 设置入口贴着刷新按钮左侧，窗口变宽时跟随右边缘移动。
 }
+
+// =====wjy====
+QRect titlebarUpdateRect()
+{
+    return QRect(shellWidth() - 260, 5, 76, kTitleBarHeight - 10); // wjy: 更新按钮位于设置按钮左侧，仅在检测到新版本时参与绘制和点击。
+}
+// ===end====
 // ===end====
 
 
@@ -1536,12 +1543,17 @@ QRect localInfoCopyButtonRect(int index)
 
 QRect settingsLocalInfoHeaderRect()
 {
-    return QRect(contentLeft(), 588 + (kDetailScriptPanelTop - 120), contentWidth(), 44); // wjy: 本机信息下移，给更新选项卡片腾出位置。
+    // =====wjy====
+    const int top = (platform::UpdateService::canPublishCurrentBuild() ? 588 : 512)
+        + (kDetailScriptPanelTop - 120); // wjy: 非构建运行包没有发布卡片，本机信息上移 76 像素填补整块空间。
+    return QRect(contentLeft(), top, contentWidth(), 44);
+    // ===end====
 }
 
 QRect settingsLocalInfoCardRect(bool expanded)
 {
-    return QRect(contentLeft(), 588 + (kDetailScriptPanelTop - 120), contentWidth(), expanded ? 152 : 44); // wjy: 本机信息卡片跟随设置页统一上移，并避开上方更新卡片。
+    const QRect header = settingsLocalInfoHeaderRect(); // wjy: 卡片和标题共用动态顶部，发布区域隐藏后下面所有设置项会连续上移。
+    return QRect(header.x(), header.y(), header.width(), expanded ? 152 : 44);
 }
 
 QRect settingsScrollViewportRect()
@@ -2361,19 +2373,9 @@ QRect settingsAutoRefreshSwitchRect()
 }
 
 // =====wjy====
-QRect settingsAutoUpdateSwitchRect()
-{
-    return QRect(contentLeft() + contentWidth() - 90, 520 + (kDetailScriptPanelTop - 120), 82, 32); // wjy: 自动检查更新开关。
-}
-
 QRect settingsPublishUpdateButtonRect()
 {
-    return QRect(contentLeft() + contentWidth() - 330, 526 + (kDetailScriptPanelTop - 120), 100, 24); // wjy: 本机发布构建到共享目录。
-}
-
-QRect settingsCheckUpdateButtonRect()
-{
-    return QRect(contentLeft() + contentWidth() - 220, 526 + (kDetailScriptPanelTop - 120), 90, 24); // wjy: 手动检查更新。
+    return QRect(contentLeft() + contentWidth() - 118, 524 + (kDetailScriptPanelTop - 120), 100, 28); // wjy: 设置页只保留发布入口，检查和安装均移到自动检测加标题栏按钮流程。
 }
 // ===end====
 
@@ -2515,7 +2517,7 @@ void drawSettingsPage(
         painter.setPen(QColor(QStringLiteral("#040B18")));
         painter.drawText(QRectF(keyboardCard.x() + 28, keyboardCard.y() + 18, keyboardCard.width() - 56, 22),
             Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("远程窗口快捷键"));
+            QString::fromUtf8("键盘快捷键")); // wjy: 键盘页现在同时展示远控窗口快捷键和设备列表固定 Delete 操作，标题改为通用名称。
 
         const struct ShortcutRow {
             const char* action;
@@ -2545,6 +2547,20 @@ void drawSettingsPage(
             painter.drawText(QRectF(keyboardCard.x() + 72, y + 20, qMax(120, keyRect.left() - keyboardCard.x() - 88), 18), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8(rows[i].detail));
             drawShortcutKey(painter, keyRect, remoteShortcutDisplayText(i));
         }
+        // =====wjy====
+        const int deleteRowIndex = 5;
+        const int deleteRowY = keyboardCard.y() + 64 + deleteRowIndex * 48;
+        const QRect deleteKeyRect = settingsShortcutKeyEditRect(deleteRowIndex); // wjy: 固定 Delete 键沿用可编辑快捷键的右侧按键块位置，视觉与上方五行保持一致。
+        drawSettingsOptionIcon(painter, QRect(keyboardCard.x() + 28, deleteRowY + 2, 28, 28), 5);
+        painter.setFont(rowTitle);
+        painter.setPen(QColor(QStringLiteral("#111827")));
+        painter.drawText(QRectF(keyboardCard.x() + 72, deleteRowY, 180, 18), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("删除设备"));
+        painter.setFont(rowDetail);
+        painter.setPen(QColor(QStringLiteral("#687384")));
+        painter.drawText(QRectF(keyboardCard.x() + 72, deleteRowY + 20, qMax(120, deleteKeyRect.left() - keyboardCard.x() - 88), 18),
+            Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("从本机设备列表中移除当前选中的设备"));
+        drawShortcutKey(painter, deleteKeyRect, QStringLiteral("Delete")); // wjy: 删除设备是固定主界面快捷键，只展示不提供编辑，避免与删除语义不一致。
+        // ===end====
         painter.restore();
         return;
     }
@@ -2559,13 +2575,16 @@ void drawSettingsPage(
     const QRect refreshCard(contentLeft(), 344 + settingsYShift, contentWidth(), 71);
     const QRect batchCard(contentLeft(), 420 + settingsYShift, contentWidth(), 88);
     const QRect updateCard(contentLeft(), 512 + settingsYShift, contentWidth(), 56); // wjy: 更新选项卡片。
+    const bool canPublishUpdates = platform::UpdateService::canPublishCurrentBuild(); // wjy: 绘制、命中测试和服务层统一使用构建目录身份。
     painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
     painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
     painter.drawRoundedRect(QRectF(startupCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
     painter.drawRoundedRect(QRectF(sleepCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
     painter.drawRoundedRect(QRectF(refreshCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
     painter.drawRoundedRect(QRectF(batchCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
-    painter.drawRoundedRect(QRectF(updateCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
+    if (canPublishUpdates) {
+        painter.drawRoundedRect(QRectF(updateCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4); // wjy: 只有构建版本显示完整发布卡片，普通运行包不绘制任何占位背景。
+    }
     painter.drawRoundedRect(QRectF(settingsLocalInfoCardRect(localInfoExpanded)).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
     painter.drawLine(QPointF(startupCard.left(), startupCard.y() + 72.5), QPointF(startupCard.right(), startupCard.y() + 72.5)); // wjy: 开机自启卡片内部横线随整体上移后的卡片位置计算。
     if (localInfoExpanded) {
@@ -2591,13 +2610,17 @@ void drawSettingsPage(
     painter.drawText(QRectF(contentLeft() + 60, sleepCard.y() + 16, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("防止电脑休眠"));
     painter.drawText(QRectF(contentLeft() + 60, refreshCard.y() + 16, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("列表自动刷新"));
     painter.drawText(QRectF(contentLeft() + 60, batchCard.y() + 24, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("批量新增设备"));
-    painter.drawText(QRectF(contentLeft() + 18, updateCard.y() + 8, 160, 18), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("自动检查更新"));
-    painter.setPen(QColor(QStringLiteral("#687384")));
-    QFont updateSub(textFont);
-    updateSub.setPixelSize(11);
-    painter.setFont(updateSub);
-    painter.drawText(QRectF(contentLeft() + 18, updateCard.y() + 28, 360, 18), Qt::AlignVCenter | Qt::AlignLeft,
-        QString::fromUtf8("共享目录: \\\\192.168.1.100\\广告部工具\\远程软件_FS"));
+    // =====wjy====
+    if (canPublishUpdates) {
+        painter.drawText(QRectF(contentLeft() + 18, updateCard.y() + 8, 160, 18), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("软件更新发布")); // wjy: 构建版本说明此区域只负责向共享目录发布新包。
+        painter.setPen(QColor(QStringLiteral("#687384")));
+        QFont updateSub(textFont);
+        updateSub.setPixelSize(11);
+        painter.setFont(updateSub);
+        painter.drawText(QRectF(contentLeft() + 18, updateCard.y() + 28, 360, 18), Qt::AlignVCenter | Qt::AlignLeft,
+            QString::fromUtf8("共享目录: \\\\192.168.1.100\\广告部工具\\远程软件_FS"));
+    }
+    // ===end====
     painter.setFont(textFont);
     painter.setPen(QColor(QStringLiteral("#040B18")));
     painter.drawText(QRectF(contentLeft() + 60, settingsLocalInfoHeaderRect().y() + 12, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("本机信息"));
@@ -2622,17 +2645,16 @@ void drawSettingsPage(
     drawSwitchWithLabel(settingsPreventSleepSwitchRect(), preventSleepEnabled);
     drawSwitchWithLabel(settingsAutoRefreshSwitchRect(), statusAutoRefreshEnabled);
     // =====wjy====
-    drawSwitchWithLabel(settingsAutoUpdateSwitchRect(), platform::AppSettings::autoUpdateCheckEnabled());
-    painter.setPen(Qt::NoPen);
-    painter.setBrush(QColor(QStringLiteral("#3A7BFC")));
-    painter.drawRoundedRect(QRectF(settingsPublishUpdateButtonRect()), 4, 4);
-    painter.drawRoundedRect(QRectF(settingsCheckUpdateButtonRect()), 4, 4);
-    QFont updateBtnFont(textFont);
-    updateBtnFont.setPixelSize(12);
-    painter.setFont(updateBtnFont);
-    painter.setPen(QColor(QStringLiteral("#FFFFFF")));
-    painter.drawText(settingsPublishUpdateButtonRect(), Qt::AlignCenter, QString::fromUtf8("发布更新"));
-    painter.drawText(settingsCheckUpdateButtonRect(), Qt::AlignCenter, QString::fromUtf8("检查更新"));
+    if (canPublishUpdates) {
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(QStringLiteral("#3A7BFC")));
+        painter.drawRoundedRect(QRectF(settingsPublishUpdateButtonRect()), 4, 4);
+        QFont updateBtnFont(textFont);
+        updateBtnFont.setPixelSize(12);
+        painter.setFont(updateBtnFont);
+        painter.setPen(QColor(QStringLiteral("#FFFFFF")));
+        painter.drawText(settingsPublishUpdateButtonRect(), Qt::AlignCenter, QString::fromUtf8("发布更新")); // wjy: 普通设备不会绘制按钮文字，也不会留下可误认的空按钮。
+    }
     // ===end====
     if (statusAutoRefreshEnabled) {
         painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
@@ -2742,6 +2764,15 @@ DeviceGrid::DeviceGrid(QWidget* parent)
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after resize setup before setMouseTracking")); // wjy: 记录尺寸设置完成，继续判断是否崩在鼠标追踪设置。
     setMouseTracking(true);
     setFocusPolicy(Qt::ClickFocus); // wjy: 允许手绘区域被点击后接管焦点，数字输入框点击外部时才能真正失焦并保存。
+    // =====wjy====
+    connect(&platform::UpdateService::instance(), &platform::UpdateService::updateAvailabilityChanged,
+        this, [this](bool available, const QString& remoteVersion) {
+            m_updateAvailable = available; // wjy: 后台检查仅改变标题栏入口可见性，不在信号处理中启动安装或弹出窗口。
+            m_availableUpdateVersion = available ? remoteVersion : QString(); // wjy: 无更新时同步清除旧版本状态，避免共享目录异常后残留按钮。
+            m_updatePreparing = false; // wjy: 新一轮检查完成后允许用户重新发起一次更新准备。
+            update(titlebarUpdateRect().adjusted(-2, -2, 2, 2)); // wjy: 只重绘标题栏更新区域，及时显示或隐藏按钮。
+        });
+    // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after basic widget setup")); // wjy: 记录基础 QWidget 属性设置完成。
 
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before app settings restore")); // wjy: 恢复读取用户设置前打点，若再次异常可以确认是否来自 QSettings/注册表。
@@ -5180,7 +5211,7 @@ void DeviceGrid::showDeviceMenu()
     QAction* restartAction = nullptr;
     if (!offlineOnly) {
         terminalAction = menu.addAction(menuIcon(QStringLiteral("terminal.svg")), zh("\xE7\xBB\x88\xE7\xAB\xAF"));
-        shutdownAction = menu.addAction(menuIcon(QStringLiteral("power.svg")), zh("\xE5\x85\xB3\xE6\x9C\xBA"));
+        shutdownAction = menu.addAction(menuIcon(QStringLiteral("shutdown.svg")), zh("\xE5\x85\xB3\xE6\x9C\xBA")); // wjy: 设备更多菜单里的关机也统一使用红色关闭图标，避免不同入口视觉不一致。
         restartAction = menu.addAction(menuIcon(QStringLiteral("restart.svg")), zh("\xE9\x87\x8D\xE5\x90\xAF"));
     }
     QAction* renameAction = menu.addAction(menuIcon(QStringLiteral("rename.svg")), zh("\xE9\x87\x8D\xE5\x91\xBD\xE5\x90\x8D"));
@@ -5204,6 +5235,76 @@ void DeviceGrid::showDeviceMenu()
     const int menuY = qRound(moreRect.bottom() + 6);
     menu.exec(mapToGlobal(QPoint(menuX, menuY)));
 }
+
+// =====wjy====
+void DeviceGrid::showDeviceContextMenuForIndexes(
+    int deviceIndex,
+    const QVector<int>& targetDeviceIndexes,
+    const QPoint& globalPosition)
+{
+    if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
+        return; // wjy: 设备已删除或下标失效时不显示可能控制错误目标的菜单。
+    }
+
+    QVector<int> validTargetIndexes; // wjy: 菜单可能来自多选设备，也可能来自单个远控窗口，先统一过滤为有效下标。
+    for (int targetIndex : targetDeviceIndexes) {
+        if (targetIndex >= 0 && targetIndex < g_devices.size() && !validTargetIndexes.contains(targetIndex)) {
+            validTargetIndexes.append(targetIndex);
+        }
+    }
+    if (validTargetIndexes.isEmpty()) {
+        validTargetIndexes.append(deviceIndex); // wjy: 远控标题栏或异常空选择至少保留当前窗口绑定的这一台设备。
+    }
+    const bool batchDeviceMenu = validTargetIndexes.size() > 1; // wjy: 只有设备列表多选才显示“批量”文案，单个远控窗口始终控制一台设备。
+
+    QMenu menu(this); // wjy: 两种入口复用同一 QMenu，后续顺序、图标或动作调整只需要维护这一处。
+    QMenu* scriptMenu = menu.addMenu(QString::fromUtf8("执行脚本"));
+    populateScriptFolderMenu(scriptMenu, QString::fromUtf8(kRemoteScriptFolderPath)); // wjy: 远控标题栏也显示与设备右键一致的共享脚本目录层级。
+    QMenu* systemMenu = menu.addMenu(menuIcon(QStringLiteral("settings.svg")), QString::fromUtf8("系统设置"));
+    QAction* wakeAction = systemMenu->addAction(menuIcon(QStringLiteral("power_on.svg")), batchDeviceMenu ? QString::fromUtf8("批量开机") : QString::fromUtf8("开机"));
+    QAction* shutdownAction = systemMenu->addAction(menuIcon(QStringLiteral("shutdown.svg")), batchDeviceMenu ? QString::fromUtf8("批量关机") : QString::fromUtf8("关机"));
+    QAction* restartAction = systemMenu->addAction(menuIcon(QStringLiteral("restart.svg")), batchDeviceMenu ? QString::fromUtf8("批量重启") : QString::fromUtf8("重启"));
+    QAction* updateAction = systemMenu->addAction(menuIcon(QStringLiteral("update.svg")), batchDeviceMenu ? QString::fromUtf8("批量更新") : QString::fromUtf8("更新"));
+    QAction* terminalAction = systemMenu->addAction(menuIcon(QStringLiteral("terminal.svg")), QString::fromUtf8("终端")); // wjy: 系统设置顺序固定为开机、关机、重启、更新、终端。
+    menu.addSeparator();
+    QAction* deleteDeviceAction = menu.addAction(menuIcon(QStringLiteral("delete.svg")), QString::fromUtf8("删除设备")); // wjy: 设备列表和远控标题栏共享删除入口，只从本机列表移除触发菜单的这台设备。
+
+    const QAction* selectedAction = menu.exec(globalPosition); // wjy: 设备列表使用列表右键屏幕坐标，远控窗口使用其标题栏右键屏幕坐标。
+    if (selectedAction && selectedAction->data().isValid()) {
+        executeDeviceScriptFolder(deviceIndex, selectedAction->data().toString(), true); // wjy: 脚本始终发送给触发菜单的真实设备，不读取 m_selectedDeviceIndex。
+    } else if (selectedAction == wakeAction) {
+        batchWakeDevices(validTargetIndexes);
+    } else if (selectedAction == shutdownAction) {
+        batchShutdownDevices(validTargetIndexes);
+    } else if (selectedAction == restartAction) {
+        batchRestartDevices(validTargetIndexes);
+    } else if (selectedAction == updateAction) {
+        if (batchDeviceMenu) {
+            batchUpdateDevices(validTargetIndexes);
+        } else {
+            updateDeviceForIndex(deviceIndex, true); // wjy: 单个远控窗口显示更新受理、已最新或失败反馈。
+        }
+    } else if (selectedAction == terminalAction) {
+        batchOpenDeviceTerminals(validTargetIndexes);
+    } else if (selectedAction == deleteDeviceAction) {
+        deleteDeviceForIndex(deviceIndex); // wjy: 使用菜单绑定的真实设备下标，远控标题栏右键不会误删主界面当前选择。
+    }
+}
+
+void DeviceGrid::showRemoteWindowDeviceMenu(const QString& hostIp, const QPoint& globalPosition)
+{
+    const QString targetIp = hostIp.trimmed();
+    if (targetIp.isEmpty()) {
+        return;
+    }
+    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+        if (g_devices.at(deviceIndex).ip.trimmed().compare(targetIp, Qt::CaseInsensitive) == 0) {
+            showDeviceContextMenuForIndexes(deviceIndex, QVector<int>{deviceIndex}, globalPosition); // wjy: IP 匹配后显式传入单设备集合，绝不继承主界面的多选状态。
+            return;
+        }
+    }
+}
+// ===end====
 
 QVector<int> DeviceGrid::deviceIndexesForGroup(int groupIndex) const
 {
@@ -5276,6 +5377,15 @@ void DeviceGrid::batchRestartDevices(const QVector<int>& deviceIndexes)
     }
 // ===end====
 }
+
+// =====wjy====
+void DeviceGrid::batchUpdateDevices(const QVector<int>& deviceIndexes)
+{
+    for (int deviceIndex : deviceIndexes) {
+        updateDeviceForIndex(deviceIndex, false); // wjy: 离线设备由单设备 helper 自动跳过，在线设备各自根据共享版本决定是否更新。
+    }
+}
+// ===end====
 
 void DeviceGrid::batchOpenDeviceTerminals(const QVector<int>& deviceIndexes)
 {
@@ -5926,6 +6036,10 @@ void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex, const QPoint&
         m_remoteTileRestoreGeometries.remove(remoteWindow);
     });
     connect(remoteWindow, &RemoteDesktopWindow::activated, this, &DeviceGrid::rememberRemoteWindowActivation);
+    // =====wjy====
+    connect(remoteWindow, &RemoteDesktopWindow::titleBarContextMenuRequested,
+        this, &DeviceGrid::showRemoteWindowDeviceMenu); // wjy: 普通远控窗口右键标题栏时按该窗口 IP 打开共享设备菜单。
+    // ===end====
     connect(remoteWindow, &RemoteDesktopWindow::shortcutFullscreenRequested, this, [this] { triggerShortcutAction(0); });
     connect(remoteWindow, &RemoteDesktopWindow::shortcutTileRequested, this, [this] { triggerShortcutAction(1); });
     connect(remoteWindow, &RemoteDesktopWindow::shortcutCloseTopmostRequested, this, [this] { triggerShortcutAction(2); });
@@ -6060,6 +6174,10 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
             m_remoteTileRestoreGeometries.remove(remoteWindow);
         });
         connect(remoteWindow, &RemoteDesktopWindow::activated, this, &DeviceGrid::rememberRemoteWindowActivation);
+        // =====wjy====
+        connect(remoteWindow, &RemoteDesktopWindow::titleBarContextMenuRequested,
+            this, &DeviceGrid::showRemoteWindowDeviceMenu); // wjy: 分组平铺创建的远控窗口也按各自 IP 弹出菜单，不会串到其它格子设备。
+        // ===end====
         connect(remoteWindow, &RemoteDesktopWindow::shortcutFullscreenRequested, this, [this] { triggerShortcutAction(0); });
         connect(remoteWindow, &RemoteDesktopWindow::shortcutTileRequested, this, [this] { triggerShortcutAction(1); });
         connect(remoteWindow, &RemoteDesktopWindow::shortcutCloseTopmostRequested, this, [this] { triggerShortcutAction(2); });
@@ -6308,6 +6426,59 @@ bool DeviceGrid::restartDeviceForIndex(int deviceIndex, bool showMessages)
     return false;
 }
 
+// =====wjy====
+bool DeviceGrid::updateDeviceForIndex(int deviceIndex, bool showMessages)
+{
+    if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
+        return false;
+    }
+    if (devicePresenceForIndex(deviceIndex) == platform::DevicePresenceState::Offline) {
+        return false;
+    }
+
+    const DeviceEntry& device = g_devices.at(deviceIndex);
+    QString errorMessage;
+    const platform::RemoteUpdateRequestResult result =
+        platform::DeviceCommandService::requestUpdate(device.ip, &errorMessage);
+    if (result == platform::RemoteUpdateRequestResult::Accepted) {
+        if (showMessages) {
+            QMessageBox messageBox(
+                QMessageBox::Information,
+                QString(),
+                QString::fromUtf8("目标设备已受理更新请求，准备完成后将自动退出并重启。"),
+                QMessageBox::NoButton,
+                this);
+            messageBox.addButton(QString::fromUtf8("知道了"), QMessageBox::AcceptRole);
+            messageBox.exec(); // wjy: 远端暂存是异步的，单设备操作明确告知“已受理”而不误报为已经安装完成。
+        }
+        return true; // wjy: 目标机已异步接管暂存、退出、替换和重启，控制端无需保持连接。
+    }
+    if (result == platform::RemoteUpdateRequestResult::UpToDate) {
+        if (showMessages) {
+            QMessageBox messageBox(
+                QMessageBox::Information,
+                QString(),
+                QString::fromUtf8("目标设备已经是最新版本。"),
+                QMessageBox::NoButton,
+                this);
+            messageBox.addButton(QString::fromUtf8("知道了"), QMessageBox::AcceptRole);
+            messageBox.exec();
+        }
+        return true;
+    }
+
+    if (showMessages) {
+        const QString detail = errorMessage.trimmed().isEmpty()
+            ? QString::fromUtf8("无法向目标设备发送更新请求。")
+            : QString::fromUtf8("无法向目标设备发送更新请求：%1").arg(errorMessage.trimmed());
+        QMessageBox messageBox(QMessageBox::Warning, QString(), detail, QMessageBox::NoButton, this);
+        messageBox.addButton(QString::fromUtf8("知道了"), QMessageBox::AcceptRole);
+        messageBox.exec();
+    }
+    return false;
+}
+// ===end====
+
 void DeviceGrid::applyDeviceRename(int deviceIndex, const QString& newName)
 {
     if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
@@ -6403,13 +6574,20 @@ void DeviceGrid::renameCurrentDevice()
 
 void DeviceGrid::deleteCurrentDevice()
 {
-    if (m_selectedDeviceIndex < 0 || m_selectedDeviceIndex >= g_devices.size()) {
+    deleteDeviceForIndex(m_selectedDeviceIndex); // wjy: 详情页删除按钮和 Delete 键统一调用按下标删除入口。
+}
+
+void DeviceGrid::deleteDeviceForIndex(int deviceIndex)
+{
+    // =====wjy====
+    if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
         return;
     }
 
-    const QString removedIp = g_devices.at(m_selectedDeviceIndex).ip.trimmed();
+    const int previousSelectedIndex = m_selectedDeviceIndex; // wjy: 删除目标可能来自远控标题栏，先保存主界面当前选择以便删除后校正下标。
+    const QString removedIp = g_devices.at(deviceIndex).ip.trimmed();
     saveCurrentScriptUiState(); // wjy: 删除当前设备前先收拢编辑框未保存文本和终端状态，随后按 IP 清理缓存。
-    g_devices.removeAt(m_selectedDeviceIndex);
+    g_devices.removeAt(deviceIndex); // wjy: 只从本机设备集合移除，不向目标设备发送任何关机、卸载或删除文件命令。
     saveDevices();
     m_deviceStatuses.remove(removedIp);
     m_deviceRemoteSessionCounts.remove(removedIp); // wjy: 删除设备时同步清掉远控人数缓存。
@@ -6417,7 +6595,7 @@ void DeviceGrid::deleteCurrentDevice()
     m_poweringOnDeviceIps.remove(removedIp);
     m_poweringOnStartedAtMs.remove(removedIp);
     m_scriptUiStates.remove(removedIp); // wjy: 被删除设备的脚本 UI 不再保留，避免后续同 IP 之外的设备误用旧状态。
-        if (g_devices.isEmpty()) {
+    if (g_devices.isEmpty()) {
             m_selectedDeviceIndex = 0;
             m_previousDeviceIndex = 0;
             m_selectedDeviceIndexes.clear();
@@ -6435,28 +6613,29 @@ void DeviceGrid::deleteCurrentDevice()
             loadScriptUiStateForDevice(QString());
             update();
             return;
-        }
+    }
 
-        const int nextIndex =
-            qMin(m_selectedDeviceIndex,
-                 g_devices.size() - 1);
+    const int nextIndex = previousSelectedIndex == deviceIndex
+        ? qMin(deviceIndex, g_devices.size() - 1)
+        : qBound(0, previousSelectedIndex - (previousSelectedIndex > deviceIndex ? 1 : 0), g_devices.size() - 1); // wjy: 删除非当前设备时保留原详情目标；删除当前设备时优先选择其后一台或最后一台。
 
-        m_selectedDeviceIndex = nextIndex;
-        m_previousDeviceIndex = nextIndex;
+    m_selectedDeviceIndex = nextIndex;
+    m_previousDeviceIndex = nextIndex;
 
-        m_selectedDeviceIndexes.clear();
-        m_selectedDeviceIndexes.insert(nextIndex);
+    m_selectedDeviceIndexes.clear();
+    m_selectedDeviceIndexes.insert(nextIndex); // wjy: 删除后收敛为一个明确主选择，清除可能因下标移动而失效的多选集合。
 
-        m_draggingDeviceIndexes.clear();
+    m_draggingDeviceIndexes.clear();
 
-        m_selectionAnchorDeviceIndex =
-            nextIndex;
+    m_selectionAnchorDeviceIndex = nextIndex;
     m_currentDeviceName = deviceDisplayName(g_devices.at(nextIndex));
     m_previousDeviceName = m_currentDeviceName;
     loadScriptUiStateForDevice(currentScriptUiDeviceIp()); // wjy: 删除后详情切到下一台设备时，下方脚本 UI 同步切到下一台设备。
     setDesktopHoverActive(false);
     clearBottomActionHover();
+    m_deviceListScrollOffset = qBound(0, m_deviceListScrollOffset, maxDeviceListScrollOffset()); // wjy: 删除设备后列表变短，立即把滚动位置限制回有效范围。
     update();
+    // ===end====
 }
 
 void DeviceGrid::startDeviceWakeVisual(const QString& ip)
@@ -6757,11 +6936,25 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
         painter.setBrush(QColor(QStringLiteral("#DDE6EF")));
         painter.drawRoundedRect(QRectF(titlebarSettingsRect()).adjusted(8, 4, -8, -4), 4, 4);
     }
+    // =====wjy====
+    if (m_updateAvailable) {
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(QStringLiteral("#3A7BFC")));
+        painter.drawRoundedRect(QRectF(titlebarUpdateRect()), 4, 4); // wjy: 仅检测到远端版本更高时，在设置按钮左侧绘制主动更新入口。
+        QFont updateFont(QStringLiteral("Microsoft YaHei UI"));
+        updateFont.setPixelSize(12);
+        updateFont.setBold(true);
+        painter.setFont(updateFont);
+        painter.setPen(QColor(QStringLiteral("#FFFFFF")));
+        painter.drawText(titlebarUpdateRect(), Qt::AlignCenter,
+            m_updatePreparing ? QString::fromUtf8("准备中") : QString::fromUtf8("更新")); // wjy: 用户点击后显示准备状态，并阻止重复创建更新任务。
+    }
+    // ===end====
     QFont identityFont(QStringLiteral("Microsoft YaHei UI"));
     identityFont.setPixelSize(12);
     painter.setFont(identityFont);
     painter.setPen(QColor(QStringLiteral("#4B5563")));
-    const int identityRight = titlebarSettingsRect().x() - 10;
+    const int identityRight = (m_updateAvailable ? titlebarUpdateRect().x() : titlebarSettingsRect().x()) - 10; // wjy: 更新按钮出现时，本机名称和 IP 自动向左让位，避免文字重叠。
     // =====wjy====
     // wjy: 顺序“本机名 本机IP 设置”；名称与 IP 间距 10px，与远控窗口标题栏 name/IP 间距一致。
     const QFontMetrics identityMetrics(identityFont);
@@ -7394,38 +7587,9 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
             updateSettingsControls();
             startDeviceSwitchAnimation(deviceIndex, deviceDisplayName(g_devices.at(deviceIndex))); // wjy: 右键某台设备时先让右侧详情和后续脚本目标统一到这台设备。
             const QVector<int> targetDeviceIndexes = contextDeviceIndexesForRightClick(deviceIndex);
-            const bool batchDeviceMenu = targetDeviceIndexes.size() > 1;
-
-            QMenu menu(this); // wjy: 设备右键菜单样式参照分组右键菜单，使用 Qt 原生级联菜单外观。
-            QMenu* scriptMenu = menu.addMenu(QString::fromUtf8("执行脚本")); // wjy: 鼠标悬浮“执行脚本”时展开脚本共享目录第一层文件夹。
-            populateScriptFolderMenu(scriptMenu, QString::fromUtf8(kRemoteScriptFolderPath)); // wjy: 递归把共享目录下的文件夹转成多级子菜单，暂不绑定点击执行逻辑。
             // =====wjy====
-            QMenu* systemMenu = menu.addMenu(menuIcon(QStringLiteral("settings.svg")), QString::fromUtf8("系统设置")); // wjy: 把设备系统操作收进级联子菜单，悬浮展开方式和“执行脚本”保持一致。
-            QAction* wakeAction = systemMenu->addAction(menuIcon(QStringLiteral("power.svg")), batchDeviceMenu ? QString::fromUtf8("批量开机") : QString::fromUtf8("开机")); // wjy: 多选右键时开机会遍历当前选中设备，单选时仍只处理当前设备。
-            QAction* terminalAction = systemMenu->addAction(menuIcon(QStringLiteral("terminal.svg")), zh("\xE7\xBB\x88\xE7\xAB\xAF")); // wjy: 终端动作由批量 helper 过滤离线设备。
-            QAction* shutdownAction = systemMenu->addAction(menuIcon(QStringLiteral("power.svg")), batchDeviceMenu ? QString::fromUtf8("批量关机") : zh("\xE5\x85\xB3\xE6\x9C\xBA")); // wjy: 关机动作允许多选右键统一下发。
-            QAction* restartAction = systemMenu->addAction(menuIcon(QStringLiteral("restart.svg")), batchDeviceMenu ? QString::fromUtf8("批量重启") : zh("\xE9\x87\x8D\xE5\x90\xAF")); // wjy: 重启动作允许多选右键统一下发。
-            // QAction* renameAction = systemMenu->addAction(menuIcon(QStringLiteral("rename.svg")), zh("\xE9\x87\x8D\xE5\x91\xBD\xE5\x90\x8D")); // wjy: 按需求隐藏设备右键“重命名”，保留代码痕迹但菜单不显示也无法调用。
-            // QAction* deleteAction = systemMenu->addAction(menuIcon(QStringLiteral("delete.svg")), zh("\xE5\x88\xA0\xE9\x99\xA4\xE8\xAE\xBE\xE5\xA4\x87")); // wjy: 按需求隐藏设备右键“删除设备”，保留代码痕迹但菜单不显示也无法调用。
+            showDeviceContextMenuForIndexes(deviceIndex, targetDeviceIndexes, mapToGlobal(event->pos())); // wjy: 设备列表右键改为调用共享菜单，和远控标题栏保证完全相同的动作顺序与目标分发。
             // ===end====
-            const QAction* selectedAction = menu.exec(mapToGlobal(event->pos()));
-            if (selectedAction && selectedAction->data().isValid()) {
-                executeCurrentDeviceScriptFolder(selectedAction->data().toString()); // wjy: 只有点击具体脚本文件夹才触发复制和远程执行，中间层子菜单只负责展开。
-            // =====wjy====
-            } else if (selectedAction && selectedAction == wakeAction) {
-                batchWakeDevices(targetDeviceIndexes); // wjy: 设备右键支持单选/多选开机，内部只对离线且有 MAC 的设备发唤醒。
-            } else if (selectedAction && selectedAction == terminalAction) {
-                batchOpenDeviceTerminals(targetDeviceIndexes); // wjy: 多选右键终端会给每台可连接设备打开终端。
-            } else if (selectedAction && selectedAction == shutdownAction) {
-                batchShutdownDevices(targetDeviceIndexes); // wjy: 多选右键关机复用批量 helper，离线设备会被跳过。
-            } else if (selectedAction && selectedAction == restartAction) {
-                batchRestartDevices(targetDeviceIndexes); // wjy: 多选右键重启复用批量 helper，离线设备会被跳过。
-            // } else if (selectedAction && selectedAction == renameAction) {
-            //     renameCurrentDevice(); // wjy: 设备右键“重命名”入口已按需求注释隐藏，不能从该菜单调用。
-            // } else if (selectedAction && selectedAction == deleteAction) {
-            //     deleteCurrentDevice(); // wjy: 设备右键“删除设备”入口已按需求注释隐藏，不能从该菜单调用。
-            // ===end====
-            }
             event->accept();
             return;
         }
@@ -7454,14 +7618,15 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
 
             QMenu menu(this); // wjy: 创建分组右键菜单，用来放分组相关操作入口。
             // QAction* tileDevicesAction = menu.addAction(QString::fromUtf8("设备平铺")); // wjy: 按需求隐藏分组右键“设备平铺”，菜单不显示也无法调用。
-            QMenu* scriptMenu = menu.addMenu(QString::fromUtf8("执行脚本")); // wjy: 分组右键复用设备右键的脚本目录级联菜单，最终叶子节点批量执行组内设备。
+            QMenu* scriptMenu = menu.addMenu(QString::fromUtf8("启动脚本")); // wjy: 分组右键用“启动脚本”明确表示将对组内设备批量启动所选脚本，底层批量执行逻辑保持不变。
             populateScriptFolderMenu(scriptMenu, QString::fromUtf8(kRemoteScriptFolderPath));
-            QAction* stopScriptsAction = menu.addAction(QString::fromUtf8("批量停止")); // wjy: 分组级停止会遍历组内设备，停止所有正在运行的脚本进程树。
+            QAction* stopScriptsAction = menu.addAction(QString::fromUtf8("停止脚本")); // wjy: 分组右键用“停止脚本”与启动入口成对显示，点击后仍遍历组内设备停止全部脚本进程树。
             menu.addSeparator(); // wjy: 系统子菜单上方加横杠，和脚本/停止动作分组显示。
             QMenu* systemMenu = menu.addMenu(menuIcon(QStringLiteral("settings.svg")), QString::fromUtf8("系统设置"));
-            QAction* wakeGroupAction = systemMenu->addAction(menuIcon(QStringLiteral("power.svg")), QString::fromUtf8("批量开机"));
-            QAction* shutdownGroupAction = systemMenu->addAction(menuIcon(QStringLiteral("power.svg")), QString::fromUtf8("批量关机"));
+            QAction* wakeGroupAction = systemMenu->addAction(menuIcon(QStringLiteral("power_on.svg")), QString::fromUtf8("批量开机")); // wjy: 分组开机与设备开机共用绿色启动图标。
+            QAction* shutdownGroupAction = systemMenu->addAction(menuIcon(QStringLiteral("shutdown.svg")), QString::fromUtf8("批量关机")); // wjy: 分组关机与设备关机共用红色关闭图标。
             QAction* restartGroupAction = systemMenu->addAction(menuIcon(QStringLiteral("restart.svg")), QString::fromUtf8("批量重启"));
+            QAction* updateGroupAction = systemMenu->addAction(menuIcon(QStringLiteral("update.svg")), QString::fromUtf8("批量更新")); // wjy: 分组更新共用蓝色循环箭头，菜单顺序保持不变。
             QAction* terminalGroupAction = systemMenu->addAction(menuIcon(QStringLiteral("terminal.svg")), QString::fromUtf8("终端"));
             QAction* deleteGroupAction = menu.addAction(QString::fromUtf8("删除分组")); // wjy: 删除分组菜单项先显示出来，后续再补真正删除分组和设备归属处理。
             const QAction* selectedAction = menu.exec(mapToGlobal(event->pos())); // wjy: 在分组行右键位置弹出菜单。
@@ -7479,6 +7644,8 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
                 batchShutdownDevices(groupDeviceIndexes); // wjy: 分组系统菜单批量关机只针对该分组内设备。
             } else if (selectedAction == restartGroupAction) {
                 batchRestartDevices(groupDeviceIndexes); // wjy: 分组系统菜单批量重启只针对该分组内设备。
+            } else if (selectedAction == updateGroupAction) {
+                batchUpdateDevices(groupDeviceIndexes); // wjy: 分组更新向每台在线设备发送异步请求，目标机各自判断是否需要更新。
             } else if (selectedAction == terminalGroupAction) {
                 batchOpenDeviceTerminals(groupDeviceIndexes); // wjy: 分组系统菜单终端会为该分组内可连接设备打开终端。
             } else if (selectedAction == deleteGroupAction) {
@@ -7552,6 +7719,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         && event->pos().y() >= 0
         && event->pos().y() < kTitleBarHeight //窗口拖动
         && !titlebarLaunchButtonRect().contains(event->pos())
+        && !(m_updateAvailable && titlebarUpdateRect().contains(event->pos())) // wjy: 可见更新按钮属于点击区，不能被标题栏拖动逻辑抢走。
         && !titlebarSettingsRect().contains(event->pos())
         && !refreshRect().contains(event->pos())
         && !minimizeRect().contains(event->pos())
@@ -7798,6 +7966,7 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
     }
     const bool sidebarButtonHovered = sidebarCollapseButtonRect(m_leftSidebarCollapsed).contains(event->pos());
     const bool titlebarButtonHovered = titlebarLaunchButtonRect().contains(event->pos())
+        || (m_updateAvailable && titlebarUpdateRect().contains(event->pos())) // wjy: 更新入口出现后使用按钮指针反馈。
         || titlebarSettingsRect().contains(event->pos())
         || refreshRect().contains(event->pos());
     const bool wakeButtonHovered = false;
@@ -7807,6 +7976,8 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
             || settingsScrolledRect(settingsRemoteWakeupSwitchRect(), m_settingsScrollOffset).contains(event->pos())
             || settingsScrolledRect(settingsPreventSleepSwitchRect(), m_settingsScrollOffset).contains(event->pos())
             || settingsScrolledRect(settingsAutoRefreshSwitchRect(), m_settingsScrollOffset).contains(event->pos())
+            || (platform::UpdateService::canPublishCurrentBuild()
+                && settingsScrolledRect(settingsPublishUpdateButtonRect(), m_settingsScrollOffset).contains(event->pos())) // wjy: 只有构建版本的可见发布按钮提供点击光标。
             || settingsScrolledRect(settingsLocalInfoHeaderRect(), m_settingsScrollOffset).contains(event->pos())
             || settingsScrolledRect(settingsAddDeviceHeaderRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset).contains(event->pos()));
     const bool settingsTabHovered = m_settingsSelected
@@ -7977,6 +8148,18 @@ void DeviceGrid::wheelEvent(QWheelEvent* event)
 void DeviceGrid::keyPressEvent(QKeyEvent* event)
 {
 // =====wjy====
+    if (event->key() == Qt::Key_Delete
+        && event->modifiers() == Qt::NoModifier
+        && !event->isAutoRepeat()
+        && !m_settingsSelected
+        && !m_remoteAssistSelected
+        && !m_localInfoSelected
+        && m_selectedDeviceIndex >= 0
+        && m_selectedDeviceIndex < g_devices.size()) {
+        deleteCurrentDevice(); // wjy: 主界面设备详情处于选中状态时，单次 Delete 直接从本机列表移除当前主选设备；长按不会连续误删多台。
+        event->accept();
+        return;
+    }
     if (matchesShortcut(event, platform::AppSettings::remoteShortcutFullscreen())) {
         triggerShortcutAction(0);
         event->accept();
@@ -8317,6 +8500,23 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
             return;
         }
 
+        // =====wjy====
+        if (m_updateAvailable && titlebarUpdateRect().contains(event->pos())) {
+            if (!m_updatePreparing) {
+                m_updatePreparing = true; // wjy: 只有用户明确点击标题栏按钮后才开始暂存更新载荷。
+                update(titlebarUpdateRect().adjusted(-2, -2, 2, 2));
+                QString error;
+                if (!platform::UpdateService::instance().applyRemoteUpdate(&error)) {
+                    m_updatePreparing = false; // wjy: 准备失败时恢复按钮，允许用户排除共享目录问题后再次点击。
+                    update(titlebarUpdateRect().adjusted(-2, -2, 2, 2));
+                    QMessageBox::warning(this, QString(), QString::fromUtf8("更新准备失败：%1").arg(error));
+                }
+            }
+            event->accept();
+            return;
+        }
+        // ===end====
+
         if (titlebarSettingsRect().contains(event->pos())) {
             finishDeviceGroupRename(true);
             finishDeviceRename(true);
@@ -8591,30 +8791,14 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 return;
             }
             // =====wjy====
-            if (settingsScrolledRect(settingsAutoUpdateSwitchRect(), m_settingsScrollOffset).contains(event->pos())) {
-                const bool enabled = !platform::AppSettings::autoUpdateCheckEnabled();
-                platform::AppSettings::setAutoUpdateCheckEnabled(enabled);
-                if (enabled) {
-                    platform::UpdateService::instance().startPeriodicCheck(this);
-                } else {
-                    platform::UpdateService::instance().stopPeriodicCheck();
-                }
-                update();
-                event->accept();
-                return;
-            }
-            if (settingsScrolledRect(settingsPublishUpdateButtonRect(), m_settingsScrollOffset).contains(event->pos())) {
+            if (platform::UpdateService::canPublishCurrentBuild()
+                && settingsScrolledRect(settingsPublishUpdateButtonRect(), m_settingsScrollOffset).contains(event->pos())) { // wjy: 普通运行包即使点击原按钮坐标也不会触发发布。
                 QString error;
                 if (platform::UpdateService::instance().publishCurrentBuild(&error)) {
                     QMessageBox::information(this, QString(), QString::fromUtf8("已发布到共享目录，其它设备将自动检测到更新。"));
                 } else {
                     QMessageBox::warning(this, QString(), QString::fromUtf8("发布失败：%1").arg(error));
                 }
-                event->accept();
-                return;
-            }
-            if (settingsScrolledRect(settingsCheckUpdateButtonRect(), m_settingsScrollOffset).contains(event->pos())) {
-                platform::UpdateService::instance().checkNow(this, true);
                 event->accept();
                 return;
             }

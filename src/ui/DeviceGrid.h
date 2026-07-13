@@ -92,6 +92,10 @@ private:
     void saveNewDevice();
     void cancelNewDevice();
     void showDeviceMenu();
+    // =====wjy====
+    void showDeviceContextMenuForIndexes(int deviceIndex, const QVector<int>& targetDeviceIndexes, const QPoint& globalPosition); // wjy: 设备列表和远控标题栏共用同一菜单构建及动作分发逻辑。
+    void showRemoteWindowDeviceMenu(const QString& hostIp, const QPoint& globalPosition); // wjy: 按远控窗口固定 IP 解析真实设备下标，避免错误控制主界面当前设备。
+    // ===end====
     void openCurrentDeviceTerminal();
     bool openTerminalForDeviceIndex(int deviceIndex, bool showMessages);
     void executeCurrentDeviceScriptFolder(const QString& scriptFolderPath); // wjy: Copy one shared script folder to remote work directory and run its entry script.
@@ -113,8 +117,12 @@ private:
     void restartCurrentDevice();
     bool shutdownDeviceForIndex(int deviceIndex, bool showMessages);
     bool restartDeviceForIndex(int deviceIndex, bool showMessages);
+    // =====wjy====
+    bool updateDeviceForIndex(int deviceIndex, bool showMessages); // wjy: 向指定在线设备发送远程更新请求，并区分已受理、已是最新版和失败。
+    // ===end====
     void renameCurrentDevice();
     void deleteCurrentDevice();
+    void deleteDeviceForIndex(int deviceIndex); // wjy: 设备列表和远控标题栏右键按明确下标删除，避免误用当前详情选择删除另一台设备。
     void startDeviceWakeVisual(const QString& ip);
     void wakeCurrentDevice();
     bool wakeDeviceForIndex(int deviceIndex, bool showMessages);
@@ -162,6 +170,9 @@ private:
     void batchWakeDevices(const QVector<int>& deviceIndexes);
     void batchShutdownDevices(const QVector<int>& deviceIndexes);
     void batchRestartDevices(const QVector<int>& deviceIndexes);
+    // =====wjy====
+    void batchUpdateDevices(const QVector<int>& deviceIndexes); // wjy: 多选设备或分组菜单统一复用单设备更新请求逻辑。
+    // ===end====
     void batchOpenDeviceTerminals(const QVector<int>& deviceIndexes);
     bool ensureRemoteControlAuthorization(int deviceIndex, bool showMessages); // wjy: 远控窗口创建前确保当前控制端公钥已登记到目标设备。
 
@@ -274,6 +285,11 @@ private:
     bool m_wakeProbeInProgress = false;
     bool m_batchAddInProgress = false; // wjy: 标记批量新增扫描是否正在后台执行。
     int m_statusAutoRefreshIntervalSeconds = 60; // wjy: Default auto refresh interval is 60 seconds.
+    // =====wjy====
+    bool m_updateAvailable = false; // wjy: 后台检测到更高版本时显示标题栏更新按钮，用户点击前绝不开始安装。
+    bool m_updatePreparing = false; // wjy: 防止用户连续点击重复创建多个更新任务和更新器进程。
+    QString m_availableUpdateVersion; // wjy: 保存检测到的远端版本，供标题栏更新状态使用。
+    // ===end====
     int m_deviceListScrollOffset = 0; // wjy: Scroll offset for the hand-painted device list.
     int m_settingsScrollOffset = 0; // wjy: Scroll offset for the Settings > General content area.
     int m_renamingDeviceGroupIndex = -1; // wjy: Current renaming group index, -1 means none.
