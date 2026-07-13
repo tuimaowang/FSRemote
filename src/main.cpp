@@ -1,4 +1,5 @@
 #include "ui/MainWindow.h"
+#include "ui/DeviceGrid.h"
 
 #include "stream/StreamRuntime.h"
 #include "system/AppSettings.h"
@@ -7,10 +8,19 @@
 #include "system/ParsecVddInstaller.h"
 #include "system/PowerManager.h"
 #include "system/PortableOpenSshManager.h"
+#include "system/StartupManager.h"
+#include "system/UpdateService.h"
 #include "system/WjyDiagnosticLog.h"
 
 #include <QApplication>
+#include <QCoreApplication>
 #include <QFont>
+#include <QLocalServer>
+#include <QLocalSocket>
+#include <QMessageBox>
+#include <QObject>
+#include <QStringList>
+#include <QTimer>
 
 namespace {
 
@@ -18,6 +28,23 @@ void writeStartupLog(const QString& message)
 {
     platform::writeWjyDiagnosticLog(message); // wjy: Keep startup diagnostics behind one helper so logging can be changed centrally.
 }
+
+// =====wjy====
+constexpr const char* kSingleInstanceKey = "FSRemote_SingleInstance_v1";
+
+bool activateExistingInstance()
+{
+    QLocalSocket socket;
+    socket.connectToServer(QString::fromLatin1(kSingleInstanceKey));
+    if (!socket.waitForConnected(300)) {
+        return false;
+    }
+    socket.write("raise");
+    socket.flush();
+    socket.waitForBytesWritten(300);
+    return true;
+}
+// ===end====
 
 } // namespace
 
@@ -29,6 +56,19 @@ int main(int argc, char* argv[])
     QApplication::setApplicationName(QStringLiteral("FSRemote"));
     QApplication::setOrganizationName(QStringLiteral("FSRemote"));
     writeStartupLog(QStringLiteral("[wjy-main] app metadata set"));
+
+    // =====wjy====
+    // wjy: 禁止重复启动；二次启动只唤醒已有主窗口。
+    if (activateExistingInstance()) {
+        writeStartupLog(QStringLiteral("[wjy-main] another instance is running, activate and exit"));
+        return 0;
+    }
+    QLocalServer::removeServer(QString::fromLatin1(kSingleInstanceKey));
+    QLocalServer singleInstanceServer;
+    if (!singleInstanceServer.listen(QString::fromLatin1(kSingleInstanceKey))) {
+        writeStartupLog(QStringLiteral("[wjy-main] single-instance server listen failed"));
+    }
+    // ===end====
 
     QFont font(QStringLiteral("Microsoft YaHei UI"));
     font.setPixelSize(13);
@@ -57,11 +97,14 @@ int main(int argc, char* argv[])
 
     // =====wjy====
     platform::DeviceStatusServer statusServer([hostHandle] {
+        platform::DeviceStatusServer::HostSessionSnapshot snapshot;
         if (!hostHandle) {
-            return 0;
+            return snapshot;
         }
-        // wjy: 返回真实活动会话数，状态协议与设备行远控数字徽标共用同一来源。
-        return static_cast<int>(stream::StreamRuntime::instance().activeSessionCount(hostHandle));
+        // wjy: 会话数 + 控制端设备名一并上报，驱动徽标与悬停气泡。
+        snapshot.sessionCount = static_cast<int>(stream::StreamRuntime::instance().activeSessionCount(hostHandle));
+        snapshot.controllerNames = stream::StreamRuntime::instance().activeControllerNames(hostHandle);
+        return snapshot;
     });
     // ===end====
     writeStartupLog(QStringLiteral("[wjy-main] status server object created"));
@@ -81,15 +124,76 @@ int main(int argc, char* argv[])
     commandServer.start(49102); // wjy: Port 49102 handles shutdown, restart, and wake proxy commands.
     writeStartupLog(QStringLiteral("[wjy-main] after command server start"));
 
+    // =====wjy====
+    // wjy: 确保开机自启项存在，并统一写入带 --minimized 的命令行。
+    if (!platform::StartupManager::isEnabled()) {
+        platform::StartupManager::setEnabled(true);
+    } else {
+        platform::StartupManager::setEnabled(true);
+    }
+
     writeStartupLog(QStringLiteral("[wjy-main] before MainWindow create"));
     ui::MainWindow window;
+
+    // =====wjy====
+    QObject::connect(&platform::UpdateService::instance(), &platform::UpdateService::updateReadyToQuit,
+        &app, [&app, &window] {
+            if (auto* deviceGrid = qobject_cast<ui::DeviceGrid*>(window.centralWidget())) {
+                deviceGrid->prepareForApplicationExit(); // wjy: 更新器等待前先取消后台任务并同步关闭所有远控窗口，让进程退出时间变得有界。
+            }
+            QTimer::singleShot(0, &app, &QCoreApplication::quit); // wjy: 延迟到事件循环执行退出，让启动阶段发现更新时也能进入既有的服务有序关闭流程。
+        });
+    // ===end====
     writeStartupLog(QStringLiteral("[wjy-main] after MainWindow create"));
 
-    window.show();
-    writeStartupLog(QStringLiteral("[wjy-main] window shown before app.exec"));
+    // =====wjy====
+    QObject::connect(&singleInstanceServer, &QLocalServer::newConnection, &window, [&] {
+        while (singleInstanceServer.hasPendingConnections()) {
+            QLocalSocket* client = singleInstanceServer.nextPendingConnection();
+            if (!client) continue;
+            QObject::connect(client, &QLocalSocket::readyRead, &window, [client, &window] {
+                client->readAll();
+                window.showFromTray(); // wjy: 二次启动请求唤醒已有窗口。
+                client->disconnectFromServer();
+                client->deleteLater();
+            });
+            QObject::connect(client, &QLocalSocket::disconnected, client, &QObject::deleteLater);
+        }
+    });
+
+    // wjy: 启动先轻量检查共享目录更新，再决定是否直接进托盘。
+    platform::UpdateService::instance().checkNow(&window, false);
+    platform::UpdateService::instance().startPeriodicCheck(&window);
+
+    const QStringList args = QCoreApplication::arguments();
+    // =====wjy====
+    const int updatedToIndex = args.indexOf(QStringLiteral("--updated-to"));
+    const int rollbackIndex = args.indexOf(QStringLiteral("--update-rollback"));
+    if (updatedToIndex >= 0 && updatedToIndex + 1 < args.size()) {
+        QTimer::singleShot(0, &window, [&window, version = args.at(updatedToIndex + 1)] {
+            QMessageBox::information(&window, QString(), QString::fromUtf8("已成功更新到 v%1。").arg(version)); // wjy: 自动重启后向用户确认新版本已实际安装完成。
+        });
+    } else if (rollbackIndex >= 0) {
+        QTimer::singleShot(0, &window, [&window] {
+            QMessageBox::warning(&window, QString(), QString::fromUtf8("更新安装失败，已恢复并重新启动原版本。")); // wjy: 回滚重启后明确反馈，避免用户误以为已升级。
+        });
+    }
+    // ===end====
+    // wjy: 仅开机自启带 --minimized 时进托盘；手动双击启动仍显示主窗口。
+    if (args.contains(QStringLiteral("--minimized"), Qt::CaseInsensitive)) {
+        window.hideToTray();
+        writeStartupLog(QStringLiteral("[wjy-main] started minimized to tray"));
+    } else {
+        window.show();
+        writeStartupLog(QStringLiteral("[wjy-main] window shown before app.exec"));
+    }
+    // ===end====
 
     const int result = app.exec();
     writeStartupLog(QStringLiteral("[wjy-main] app.exec returned"));
+    platform::UpdateService::instance().stopPeriodicCheck();
+    singleInstanceServer.close();
+    QLocalServer::removeServer(QString::fromLatin1(kSingleInstanceKey));
 
     platform::PowerManager::setPreventSleepEnabled(false);
     writeStartupLog(QStringLiteral("[wjy-main] prevent sleep disabled"));

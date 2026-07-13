@@ -242,6 +242,50 @@ void AppSettings::setRemoteShortcutCloseAll(const QKeySequence& shortcut)
 {
     setShortcutToSettings(QStringLiteral("remoteShortcutCloseAll"), shortcut, QKeySequence(QStringLiteral("Ctrl+F4"))); // wjy: 保存设置页录入的关闭全部窗口快捷键。
 }
+
+// =====wjy====
+QKeySequence AppSettings::remoteShortcutClipboardSync()
+{
+    return shortcutFromSettings(QStringLiteral("remoteShortcutClipboardSync"), QKeySequence(QStringLiteral("Ctrl+B"))); // wjy: 默认 Ctrl+B 切换远控剪切板同步。
+}
+
+void AppSettings::setRemoteShortcutClipboardSync(const QKeySequence& shortcut)
+{
+    setShortcutToSettings(QStringLiteral("remoteShortcutClipboardSync"), shortcut, QKeySequence(QStringLiteral("Ctrl+B")));
+}
+
+bool AppSettings::remoteClipboardSyncEnabled()
+{
+    return settings().value(QStringLiteral("remoteClipboardSyncEnabled"), true).toBool(); // wjy: 默认开启剪切板同步。
+}
+
+void AppSettings::setRemoteClipboardSyncEnabled(bool enabled)
+{
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("remoteClipboardSyncEnabled"), enabled);
+}
+
+bool AppSettings::autoUpdateCheckEnabled()
+{
+    return settings().value(QStringLiteral("autoUpdateCheckEnabled"), true).toBool(); // wjy: 默认允许目标设备检查共享目录更新。
+}
+
+void AppSettings::setAutoUpdateCheckEnabled(bool enabled)
+{
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("autoUpdateCheckEnabled"), enabled);
+}
+
+bool AppSettings::startMinimizedToTray()
+{
+    return settings().value(QStringLiteral("startMinimizedToTray"), true).toBool(); // wjy: 开机自启默认最小化到托盘。
+}
+
+void AppSettings::setStartMinimizedToTray(bool enabled)
+{
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("startMinimizedToTray"), enabled);
+}
 // ===end====
 
 bool AppSettings::hasRemoteDesktopWindowGeometry(const QString& deviceKey)

@@ -12,7 +12,11 @@ constexpr const char* kValueName = "FSRemote";
 
 QString startupCommand()
 {
-    return QStringLiteral("\"%1\"").arg(QDir::toNativeSeparators(QCoreApplication::applicationFilePath()));
+    // =====wjy====
+    // wjy: 开机自启默认带 --minimized，进入托盘而不是直接弹主窗口。
+    return QStringLiteral("\"%1\" --minimized")
+        .arg(QDir::toNativeSeparators(QCoreApplication::applicationFilePath()));
+    // ===end====
 }
 
 QSettings runSettings()
@@ -25,7 +29,12 @@ QSettings runSettings()
 bool StartupManager::isEnabled()
 {
     QSettings settings = runSettings();
-    return settings.value(QString::fromLatin1(kValueName)).toString() == startupCommand();
+    const QString value = settings.value(QString::fromLatin1(kValueName)).toString();
+    // =====wjy====
+    // wjy: 兼容旧版未带 --minimized 的自启项，只要指向当前 exe 即视为已启用。
+    const QString exePath = QDir::toNativeSeparators(QCoreApplication::applicationFilePath());
+    return value == startupCommand() || value.contains(exePath, Qt::CaseInsensitive);
+    // ===end====
 }
 
 bool StartupManager::setEnabled(bool enabled)

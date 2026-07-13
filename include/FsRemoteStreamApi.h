@@ -112,6 +112,11 @@ int FSREMOTE_STREAM_CALL fsremote_stream_send_input(FsRemoteStreamHandle handle,
 int FSREMOTE_STREAM_CALL fsremote_stream_is_busy(FsRemoteStreamHandle handle);
 // =====wjy====
 uint32_t FSREMOTE_STREAM_CALL fsremote_stream_active_session_count(FsRemoteStreamHandle handle); // wjy: 返回主机当前已登记会话数，供状态服务上报远控人数徽标。
+// wjy: 复制当前控制端设备名（UTF-8，逗号分隔）到 output；返回需要的字节数（不含结尾 0）。output 为空或容量不足时只返回长度。
+uint32_t FSREMOTE_STREAM_CALL fsremote_stream_active_controller_names(
+    FsRemoteStreamHandle handle,
+    char* output,
+    uint32_t output_capacity);
 // ===end====
 const char* FSREMOTE_STREAM_CALL fsremote_stream_last_error(void);
 

@@ -49,6 +49,12 @@ public:
     void shutdownForApplicationExit();
     bool isWaitingShortcutRelease() const;
     void updateShortcutReleaseGuard();
+    // =====wjy====
+    void setClipboardSyncEnabled(bool enabled);
+    bool isClipboardSyncEnabled() const;
+    void pushLocalClipboardIfNeeded();
+    void applyRemoteClipboardPayload(const QString& encodedBase64);
+    // ===end====
 
 signals:
     void activated(RemoteDesktopWindow* window);
@@ -56,6 +62,9 @@ signals:
     void shortcutTileRequested();
     void shortcutCloseTopmostRequested();
     void shortcutCloseAllRequested();
+    // =====wjy====
+    void shortcutClipboardSyncRequested();
+    // ===end====
 
 protected:
     bool event(QEvent* event) override;
@@ -79,12 +88,17 @@ private:
     // wjy: 远控标题栏已删除“虚拟屏”标签和“+”入口，因此不再保留标签命中类型。
     // ===end====
 
+    // =====wjy====
+    int titleBarHeight() const; // wjy: 远控标题栏高度与主窗口 28px 对齐。
+    QRect clipboardSyncRect() const;
+    // ===end====
     QRect minimizeRect() const;
     QRect maximizeRect() const;
     QRect closeRect() const;
     // =====wjy====
     bool isTitleBarBlankArea(const QPoint& position) const; // wjy: 统一判断标题栏可拖动/可双击区域，排除右侧窗口控制按钮。
     void toggleMaximizedState(); // wjy: 最大化图标点击和标题栏双击共用这一段窗口状态切换逻辑。
+    void toggleClipboardSync();
     // ===end====
     QRect remoteImageRect() const;
     QSize remoteFrameSize() const;
@@ -152,6 +166,12 @@ private:
     bool m_waitingShortcutRelease = false;
     QVector<int> m_shortcutReleaseVirtualKeys;
     QSet<int> m_pressedKeys;
+    // =====wjy====
+    bool m_clipboardSyncEnabled = true; // wjy: 标题栏按钮与 Ctrl+B 共同切换，默认开启。
+    QString m_lastLocalClipboardText;
+    QString m_lastAppliedRemoteClipboardText;
+    QTimer* m_clipboardPollTimer = nullptr;
+    // ===end====
     D3D11FramePresenter* m_texturePresenter = nullptr;
 };
 

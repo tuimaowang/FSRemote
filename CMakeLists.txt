@@ -7,6 +7,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
+# =====wjy====
+if(WIN32)
+    add_executable(FSRemoteUpdater src/updater/main.cpp) # wjy: 独立原生更新器不链接 Qt，在主程序退出后替换被占用的 EXE 与 DLL。
+    target_compile_definitions(FSRemoteUpdater PRIVATE UNICODE _UNICODE) # wjy: 全程使用宽字符 Win32 API，可靠处理中文安装与暂存路径。
+    if(MSVC)
+        target_compile_options(FSRemoteUpdater PRIVATE /utf-8) # wjy: 源文件中的中文维护注释按 UTF-8 编译。
+        set_property(TARGET FSRemoteUpdater PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>") # wjy: 静态链接 MSVC 运行库，更新器不会占用待更新的运行库 DLL。
+    endif()
+endif()
+# ===end====
+
 option(FSREMOTE_BUILD_UU_STREAM_WEBRTC "Build the vendored UU native WebRTC streaming tools" ON)
 
 if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
@@ -93,6 +104,30 @@ endif()
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets Svg Network)
 
+# =====wjy====
+option(FSREMOTE_BUILD_UPDATE_TESTS "Build reliable updater behavior tests" ON)
+if(FSREMOTE_BUILD_UPDATE_TESTS)
+    enable_testing()
+    add_executable(fsremote_update_service_tests
+        tests/update_service_tests.cpp
+        src/system/UpdateService.cpp
+        src/system/UpdateService.h
+        src/system/AppSettings.cpp
+        src/system/AppSettings.h
+    ) # wjy: 直接编译生产更新服务，验证真实语义版本逻辑而不是测试替身。
+    target_include_directories(fsremote_update_service_tests PRIVATE src)
+    target_link_libraries(fsremote_update_service_tests PRIVATE Qt6::Widgets)
+    if(MSVC)
+        target_compile_options(fsremote_update_service_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME fsremote_update_service_tests COMMAND fsremote_update_service_tests)
+    if(TARGET FSRemoteUpdater)
+        add_test(NAME fsremote_updater_rejects_missing_task COMMAND FSRemoteUpdater --task "missing-update-task.json")
+        set_tests_properties(fsremote_updater_rejects_missing_task PROPERTIES WILL_FAIL TRUE) # wjy: 缺失或无效任务必须在触碰安装目录前以失败退出。
+    endif()
+endif()
+# ===end====
+
 qt_add_executable(FSRemote WIN32
     src/main.cpp
     src/ui/MainWindow.cpp
@@ -127,6 +162,8 @@ qt_add_executable(FSRemote WIN32
     src/system/WolDetector.h
     src/system/WjyDiagnosticLog.cpp
     src/system/WjyDiagnosticLog.h
+    src/system/UpdateService.cpp
+    src/system/UpdateService.h
     resources/app.manifest
     resources/app.rc
     resources/resources.qrc
@@ -155,6 +192,16 @@ endif()
 set_target_properties(FSRemote PROPERTIES
     WIN32_EXECUTABLE TRUE
 )
+
+# =====wjy====
+if(TARGET FSRemoteUpdater)
+    add_dependencies(FSRemote FSRemoteUpdater) # wjy: 构建主程序前确保稳定更新器已经生成。
+    add_custom_command(TARGET FSRemote POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:FSRemoteUpdater>" "$<TARGET_FILE_DIR:FSRemote>/FSRemoteUpdater.exe"
+        VERBATIM
+    ) # wjy: 将无 Qt 更新器部署到主程序旁，供主程序复制到本地临时目录后启动。
+endif()
+# ===end====
 
 get_target_property(QT_QMAKE_EXECUTABLE Qt6::qmake IMPORTED_LOCATION)
 get_filename_component(QT_BIN_DIR "${QT_QMAKE_EXECUTABLE}" DIRECTORY)

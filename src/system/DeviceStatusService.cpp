@@ -231,9 +231,9 @@ QString decodedStatusText(const QByteArray& text)
 }
 // ===end====
 
-QByteArray statusPayload(int remoteSessionCount)
+QByteArray statusPayload(const DeviceStatusServer::HostSessionSnapshot& snapshot)
 {
-    const int sessionCount = qBound(0, remoteSessionCount, 10); // wjy: 状态协议人数夹在 0-10，与设备行徽标档位一致。
+    const int sessionCount = qBound(0, snapshot.sessionCount, 10); // wjy: 状态协议人数夹在 0-10，与设备行徽标档位一致。
     QByteArray payload = sessionCount > 0 ? QByteArrayLiteral("busy") : QByteArrayLiteral("online");
     const QString loginUser = PortableOpenSshManager::instance().loginUser();
     const DeviceInfo localInfo = DeviceInfoService::local();
@@ -269,6 +269,8 @@ QByteArray statusPayload(int remoteSessionCount)
     payload.append(QByteArray::number(scriptRuntime.startedAtEpochMs)); // wjy: 新字段全部追加在旧 MAC 字段之后，旧控制端会自然忽略，保持协议向后兼容。
     payload.append('|');
     payload.append(QByteArray::number(sessionCount)); // wjy: 第 16 字段为远控会话数；旧控制端忽略，新控制端驱动数字徽标。
+    payload.append('|');
+    payload.append(encodedStatusText(snapshot.controllerNames)); // wjy: 第 17 字段为控制端设备名列表，气泡展示。
     // ===end====
     payload.append('\n');
     return payload;
@@ -334,6 +336,9 @@ DeviceStatusInfo queryStatusInfo(const QString& hostIp, uint16_t port, int timeo
         } else if (info.state == DevicePresenceState::Busy) {
             info.remoteSessionCount = 1;
         }
+        if (parts.size() > 16) {
+            info.remoteControllerNames = decodedStatusText(parts.at(16)); // wjy: 控制端设备名列表（Base64）。
+        }
         // ===end====
     } else {
         // =====wjy====
@@ -359,8 +364,8 @@ DeviceStatusInfo queryStatusInfo(const QString& hostIp, uint16_t port, int timeo
 
 } // namespace
 
-DeviceStatusServer::DeviceStatusServer(std::function<int()> sessionCountProvider)
-    : m_sessionCountProvider(std::move(sessionCountProvider))
+DeviceStatusServer::DeviceStatusServer(std::function<HostSessionSnapshot()> sessionSnapshotProvider)
+    : m_sessionSnapshotProvider(std::move(sessionSnapshotProvider))
 {
 }
 
@@ -389,8 +394,11 @@ bool DeviceStatusServer::start(uint16_t port)
                 continue;
             }
 
-            const int sessionCount = m_sessionCountProvider ? m_sessionCountProvider() : 0;
-            socket->write(statusPayload(sessionCount));
+            DeviceStatusServer::HostSessionSnapshot snapshot;
+            if (m_sessionSnapshotProvider) {
+                snapshot = m_sessionSnapshotProvider();
+            }
+            socket->write(statusPayload(snapshot));
             socket->flush();
             QObject::connect(socket, &QAbstractSocket::disconnected, socket, &QObject::deleteLater);
             socket->disconnectFromHost();

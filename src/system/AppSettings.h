@@ -34,6 +34,16 @@ public:
     static void setRemoteShortcutCloseTopmost(const QKeySequence& shortcut);
     static QKeySequence remoteShortcutCloseAll();
     static void setRemoteShortcutCloseAll(const QKeySequence& shortcut);
+    // =====wjy====
+    static QKeySequence remoteShortcutClipboardSync();
+    static void setRemoteShortcutClipboardSync(const QKeySequence& shortcut);
+    static bool remoteClipboardSyncEnabled();
+    static void setRemoteClipboardSyncEnabled(bool enabled);
+    static bool autoUpdateCheckEnabled();
+    static void setAutoUpdateCheckEnabled(bool enabled);
+    static bool startMinimizedToTray();
+    static void setStartMinimizedToTray(bool enabled);
+    // ===end====
     static bool hasRemoteDesktopWindowGeometry(const QString& deviceKey);
     static QRect remoteDesktopWindowGeometry(const QString& deviceKey);
     static void setRemoteDesktopWindowGeometry(const QString& deviceKey, const QRect& geometry);

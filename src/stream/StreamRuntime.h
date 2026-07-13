@@ -62,6 +62,7 @@ public:
     bool isBusy(FsRemoteStreamHandle handle) const;
     // =====wjy====
     uint32_t activeSessionCount(FsRemoteStreamHandle handle) const; // wjy: 查询主机当前活动远控会话数，驱动设备行人数徽标。
+    QString activeControllerNames(FsRemoteStreamHandle handle) const; // wjy: 逗号分隔控制端设备名，供状态气泡展示。
     // ===end====
 
 private:
@@ -93,6 +94,7 @@ private:
     using IsBusyFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
     // =====wjy====
     using ActiveSessionCountFn = uint32_t(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
+    using ActiveControllerNamesFn = uint32_t(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, char*, uint32_t);
     // ===end====
     using LastErrorFn = const char*(FSREMOTE_STREAM_CALL*)();
 
@@ -109,6 +111,7 @@ private:
     IsBusyFn m_isBusy = nullptr;
     // =====wjy====
     ActiveSessionCountFn m_activeSessionCount = nullptr;
+    ActiveControllerNamesFn m_activeControllerNames = nullptr;
     // ===end====
     LastErrorFn m_lastError = nullptr;
 };

@@ -41,13 +41,18 @@ struct DeviceStatusInfo {
     RemoteScriptRuntimeInfo scriptRuntime; // wjy: 在现有设备在线状态响应中附带目标脚本运行信息，不额外增加服务端口。
     // =====wjy====
     int remoteSessionCount = 0; // wjy: 目标端当前远控会话数 0-10，驱动设备行数字徽标；旧协议缺失时保持 0。
+    QString remoteControllerNames; // wjy: 逗号分隔控制端设备名，悬停远控徽标时气泡展示。
     // ===end====
 };
 
 class DeviceStatusServer final {
 public:
     // =====wjy====
-    explicit DeviceStatusServer(std::function<int()> sessionCountProvider); // wjy: 返回当前远控会话数；>0 时状态前缀为 busy。
+    struct HostSessionSnapshot {
+        int sessionCount = 0;
+        QString controllerNames; // wjy: UTF-8 设备名，逗号分隔。
+    };
+    explicit DeviceStatusServer(std::function<HostSessionSnapshot()> sessionSnapshotProvider);
     // ===end====
     ~DeviceStatusServer();
 
@@ -56,7 +61,7 @@ public:
 
 private:
     // =====wjy====
-    std::function<int()> m_sessionCountProvider;
+    std::function<HostSessionSnapshot()> m_sessionSnapshotProvider;
     // ===end====
     QTcpServer* m_server = nullptr;
 };

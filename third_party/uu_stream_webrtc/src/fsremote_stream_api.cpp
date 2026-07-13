@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstdio>
 // =====wjy====
+#include <cctype>
 #include <functional>
 // ===end====
 #include <memory>
@@ -289,6 +290,7 @@ struct SessionAdmission {
     std::string session_id; // wjy: 每次 TCP 准入生成独立会话 ID，后续控制权和音频凭证都绑定它。
     std::string audio_token; // wjy: 单次短期音频令牌先随准入结果下发，音频中心阶段再强制消费。
     std::string client_id;
+    std::string client_device_name; // wjy: 控制端在 hello 中上报的设备名，用于状态气泡展示“谁在控制”。
     std::string public_key;
     std::string host_id; // wjy: 保存签名上下文中的受控设备身份，供 ViewerInstance 后续状态和诊断使用。
     std::string requested_role; // wjy: 保存本次经过验证的请求角色，避免 WebRTC 阶段重新猜测客户端意图。
@@ -593,6 +595,7 @@ bool perform_host_admission(
     admission->audio_token = issue_audio_token(admission->session_id); // wjy: AdmissionAccepted 协议要求令牌非空；只读会话也取得独立短期令牌，但因 capabilities 不含 audio，Viewer 不会连接音频端口。
     // ===end====
     admission->client_id = hello.fields.at("client_id");
+    admission->client_device_name = hello.fields.count("device_name") ? hello.fields.at("device_name") : std::string();
     admission->public_key = public_key;
     admission->host_id = host_id;
     admission->requested_role = requested_role;
@@ -1015,6 +1018,152 @@ void send_key(int vk, bool down)
     SendInput(1, &input, sizeof(input));
 }
 
+// =====wjy====
+std::string base64_encode_bytes(const uint8_t* data, size_t size)
+{
+    static constexpr char kTable[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((size + 2) / 3) * 4);
+    size_t index = 0;
+    while (index + 2 < size) {
+        const unsigned int n = (static_cast<unsigned int>(data[index]) << 16)
+            | (static_cast<unsigned int>(data[index + 1]) << 8)
+            | static_cast<unsigned int>(data[index + 2]);
+        out.push_back(kTable[(n >> 18) & 63]);
+        out.push_back(kTable[(n >> 12) & 63]);
+        out.push_back(kTable[(n >> 6) & 63]);
+        out.push_back(kTable[n & 63]);
+        index += 3;
+    }
+    if (index < size) {
+        unsigned int n = static_cast<unsigned int>(data[index]) << 16;
+        out.push_back(kTable[(n >> 18) & 63]);
+        if (index + 1 < size) {
+            n |= static_cast<unsigned int>(data[index + 1]) << 8;
+            out.push_back(kTable[(n >> 12) & 63]);
+            out.push_back(kTable[(n >> 6) & 63]);
+            out.push_back('=');
+        } else {
+            out.push_back(kTable[(n >> 12) & 63]);
+            out.push_back('=');
+            out.push_back('=');
+        }
+    }
+    return out;
+}
+
+int base64_value(char ch)
+{
+    if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+    if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+    if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+    if (ch == '+') return 62;
+    if (ch == '/') return 63;
+    return -1;
+}
+
+bool base64_decode_bytes(std::string_view text, std::vector<uint8_t>* output)
+{
+    if (!output) return false;
+    output->clear();
+    int values[4] = {};
+    int count = 0;
+    for (char ch : text) {
+        if (ch == '=' || std::isspace(static_cast<unsigned char>(ch))) {
+            if (ch == '=') break;
+            continue;
+        }
+        const int value = base64_value(ch);
+        if (value < 0) return false;
+        values[count++] = value;
+        if (count == 4) {
+            output->push_back(static_cast<uint8_t>((values[0] << 2) | (values[1] >> 4)));
+            output->push_back(static_cast<uint8_t>(((values[1] & 15) << 4) | (values[2] >> 2)));
+            output->push_back(static_cast<uint8_t>(((values[2] & 3) << 6) | values[3]));
+            count = 0;
+        }
+    }
+    if (count == 3) {
+        output->push_back(static_cast<uint8_t>((values[0] << 2) | (values[1] >> 4)));
+        output->push_back(static_cast<uint8_t>(((values[1] & 15) << 4) | (values[2] >> 2)));
+    } else if (count == 2) {
+        output->push_back(static_cast<uint8_t>((values[0] << 2) | (values[1] >> 4)));
+    } else if (count != 0) {
+        return false;
+    }
+    return true;
+}
+
+bool set_windows_clipboard_utf8(const std::string& utf8)
+{
+    const int wide_count = ::MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    if (wide_count <= 0) return false;
+    std::wstring wide(static_cast<size_t>(wide_count), L'\0');
+    if (::MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(), wide_count) <= 0) {
+        return false;
+    }
+    if (!::OpenClipboard(nullptr)) return false;
+    ::EmptyClipboard();
+    const size_t bytes = (wide.size() + 1) * sizeof(wchar_t);
+    HGLOBAL memory = ::GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!memory) {
+        ::CloseClipboard();
+        return false;
+    }
+    void* locked = ::GlobalLock(memory);
+    if (!locked) {
+        ::GlobalFree(memory);
+        ::CloseClipboard();
+        return false;
+    }
+    std::memcpy(locked, wide.c_str(), bytes);
+    ::GlobalUnlock(memory);
+    const bool ok = ::SetClipboardData(CF_UNICODETEXT, memory) != nullptr;
+    if (!ok) ::GlobalFree(memory);
+    ::CloseClipboard();
+    return ok;
+}
+
+bool read_windows_clipboard_utf8(std::string* utf8)
+{
+    if (!utf8 || !::OpenClipboard(nullptr)) return false;
+    HANDLE data = ::GetClipboardData(CF_UNICODETEXT);
+    if (!data) {
+        ::CloseClipboard();
+        return false;
+    }
+    const wchar_t* wide = static_cast<const wchar_t*>(::GlobalLock(data));
+    if (!wide) {
+        ::CloseClipboard();
+        return false;
+    }
+    const int utf8_count = ::WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+    if (utf8_count <= 1) {
+        ::GlobalUnlock(data);
+        ::CloseClipboard();
+        return false;
+    }
+    utf8->assign(static_cast<size_t>(utf8_count - 1), '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, wide, -1, utf8->data(), utf8_count, nullptr, nullptr);
+    ::GlobalUnlock(data);
+    ::CloseClipboard();
+    return true;
+}
+
+std::atomic_uint32_t g_clipboard_ignore_sequence = 0; // wjy: 写入远端剪贴板后忽略一次本机回读，防止环回广播。
+
+void apply_remote_clipboard_text(const std::string& encoded)
+{
+    std::vector<uint8_t> decoded;
+    if (!base64_decode_bytes(encoded, &decoded) || decoded.empty()) return;
+    if (decoded.size() > 512 * 1024) return; // wjy: 限制文本剪贴板大小，避免 data-channel 塞入过大内容。
+    const std::string utf8(reinterpret_cast<const char*>(decoded.data()), decoded.size());
+    if (!set_windows_clipboard_utf8(utf8)) return;
+    g_clipboard_ignore_sequence.store(::GetClipboardSequenceNumber());
+}
+// ===end====
+
 void inject_input_message(
     const std::string& session_id,
     const std::string& message,
@@ -1105,17 +1254,29 @@ void inject_input_message(
                 send_key(vk, false); // wjy: 非持有者的抬键被忽略，最后一个持有者才真正释放系统按键。
             }
         }
+        return;
     }
+    // =====wjy====
+    if (kind == "cb") {
+        // wjy: Viewer -> Host 文本剪贴板：cb <base64-utf8>
+        std::string encoded;
+        std::getline(input, encoded);
+        if (!encoded.empty() && encoded.front() == ' ') encoded.erase(encoded.begin());
+        apply_remote_clipboard_text(encoded);
+    }
+    // ===end====
 }
 
 class InputDispatcher final {
 public:
     using MouseModeCallback = std::function<void(bool relative, const char* reason)>;
+    using ClipboardCallback = std::function<void(const std::string& encodedText)>;
 
-    void registerSession(const std::string& session_id, MouseModeCallback callback)
+    void registerSession(const std::string& session_id, MouseModeCallback callback, ClipboardCallback clipboard_callback = {})
     {
         std::lock_guard lock(mutex_);
         mouse_mode_callbacks_[session_id] = std::move(callback); // wjy: 每个已授权会话登记弱引用通知，鼠标模式变化时所有控制窗口保持一致。
+        if (clipboard_callback) clipboard_callbacks_[session_id] = std::move(clipboard_callback);
     }
 
     void dispatch(const std::string& session_id, const std::string& message)
@@ -1136,6 +1297,38 @@ public:
         for (const auto& callback : mode_callbacks) callback(relative, "shared-dispatcher"); // wjy: 模式通知在互斥区外发送，避免 WebRTC 回调反向阻塞其他控制端输入。
     }
 
+    void pollHostClipboard()
+    {
+        std::vector<ClipboardCallback> callbacks;
+        std::string encoded;
+        {
+            std::lock_guard lock(mutex_);
+            if (clipboard_callbacks_.empty()) return;
+            const DWORD sequence = ::GetClipboardSequenceNumber();
+            if (sequence == 0 || sequence == last_clipboard_sequence_) return;
+            if (sequence == g_clipboard_ignore_sequence.load()) {
+                last_clipboard_sequence_ = sequence;
+                return; // wjy: 刚写入的远端剪贴板内容不回推，避免环路。
+            }
+            std::string utf8;
+            if (!read_windows_clipboard_utf8(&utf8) || utf8.empty()) {
+                last_clipboard_sequence_ = sequence;
+                return;
+            }
+            if (utf8.size() > 512 * 1024) {
+                last_clipboard_sequence_ = sequence;
+                return;
+            }
+            last_clipboard_sequence_ = sequence;
+            last_clipboard_payload_ = utf8;
+            encoded = base64_encode_bytes(reinterpret_cast<const uint8_t*>(utf8.data()), utf8.size());
+            for (const auto& [id, callback] : clipboard_callbacks_) {
+                if (callback) callbacks.push_back(callback);
+            }
+        }
+        for (const auto& callback : callbacks) callback(encoded);
+    }
+
     void releaseSession(const std::string& session_id)
     {
         std::lock_guard lock(mutex_);
@@ -1144,6 +1337,7 @@ public:
         for (const int button : released.buttons) send_button_up(button); // wjy: 断线只补发该会话最后持有的输入，其他控制端的按住状态继续有效。
         pointer_by_session_.erase(session_id);
         mouse_mode_callbacks_.erase(session_id);
+        clipboard_callbacks_.erase(session_id);
         if (mouse_mode_callbacks_.empty()) reset_mouse_relative_mode("last-controller-left", false, nullptr);
     }
 
@@ -1157,6 +1351,7 @@ public:
         }
         pointer_by_session_.clear();
         mouse_mode_callbacks_.clear();
+        clipboard_callbacks_.clear();
         reset_mouse_relative_mode("host-shutdown", false, nullptr); // wjy: Host 资源销毁前兜底清空所有会话输入与相对鼠标状态。
     }
 
@@ -1172,6 +1367,9 @@ private:
     uu::SharedInputState held_input_;
     std::unordered_map<std::string, SessionPointerState> pointer_by_session_;
     std::unordered_map<std::string, MouseModeCallback> mouse_mode_callbacks_;
+    std::unordered_map<std::string, ClipboardCallback> clipboard_callbacks_;
+    DWORD last_clipboard_sequence_ = 0;
+    std::string last_clipboard_payload_;
 };
 // ===end====
 
@@ -1199,6 +1397,7 @@ public:
     virtual bool isBusy() const { return false; }
     // =====wjy====
     virtual uint32_t activeSessionCount() const { return 0; } // wjy: Viewer 无会话表；Host 覆盖为当前登记会话数。
+    virtual std::string activeControllerNamesCsv() const { return {}; } // wjy: 逗号分隔的控制端设备名列表。
     // ===end====
 
 protected:
@@ -1249,6 +1448,9 @@ public:
         std::string error;
         if (!runtime_.initialize(&error)) throw std::runtime_error(error.empty() ? "host WebRTC runtime initialization failed" : error); // wjy: runtime 在 HostInstance 创建线程初始化，关闭时回到同一线程清理。
         worker_ = std::thread([this, port] { runAcceptLoop(port); }); // wjy: manager 线程只负责共享运行时、持久监听和会话登记/回收。
+        // =====wjy====
+        clipboard_worker_ = std::thread([this] { runClipboardPollLoop(); }); // wjy: 独立轮询本机剪贴板，不依赖信令 recv 是否阻塞。
+        // ===end====
     }
 
     ~HostInstance() override
@@ -1273,6 +1475,33 @@ public:
             }
         }
         return count;
+    }
+
+    std::string activeControllerNamesCsv() const override
+    {
+        std::lock_guard lock(sessions_mutex_);
+        std::string names;
+        for (const auto& [id, session] : sessions_) {
+            if (!session || session->completed) continue;
+            // wjy: 气泡优先展示“有控制权”的端；没有设备名时回退 client_id 前 8 位。
+            if (session->admission.ownership != "control_granted"
+                && session->admission.requested_role != "control") {
+                // still include any active session that holds video so multi-viewer is visible
+            }
+            std::string name = session->admission.client_device_name;
+            if (name.empty()) {
+                name = session->admission.client_id.empty()
+                    ? std::string("unknown")
+                    : session->admission.client_id.substr(0, std::min<size_t>(8, session->admission.client_id.size()));
+            }
+            // strip commas so CSV stays parseable
+            for (char& ch : name) {
+                if (ch == ',' || ch == '|' || ch == '\n' || ch == '\r') ch = ' ';
+            }
+            if (!names.empty()) names.push_back(',');
+            names += name;
+        }
+        return names;
     }
     // ===end====
 
@@ -1387,12 +1616,25 @@ private:
             if (const auto locked = weak.lock()) locked->send(kind + "\n" + body); // wjy: 回调只持弱引用，会话销毁后不会访问悬空 socket。
         });
         if (has_control) {
-            input_dispatcher_.registerSession(context->admission.session_id, [weak = std::weak_ptr<HostClientSession>(context)](bool relative, const char* reason) {
-                if (const auto locked = weak.lock(); locked && !locked->cancelled) {
-                    std::lock_guard webrtc_lock(locked->webrtc_mutex);
-                    publish_mouse_mode(locked->webrtc.get(), relative, reason); // wjy: 任一控制端触发鼠标模式切换后安全广播给全部仍存活的协同控制窗口。
-                }
-            });
+            // =====wjy====
+            input_dispatcher_.registerSession(
+                context->admission.session_id,
+                [weak = std::weak_ptr<HostClientSession>(context)](bool relative, const char* reason) {
+                    if (const auto locked = weak.lock(); locked && !locked->cancelled) {
+                        std::lock_guard webrtc_lock(locked->webrtc_mutex);
+                        publish_mouse_mode(locked->webrtc.get(), relative, reason); // wjy: 任一控制端触发鼠标模式切换后安全广播给全部仍存活的协同控制窗口。
+                    }
+                },
+                [weak = std::weak_ptr<HostClientSession>(context)](const std::string& encoded) {
+                    // wjy: Host 剪贴板变化后推送到 Viewer：cb <base64>
+                    if (const auto locked = weak.lock(); locked && !locked->cancelled) {
+                        std::lock_guard webrtc_lock(locked->webrtc_mutex);
+                        if (locked->webrtc) {
+                            locked->webrtc->send_control_message(std::string("cb ") + encoded);
+                        }
+                    }
+                });
+            // ===end====
             context->webrtc->set_control_callback([this, weak = std::weak_ptr<HostClientSession>(context)](const std::string& message) {
                 if (const auto locked = weak.lock(); locked && !locked->cancelled) {
                     input_dispatcher_.dispatch(locked->admission.session_id, message); // wjy: 每个授权会话都可提交输入，但实际 SendInput 统一经过主机级串行调度器。
@@ -1500,6 +1742,18 @@ private:
         append_log("host manager resources shutdown");
     }
 
+    // =====wjy====
+    void runClipboardPollLoop()
+    {
+        while (running_) {
+            input_dispatcher_.pollHostClipboard();
+            for (int i = 0; i < 7 && running_; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50)); // wjy: 约 350ms 一轮，关闭时尽快退出。
+            }
+        }
+    }
+    // ===end====
+
     void shutdown()
     {
         bool expected = true;
@@ -1509,6 +1763,9 @@ private:
         append_log("host shutdown listener closed");
         if (worker_.joinable()) worker_.join(); // wjy: 第二步先等待 accept manager 退出，杜绝它与关闭线程同时回收并 join 同一个 worker。
         append_log("host shutdown accept worker joined");
+        // =====wjy====
+        if (clipboard_worker_.joinable()) clipboard_worker_.join(); // wjy: 剪贴板轮询线程在 accept worker 之后 join，避免关闭竞态。
+        // ===end====
         runtime_.shutdown(); // wjy: 全部会话对象销毁后，由 HostInstance 创建线程配对关闭共享 WebRTC/SSL runtime。
         append_log("host shutdown completed");
     }
@@ -1517,6 +1774,9 @@ private:
     uu::NativeWebrtcRuntime runtime_; // wjy: 全部 HostClientSession 共用一个进程内 WebRTC runtime。
     uu::HostMediaPipeline media_pipeline_; // wjy: manager 独占 VDD/桌面捕获启停权，会话只能通过订阅令牌引用共享 source。
     InputDispatcher input_dispatcher_; // wjy: HostInstance 唯一持有输入调度器，三个会话共享同一确定性 SendInput 顺序。
+    // =====wjy====
+    std::thread clipboard_worker_;
+    // ===end====
     mutable std::mutex sessions_mutex_;
     std::unordered_map<std::string, std::shared_ptr<HostClientSession>> sessions_;
     std::mutex audio_mutex_;
@@ -1693,6 +1953,9 @@ private:
                 report_status(status_callback_, user_, 61, "MOUSE relative");
             } else if (message == "__fsremote_mouse_mode desktop") {
                 report_status(status_callback_, user_, 61, "MOUSE desktop");
+            } else if (message.rfind("cb ", 0) == 0) {
+                // wjy: Host -> Viewer 文本剪贴板：通过状态回调把 payload 交给 Qt 层写入本机剪贴板。
+                report_status(status_callback_, user_, 62, message.c_str());
             }
         });
         if (!session.initialize(&error)) {
@@ -1893,6 +2156,25 @@ uint32_t FSREMOTE_STREAM_CALL fsremote_stream_active_session_count(FsRemoteStrea
         return 0;
     }
     return static_cast<StreamInstance*>(handle)->activeSessionCount(); // wjy: 状态服务用真实会话数填充远控人数字段。
+}
+
+uint32_t FSREMOTE_STREAM_CALL fsremote_stream_active_controller_names(
+    FsRemoteStreamHandle handle,
+    char* output,
+    uint32_t output_capacity)
+{
+    if (!handle) {
+        return 0;
+    }
+    const std::string names = static_cast<StreamInstance*>(handle)->activeControllerNamesCsv();
+    const uint32_t required = static_cast<uint32_t>(names.size());
+    if (!output || output_capacity < required) {
+        return required;
+    }
+    if (required > 0) {
+        std::memcpy(output, names.data(), required);
+    }
+    return required;
 }
 // ===end====
 

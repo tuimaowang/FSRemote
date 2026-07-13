@@ -4,6 +4,8 @@
 #include "stream/StreamRuntime.h"
 #include "ui/D3D11FramePresenter.h"
 
+#include <QByteArray>
+#include <QClipboard>
 #include <QCloseEvent>
 #include <QCoreApplication>
 #include <QCursor>
@@ -543,6 +545,12 @@ void FSREMOTE_STREAM_CALL onViewerStatus(void* user, int code, const char* messa
             window->setRemoteMouseCaptureActive(text == QStringLiteral("MOUSE relative"));
             return;
         }
+        // =====wjy====
+        if (code == 62 && text.startsWith(QStringLiteral("cb "))) {
+            window->applyRemoteClipboardPayload(text.mid(3)); // wjy: Host 推送的文本剪贴板。
+            return;
+        }
+        // ===end====
         window->setConnectionStatus(code, text);
     }, Qt::QueuedConnection);
 }
@@ -574,7 +582,15 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
     setFocusPolicy(Qt::StrongFocus);
     updateWindowMask();
     // =====wjy====
-    // wjy: 标题栏不再显示虚拟屏标签，因此无需初始化虚拟屏标签编号状态。
+    m_clipboardSyncEnabled = platform::AppSettings::remoteClipboardSyncEnabled(); // wjy: 新窗口继承设置页默认剪切板同步开关。
+    m_clipboardPollTimer = new QTimer(this);
+    m_clipboardPollTimer->setInterval(350);
+    connect(m_clipboardPollTimer, &QTimer::timeout, this, [this] {
+        pushLocalClipboardIfNeeded(); // wjy: 轮询本机剪贴板，变化时经 data-channel 推到被控端。
+    });
+    if (m_clipboardSyncEnabled) {
+        m_clipboardPollTimer->start();
+    }
     // ===end====
     m_connectionStatus = zh("\xE5\x87\x86\xE5\xA4\x87\xE8\xBF\x9E\xE6\x8E\xA5");
 
@@ -589,7 +605,7 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
     m_texturePresenter->setMouseMoveCallback([this](const QPoint& parentPosition, Qt::MouseButtons buttons) {
         m_hoveredPos = parentPosition;
         if (!isFullScreen()) {
-            update(QRect(0, 0, width(), 40)); // wjy: 共享纹理模式的鼠标移动只在普通窗口刷新标题栏，全屏时避免重复重绘远端画面顶部。
+            update(QRect(0, 0, width(), titleBarHeight())); // wjy: 共享纹理模式的鼠标移动只在普通窗口刷新标题栏。
         }
         sendRemoteMouseMove(parentPosition, buttons);
     });
@@ -597,7 +613,7 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
     m_sessionTimer->setInterval(1000);
     connect(m_sessionTimer, &QTimer::timeout, this, [this] {
         if (!isFullScreen()) {
-            update(QRect(0, 0, width(), 40)); // wjy: 会话计时只显示在普通标题栏，全屏时不再触发顶部重绘。
+            update(QRect(0, 0, width(), titleBarHeight())); // wjy: 会话计时只显示在普通标题栏。
         }
     });
     m_sessionTimer->start();
@@ -646,36 +662,117 @@ bool RemoteDesktopWindow::isWaitingShortcutRelease() const
     return m_waitingShortcutRelease;
 }
 
+// =====wjy====
+int RemoteDesktopWindow::titleBarHeight() const
+{
+    return isFullScreen() ? 0 : 28; // wjy: 与主窗口 kTitleBarHeight=28 对齐，全屏时不占画面。
+}
+
+QRect RemoteDesktopWindow::clipboardSyncRect() const
+{
+    return QRect(width() - 160, 0, 28, titleBarHeight()); // wjy: 剪切板同步按钮固定在最小化左侧。
+}
+
 QRect RemoteDesktopWindow::minimizeRect() const
 {
-    return QRect(width() - 138, 0, 48, 40);
+    // wjy: 热区 32x28，绘制时按 SVG 原始比例居中，避免图标被压扁裁切。
+    return QRect(width() - 128, 0, 32, titleBarHeight());
 }
 
 QRect RemoteDesktopWindow::maximizeRect() const
 {
-    return QRect(width() - 90, 0, 43, 40);
+    return QRect(width() - 96, 0, 32, titleBarHeight());
 }
 
 QRect RemoteDesktopWindow::closeRect() const
 {
-    return QRect(width() - 47, 0, 47, 40);
+    return QRect(width() - 48, 0, 32, titleBarHeight());
 }
 
-// =====wjy====
 bool RemoteDesktopWindow::isTitleBarBlankArea(const QPoint& position) const
 {
-    return !isFullScreen() // wjy: 全屏时整窗都是远控画面，标题栏双击/拖动热区必须停用。
+    return !isFullScreen()
         && position.y() >= 0
-        && position.y() < 40 // wjy: 只接受自绘标题栏高度内的空白区域。
+        && position.y() < titleBarHeight()
+        && !clipboardSyncRect().contains(position)
         && !minimizeRect().contains(position)
         && !maximizeRect().contains(position)
-        && !closeRect().contains(position); // wjy: 右侧三个窗口按钮保留各自点击行为，不被标题栏双击逻辑抢走。
+        && !closeRect().contains(position);
 }
 
 void RemoteDesktopWindow::toggleMaximizedState()
 {
-    isMaximized() ? showNormal() : showMaximized(); // wjy: 这里保留原右侧最大化图标的切换规则，供图标点击和标题栏双击复用。
-    saveWindowGeometry(); // wjy: 与原最大化按钮点击保持一致，切换后立即记录窗口几何状态。
+    isMaximized() ? showNormal() : showMaximized();
+    saveWindowGeometry();
+}
+
+void RemoteDesktopWindow::setClipboardSyncEnabled(bool enabled)
+{
+    if (m_clipboardSyncEnabled == enabled) {
+        return;
+    }
+    m_clipboardSyncEnabled = enabled;
+    if (m_clipboardPollTimer) {
+        if (enabled) {
+            m_clipboardPollTimer->start();
+            pushLocalClipboardIfNeeded();
+        } else {
+            m_clipboardPollTimer->stop();
+        }
+    }
+    update(QRect(0, 0, width(), titleBarHeight()));
+}
+
+bool RemoteDesktopWindow::isClipboardSyncEnabled() const
+{
+    return m_clipboardSyncEnabled;
+}
+
+void RemoteDesktopWindow::toggleClipboardSync()
+{
+    setClipboardSyncEnabled(!m_clipboardSyncEnabled);
+    platform::AppSettings::setRemoteClipboardSyncEnabled(m_clipboardSyncEnabled);
+}
+
+void RemoteDesktopWindow::pushLocalClipboardIfNeeded()
+{
+    if (!m_clipboardSyncEnabled || !m_viewerHandle || m_closeInProgress) {
+        return;
+    }
+    QClipboard* clipboard = QGuiApplication::clipboard();
+    if (!clipboard) {
+        return;
+    }
+    const QString text = clipboard->text();
+    if (text.isEmpty() || text == m_lastLocalClipboardText || text == m_lastAppliedRemoteClipboardText) {
+        return; // wjy: 空内容、未变化或刚从远端写入的内容不回推，避免环路。
+    }
+    if (text.size() > 512 * 1024) {
+        return;
+    }
+    m_lastLocalClipboardText = text;
+    const QByteArray encoded = text.toUtf8().toBase64();
+    sendInputMessage(QByteArray("cb ") + encoded); // wjy: Viewer -> Host 文本剪贴板同步。
+}
+
+void RemoteDesktopWindow::applyRemoteClipboardPayload(const QString& encodedBase64)
+{
+    if (!m_clipboardSyncEnabled) {
+        return;
+    }
+    const QByteArray decoded = QByteArray::fromBase64(encodedBase64.toLatin1());
+    if (decoded.isEmpty()) {
+        return;
+    }
+    const QString text = QString::fromUtf8(decoded);
+    if (text.isEmpty() || text == m_lastAppliedRemoteClipboardText) {
+        return;
+    }
+    m_lastAppliedRemoteClipboardText = text;
+    m_lastLocalClipboardText = text;
+    if (QClipboard* clipboard = QGuiApplication::clipboard()) {
+        clipboard->setText(text); // wjy: Host -> Viewer 文本剪贴板落地。
+    }
 }
 // ===end====
 
@@ -685,8 +782,8 @@ QRect RemoteDesktopWindow::remoteImageRect() const
     if (!remoteSize.isValid()) {
         return {};
     }
-    const int titleBarHeight = isFullScreen() ? 0 : 40; // wjy: Ctrl+D 全屏时不再为自绘标题栏预留 40 像素画面空间。
-    const QRect contentRect(0, titleBarHeight, width(), qMax(0, height() - titleBarHeight));
+    const int barHeight = titleBarHeight();
+    const QRect contentRect(0, barHeight, width(), qMax(0, height() - barHeight));
     const QSize scaled = remoteSize.scaled(contentRect.size(), Qt::KeepAspectRatio);
     return QRect(
         contentRect.x() + (contentRect.width() - scaled.width()) / 2,
@@ -1089,7 +1186,7 @@ bool RemoteDesktopWindow::enqueueRemoteTextureFrame(int width, int height, void*
         m_connectionStatus = QString::fromUtf8("画面已接收");
         m_texturePresenter->show();
         m_texturePresenter->raise();
-        update(QRect(0, 0, this->width(), 40));
+        update(QRect(0, 0, this->width(), titleBarHeight()));
     }, Qt::QueuedConnection);
     return true;
 }
@@ -1123,7 +1220,7 @@ void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
     m_remoteFrame = image;
     m_connectionStatusCode = 50;
     m_connectionStatus = QString::fromUtf8("画面已接收");
-    update(isFullScreen() ? rect() : QRect(0, 40, width(), height() - 40)); // wjy: 全屏帧需要覆盖整窗，普通窗口仍只刷新标题栏下方的远控画面。
+    update(isFullScreen() ? rect() : QRect(0, titleBarHeight(), width(), height() - titleBarHeight())); // wjy: 普通窗口只刷新标题栏下方远控画面。
     // appendViewerDebugLog(QStringLiteral("setRemoteFrame update requested")); // wjy: per-frame repaint log disabled to avoid disk IO on every frame.
 }
 
@@ -1260,6 +1357,13 @@ bool RemoteDesktopWindow::handleLocalShortcutKey(int virtualKey, Qt::KeyboardMod
         emit shortcutCloseTopmostRequested();
         return true;
     }
+    // =====wjy====
+    if (matchesShortcut(current, platform::AppSettings::remoteShortcutClipboardSync())) {
+        beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutClipboardSync());
+        emit shortcutClipboardSyncRequested();
+        return true;
+    }
+    // ===end====
 #else
     Q_UNUSED(virtualKey)
     Q_UNUSED(modifiers)
@@ -1320,7 +1424,7 @@ void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
         m_connectionStatus = message.isEmpty() ? zh("\xE6\xAD\xA3\xE5\x9C\xA8\xE8\xBF\x9E\xE6\x8E\xA5") : message;
         break;
     }
-    update(isFullScreen() ? rect() : QRect(0, 40, width(), height() - 40)); // wjy: 连接状态在全屏时也应覆盖整张远控画面，而不是保留顶部 40 像素。
+    update(isFullScreen() ? rect() : QRect(0, titleBarHeight(), width(), height() - titleBarHeight())); // wjy: 连接状态在全屏覆盖整窗。
 }
 
 void RemoteDesktopWindow::setEncodedBitrateMbps(double mbps)
@@ -1381,8 +1485,8 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
         }
         // ===end====
     } else {
-        const int titleBarHeight = fullScreen ? 0 : 40;
-        const QRect contentRect(0, titleBarHeight, width(), qMax(0, height() - titleBarHeight));
+        const int barHeight = fullScreen ? 0 : titleBarHeight();
+        const QRect contentRect(0, barHeight, width(), qMax(0, height() - barHeight));
         QFont titleFont(QStringLiteral("Microsoft YaHei UI"));
         titleFont.setPixelSize(18);
         titleFont.setWeight(QFont::DemiBold);
@@ -1407,40 +1511,42 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     if (fullScreen) {
         return; // wjy: Ctrl+D 进入全屏后只保留远控画面/连接提示，不绘制标题栏、边框和窗口控制按钮。
     }
+    const int barH = titleBarHeight();
     // ===end====
 
-    painter.fillRect(QRectF(0, 0, width(), 40), QColor(QStringLiteral("#E9EEF2")));
+    painter.fillRect(QRectF(0, 0, width(), barH), QColor(QStringLiteral("#E9EEF2")));
 
     painter.setPen(QPen(QColor(QStringLiteral("#AEB7C2")), 1));
     painter.setBrush(Qt::NoBrush);
     painter.drawRoundedRect(QRectF(0.5, 0.5, width() - 1, height() - 1), 6, 6);
 
-    painter.drawPixmap(QRect(16, 10, 20, 20), icon(QStringLiteral("fs_session_logo.svg")));
+    // =====wjy====
+    // wjy: logo/文字/按钮都按 28px 标题栏垂直居中，贴近主窗口标题栏视觉。
+    const int logoY = (barH - 16) / 2;
+    painter.drawPixmap(QRect(12, logoY, 16, 16), icon(QStringLiteral("fs_session_logo.svg")));
     QFont textFont(QStringLiteral("Microsoft YaHei UI"));
     textFont.setPixelSize(12);
     painter.setFont(textFont);
     painter.setPen(QColor(QStringLiteral("#111820")));
     const int nameWidth = computerNameWidth(m_deviceName, textFont);
-    painter.drawText(QRectF(40, 0, nameWidth, 40), Qt::AlignVCenter | Qt::AlignLeft, m_deviceName);
+    painter.drawText(QRectF(34, 0, nameWidth, barH), Qt::AlignVCenter | Qt::AlignLeft, m_deviceName);
 
-    // =====wjy====
-    const int nameRight = 40 + nameWidth;
+    const int nameRight = 34 + nameWidth;
     const int ipX = nameRight + 10;
     constexpr int elapsedTextWidth = 70;
-    constexpr int elapsedGap = 18;
-    const int maxIpWidth = qMax(0, minimizeRect().left() - ipX - elapsedGap - elapsedTextWidth - 12); // wjy: IP 文本最多使用右侧窗口按钮前的剩余空间，窄窗口时自动缩短而不覆盖按钮。
+    constexpr int elapsedGap = 14;
+    const int maxIpWidth = qMax(0, clipboardSyncRect().left() - ipX - elapsedGap - elapsedTextWidth - 8);
     const QFontMetrics titleMetrics(textFont);
     const int ipWidth = qMin(titleMetrics.horizontalAdvance(m_hostIp), maxIpWidth);
     int elapsedX = ipX;
     if (ipWidth > 0) {
         painter.setPen(QColor(QStringLiteral("#667085")));
         painter.drawText(
-            QRectF(ipX, 0, ipWidth, 40),
+            QRectF(ipX, 0, ipWidth, barH),
             Qt::AlignVCenter | Qt::AlignLeft,
-            titleMetrics.elidedText(m_hostIp, Qt::ElideRight, ipWidth)); // wjy: 目标设备 IP 紧跟名称显示，空间不足时省略而不是挤压计时和窗口按钮。
+            titleMetrics.elidedText(m_hostIp, Qt::ElideRight, ipWidth));
         elapsedX = ipX + ipWidth + elapsedGap;
     }
-    // ===end====
 
     const qint64 elapsedSeconds = m_sessionClock.elapsed() / 1000;
     const qint64 hours = elapsedSeconds / 3600;
@@ -1449,18 +1555,42 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     painter.setFont(textFont);
     painter.setPen(QColor(QStringLiteral("#4B4B4C")));
     painter.drawText(
-        QRectF(elapsedX, 9, elapsedTextWidth, 22),
+        QRectF(elapsedX, 0, elapsedTextWidth, barH),
         Qt::AlignVCenter | Qt::AlignLeft,
         QStringLiteral("%1:%2:%3")
             .arg(hours, 2, 10, QLatin1Char('0'))
             .arg(minutes, 2, 10, QLatin1Char('0'))
             .arg(seconds, 2, 10, QLatin1Char('0')));
 
-    // =====wjy====
-    // wjy: “控制中心”文字和图标已从远控标题栏删除，右侧仅保留窗口控制按钮。
-    painter.drawPixmap(QRect(width() - 137, 0, 46, 40), icon(QStringLiteral("rd_minimize.svg")));
-    painter.drawPixmap(QRect(width() - 91, 0, 46, 40), icon(QStringLiteral("rd_maximize.svg")));
-    painter.drawPixmap(QRect(width() - 48, -4, 48, 48), icon(QStringLiteral("rd_close.svg")));
+    // wjy: 剪切板同步按钮在最小化左侧；开启用主蓝，关闭用灰色，中间画剪贴板简图。
+    const QRect clipRect = clipboardSyncRect();
+    const QColor clipAccent = m_clipboardSyncEnabled ? QColor(QStringLiteral("#3A7BFC")) : QColor(QStringLiteral("#9CA3AF"));
+    painter.setPen(QPen(clipAccent, 1.2));
+    painter.setBrush(m_clipboardSyncEnabled ? QColor(QStringLiteral("#EAF2FF")) : QColor(QStringLiteral("#F3F4F6")));
+    painter.drawRoundedRect(QRectF(clipRect).adjusted(4, 5, -4, -5), 4, 4);
+    painter.setPen(QPen(clipAccent, 1.2));
+    painter.setBrush(Qt::NoBrush);
+    painter.drawRoundedRect(QRectF(clipRect.center().x() - 4, clipRect.center().y() - 5, 8, 10), 1.5, 1.5);
+    painter.drawLine(QPointF(clipRect.center().x() - 2, clipRect.center().y() - 2), QPointF(clipRect.center().x() + 2, clipRect.center().y() - 2));
+
+    // wjy: 按钮图标按原始 SVG 比例缩放后居中绘制，不再把 46x40 硬塞进 28px 热区导致裁切。
+    const auto drawTitleButton = [&](const QRect& hitRect, const QString& iconName) {
+        const QPixmap raw = icon(iconName);
+        if (raw.isNull()) return;
+        const int maxH = qMax(12, barH - 8);
+        const int maxW = qMax(12, hitRect.width() - 4);
+        QSize target = raw.size();
+        target.scale(maxW, maxH, Qt::KeepAspectRatio);
+        const QRect drawRect(
+            hitRect.center().x() - target.width() / 2,
+            hitRect.center().y() - target.height() / 2,
+            target.width(),
+            target.height());
+        painter.drawPixmap(drawRect, raw);
+    };
+    drawTitleButton(minimizeRect(), QStringLiteral("rd_minimize.svg"));
+    drawTitleButton(maximizeRect(), QStringLiteral("rd_maximize.svg"));
+    drawTitleButton(closeRect(), QStringLiteral("rd_close.svg"));
     // ===end====
 }
 
@@ -1551,7 +1681,7 @@ void RemoteDesktopWindow::mouseMoveEvent(QMouseEvent* event)
 {
     m_hoveredPos = event->pos();
     if (!isFullScreen()) {
-        update(QRect(0, 0, width(), 40)); // wjy: 普通窗口才需要刷新标题栏；全屏远控鼠标移动不触发无意义的顶部重绘。
+        update(QRect(0, 0, width(), titleBarHeight())); // wjy: 普通窗口才需要刷新标题栏。
     }
 
     if (m_resizingWindow && (event->buttons() & Qt::LeftButton)) {
@@ -1618,6 +1748,11 @@ void RemoteDesktopWindow::mouseReleaseEvent(QMouseEvent* event)
 
         // =====wjy====
         if (!isFullScreen()) { // wjy: 全屏时顶部右侧也属于远端画面，释放鼠标不能误触发本地最小化、最大化或关闭。
+            if (clipboardSyncRect().contains(event->pos())) {
+                toggleClipboardSync(); // wjy: 标题栏按钮切换剪切板同步，与 Ctrl+B 共用同一状态。
+                event->accept();
+                return;
+            }
             if (minimizeRect().contains(event->pos())) {
                 showMinimized();
                 event->accept();
@@ -1702,6 +1837,12 @@ void RemoteDesktopWindow::keyPressEvent(QKeyEvent* event)
         event->accept();
         return;
     }
+    if (matchesShortcut(current, platform::AppSettings::remoteShortcutClipboardSync())) {
+        beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutClipboardSync());
+        emit shortcutClipboardSyncRequested();
+        event->accept();
+        return;
+    }
 // ===end====
 
     if (event->nativeVirtualKey() > 0) {
@@ -1760,7 +1901,7 @@ void RemoteDesktopWindow::leaveEvent(QEvent* event)
 {
     m_hoveredPos = QPoint(-1, -1);
     if (!isFullScreen()) {
-        update(QRect(0, 0, width(), 40)); // wjy: 普通窗口离开时清理标题栏悬停重绘，全屏无需处理该区域。
+        update(QRect(0, 0, width(), titleBarHeight())); // wjy: 普通窗口离开时清理标题栏悬停重绘。
     }
     QWidget::leaveEvent(event);
 }

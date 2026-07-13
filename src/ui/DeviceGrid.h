@@ -163,6 +163,7 @@ private:
     void batchShutdownDevices(const QVector<int>& deviceIndexes);
     void batchRestartDevices(const QVector<int>& deviceIndexes);
     void batchOpenDeviceTerminals(const QVector<int>& deviceIndexes);
+    bool ensureRemoteControlAuthorization(int deviceIndex, bool showMessages); // wjy: 远控窗口创建前确保当前控制端公钥已登记到目标设备。
 
     struct ScriptUiState {
         bool outputVisible = false;
@@ -258,7 +259,9 @@ private:
     bool m_localInfoSelected = false;
     bool m_settingsSelected = false;
     SettingsTab m_settingsTab = SettingsTab::General;
-    DeviceDetailTab m_deviceDetailTab = DeviceDetailTab::Config;
+    // =====wjy====
+    DeviceDetailTab m_deviceDetailTab = DeviceDetailTab::ScriptLog; // wjy: 设备详情页默认显示脚本界面。
+    // ===end====
     bool m_leftSidebarCollapsed = false;
     bool m_settingsLocalInfoExpanded = false;
     bool m_settingsAddDeviceExpanded = false;
@@ -292,21 +295,31 @@ private:
     QHash<QString, platform::DevicePresenceState> m_deviceStatuses;
     // =====wjy====
     QHash<QString, int> m_deviceRemoteSessionCounts; // wjy: 目标端远控会话数 0-10，设备行数字徽标的权威缓存。
+    QHash<QString, QString> m_deviceRemoteControllerNames; // wjy: 控制端设备名列表，悬停远控徽标气泡展示。
     // ===end====
     QTimer* m_detailAnimationTimer = nullptr;
     QTimer* m_desktopHoverTimer = nullptr;
     QTimer* m_refreshTimer = nullptr;
+    // =====wjy====
+    QTimer* m_settingsGearTimer = nullptr; // wjy: 设置齿轮点击后旋转半圈的动画定时器。
+    // ===end====
     QTimer* m_statusAutoRefreshTimer = nullptr;
     QTimer* m_wakeVisualTimer = nullptr;
     QTimer* m_scriptOutputFlushTimer = nullptr;
     QElapsedTimer m_detailAnimationClock;
     QElapsedTimer m_desktopHoverClock;
     QElapsedTimer m_refreshClock;
+    // =====wjy====
+    QElapsedTimer m_settingsGearClock;
+    // ===end====
     QElapsedTimer m_wakeVisualClock;
     qreal m_detailAnimationProgress = 1.0;
     qreal m_desktopHoverProgress = 0.0;
     qreal m_desktopHoverStartProgress = 0.0;
     qreal m_refreshRotation = 0.0;
+    // =====wjy====
+    qreal m_settingsGearRotation = 0.0; // wjy: 设置图标当前旋转角，点击后在 0→180 间插值。
+    // ===end====
     qreal m_wakeVisualRotation = 0.0;
     qint64 m_lastWakeProbeAtMs = 0;
     bool m_desktopHovered = false;
