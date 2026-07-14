@@ -132,8 +132,58 @@ PortableOpenSshManager& PortableOpenSshManager::instance()
 
 PortableOpenSshManager::~PortableOpenSshManager()
 {
+    stopClientProcesses(); // wjy: 静态单例析构再兜底一次，异常退出顺序下也不遗留交互式 ssh.exe。
     stopServer();
 }
+
+// =====wjy====
+bool PortableOpenSshManager::ensureClientProcessJob(QString* errorMessage)
+{
+#if !defined(_WIN32)
+    Q_UNUSED(errorMessage);
+    return true;
+#else
+    if (m_clientProcessJob) {
+        return true;
+    }
+
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (!job) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("无法创建终端进程组，错误码 %1").arg(GetLastError());
+        }
+        return false;
+    }
+
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; // wjy: FSRemote 关闭 Job 句柄时由系统终止其中 cmd.exe 以及继承 Job 的 ssh.exe。
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+        const DWORD error = GetLastError();
+        CloseHandle(job);
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("无法设置终端退出清理规则，错误码 %1").arg(error);
+        }
+        return false;
+    }
+
+    m_clientProcessJob = job;
+    return true;
+#endif
+}
+
+void PortableOpenSshManager::stopClientProcesses()
+{
+#if defined(_WIN32)
+    HANDLE job = reinterpret_cast<HANDLE>(m_clientProcessJob);
+    if (!job) {
+        return;
+    }
+    m_clientProcessJob = nullptr; // wjy: 先清空成员保证托盘退出、main 和析构重复调用时保持幂等。
+    TerminateJobObject(job, 0); // wjy: 主动结束 Job 内全部交互终端，随后关闭句柄完成系统资源释放。
+    CloseHandle(job);
+#endif
+}
+// ===end====
 
 bool PortableOpenSshManager::startServer(QString* errorMessage)
 {
@@ -232,6 +282,10 @@ bool PortableOpenSshManager::openTerminal(const QString& hostIp, const QString& 
         normalizedHost);
 
 #if defined(_WIN32)
+    if (!ensureClientProcessJob(errorMessage)) {
+        return false; // wjy: 无法纳入退出管理时不启动游离终端，避免用户退出 FSRemote 后残留 ssh.exe。
+    }
+
     STARTUPINFOW startupInfo{};
     startupInfo.cb = sizeof(startupInfo);
     startupInfo.dwFlags = STARTF_USESHOWWINDOW;
@@ -261,7 +315,7 @@ bool PortableOpenSshManager::openTerminal(const QString& hostIp, const QString& 
         nullptr,
         nullptr,
         FALSE,
-        CREATE_NEW_CONSOLE,
+        CREATE_NEW_CONSOLE | CREATE_SUSPENDED, // wjy: 先暂停 cmd.exe，加入 Job 后再运行，避免它提前创建未受管理的 ssh.exe 子进程。
         nullptr,
         workingDirectory.c_str(),
         &startupInfo,
@@ -269,6 +323,27 @@ bool PortableOpenSshManager::openTerminal(const QString& hostIp, const QString& 
     if (!created) {
         if (errorMessage) {
             *errorMessage = QStringLiteral("failed to start terminal process (%1)").arg(GetLastError());
+        }
+        return false;
+    }
+
+    if (!AssignProcessToJobObject(reinterpret_cast<HANDLE>(m_clientProcessJob), processInfo.hProcess)) {
+        const DWORD error = GetLastError();
+        TerminateProcess(processInfo.hProcess, 1);
+        CloseHandle(processInfo.hThread);
+        CloseHandle(processInfo.hProcess);
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("无法管理终端进程，错误码 %1").arg(error);
+        }
+        return false; // wjy: 绑定失败时直接终止仍处于暂停状态的 cmd，绝不留下无法随程序退出的终端。
+    }
+    if (ResumeThread(processInfo.hThread) == DWORD(-1)) {
+        const DWORD error = GetLastError();
+        TerminateProcess(processInfo.hProcess, 1);
+        CloseHandle(processInfo.hThread);
+        CloseHandle(processInfo.hProcess);
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("无法启动受管理的终端进程，错误码 %1").arg(error);
         }
         return false;
     }

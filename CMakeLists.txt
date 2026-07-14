@@ -105,6 +105,24 @@ endif()
 find_package(Qt6 REQUIRED COMPONENTS Widgets Svg Network)
 
 # =====wjy====
+option(FSREMOTE_BUILD_DEVICE_SYNC_TESTS "Build device list synchronization model tests" ON)
+if(FSREMOTE_BUILD_DEVICE_SYNC_TESTS)
+    enable_testing()
+    add_executable(fsremote_device_sync_tests
+        tests/device_list_sync_tests.cpp
+        src/system/DeviceListSyncModel.cpp
+        src/system/DeviceListSyncModel.h
+    ) # wjy: 纯 JSON 测试不访问真实共享目录，稳定覆盖三方合并、冲突、墓碑和旧格式迁移。
+    target_include_directories(fsremote_device_sync_tests PRIVATE src)
+    target_link_libraries(fsremote_device_sync_tests PRIVATE Qt6::Core)
+    if(MSVC)
+        target_compile_options(fsremote_device_sync_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME fsremote_device_sync_tests COMMAND fsremote_device_sync_tests)
+endif()
+# ===end====
+
+# =====wjy====
 option(FSREMOTE_BUILD_UPDATE_TESTS "Build reliable updater behavior tests" ON)
 if(FSREMOTE_BUILD_UPDATE_TESTS)
     enable_testing()
@@ -152,6 +170,10 @@ qt_add_executable(FSRemote WIN32
     src/system/ParsecVddInstaller.h
     src/system/DeviceCommandService.cpp
     src/system/DeviceCommandService.h
+    src/system/DeviceListSyncModel.cpp
+    src/system/DeviceListSyncModel.h
+    src/system/DeviceListSyncService.cpp
+    src/system/DeviceListSyncService.h
     src/system/DeviceInfoService.cpp
     src/system/DeviceInfoService.h
     src/system/DeviceStatusService.cpp

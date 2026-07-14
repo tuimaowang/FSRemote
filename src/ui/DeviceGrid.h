@@ -24,6 +24,7 @@
 class QEvent;
 class QByteArray;
 class QKeyEvent;
+class QJsonObject;
 class QLineEdit;
 class QMouseEvent;
 class QPaintEvent;
@@ -77,6 +78,7 @@ private:
     };
 
     void startDeviceSwitchAnimation(int newIndex, const QString& newName);
+    void applySyncedDeviceSnapshot(const QJsonObject& snapshot); // wjy: 在 UI 线程按稳定 ID 应用共享快照，并保留本机分组展开状态和当前选择。
     void syncResponsiveLayoutState() const;
     void beginWindowResize(const QPoint& position, const QPoint& globalPosition);
     void updateWindowResize(const QPoint& globalPosition);
@@ -141,7 +143,10 @@ private:
     void triggerShortcutAction(int shortcutIndex);
     void releaseRemoteShortcutKeyState(int shortcutIndex);
     void applyStatusAutoRefreshSetting(bool refreshImmediately);
-    void startBatchAddDevices(); // wjy: 从设置页网段输入框启动批量扫描并追加在线设备。
+    // =====wjy====
+    void applyPeriodicDeviceDiscoverySetting(bool scanImmediately);
+    void startBatchAddDevices(bool userInitiated = true); // wjy: 手动按钮和周期定时器复用同一网段扫描；周期触发时不跳转当前页面或选择新设备。
+    // ===end====
     void beginDeviceGroupRename(int groupIndex); // wjy: Show the group rename editor in place.
     void finishDeviceGroupRename(bool saveText); // wjy: Finish group rename on Enter or focus loss.
     bool beginDeviceRename(int deviceIndex);
@@ -229,7 +234,8 @@ private:
     QString m_scriptEditorWorkName;
     QHash<QString, ScriptUiState> m_scriptUiStates; // wjy: Keep script output/editor state isolated per device IP so switching devices does not mix panels.
     QLineEdit* m_statusRefreshIntervalEdit = nullptr; // wjy: Auto refresh interval edit.
-    QLineEdit* m_batchSubnetEdit = nullptr; // wjy: 批量新增网段输入框，支持 192.168.3.* 格式。
+    QLineEdit* m_periodicDeviceDiscoveryIntervalEdit = nullptr; // wjy: 周期检查新增设备的秒数输入框，默认 60 秒。
+    QLineEdit* m_batchSubnetEdit = nullptr; // wjy: 批量新增网段输入框，支持以空格分隔多个 IPv4 通配网段。
     QPushButton* m_batchAddButton = nullptr; // wjy: 批量新增按钮，扫描期间禁用避免重复启动。
     QVector<QLineEdit*> m_shortcutKeyEdits; // wjy: Keyboard settings shortcut editors, one per remote-window action.
     QSet<int> m_registeredGlobalShortcutIds;
@@ -281,10 +287,12 @@ private:
     bool m_wolDetectionInProgress = false;
     bool m_preventSleepEnabled = true;
     bool m_statusAutoRefreshEnabled = false;
+    bool m_periodicDeviceDiscoveryEnabled = false; // wjy: 默认关闭，开启后按批量新增输入框中的网段周期扫描。
     bool m_statusRefreshInProgress = false;
     bool m_wakeProbeInProgress = false;
     bool m_batchAddInProgress = false; // wjy: 标记批量新增扫描是否正在后台执行。
     int m_statusAutoRefreshIntervalSeconds = 60; // wjy: Default auto refresh interval is 60 seconds.
+    int m_periodicDeviceDiscoveryIntervalSeconds = 60; // wjy: 周期新增设备默认每 60 秒扫描一次。
     // =====wjy====
     bool m_updateAvailable = false; // wjy: 后台检测到更高版本时显示标题栏更新按钮，用户点击前绝不开始安装。
     bool m_updatePreparing = false; // wjy: 防止用户连续点击重复创建多个更新任务和更新器进程。
@@ -320,6 +328,7 @@ private:
     QTimer* m_settingsGearTimer = nullptr; // wjy: 设置齿轮点击后旋转半圈的动画定时器。
     // ===end====
     QTimer* m_statusAutoRefreshTimer = nullptr;
+    QTimer* m_periodicDeviceDiscoveryTimer = nullptr; // wjy: 到期后复用批量新增扫描，已有扫描进行中时自动跳过本轮。
     QTimer* m_wakeVisualTimer = nullptr;
     QTimer* m_scriptOutputFlushTimer = nullptr;
     QElapsedTimer m_detailAnimationClock;

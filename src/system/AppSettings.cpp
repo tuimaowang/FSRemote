@@ -155,6 +155,31 @@ void AppSettings::setStatusAutoRefreshIntervalSeconds(int seconds)
 }
 
 // =====wjy====
+bool AppSettings::periodicDeviceDiscoveryEnabled()
+{
+    return settings().value(QStringLiteral("periodicDeviceDiscoveryEnabled"), false).toBool(); // wjy: 新安装默认关闭，用户主动开启后才周期扫描三个默认网段。
+}
+
+void AppSettings::setPeriodicDeviceDiscoveryEnabled(bool enabled)
+{
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("periodicDeviceDiscoveryEnabled"), enabled);
+}
+
+int AppSettings::periodicDeviceDiscoveryIntervalSeconds()
+{
+    const int seconds = settings().value(QStringLiteral("periodicDeviceDiscoveryIntervalSeconds"), 60).toInt();
+    return seconds > 0 ? seconds : 60; // wjy: 空值或旧注册表异常值统一回退到用户指定的 60 秒默认周期。
+}
+
+void AppSettings::setPeriodicDeviceDiscoveryIntervalSeconds(int seconds)
+{
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("periodicDeviceDiscoveryIntervalSeconds"), seconds > 0 ? seconds : 60);
+}
+// ===end====
+
+// =====wjy====
 int AppSettings::remoteHostMaxSessions()
 {
     return qBound(1, settings().value(QStringLiteral("remoteHostMaxSessions"), 3).toInt(), 3); // wjy: 注册表没有该项时直接返回 3，新设备复制程序后无需额外配置即可使用三路会话。

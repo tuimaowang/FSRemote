@@ -17,6 +17,7 @@ public:
 
     bool startServer(QString* errorMessage = nullptr);
     void stopServer();
+    void stopClientProcesses(); // wjy: 关闭 FSRemote 自己启动的交互终端进程树，不扫描也不影响用户手动启动的 ssh.exe。
 
     bool openTerminal(const QString& hostIp, const QString& loginUser, QString* errorMessage = nullptr);
     bool runRemoteCommands(const QString& hostIp, const QString& loginUser, const QStringList& commands, QString* outputText = nullptr, QString* errorMessage = nullptr, int timeoutMs = 120000, std::function<void(const QString&)> outputCallback = {}, std::function<bool()> shouldCancel = {});
@@ -41,6 +42,7 @@ private:
     bool ensureConfig(QString* errorMessage);
     bool ensurePrivateKeyPermissions(const QString& keyPath, QString* errorMessage) const;
     bool cleanupResidualServerProcesses(QString* errorMessage) const;
+    bool ensureClientProcessJob(QString* errorMessage); // wjy: Windows 终端启动前建立退出即杀子进程的 Job Object。
     bool runTool(const QString& program, const QStringList& arguments, int timeoutMs, QString* errorMessage) const;
     bool runToolWithStandardInput(const QString& program, const QStringList& arguments, const QString& inputPath, int timeoutMs, QString* errorMessage) const;
 
@@ -67,6 +69,9 @@ private:
     bool m_prepared = false;
     std::recursive_mutex m_identityMutex; // wjy: DLL 的主机和 Viewer 工作线程可能同时签名/验签，串行保护 OpenSSH 准备和临时工具调用。
     QProcess* m_sshdProcess = nullptr;
+#if defined(_WIN32)
+    void* m_clientProcessJob = nullptr; // wjy: 保存 Windows Job 句柄，所有由“终端”入口启动的 cmd/ssh 都归入该 Job。
+#endif
 };
 
 } // namespace platform

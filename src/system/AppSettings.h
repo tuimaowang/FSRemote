@@ -17,6 +17,12 @@ public:
     static int statusAutoRefreshIntervalSeconds();
     static void setStatusAutoRefreshIntervalSeconds(int seconds);
     // =====wjy====
+    static bool periodicDeviceDiscoveryEnabled();
+    static void setPeriodicDeviceDiscoveryEnabled(bool enabled);
+    static int periodicDeviceDiscoveryIntervalSeconds();
+    static void setPeriodicDeviceDiscoveryIntervalSeconds(int seconds);
+    // ===end====
+    // =====wjy====
     static int remoteHostMaxSessions();
     static void setRemoteHostMaxSessions(int sessions);
     static int remoteHostAggregateVideoKbps();

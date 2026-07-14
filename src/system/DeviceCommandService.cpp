@@ -1,6 +1,7 @@
 #include "system/DeviceCommandService.h"
 
 #include "system/DeviceInfoService.h"
+#include "system/DeviceListSyncService.h"
 #include "system/PortableOpenSshManager.h"
 #include "system/UpdateService.h"
 #include "system/WakeOnLanSender.h"
@@ -228,6 +229,15 @@ private:
             schedulePowerAction(DeviceControlAction::Restart);
             return;
         }
+// =====wjy====
+        if (command == "device_sync") {
+            replyAndClose(QByteArrayLiteral("ok\n"));
+            QTimer::singleShot(0, [] {
+                DeviceListSyncService::instance().requestImmediateSync(); // wjy: 命令仅唤醒本机同步服务，实际数据仍从带锁和 revision 的共享快照读取。
+            });
+            return;
+        }
+// ===end====
 // =====wjy====
         if (command == "update") {
             UpdateService& updateService = UpdateService::instance();
@@ -576,5 +586,12 @@ bool DeviceCommandService::authorizeTerminalKey(const QString& hostIp, const QSt
     return sendCommandPayload(hostIp, payload, errorMessage, port, timeoutMs); // wjy: 打开终端前先把本机公钥登记到目标机，解决多台设备各自生成 key 后互不信任的问题。
 // ===end====
 }
+
+// =====wjy====
+bool DeviceCommandService::requestDeviceListSync(const QString& hostIp, QString* errorMessage, uint16_t port, int timeoutMs)
+{
+    return sendCommandPayload(hostIp, QByteArrayLiteral("device_sync\n"), errorMessage, port, timeoutMs); // wjy: 通知包固定且幂等，重复收到只会多执行一次 revision 检查。
+}
+// ===end====
 
 } // namespace platform

@@ -199,6 +199,11 @@ int main(int argc, char* argv[])
     platform::PowerManager::setPreventSleepEnabled(false);
     writeStartupLog(QStringLiteral("[wjy-main] prevent sleep disabled"));
 
+    // =====wjy====
+    writeStartupLog(QStringLiteral("[wjy-main] before SSH client process stop"));
+    platform::PortableOpenSshManager::instance().stopClientProcesses(); // wjy: main 退出路径再次兜底，确保绕过 DeviceGrid 清理时也不会残留终端 cmd/ssh 进程树。
+    writeStartupLog(QStringLiteral("[wjy-main] after SSH client process stop"));
+    // ===end====
     writeStartupLog(QStringLiteral("[wjy-main] before SSH server stop")); // wjy: Stop OpenSSH before application teardown so no sshd process is left behind.
     platform::PortableOpenSshManager::instance().stopServer(); // wjy: Explicit stop keeps shutdown order deterministic.
     writeStartupLog(QStringLiteral("[wjy-main] after SSH server stop"));

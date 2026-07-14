@@ -40,6 +40,7 @@ public:
     static bool authorizeTerminalKey(const QString& hostIp, const QString& publicKey, QString* errorMessage = nullptr, uint16_t port = 49102, int timeoutMs = 1500);
     // =====wjy====
     static RemoteUpdateRequestResult requestUpdate(const QString& hostIp, QString* errorMessage = nullptr, uint16_t port = 49102, int timeoutMs = 1500); // wjy: 只请求目标机启动它自己的更新流程，控制端不直接复制或覆盖目标安装目录。
+    static bool requestDeviceListSync(const QString& hostIp, QString* errorMessage = nullptr, uint16_t port = 49102, int timeoutMs = 700); // wjy: 只通知目标设备立即读取共享 revision，设备 JSON 本身不通过命令端口传输。
     // ===end====
 };
 
