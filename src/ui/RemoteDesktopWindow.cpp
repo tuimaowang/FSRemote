@@ -1,6 +1,7 @@
 ﻿#include "ui/RemoteDesktopWindow.h"
 
 #include "system/AppSettings.h"
+#include "system/DeviceCommandService.h"
 #include "stream/StreamRuntime.h"
 #include "ui/D3D11FramePresenter.h"
 
@@ -22,12 +23,14 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmap>
+#include <QPointer>
 #include <QRegion>
 #include <QResizeEvent>
 #include <QScreen>
 #include <QStringList>
 #include <QTextStream>
 #include <QTimer>
+#include <QToolTip>
 #include <QWheelEvent>
 
 #include <thread>
@@ -59,6 +62,8 @@ enum ResizeEdge {
     ResizeRight = 0x4,
     ResizeBottom = 0x8,
 };
+
+constexpr int kWindowResizeMargin = 6; // wjy: 无边框远控窗口四周统一保留 6px 缩放带，标题栏按钮不得覆盖这一区域。
 
 QString zh(const char* utf8)
 {
@@ -545,7 +550,6 @@ void FSREMOTE_STREAM_CALL onViewerStatus(void* user, int code, const char* messa
             window->setRemoteMouseCaptureActive(text == QStringLiteral("MOUSE relative"));
             return;
         }
-        // =====wjy====
         if (code == 62 && text.startsWith(QStringLiteral("cb "))) {
             window->applyRemoteClipboardPayload(text.mid(3)); // wjy: Host 推送的文本剪贴板。
             return;
@@ -568,14 +572,39 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
     setAttribute(Qt::WA_DeleteOnClose);
     setAttribute(Qt::WA_QuitOnClose, false);
-    setMinimumSize(520, 360);
+    // =====wjy====
+    setMinimumSize(100, 100); // wjy: 远控窗口允许缩放到 100x100，但继续阻止窗口缩小到无法操作标题栏和远控画面的尺寸。
+    // ===end====
+    // =====wjy====
+    // wjy: 删除远控窗口 520x360 固定最小尺寸，让手动缩放和平铺布局可以按屏幕空间继续缩小。
+    // ===end====
     const QRect savedGeometry = normalizedSavedWindowGeometry(
         platform::AppSettings::remoteDesktopWindowGeometry(m_hostIp),
         minimumSize());
     if (savedGeometry.isValid()) {
         setGeometry(savedGeometry);
     } else {
-        resize(1920, 1120);
+        // =====wjy====
+        QScreen* initialScreen = QGuiApplication::screenAt(QCursor::pos()); // wjy: 首次远控优先显示在鼠标当前所在屏幕，方便多显示器环境直接操作。
+        if (!initialScreen) {
+            initialScreen = QGuiApplication::primaryScreen(); // wjy: 无法按鼠标定位屏幕时回退到主屏幕，确保始终有稳定的居中基准。
+        }
+        const QRect availableGeometry = initialScreen
+            ? initialScreen->availableGeometry()
+            : QRect(0, 0, 1280, 720); // wjy: 使用扣除任务栏后的可用区域；极端无屏幕信息时采用安全的 720p 区域。
+        constexpr int screenMargin = 64;
+        const QSize maximumInitialSize(
+            qMax(minimumWidth(), availableGeometry.width() - screenMargin),
+            qMax(minimumHeight(), availableGeometry.height() - screenMargin)); // wjy: 四周预留空间，避免首次窗口紧贴屏幕边缘或遮住任务栏。
+        QSize initialSize(1280, 720); // wjy: 首次远控默认使用更紧凑的 16:9 尺寸；已有记录的设备仍恢复上次大小。
+        if (initialSize.width() > maximumInitialSize.width()
+            || initialSize.height() > maximumInitialSize.height()) {
+            initialSize.scale(maximumInitialSize, Qt::KeepAspectRatio); // wjy: 小屏幕按比例缩小，避免窗口超出可用显示区域。
+        }
+        QRect initialGeometry(QPoint(0, 0), initialSize);
+        initialGeometry.moveCenter(availableGeometry.center()); // wjy: 首次窗口放在目标屏幕正中央。
+        setGeometry(initialGeometry);
+        // ===end====
     }
     setWindowTitle(m_deviceName);
     setMouseTracking(true);
@@ -618,6 +647,33 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
     });
     m_sessionTimer->start();
 
+    // =====wjy====
+    m_remoteUpdateTimer = new QTimer(this);
+    m_remoteUpdateTimer->setInterval(250); // wjy: 250ms 只推进遮罩动画，网络状态查询限制为约每秒一次。
+    connect(m_remoteUpdateTimer, &QTimer::timeout, this, [this] {
+        if (!remoteUpdateActive() || m_closeInProgress) {
+            return;
+        }
+
+        m_remoteUpdateSpinnerStep = (m_remoteUpdateSpinnerStep + 1) % 12;
+        const qint64 elapsedMs = m_remoteUpdateClock.isValid() ? m_remoteUpdateClock.elapsed() : 0;
+        if (m_remoteUpdateState != RemoteUpdateState::Failed && elapsedMs >= 5 * 60 * 1000) {
+            m_remoteUpdateState = RemoteUpdateState::Failed;
+            m_remoteUpdateFailure = QString::fromUtf8("等待目标设备更新完成超时，请稍后重新远控。");
+            m_remoteUpdateReconnectRequested = false;
+            m_remoteUpdateTimer->stop();
+            stopViewerConnectionAsync(false); // wjy: 超时后停止仍在尝试的连接，避免后台继续占用目标会话资源。
+        } else if (m_remoteUpdateState != RemoteUpdateState::Failed
+            && m_remoteUpdateState != RemoteUpdateState::Reconnecting
+            && !m_remoteUpdateProbeInProgress
+            && elapsedMs >= m_nextRemoteUpdateProbeAtMs) {
+            pollRemoteUpdateStatus(); // wjy: 准备和安装阶段轮询目标端，重新连接阶段由流回调确认画面恢复。
+        }
+        update(isFullScreen() ? rect() : QRect(0, titleBarHeight(), width(), height() - titleBarHeight()));
+    });
+
+    // ===end====
+
     QTimer::singleShot(0, this, &RemoteDesktopWindow::startViewerConnection);
 }
 
@@ -626,6 +682,9 @@ RemoteDesktopWindow::~RemoteDesktopWindow()
     // =====wjy====
     appendViewerDebugLog(QStringLiteral("RemoteDesktopWindow dtor begin")); // wjy: identify crashes during window teardown.
     // ===end====
+    if (m_remoteUpdateTimer) {
+        m_remoteUpdateTimer->stop(); // wjy: 窗口析构后停止更新状态轮询和遮罩动画。
+    }
     setRemoteMouseCaptureActive(false);
     releasePressedKeys();
     setKeyboardForwardingActive(false);
@@ -663,9 +722,278 @@ bool RemoteDesktopWindow::isWaitingShortcutRelease() const
 }
 
 // =====wjy====
+QString RemoteDesktopWindow::hostIp() const
+{
+    return m_hostIp.trimmed(); // wjy: 更新操作按窗口固定目标 IP 匹配，不跟随主界面选择变化。
+}
+
+void RemoteDesktopWindow::setRemoteUpdateAvailable(bool available)
+{
+    const bool normalizedAvailable = available && !remoteUpdateActive(); // wjy: 已进入更新遮罩后不再保留标题栏入口，避免重复点击同一任务。
+    if (m_remoteUpdateAvailable == normalizedAvailable) {
+        return;
+    }
+    m_remoteUpdateAvailable = normalizedAvailable;
+    if (!isFullScreen()) {
+        update(QRect(0, 0, width(), titleBarHeight())); // wjy: 版本状态变化只重绘标题栏，不刷新正在播放的远控画面。
+    }
+}
+
+bool RemoteDesktopWindow::isRemoteUpdateActive() const
+{
+    return remoteUpdateActive(); // wjy: 仅向设备列表公开只读更新状态，更新阶段的具体状态机仍由远控窗口内部维护。
+}
+
+bool RemoteDesktopWindow::remoteUpdateActive() const
+{
+    return m_remoteUpdateState != RemoteUpdateState::None;
+}
+
+bool RemoteDesktopWindow::remoteUpdateAcceptsFrames() const
+{
+    return m_remoteUpdateState == RemoteUpdateState::None
+        || m_remoteUpdateState == RemoteUpdateState::Reconnecting; // wjy: 更新准备和安装阶段丢弃旧帧，重连阶段才接受首帧。
+}
+
+QString RemoteDesktopWindow::remoteUpdateTitle() const
+{
+    if (m_remoteUpdateState == RemoteUpdateState::Reconnecting) {
+        return QString::fromUtf8("更新完成，正在恢复远控");
+    }
+    if (m_remoteUpdateState == RemoteUpdateState::Failed) {
+        return QString::fromUtf8("更新失败");
+    }
+    return QString::fromUtf8("正在更新中");
+}
+
+QString RemoteDesktopWindow::remoteUpdateDetail() const
+{
+    switch (m_remoteUpdateState) {
+    case RemoteUpdateState::Preparing:
+        return QString::fromUtf8("目标设备正在准备和校验更新文件");
+    case RemoteUpdateState::Installing:
+        return QString::fromUtf8("目标程序正在替换文件并重新启动");
+    case RemoteUpdateState::Reconnecting:
+        return QString::fromUtf8("目标设备已重新上线，正在等待远程画面");
+    case RemoteUpdateState::Failed:
+        return m_remoteUpdateFailure.trimmed().isEmpty()
+            ? QString::fromUtf8("目标设备未能完成更新，请稍后重试")
+            : m_remoteUpdateFailure.trimmed();
+    case RemoteUpdateState::None:
+    default:
+        return {};
+    }
+}
+
+void RemoteDesktopWindow::beginRemoteUpdateWait()
+{
+    if (m_closeInProgress || m_hostIp.trimmed().isEmpty()) {
+        return;
+    }
+
+    setRemoteMouseCaptureActive(false); // wjy: 切换状态前先向旧连接释放鼠标和按键，防止目标端残留输入状态。
+    releaseForwardedKeys();
+    m_waitingShortcutRelease = false;
+    m_shortcutReleaseVirtualKeys.clear(); // wjy: 更新开始后不再等待本地组合键释放，确保键盘 hook 可以立即卸载。
+    setKeyboardForwardingActive(false);
+    if (m_clipboardPollTimer) {
+        m_clipboardPollTimer->stop();
+    }
+
+    m_remoteUpdateAvailable = false; // wjy: 请求被目标端受理后立即隐藏更新按钮，由中央遮罩接管反馈。
+    m_remoteUpdateState = RemoteUpdateState::Preparing;
+    m_remoteUpdateFailure.clear();
+    m_remoteUpdateClock.restart();
+    m_nextRemoteUpdateProbeAtMs = 0;
+    m_remoteUpdateProbeInProgress = false;
+    m_remoteUpdateReconnectRequested = false;
+    m_remoteUpdateSpinnerStep = 0;
+    ++m_remoteUpdateGeneration;
+    m_textureFrameActive = false;
+    if (m_texturePresenter) {
+        m_texturePresenter->hide(); // wjy: D3D 子窗口位于父窗口之上，更新时隐藏才能看见中央遮罩。
+    }
+    {
+        QMutexLocker locker(&m_pendingFrameMutex);
+        m_pendingRemoteFrame = QImage(); // wjy: 清掉更新开始前排队的旧帧，避免重连前闪回旧桌面。
+    }
+    if (m_remoteUpdateTimer) {
+        m_remoteUpdateTimer->start();
+    }
+    pollRemoteUpdateStatus(); // wjy: accepted 后立即查询准备状态，目标端失败时不用等待超时。
+    update();
+}
+
+void RemoteDesktopWindow::pollRemoteUpdateStatus()
+{
+    if (!remoteUpdateActive() || m_remoteUpdateState == RemoteUpdateState::Failed
+        || m_remoteUpdateProbeInProgress || m_closeInProgress) {
+        return;
+    }
+
+    m_remoteUpdateProbeInProgress = true;
+    m_nextRemoteUpdateProbeAtMs = (m_remoteUpdateClock.isValid() ? m_remoteUpdateClock.elapsed() : 0) + 1000;
+    const QString targetIp = m_hostIp.trimmed();
+    const int updateGeneration = m_remoteUpdateGeneration;
+    QPointer<RemoteDesktopWindow> self(this);
+    std::thread([self, targetIp, updateGeneration] {
+        QString errorMessage;
+        const platform::RemoteUpdateStatus status =
+            platform::DeviceCommandService::queryUpdateStatus(targetIp, &errorMessage);
+        if (!self) {
+            return;
+        }
+        QMetaObject::invokeMethod(self.data(), [self, status, errorMessage, updateGeneration] {
+            if (!self) {
+                return;
+            }
+            RemoteDesktopWindow* window = self.data();
+            if (window->m_remoteUpdateGeneration != updateGeneration) {
+                return; // wjy: 用户重新发起更新后忽略上一轮网络线程的迟到结果。
+            }
+            window->m_remoteUpdateProbeInProgress = false;
+            if (!window->remoteUpdateActive() || window->m_remoteUpdateState == RemoteUpdateState::Failed
+                || window->m_closeInProgress) {
+                return;
+            }
+
+            switch (status) {
+            case platform::RemoteUpdateStatus::Preparing:
+            case platform::RemoteUpdateStatus::Idle:
+            case platform::RemoteUpdateStatus::Unsupported:
+                window->m_remoteUpdateState = RemoteUpdateState::Preparing; // wjy: 旧客户端不支持查询时继续等待其断线，兼容第一次升级。
+                break;
+            case platform::RemoteUpdateStatus::Unreachable:
+                window->m_remoteUpdateState = RemoteUpdateState::Installing;
+                window->stopViewerConnectionAsync(false); // wjy: 命令端口消失说明主进程已退出，停止旧流但保留窗口。
+                break;
+            case platform::RemoteUpdateStatus::Complete:
+                window->m_remoteUpdateState = RemoteUpdateState::Reconnecting;
+                window->m_remoteUpdateReconnectRequested = true;
+                if (window->m_viewerHandle || window->m_viewerStopInProgress) {
+                    window->stopViewerConnectionAsync(false); // wjy: 旧会话完全停止后才连接重启后的新进程。
+                } else {
+                    window->startViewerAfterUpdate();
+                }
+                break;
+            case platform::RemoteUpdateStatus::Failed:
+                window->m_remoteUpdateState = RemoteUpdateState::Failed;
+                window->m_remoteUpdateFailure = errorMessage.trimmed();
+                window->m_remoteUpdateReconnectRequested = false;
+                if (window->m_remoteUpdateTimer) {
+                    window->m_remoteUpdateTimer->stop();
+                }
+                break;
+            }
+            window->update();
+        }, Qt::QueuedConnection);
+    }).detach();
+}
+
+void RemoteDesktopWindow::stopViewerConnectionAsync(bool deleteAfterStop)
+{
+    if (deleteAfterStop) {
+        m_deleteAfterViewerStop = true;
+    }
+    if (m_viewerStopInProgress) {
+        return;
+    }
+
+    const FsRemoteStreamHandle handle = m_viewerHandle;
+    m_viewerHandle = nullptr;
+    if (!handle) {
+        if (m_deleteAfterViewerStop || m_closeInProgress) {
+            deleteLater();
+        } else if (m_remoteUpdateReconnectRequested) {
+            startViewerAfterUpdate();
+        }
+        return;
+    }
+
+    m_viewerStopInProgress = true;
+    QPointer<RemoteDesktopWindow> self(this);
+    std::thread([self, handle] {
+        stream::StreamRuntime::instance().stop(handle);
+        if (!self) {
+            return;
+        }
+        QMetaObject::invokeMethod(self.data(), [self] {
+            if (!self) {
+                return;
+            }
+            RemoteDesktopWindow* window = self.data();
+            window->m_viewerStopInProgress = false;
+            if (window->m_deleteAfterViewerStop || window->m_closeInProgress) {
+                window->deleteLater();
+                return;
+            }
+            if (window->m_remoteUpdateReconnectRequested) {
+                window->startViewerAfterUpdate(); // wjy: stop 返回后再创建新 viewer，避免旧回调污染新会话。
+            }
+        }, Qt::QueuedConnection);
+    }).detach();
+}
+
+void RemoteDesktopWindow::startViewerAfterUpdate()
+{
+    if (m_closeInProgress || m_remoteUpdateState == RemoteUpdateState::Failed
+        || m_remoteUpdateState == RemoteUpdateState::None) {
+        return;
+    }
+    if (m_viewerStopInProgress) {
+        m_remoteUpdateReconnectRequested = true;
+        return;
+    }
+    if (m_viewerHandle) {
+        m_remoteUpdateReconnectRequested = true;
+        stopViewerConnectionAsync(false);
+        return;
+    }
+
+    m_remoteUpdateReconnectRequested = false;
+    m_remoteUpdateState = RemoteUpdateState::Reconnecting;
+    m_texturePresentFailed.store(false);
+    startViewerConnection();
+    if (!m_viewerHandle) {
+        m_remoteUpdateState = RemoteUpdateState::Installing;
+        m_nextRemoteUpdateProbeAtMs = 0; // wjy: 流句柄创建失败时回到状态查询，不关闭远控窗口。
+    }
+    update();
+}
+
+void RemoteDesktopWindow::finishRemoteUpdateWait()
+{
+    if (m_remoteUpdateState != RemoteUpdateState::Reconnecting) {
+        return;
+    }
+
+    m_remoteUpdateState = RemoteUpdateState::None;
+    m_remoteUpdateFailure.clear();
+    m_remoteUpdateReconnectRequested = false;
+    m_remoteUpdateProbeInProgress = false;
+    if (m_remoteUpdateTimer) {
+        m_remoteUpdateTimer->stop();
+    }
+    if (m_clipboardSyncEnabled && m_clipboardPollTimer) {
+        m_clipboardPollTimer->start();
+    }
+    if (isActiveWindow()) {
+        setKeyboardForwardingActive(true); // wjy: 首帧真正到达后才恢复键盘和剪贴板转发。
+    }
+    update();
+}
+// ===end====
+
+// =====wjy====
 int RemoteDesktopWindow::titleBarHeight() const
 {
     return isFullScreen() ? 0 : 28; // wjy: 与主窗口 kTitleBarHeight=28 对齐，全屏时不占画面。
+}
+
+QRect RemoteDesktopWindow::remoteUpdateButtonRect() const
+{
+    const QRect clipboardRect = clipboardSyncRect();
+    return QRect(clipboardRect.left() - 58, 3, 54, qMax(0, titleBarHeight() - 6)); // wjy: 54px 蓝色按钮放在剪切板左侧并保留 4px 间距，对齐用户标出的区域。
 }
 
 QRect RemoteDesktopWindow::clipboardSyncRect() const
@@ -685,7 +1013,7 @@ QRect RemoteDesktopWindow::maximizeRect() const
 
 QRect RemoteDesktopWindow::closeRect() const
 {
-    return QRect(width() - 48, 0, 48, titleBarHeight()); // wjy: 关闭热区延伸到窗口最右边，符合常见标题栏操作习惯并保留圆角遮罩。
+    return QRect(width() - 48, 0, 48 - kWindowResizeMargin, titleBarHeight()); // wjy: 关闭按钮右侧留出 6px 缩放空隙，拖动右边缘时不会落入关闭响应区。
 }
 
 bool RemoteDesktopWindow::isTitleBarBlankArea(const QPoint& position) const
@@ -693,6 +1021,7 @@ bool RemoteDesktopWindow::isTitleBarBlankArea(const QPoint& position) const
     return !isFullScreen()
         && position.y() >= 0
         && position.y() < titleBarHeight()
+        && !(m_remoteUpdateAvailable && remoteUpdateButtonRect().contains(position)) // wjy: 更新按钮可见时从拖动、双击和右键空白区中排除。
         && !clipboardSyncRect().contains(position)
         && !minimizeRect().contains(position)
         && !maximizeRect().contains(position)
@@ -832,6 +1161,9 @@ void RemoteDesktopWindow::saveWindowGeometry()
 
 void RemoteDesktopWindow::sendInputMessage(const QByteArray& message)
 {
+    if (remoteUpdateActive()) {
+        return; // wjy: 更新遮罩期间统一阻断鼠标、键盘和剪贴板消息，避免发送到正在退出或刚重启的目标进程。
+    }
     const bool shouldLog = shouldLogInputMessage(message);
     const bool ok = stream::StreamRuntime::instance().sendInput(m_viewerHandle, message);
     if (shouldLog) {
@@ -844,6 +1176,9 @@ void RemoteDesktopWindow::sendInputMessage(const QByteArray& message)
 
 void RemoteDesktopWindow::setRemoteMouseCaptureActive(bool active)
 {
+    if (active && remoteUpdateActive()) {
+        return; // wjy: 更新过程中忽略旧流迟到的 relative mouse 状态，保持本机鼠标可见可操作。
+    }
     if (m_remoteMouseCaptureActive == active) {
         if (active) {
             recenterRemoteMouseCapture();
@@ -942,7 +1277,7 @@ void RemoteDesktopWindow::setKeyboardForwardingActive(bool active)
 #if defined(Q_OS_WIN)
     if (m_waitingShortcutRelease && !m_closeInProgress) {
         installKeyboardHook(this); // wjy: 等待组合键松开时保留 hook，但 hook 只记录 keyup，不转发远端。
-    } else if (active && !m_closeInProgress && isActiveWindow()) {
+    } else if (active && !m_closeInProgress && !remoteUpdateActive() && isActiveWindow()) {
         installKeyboardHook(this);
     } else {
         uninstallKeyboardHook(this);
@@ -1047,6 +1382,11 @@ void RemoteDesktopWindow::shutdownForApplicationExit()
 {
     saveWindowGeometry();
     m_closeInProgress = true;
+    m_remoteUpdateState = RemoteUpdateState::None;
+    m_remoteUpdateReconnectRequested = false;
+    if (m_remoteUpdateTimer) {
+        m_remoteUpdateTimer->stop(); // wjy: 控制端自身退出时终止远端更新轮询，不再尝试恢复窗口。
+    }
     m_waitingShortcutRelease = false;
     m_shortcutReleaseVirtualKeys.clear();
     hide();
@@ -1088,17 +1428,16 @@ int RemoteDesktopWindow::resizeEdgesAt(const QPoint& position) const
         return ResizeNone;
     }
 
-    constexpr int margin = 6;
     int edges = ResizeNone;
-    if (position.x() <= margin) {
+    if (position.x() <= kWindowResizeMargin) {
         edges |= ResizeLeft;
-    } else if (position.x() >= width() - margin) {
+    } else if (position.x() >= width() - kWindowResizeMargin) {
         edges |= ResizeRight;
     }
 
-    if (position.y() <= margin) {
+    if (position.y() <= kWindowResizeMargin) {
         edges |= ResizeTop;
-    } else if (position.y() >= height() - margin) {
+    } else if (position.y() >= height() - kWindowResizeMargin) {
         edges |= ResizeBottom;
     }
     return edges;
@@ -1106,6 +1445,10 @@ int RemoteDesktopWindow::resizeEdgesAt(const QPoint& position) const
 
 void RemoteDesktopWindow::updateResizeCursor(const QPoint& position)
 {
+    if (!isFullScreen() && m_remoteUpdateAvailable && remoteUpdateButtonRect().contains(position)) {
+        setCursor(Qt::PointingHandCursor);
+        return; // wjy: 更新入口使用手型指针；按钮远离 6px 缩放边缘，不影响窗口缩放命中。
+    }
     const int edges = resizeEdgesAt(position);
     if ((edges & ResizeLeft && edges & ResizeTop) || (edges & ResizeRight && edges & ResizeBottom)) {
         setCursor(Qt::SizeFDiagCursor);
@@ -1165,7 +1508,8 @@ bool RemoteDesktopWindow::enqueueRemoteTextureFrame(int width, int height, void*
     }
 
     QMetaObject::invokeMethod(this, [this, width, height, sharedHandle, encodedMbps] {
-        if (isClosingConnection() || m_texturePresentFailed.load() || !m_texturePresenter) {
+        if (isClosingConnection() || m_texturePresentFailed.load() || !m_texturePresenter
+            || !remoteUpdateAcceptsFrames()) {
             return;
         }
         m_remoteTextureSize = QSize(width, height);
@@ -1185,6 +1529,9 @@ bool RemoteDesktopWindow::enqueueRemoteTextureFrame(int width, int height, void*
         m_connectionStatus = QString::fromUtf8("画面已接收");
         m_texturePresenter->show();
         m_texturePresenter->raise();
+        if (m_remoteUpdateState == RemoteUpdateState::Reconnecting) {
+            finishRemoteUpdateWait(); // wjy: 共享纹理首帧成功呈现后才移除更新遮罩并恢复输入。
+        }
         update(QRect(0, 0, this->width(), titleBarHeight()));
     }, Qt::QueuedConnection);
     return true;
@@ -1199,7 +1546,7 @@ void RemoteDesktopWindow::flushPendingRemoteFrame()
         m_pendingRemoteFrame = QImage();
     }
 
-    if (isClosingConnection() || image.isNull()) {
+    if (isClosingConnection() || image.isNull() || !remoteUpdateAcceptsFrames()) {
         return;
     }
 
@@ -1208,6 +1555,9 @@ void RemoteDesktopWindow::flushPendingRemoteFrame()
 
 void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
 {
+    if (!remoteUpdateAcceptsFrames()) {
+        return; // wjy: 目标更新期间忽略旧连接残留帧，避免遮罩后面继续变化或误判更新完成。
+    }
     // =====wjy====
     // appendViewerDebugLog(QStringLiteral("setRemoteFrame enter size=%1x%2").arg(image.width()).arg(image.height())); // wjy: per-frame UI log disabled for smoother rendering.
     // ===end====
@@ -1219,6 +1569,9 @@ void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
     m_remoteFrame = image;
     m_connectionStatusCode = 50;
     m_connectionStatus = QString::fromUtf8("画面已接收");
+    if (m_remoteUpdateState == RemoteUpdateState::Reconnecting) {
+        finishRemoteUpdateWait(); // wjy: 软件帧路径同样以首帧到达作为恢复正常远控的唯一完成点。
+    }
     update(isFullScreen() ? rect() : QRect(0, titleBarHeight(), width(), height() - titleBarHeight())); // wjy: 普通窗口只刷新标题栏下方远控画面。
     // appendViewerDebugLog(QStringLiteral("setRemoteFrame update requested")); // wjy: per-frame repaint log disabled to avoid disk IO on every frame.
 }
@@ -1315,7 +1668,7 @@ bool RemoteDesktopWindow::isClosingConnection() const
 
 bool RemoteDesktopWindow::forwardNativeKey(int virtualKey, bool down)
 {
-    if (m_closeInProgress || virtualKey <= 0) {
+    if (m_closeInProgress || remoteUpdateActive() || virtualKey <= 0) {
         return false;
     }
     if (down) {
@@ -1332,7 +1685,7 @@ bool RemoteDesktopWindow::forwardNativeKey(int virtualKey, bool down)
 bool RemoteDesktopWindow::handleLocalShortcutKey(int virtualKey, Qt::KeyboardModifiers modifiers)
 {
 #if defined(Q_OS_WIN)
-    if (m_closeInProgress) {
+    if (m_closeInProgress || remoteUpdateActive()) {
         return false;
     }
     const QKeySequence current = shortcutSequenceFromNativeVirtualKey(virtualKey, modifiers); // wjy: 低级键盘钩子路径同样使用用户保存的快捷键设置。
@@ -1375,6 +1728,9 @@ void RemoteDesktopWindow::startViewerConnection()
     // =====wjy====
     appendViewerDebugLog(QStringLiteral("startViewerConnection begin host=%1").arg(m_hostIp)); // wjy: mark when the UI asks the stream DLL to connect.
     // ===end====
+    if (m_viewerHandle || m_viewerStopInProgress || m_closeInProgress) {
+        return; // wjy: 更新重连必须等待旧 viewer 完全停止，禁止同一窗口同时持有两个流会话。
+    }
     if (!m_hostIp.trimmed().isEmpty()) {
         m_viewerHandle = stream::StreamRuntime::instance().startViewer(
             m_hostIp.trimmed(),
@@ -1394,6 +1750,22 @@ void RemoteDesktopWindow::startViewerConnection()
 
 void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
 {
+    // =====wjy====
+    if (remoteUpdateActive()) {
+        if (m_remoteUpdateState == RemoteUpdateState::Reconnecting && code == 50) {
+            finishRemoteUpdateWait();
+            return;
+        }
+        if (code == 80 || code == 90) {
+            m_remoteUpdateState = RemoteUpdateState::Installing;
+            m_remoteUpdateReconnectRequested = false;
+            m_nextRemoteUpdateProbeAtMs = 0;
+            stopViewerConnectionAsync(false); // wjy: 更新过程中的断线属于目标主进程退出，保持窗口并转入安装等待。
+        }
+        update(isFullScreen() ? rect() : QRect(0, titleBarHeight(), width(), height() - titleBarHeight()));
+        return; // wjy: 更新遮罩接管连接文字，不显示“连接失败/已断开”。
+    }
+    // ===end====
     m_connectionStatusCode = code;
     switch (code) {
     case 10:
@@ -1507,6 +1879,58 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
             m_connectionStatus);
     }
     // =====wjy====
+    if (remoteUpdateActive()) {
+        const int contentTop = fullScreen ? 0 : titleBarHeight();
+        const QRect contentRect(0, contentTop, width(), qMax(0, height() - contentTop));
+        painter.fillRect(contentRect, QColor(3, 10, 22, 196)); // wjy: 保留窗口和最后画面位置，用半透明遮罩明确当前不可操作。
+
+        const int cardWidth = qMin(380, qMax(240, contentRect.width() - 48));
+        const int cardHeight = 136;
+        const QRect card(
+            contentRect.center().x() - cardWidth / 2,
+            contentRect.center().y() - cardHeight / 2,
+            cardWidth,
+            cardHeight);
+        painter.setPen(QPen(QColor(255, 255, 255, 28), 1));
+        painter.setBrush(QColor(17, 27, 45, 238));
+        painter.drawRoundedRect(QRectF(card), 12, 12);
+
+        const QRect spinnerRect(card.center().x() - 15, card.top() + 20, 30, 30);
+        if (m_remoteUpdateState == RemoteUpdateState::Failed) {
+            painter.setPen(QPen(QColor(QStringLiteral("#FF7A7A")), 3));
+            painter.setBrush(Qt::NoBrush);
+            painter.drawEllipse(spinnerRect);
+            painter.drawLine(spinnerRect.center().x(), spinnerRect.top() + 7,
+                spinnerRect.center().x(), spinnerRect.bottom() - 9);
+            painter.drawPoint(spinnerRect.center().x(), spinnerRect.bottom() - 5);
+        } else {
+            painter.setPen(QPen(QColor(255, 255, 255, 48), 4, Qt::SolidLine, Qt::RoundCap));
+            painter.setBrush(Qt::NoBrush);
+            painter.drawEllipse(spinnerRect);
+            painter.setPen(QPen(QColor(QStringLiteral("#3A9BFF")), 4, Qt::SolidLine, Qt::RoundCap));
+            const int startAngle = (90 - m_remoteUpdateSpinnerStep * 30) * 16;
+            painter.drawArc(spinnerRect, startAngle, -210 * 16); // wjy: 轻量圆环随 250ms 定时器旋转，不阻塞更新状态查询。
+        }
+
+        QFont updateTitleFont(QStringLiteral("Microsoft YaHei UI"));
+        updateTitleFont.setPixelSize(17);
+        updateTitleFont.setWeight(QFont::DemiBold);
+        painter.setFont(updateTitleFont);
+        painter.setPen(QColor(QStringLiteral("#F4F8FF")));
+        painter.drawText(QRect(card.left() + 20, card.top() + 58, card.width() - 40, 26),
+            Qt::AlignCenter, remoteUpdateTitle());
+
+        QFont updateDetailFont(QStringLiteral("Microsoft YaHei UI"));
+        updateDetailFont.setPixelSize(12);
+        painter.setFont(updateDetailFont);
+        painter.setPen(m_remoteUpdateState == RemoteUpdateState::Failed
+                ? QColor(QStringLiteral("#FFB4B4"))
+                : QColor(QStringLiteral("#AEBBCD")));
+        painter.drawText(QRect(card.left() + 26, card.top() + 91, card.width() - 52, 34),
+            Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap, remoteUpdateDetail());
+    }
+    // ===end====
+    // =====wjy====
     if (fullScreen) {
         return; // wjy: Ctrl+D 进入全屏后只保留远控画面/连接提示，不绘制标题栏、边框和窗口控制按钮。
     }
@@ -1534,7 +1958,10 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     const int ipX = nameRight + 10;
     constexpr int elapsedTextWidth = 70;
     constexpr int elapsedGap = 14;
-    const int maxIpWidth = qMax(0, clipboardSyncRect().left() - ipX - elapsedGap - elapsedTextWidth - 8);
+    const int titleTextRight = m_remoteUpdateAvailable
+        ? remoteUpdateButtonRect().left()
+        : clipboardSyncRect().left(); // wjy: 更新按钮出现时名称/IP/计时整体提前截止，防止文字覆盖按钮。
+    const int maxIpWidth = qMax(0, titleTextRight - ipX - elapsedGap - elapsedTextWidth - 8);
     const QFontMetrics titleMetrics(textFont);
     const int ipWidth = qMin(titleMetrics.horizontalAdvance(m_hostIp), maxIpWidth);
     int elapsedX = ipX;
@@ -1560,6 +1987,22 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
             .arg(hours, 2, 10, QLatin1Char('0'))
             .arg(minutes, 2, 10, QLatin1Char('0'))
             .arg(seconds, 2, 10, QLatin1Char('0')));
+
+    if (m_remoteUpdateAvailable) {
+        const QRect updateRect = remoteUpdateButtonRect();
+        const bool updateHovered = updateRect.contains(m_hoveredPos);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(updateHovered
+                ? QColor(QStringLiteral("#2F6FE4"))
+                : QColor(QStringLiteral("#3A7BFC"))); // wjy: 更新入口沿用主窗口蓝色，悬停时加深以明确点击反馈。
+        painter.drawRoundedRect(QRectF(updateRect), 4, 4);
+        QFont updateFont(QStringLiteral("Microsoft YaHei UI"));
+        updateFont.setPixelSize(12);
+        updateFont.setWeight(QFont::DemiBold);
+        painter.setFont(updateFont);
+        painter.setPen(QColor(QStringLiteral("#FFFFFF")));
+        painter.drawText(updateRect, Qt::AlignCenter, QString::fromUtf8("更新")); // wjy: 只在目标端明确返回需要更新时显示文字按钮。
+    }
 
     // wjy: 剪切板同步按钮在最小化左侧；开启用主蓝，关闭用灰色，中间画剪贴板简图。
     const QRect clipRect = clipboardSyncRect();
@@ -1608,28 +2051,25 @@ void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
         .arg(reinterpret_cast<quintptr>(m_viewerHandle))
         .arg(m_closeInProgress ? 1 : 0)); // wjy: show whether a crash is triggered by closing/stop.
     // ===end====
-    if (!m_viewerHandle || m_closeInProgress) {
+    if (m_closeInProgress) {
+        event->ignore();
+        return;
+    }
+    if (!m_viewerHandle && !m_viewerStopInProgress) {
         QWidget::closeEvent(event);
         return;
     }
 
     event->ignore();
     m_closeInProgress = true;
+    if (m_remoteUpdateTimer) {
+        m_remoteUpdateTimer->stop();
+    }
     setRemoteMouseCaptureActive(false);
     releasePressedKeys();
     setKeyboardForwardingActive(false);
-    const FsRemoteStreamHandle handle = m_viewerHandle;
-    m_viewerHandle = nullptr;
     hide();
-
-    std::thread([this, handle] {
-        appendViewerDebugLog(QStringLiteral("closeEvent stop thread begin handle=%1").arg(reinterpret_cast<quintptr>(handle))); // wjy: background stop starts.
-        stream::StreamRuntime::instance().stop(handle);
-        appendViewerDebugLog(QStringLiteral("closeEvent stop thread end")); // wjy: background stop returned cleanly.
-        QMetaObject::invokeMethod(this, [this] {
-            deleteLater();
-        }, Qt::QueuedConnection);
-    }).detach();
+    stopViewerConnectionAsync(true); // wjy: 更新等待或普通远控都复用安全停流，stop 返回前窗口对象保持存活。
 }
 
 void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
@@ -1697,6 +2137,25 @@ void RemoteDesktopWindow::mouseMoveEvent(QMouseEvent* event)
         update(QRect(0, 0, width(), titleBarHeight())); // wjy: 普通窗口才需要刷新标题栏。
     }
 
+    // =====wjy====
+    const QString titleButtonTip = !isFullScreen() && m_remoteUpdateAvailable
+            && remoteUpdateButtonRect().contains(event->pos())
+        ? zh("更新目标设备")
+        : (!isFullScreen() && clipboardSyncRect().contains(event->pos())
+                ? zh("开关剪切板")
+                : QString()); // wjy: 更新和剪切板按钮共用一套标题栏气泡，远控画面及全屏状态不显示本地提示。
+    if (toolTip() != titleButtonTip) {
+        setToolTip(titleButtonTip); // wjy: 保存当前提示内容，避免鼠标在同一按钮内移动时反复重置气泡。
+        if (!titleButtonTip.isEmpty()) {
+            QToolTip::showText(event->globalPosition().toPoint(), titleButtonTip, this); // wjy: 气泡跟随鼠标显示，明确“更新”操作的是当前窗口绑定设备。
+        } else {
+            QToolTip::hideText(); // wjy: 离开两个标题栏按钮后立即收起气泡，防止提示残留在远控画面上。
+        }
+    } else if (!titleButtonTip.isEmpty() && !QToolTip::isVisible()) {
+        QToolTip::showText(event->globalPosition().toPoint(), titleButtonTip, this); // wjy: 系统自动隐藏气泡后，只要鼠标仍停在按钮上就允许再次显示。
+    }
+    // ===end====
+
     if (m_resizingWindow && (event->buttons() & Qt::LeftButton)) {
         const QPoint delta = event->globalPosition().toPoint() - m_resizeStartGlobal;
         QRect next = m_resizeStartGeometry;
@@ -1756,11 +2215,19 @@ void RemoteDesktopWindow::mouseReleaseEvent(QMouseEvent* event)
         m_resizingWindow = false;
         m_resizeEdges = ResizeNone;
         if (wasDraggingWindow || wasResizingWindow) {
-            saveWindowGeometry();
+            saveWindowGeometry(); // wjy: 拖动或缩放完成后只保存新几何，不再把这次鼠标释放解释为标题栏按钮点击。
+            updateResizeCursor(event->pos());
+            event->accept();
+            return; // wjy: 防止从右上角缩放窗口后，释放位置仍在关闭矩形内而误关闭远控窗口。
         }
 
         // =====wjy====
         if (!isFullScreen()) { // wjy: 全屏时顶部右侧也属于远端画面，释放鼠标不能误触发本地最小化、最大化或关闭。
+            if (m_remoteUpdateAvailable && remoteUpdateButtonRect().contains(event->pos())) {
+                emit titleBarUpdateRequested(m_hostIp); // wjy: 只发出固定 IP 请求，实际检查、提示和更新窗口保持全部复用设备菜单逻辑。
+                event->accept();
+                return;
+            }
             if (clipboardSyncRect().contains(event->pos())) {
                 toggleClipboardSync(); // wjy: 标题栏按钮切换剪切板同步，与 Ctrl+B 共用同一状态。
                 event->accept();
@@ -1891,7 +2358,7 @@ void RemoteDesktopWindow::keyReleaseEvent(QKeyEvent* event)
 void RemoteDesktopWindow::focusInEvent(QFocusEvent* event)
 {
     emit activated(this);
-    setKeyboardForwardingActive(true);
+    setKeyboardForwardingActive(!remoteUpdateActive()); // wjy: 更新遮罩获得焦点时也不安装全局键盘转发钩子。
     QWidget::focusInEvent(event);
 }
 
@@ -1913,6 +2380,12 @@ void RemoteDesktopWindow::resizeEvent(QResizeEvent* event)
 void RemoteDesktopWindow::leaveEvent(QEvent* event)
 {
     m_hoveredPos = QPoint(-1, -1);
+    // =====wjy====
+    if (!toolTip().isEmpty()) {
+        setToolTip(QString()); // wjy: 鼠标离开整个远控窗口时同步清空剪切板按钮的提示状态。
+        QToolTip::hideText(); // wjy: 主动关闭已显示的系统气泡，避免切到其他窗口后仍短暂残留。
+    }
+    // ===end====
     if (!isFullScreen()) {
         update(QRect(0, 0, width(), titleBarHeight())); // wjy: 普通窗口离开时清理标题栏悬停重绘。
     }

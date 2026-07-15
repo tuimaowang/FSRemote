@@ -97,6 +97,7 @@ private:
     // =====wjy====
     void showDeviceContextMenuForIndexes(int deviceIndex, const QVector<int>& targetDeviceIndexes, const QPoint& globalPosition); // wjy: 设备列表和远控标题栏共用同一菜单构建及动作分发逻辑。
     void showRemoteWindowDeviceMenu(const QString& hostIp, const QPoint& globalPosition); // wjy: 按远控窗口固定 IP 解析真实设备下标，避免错误控制主界面当前设备。
+    void updateRemoteWindowDevice(const QString& hostIp); // wjy: 远控标题栏按钮按固定 IP 复用设备右键菜单的单设备更新逻辑。
     // ===end====
     void openCurrentDeviceTerminal();
     bool openTerminalForDeviceIndex(int deviceIndex, bool showMessages);
@@ -104,10 +105,12 @@ private:
     bool executeDeviceScriptFolder(int deviceIndex, const QString& scriptFolderPath, bool showMessages); // wjy: Run one shared script folder on a specified device without forcing the current selection.
     void executeDeviceGroupScriptFolder(int groupIndex, const QString& scriptFolderPath); // wjy: Run one selected script folder for every device in a group.
     void openRemoteDesktopWindow();
-    void openRemoteDesktopWindowForDevice(int deviceIndex, const QPoint& fallbackOffset);
+    void openRemoteDesktopWindowForDevice(int deviceIndex); // wjy: 首次窗口的位置由 RemoteDesktopWindow 统一按当前屏幕居中，不再由设备列表附加偏移。
     void launchSelectedRemoteDesktopWindows();
     void openDeviceGroupTiledWindows(int groupIndex); // wjy: Open all devices in one group and tile remote windows.
     QVector<QPointer<RemoteDesktopWindow>> openedRemoteWindows() const;
+    void setRemoteUpdateAvailability(const QString& hostIp, bool available); // wjy: 同步缓存并刷新同 IP 的普通/平铺远控窗口更新按钮。
+    void refreshOpenedRemoteUpdateAvailability(); // wjy: 仅轮询当前已打开远控窗口的目标版本，不依赖设备列表自动刷新开关。
     void rememberRemoteWindowActivation(RemoteDesktopWindow* window);
     RemoteDesktopWindow* topmostRemoteWindow() const;
     void toggleTopmostRemoteWindowFullscreen();
@@ -289,6 +292,7 @@ private:
     bool m_statusAutoRefreshEnabled = false;
     bool m_periodicDeviceDiscoveryEnabled = false; // wjy: 默认关闭，开启后按批量新增输入框中的网段周期扫描。
     bool m_statusRefreshInProgress = false;
+    bool m_remoteUpdateAvailabilityRefreshInProgress = false; // wjy: 防止上一轮目标版本查询未结束时重复创建后台任务。
     bool m_wakeProbeInProgress = false;
     bool m_batchAddInProgress = false; // wjy: 标记批量新增扫描是否正在后台执行。
     int m_statusAutoRefreshIntervalSeconds = 60; // wjy: Default auto refresh interval is 60 seconds.
@@ -317,6 +321,7 @@ private:
     std::vector<std::thread> m_backgroundThreads; // wjy: Joined in destructor to avoid late UI callbacks.
     bool m_shuttingDown = false; // wjy: No new background tasks after destruction begins.
     QHash<QString, platform::DevicePresenceState> m_deviceStatuses;
+    QHash<QString, bool> m_deviceUpdateAvailability; // wjy: 设备状态刷新线程统一维护目标是否需要更新，远控窗口只消费结果。
     // =====wjy====
     QHash<QString, int> m_deviceRemoteSessionCounts; // wjy: 目标端远控会话数 0-10，设备行数字徽标的权威缓存。
     QHash<QString, QString> m_deviceRemoteControllerNames; // wjy: 控制端设备名列表，悬停远控徽标气泡展示。
@@ -328,6 +333,7 @@ private:
     QTimer* m_settingsGearTimer = nullptr; // wjy: 设置齿轮点击后旋转半圈的动画定时器。
     // ===end====
     QTimer* m_statusAutoRefreshTimer = nullptr;
+    QTimer* m_remoteUpdateAvailabilityTimer = nullptr; // wjy: 打开远控窗口期间每 10 秒检查一次目标是否发现共享新版。
     QTimer* m_periodicDeviceDiscoveryTimer = nullptr; // wjy: 到期后复用批量新增扫描，已有扫描进行中时自动跳过本轮。
     QTimer* m_wakeVisualTimer = nullptr;
     QTimer* m_scriptOutputFlushTimer = nullptr;

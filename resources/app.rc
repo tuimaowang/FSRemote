@@ -1,1 +1,3 @@
-101 ICON "app.ico"
+// =====wjy====
+101 ICON "fsremote_app.ico" // wjy: Windows 可执行文件嵌入最终确认的 FS 渐变图标。
+// ===end====

@@ -332,7 +332,9 @@ if(WIN32)
                 -D "FSREMOTE_ISS_TEMPLATE=${CMAKE_CURRENT_SOURCE_DIR}/installer/FSRemote.iss.in"
                 -D "FSREMOTE_ISS_OUTPUT=${FSREMOTE_INSTALLER_SCRIPT}"
                 -D "FSREMOTE_INSTALLER_OUTPUT_DIR=${FSREMOTE_INSTALLER_OUTPUT_DIR}"
-                -D "FSREMOTE_SETUP_ICON=${CMAKE_CURRENT_SOURCE_DIR}/resources/app.ico"
+                # =====wjy====
+                -D "FSREMOTE_SETUP_ICON=${CMAKE_CURRENT_SOURCE_DIR}/resources/fsremote_app.ico" # wjy: 安装器与主程序统一使用最终 FS Logo。
+                # ===end====
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/installer/configure_installer.cmake"
             COMMAND "${FSREMOTE_INNO_SETUP_COMPILER}" /Qp "${FSREMOTE_INSTALLER_SCRIPT}"
             BYPRODUCTS "${FSREMOTE_INSTALLER_OUTPUT_DIR}/FSRemote安装器.exe"

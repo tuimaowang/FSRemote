@@ -140,7 +140,7 @@ int main(int argc, char* argv[])
     // =====wjy====
     QObject::connect(&platform::UpdateService::instance(), &platform::UpdateService::updateReadyToQuit,
         &app, [&window] {
-            window.requestApplicationExit(); // wjy: 更新退出先同步注销旧托盘图标，并与手动退出共享有界清理和强制退出兜底。
+            window.requestApplicationExit(); // wjy: 更新退出恢复为本机直接退出；控制端仅在设备右键菜单主动更新时维护远控等待窗口。
         });
     // ===end====
     writeStartupLog(QStringLiteral("[wjy-main] after MainWindow create"));

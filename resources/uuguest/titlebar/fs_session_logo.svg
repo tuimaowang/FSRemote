@@ -1,14 +1,23 @@
-<svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
-<path d="M1.15 12.15V1.85H7.25V3.42H2.95V6.02H6.72V7.54H2.95V12.15H1.15Z" fill="url(#paint0_linear_1_1)"/>
-<path d="M6.42 12.15V10.65H9.78C10.52 10.65 10.91 10.36 10.91 9.82C10.91 9.31 10.56 9.03 9.86 9.03H8.58C7.19 9.03 6.35 8.23 6.35 6.98C6.35 5.61 7.34 4.78 8.96 4.78H12.45V6.28H9.1C8.43 6.28 8.07 6.53 8.07 7C8.07 7.46 8.4 7.7 9.05 7.7H10.36C11.83 7.7 12.64 8.5 12.64 9.87C12.64 11.3 11.61 12.15 9.88 12.15H6.42Z" fill="url(#paint1_linear_1_1)"/>
-<defs>
-<linearGradient id="paint0_linear_1_1" x1="1.15" y1="1.85" x2="7.42" y2="11.7" gradientUnits="userSpaceOnUse">
-<stop stop-color="#1E88FF"/>
-<stop offset="1" stop-color="#36A8FF"/>
-</linearGradient>
-<linearGradient id="paint1_linear_1_1" x1="6.35" y1="4.78" x2="12.72" y2="12.06" gradientUnits="userSpaceOnUse">
-<stop stop-color="#20D3B0"/>
-<stop offset="1" stop-color="#00CFFF"/>
-</linearGradient>
-</defs>
+<svg width="16" height="16" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="fGradient" x1="48" y1="48" x2="124" y2="208" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#1E88FF"/>
+      <stop offset="1" stop-color="#36A8FF"/>
+    </linearGradient>
+    <linearGradient id="sGradient" x1="132" y1="48" x2="208" y2="208" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#20D3B0"/>
+      <stop offset="1" stop-color="#00CFFF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- =====wjy==== -->
+  <g transform="rotate(45 128 128)" stroke="#073DAF" stroke-width="6" stroke-linejoin="miter" paint-order="stroke fill">
+    <!-- wjy: F 使用七十六单位宽度，两条横线之间形成六十乘六十的标准正方形区域。 -->
+    <path fill="url(#fGradient)" d="M48 48H124V64H64V124H124V140H64V208H48V48Z"/>
+    <!-- wjy: 实心方块为四十四乘四十四，与 F 四边均保持八单位间距，并使用相同描边宽度保证视觉间距一致。 -->
+    <rect x="72" y="72" width="44" height="44" fill="url(#fGradient)" stroke="#073DAF" stroke-width="6"/>
+    <!-- wjy: S 同样使用七十六单位宽度，并与 F 保持八单位间距。 -->
+    <path fill="url(#sGradient)" d="M132 48H208V64H148V124H208V208H132V192H192V140H132V48Z"/>
+  </g>
+  <!-- ===end==== -->
 </svg>

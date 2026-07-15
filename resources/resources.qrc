@@ -1,6 +1,8 @@
 <RCC>
     <qresource prefix="/UUGuest">
-        <file alias="resource/images/titlebar/app_icon.ico">app.ico</file>
+        <!-- =====wjy==== -->
+        <file alias="resource/images/titlebar/app_icon.ico">fsremote_app.ico</file> <!-- wjy: 主窗口与托盘保持原资源别名，但改用最终确认的多尺寸程序图标。 -->
+        <!-- ===end==== -->
         <file alias="resource/images/titlebar/title_wordmark.png">uuguest/titlebar/title_wordmark.png</file>
         <file alias="resource/images/titlebar/fs_session_logo.svg">uuguest/titlebar/fs_session_logo.svg</file>
         <file alias="resource/images/titlebar/remote_control_center.svg">uuguest/titlebar/remote_control_center.svg</file>

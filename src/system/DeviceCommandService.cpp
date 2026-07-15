@@ -32,6 +32,10 @@ bool g_remoteUpdateScheduled = false; // wjy: 目标进程退出前只允许排�
 // ===end====
 
 // =====wjy====
+QString g_remoteUpdateFailure; // wjy: 暂存失败时保存可查询的错误，控制端无需一直等待到超时。
+// ===end====
+
+// =====wjy====
 void writeCommandServerLog(const QString& message)
 {
     writeWjyDiagnosticLog(message); // wjy: 命令服务关闭阶段写入统一诊断日志，用来确认 main 返回后的析构是否触发 Release 堆损坏。
@@ -239,6 +243,23 @@ private:
         }
 // ===end====
 // =====wjy====
+        if (command == "update_status") {
+            if (g_remoteUpdateScheduled) {
+                replyAndClose(QByteArrayLiteral("preparing\n"));
+                return; // wjy: 仅设备右键菜单发起的远程更新向控制端返回准备阶段。
+            }
+            if (!g_remoteUpdateFailure.trimmed().isEmpty()) {
+                replyAndClose(QByteArrayLiteral("failed|")
+                    + QUrl::toPercentEncoding(g_remoteUpdateFailure.trimmed())
+                    + QByteArrayLiteral("\n"));
+                return; // wjy: 目标端准备失败时把真实原因传给远控窗口。
+            }
+            replyAndClose(UpdateService::instance().isUpdateAvailable()
+                    ? QByteArrayLiteral("idle\n")
+                    : QByteArrayLiteral("complete\n")); // wjy: 重启后本地版本已追上共享版本即视为更新完成。
+            return;
+        }
+
         if (command == "update") {
             UpdateService& updateService = UpdateService::instance();
             if (!updateService.isUpdateAvailable()) {
@@ -251,11 +272,15 @@ private:
             }
 
             g_remoteUpdateScheduled = true;
+            g_remoteUpdateFailure.clear(); // wjy: 新请求开始时清除上一轮失败，避免状态查询读到过期错误。
             replyAndClose(QByteArrayLiteral("accepted\n")); // wjy: 先把受理结果发回控制端，再开始可能耗时的大文件暂存，避免 1.5 秒命令超时。
             QTimer::singleShot(150, [] {
                 QString errorMessage;
                 if (!UpdateService::instance().applyRemoteUpdate(&errorMessage)) {
                     g_remoteUpdateScheduled = false;
+                    g_remoteUpdateFailure = errorMessage.trimmed().isEmpty()
+                        ? QString::fromUtf8("目标设备准备更新失败。")
+                        : errorMessage.trimmed(); // wjy: 主进程未退出时保留失败原因，控制端下一轮查询即可结束等待。
                     writeCommandServerLog(QStringLiteral("[wjy-command] remote update prepare failed: %1")
                         .arg(errorMessage.trimmed())); // wjy: 准备失败时保留当前进程并允许再次请求，原因写入目标端统一诊断日志。
                 }
@@ -504,6 +529,55 @@ RemoteUpdateRequestResult DeviceCommandService::requestUpdate(const QString& hos
         *errorMessage = QString::fromUtf8("目标设备未受理更新请求；请确认目标设备已安装支持远程更新的版本。");
     }
     return RemoteUpdateRequestResult::Failed; // wjy: 旧客户端只会返回 error，这里给出可直接定位版本兼容性的提示。
+}
+// ===end====
+
+// =====wjy====
+RemoteUpdateStatus DeviceCommandService::queryUpdateStatus(const QString& hostIp, QString* errorMessage, uint16_t port, int timeoutMs)
+{
+    if (hostIp.trimmed().isEmpty()) {
+        if (errorMessage) *errorMessage = QString::fromUtf8("目标 IP 为空。");
+        return RemoteUpdateStatus::Unreachable;
+    }
+
+    QTcpSocket socket;
+    socket.connectToHost(hostIp.trimmed(), port);
+    if (!socket.waitForConnected(timeoutMs)) {
+        if (errorMessage) *errorMessage = socket.errorString().trimmed();
+        return RemoteUpdateStatus::Unreachable; // wjy: 主程序退出及更新器替换文件期间端口不可达是正常阶段。
+    }
+
+    const QByteArray payload = QByteArrayLiteral("update_status\n");
+    if (socket.write(payload) != payload.size() || !socket.waitForBytesWritten(timeoutMs)
+        || !socket.waitForReadyRead(timeoutMs)) {
+        if (errorMessage) *errorMessage = socket.errorString().trimmed();
+        socket.disconnectFromHost();
+        return RemoteUpdateStatus::Unreachable;
+    }
+
+    const QByteArray reply = socket.readAll().trimmed();
+    socket.disconnectFromHost();
+    const QList<QByteArray> parts = reply.split('|');
+    const QByteArray status = parts.value(0).trimmed().toLower();
+    if (status == "preparing") {
+        if (errorMessage) errorMessage->clear();
+        return RemoteUpdateStatus::Preparing;
+    }
+    if (status == "complete") {
+        if (errorMessage) errorMessage->clear();
+        return RemoteUpdateStatus::Complete;
+    }
+    if (status == "idle") {
+        if (errorMessage) errorMessage->clear();
+        return RemoteUpdateStatus::Idle;
+    }
+    if (status == "failed") {
+        if (errorMessage) *errorMessage = QUrl::fromPercentEncoding(parts.value(1)).trimmed();
+        return RemoteUpdateStatus::Failed;
+    }
+
+    if (errorMessage) *errorMessage = QString::fromUtf8("目标设备暂不支持更新状态查询。");
+    return RemoteUpdateStatus::Unsupported; // wjy: 首次滚动升级时旧目标端会返回 error，继续等待其退出并升级到新协议。
 }
 // ===end====
 

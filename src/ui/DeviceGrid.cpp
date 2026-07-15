@@ -3048,6 +3048,14 @@ DeviceGrid::DeviceGrid(QWidget* parent)
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status auto refresh timer")); // wjy: 记录自动刷新定时器创建完成。
 
     // =====wjy====
+    m_remoteUpdateAvailabilityTimer = new QTimer(this);
+    m_remoteUpdateAvailabilityTimer->setInterval(10000);
+    connect(m_remoteUpdateAvailabilityTimer, &QTimer::timeout,
+        this, &DeviceGrid::refreshOpenedRemoteUpdateAvailability); // wjy: 只要存在远控窗口，就周期确认其目标是否需要更新；不要求用户开启列表自动刷新。
+    m_remoteUpdateAvailabilityTimer->start();
+    // ===end====
+
+    // =====wjy====
     m_periodicDeviceDiscoveryTimer = new QTimer(this);
     connect(m_periodicDeviceDiscoveryTimer, &QTimer::timeout, this, [this] {
         startBatchAddDevices(false); // wjy: 周期扫描复用手动批量新增，但新增后不切换当前页面或设备选择。
@@ -5085,6 +5093,7 @@ void DeviceGrid::saveNewDevice()
     g_devices.append({name, ip, mac, {}, m_deviceRemarkEdit->text().trimmed(), {}}); // wjy: 新增设备默认无分组，只有后续拖入具体分组时才写 group。
     saveDevices();
     m_deviceStatuses.remove(ip);
+    m_deviceUpdateAvailability.remove(ip); // wjy: 新增同 IP 记录时清掉旧版本判断，等待下一轮目标状态刷新重新确认。
     m_deviceRemoteSessionCounts.remove(ip); // wjy: 新增同 IP 前清掉旧远控人数，避免误显示上一次会话徽标。
     m_deviceRemoteControllerNames.remove(ip);
     m_deviceIpEdit->clear();
@@ -5219,13 +5228,16 @@ void DeviceGrid::refreshDeviceStatuses()
         QHash<QString, platform::DevicePresenceState> statuses;
         statuses.reserve(ips.size());
         // =====wjy====
+        QHash<QString, bool> remoteUpdateAvailability;
         QHash<QString, int> remoteSessionCounts;
         QHash<QString, QString> remoteControllerNames;
+        remoteUpdateAvailability.reserve(ips.size());
         remoteSessionCounts.reserve(ips.size());
         remoteControllerNames.reserve(ips.size());
         // ===end====
         for (const QString& ip : ips) {
             statuses.insert(ip, platform::DevicePresenceState::Offline); // wjy: 每轮刷新先默认离线，只有状态服务明确返回 online/busy 时才覆盖，避免沿用旧在线状态。
+            remoteUpdateAvailability.insert(ip, false); // wjy: 离线、旧协议或查询失败默认不显示更新按钮，避免给不可操作设备提供入口。
             remoteSessionCounts.insert(ip, 0); // wjy: 默认无远控会话，只有状态服务返回人数后才显示数字徽标。
             remoteControllerNames.insert(ip, {});
         }
@@ -5263,6 +5275,14 @@ void DeviceGrid::refreshDeviceStatuses()
                         .arg(ip)); // wjy: 单个 IP 探测前记录，崩溃时可定位是否卡在某台设备。
 // ===end====
                     const platform::DeviceStatusInfo info = platform::DeviceStatusService::query(ip);
+                    bool updateAvailable = false;
+                    if (info.state == platform::DevicePresenceState::Online
+                        || info.state == platform::DevicePresenceState::Busy) {
+                        const platform::RemoteUpdateStatus updateStatus =
+                            platform::DeviceCommandService::queryUpdateStatus(ip, nullptr, 49102, 500); // wjy: 复用目标端已有 update_status，只在统一设备刷新线程查询，不接触远控流回调。
+                        updateAvailable = updateStatus == platform::RemoteUpdateStatus::Idle
+                            || updateStatus == platform::RemoteUpdateStatus::Failed; // wjy: idle 表示发现新版；上次准备失败后仍允许用户从标题栏重试。
+                    }
 // =====wjy====
                     writeDeviceGridStartupLog(QStringLiteral("[wjy-status] probe done worker=%1 index=%2 ip=%3 state=%4")
                         .arg(worker)
@@ -5273,6 +5293,7 @@ void DeviceGrid::refreshDeviceStatuses()
                     std::lock_guard lock(resultMutex);
                     statuses.insert(ip, info.state);
                     // =====wjy====
+                    remoteUpdateAvailability.insert(ip, updateAvailable);
                     remoteSessionCounts.insert(ip, qBound(0, info.remoteSessionCount, 10)); // wjy: 同步缓存远控人数，驱动设备行 1-10 数字徽标。
                     remoteControllerNames.insert(ip, info.remoteControllerNames.trimmed());
                     // ===end====
@@ -5316,7 +5337,7 @@ void DeviceGrid::refreshDeviceStatuses()
 
 // =====wjy====
         writeDeviceGridStartupLog(QStringLiteral("[wjy-status] invoke ui post begin")); // wjy: 准备把后台探测结果投递回 UI 线程；如果有 begin 没有 end，说明崩在投递附近。
-        const bool invokeQueued = QMetaObject::invokeMethod(self, [self, statuses = std::move(statuses), remoteSessionCounts = std::move(remoteSessionCounts), remoteControllerNames = std::move(remoteControllerNames), remoteDeviceNames = std::move(remoteDeviceNames), remoteDeviceMacs = std::move(remoteDeviceMacs), remoteDeviceBroadcastIps = std::move(remoteDeviceBroadcastIps), remoteScriptRuntimes = std::move(remoteScriptRuntimes), remoteTerminalUsers = std::move(remoteTerminalUsers)]() mutable { // wjy: 把脚本运行、远控人数/设备名和在线结果同批投递到 UI 线程。
+        const bool invokeQueued = QMetaObject::invokeMethod(self, [self, statuses = std::move(statuses), remoteUpdateAvailability = std::move(remoteUpdateAvailability), remoteSessionCounts = std::move(remoteSessionCounts), remoteControllerNames = std::move(remoteControllerNames), remoteDeviceNames = std::move(remoteDeviceNames), remoteDeviceMacs = std::move(remoteDeviceMacs), remoteDeviceBroadcastIps = std::move(remoteDeviceBroadcastIps), remoteScriptRuntimes = std::move(remoteScriptRuntimes), remoteTerminalUsers = std::move(remoteTerminalUsers)]() mutable { // wjy: 把更新可用性、脚本运行、远控人数/设备名和在线结果同批投递到 UI 线程。
 // =====wjy====
             writeDeviceGridStartupLog(QStringLiteral("[wjy-status] invoke ui begin")); // wjy: 回到 UI 线程前半段日志，判断崩溃是否发生在 UI 更新阶段。
 // ===end====
@@ -5329,15 +5350,23 @@ void DeviceGrid::refreshDeviceStatuses()
             DeviceGrid* grid = self.data();
             grid->m_deviceStatuses = std::move(statuses);
             // =====wjy====
+            grid->m_deviceUpdateAvailability.clear();
             grid->m_deviceRemoteSessionCounts = std::move(remoteSessionCounts); // wjy: 刷新完成后整表替换远控人数缓存，设备行徽标立即反映 1-10 路变化。
             grid->m_deviceRemoteControllerNames = std::move(remoteControllerNames);
-            // wjy: 目标设备离线时自动关闭对应远控窗口，避免悬挂连接。
+            for (auto it = remoteUpdateAvailability.cbegin(); it != remoteUpdateAvailability.cend(); ++it) {
+                grid->setRemoteUpdateAvailability(it.key(), it.value()); // wjy: 通过统一入口过滤更新任务启动后的迟到结果，再刷新普通和平铺窗口按钮。
+            }
+            // wjy: 普通设备离线时关闭悬挂窗口；更新造成的预期离线必须保留原窗口继续等待重连。
             for (auto it = grid->m_remoteDesktopWindows.begin(); it != grid->m_remoteDesktopWindows.end();) {
                 const QString ip = it.key().trimmed();
                 const platform::DevicePresenceState state = grid->m_deviceStatuses.value(ip, platform::DevicePresenceState::Unknown);
                 QPointer<RemoteDesktopWindow> window = it.value();
-                if (state == platform::DevicePresenceState::Offline && window && !window->isClosingConnection()) {
-                    window->close();
+                const bool keepForRemoteUpdate = window && window->isRemoteUpdateActive(); // wjy: 更新准备、安装、重连和失败提示阶段都保留窗口，防止状态机随窗口销毁。
+                if (state == platform::DevicePresenceState::Offline
+                    && window
+                    && !window->isClosingConnection()
+                    && !keepForRemoteUpdate) {
+                    window->close(); // wjy: 只有非更新状态的普通断线沿用原来的自动关闭行为。
                     it = grid->m_remoteDesktopWindows.erase(it);
                     continue;
                 }
@@ -5587,6 +5616,21 @@ void DeviceGrid::showRemoteWindowDeviceMenu(const QString& hostIp, const QPoint&
             showDeviceContextMenuForIndexes(deviceIndex, QVector<int>{deviceIndex}, globalPosition); // wjy: IP 匹配后显式传入单设备集合，绝不继承主界面的多选状态。
             return;
         }
+    }
+}
+
+void DeviceGrid::updateRemoteWindowDevice(const QString& hostIp)
+{
+    const QString targetIp = hostIp.trimmed();
+    if (targetIp.isEmpty()) {
+        return;
+    }
+    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+        if (g_devices.at(deviceIndex).ip.trimmed().compare(targetIp, Qt::CaseInsensitive) != 0) {
+            continue;
+        }
+        updateDeviceForIndex(deviceIndex, true); // wjy: 标题栏按钮与设备右键“更新”调用同一个入口，共享受理提示、失败处理和窗口保持状态机。
+        return;
     }
 }
 // ===end====
@@ -6237,7 +6281,7 @@ void DeviceGrid::openRemoteDesktopWindow()
         return;
     }
 
-    openRemoteDesktopWindowForDevice(m_selectedDeviceIndex, QPoint(42, 24));
+    openRemoteDesktopWindowForDevice(m_selectedDeviceIndex); // wjy: 单设备首次远控使用窗口自身计算的屏幕中央位置。
 }
 
 // =====wjy====
@@ -6277,7 +6321,7 @@ bool DeviceGrid::ensureRemoteControlAuthorization(int deviceIndex, bool showMess
 }
 // ===end====
 
-void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex, const QPoint& fallbackOffset)
+void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex)
 {
     if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
         return;
@@ -6324,20 +6368,21 @@ void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex, const QPoint&
     // =====wjy====
     connect(remoteWindow, &RemoteDesktopWindow::titleBarContextMenuRequested,
         this, &DeviceGrid::showRemoteWindowDeviceMenu); // wjy: 普通远控窗口右键标题栏时按该窗口 IP 打开共享设备菜单。
+    connect(remoteWindow, &RemoteDesktopWindow::titleBarUpdateRequested,
+        this, &DeviceGrid::updateRemoteWindowDevice); // wjy: 普通远控窗口更新按钮按自身 IP 复用单设备更新逻辑。
+    remoteWindow->setRemoteUpdateAvailable(m_deviceUpdateAvailability.value(deviceIp, false)); // wjy: 窗口创建时立即使用最近一次状态刷新结果，不等待下一轮定时刷新。
     // ===end====
     connect(remoteWindow, &RemoteDesktopWindow::shortcutFullscreenRequested, this, [this] { triggerShortcutAction(0); });
     connect(remoteWindow, &RemoteDesktopWindow::shortcutTileRequested, this, [this] { triggerShortcutAction(1); });
     connect(remoteWindow, &RemoteDesktopWindow::shortcutCloseTopmostRequested, this, [this] { triggerShortcutAction(2); });
     connect(remoteWindow, &RemoteDesktopWindow::shortcutCloseAllRequested, this, [this] { triggerShortcutAction(3); });
     connect(remoteWindow, &RemoteDesktopWindow::shortcutClipboardSyncRequested, this, [this] { triggerShortcutAction(4); });
-    if (!platform::AppSettings::hasRemoteDesktopWindowGeometry(deviceIp)) {
-        remoteWindow->move(window()->frameGeometry().topLeft() + fallbackOffset);
-    }
     remoteWindow->show();
     remoteWindow->raise();
     remoteWindow->activateWindow();
     remoteWindow->setFocus(Qt::ActiveWindowFocusReason);
     rememberRemoteWindowActivation(remoteWindow);
+    refreshOpenedRemoteUpdateAvailability(); // wjy: 新窗口创建后立即查询一次，最快显示目标更新按钮，不必等待 10 秒定时器。
 }
 
 void DeviceGrid::launchSelectedRemoteDesktopWindows()
@@ -6367,7 +6412,7 @@ void DeviceGrid::launchSelectedRemoteDesktopWindows()
             wakeCurrentDevice();
         }
 
-        openRemoteDesktopWindowForDevice(deviceIndex, QPoint(42 + launchOrder * 28, 24 + launchOrder * 28));
+        openRemoteDesktopWindowForDevice(deviceIndex); // wjy: 批量打开的首次窗口同样采用统一居中规则；设备分组平铺仍使用独立布局逻辑。
     }
     m_selectedDeviceIndex = originalSelectedDeviceIndex;
 }
@@ -6410,8 +6455,8 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
     const int gridSize = qMax(1, static_cast<int>(std::ceil(std::sqrt(static_cast<double>(deviceCount))))); // wjy: 设备数量开方取上整，形成 1x1、2x2、3x3 这种方阵网格。
     const int columnCount = gridSize; // wjy: 列数等于方阵边长，保证布局是 2x2、3x3 这类平铺。
     const int rowCount = gridSize; // wjy: 行数也等于方阵边长，设备不足时只是后面的格子空着。
-    const int tileWidth = qMax(320, availableRect.width() / columnCount); // wjy: 每个远程桌面窗口的宽度按列数均分，最低保留 320 避免窗口太窄。
-    const int tileHeight = qMax(240, availableRect.height() / rowCount); // wjy: 每个远程桌面窗口的高度按行数均分，最低保留 240 避免窗口太矮。
+    const int tileWidth = qMax(1, availableRect.width() / columnCount); // wjy: 完全按可用屏幕宽度均分，不再用 320px 下限把多列窗口顶到重叠。
+    const int tileHeight = qMax(1, availableRect.height() / rowCount); // wjy: 完全按可用屏幕高度均分，12 台等大分组也能保持在屏幕范围内。
 
     for (int tileIndex = 0; tileIndex < groupDeviceIndexes.size(); ++tileIndex) {
         const int deviceIndex = groupDeviceIndexes.at(tileIndex); // wjy: 当前要打开的真实设备下标。
@@ -6462,12 +6507,15 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
         // =====wjy====
         connect(remoteWindow, &RemoteDesktopWindow::titleBarContextMenuRequested,
             this, &DeviceGrid::showRemoteWindowDeviceMenu); // wjy: 分组平铺创建的远控窗口也按各自 IP 弹出菜单，不会串到其它格子设备。
+        connect(remoteWindow, &RemoteDesktopWindow::titleBarUpdateRequested,
+            this, &DeviceGrid::updateRemoteWindowDevice); // wjy: 平铺窗口同样只更新自身绑定设备。
+        remoteWindow->setRemoteUpdateAvailable(m_deviceUpdateAvailability.value(g_devices.at(deviceIndex).ip.trimmed(), false)); // wjy: 平铺创建后同步显示该设备最近确认的更新状态。
         // ===end====
         connect(remoteWindow, &RemoteDesktopWindow::shortcutFullscreenRequested, this, [this] { triggerShortcutAction(0); });
         connect(remoteWindow, &RemoteDesktopWindow::shortcutTileRequested, this, [this] { triggerShortcutAction(1); });
         connect(remoteWindow, &RemoteDesktopWindow::shortcutCloseTopmostRequested, this, [this] { triggerShortcutAction(2); });
         connect(remoteWindow, &RemoteDesktopWindow::shortcutCloseAllRequested, this, [this] { triggerShortcutAction(3); });
-        remoteWindow->setMinimumSize(240, 180); // wjy: 平铺模式允许窗口小于普通远程桌面的默认最小尺寸，确保 3x3 时能尽量塞进屏幕可用区域。
+        // wjy: 不再为平铺窗口设置 240x180 最小尺寸，targetRect 的网格尺寸可以被 QWidget 原样采用。
         remoteWindow->setGeometry(targetRect); // wjy: 按网格设置窗口位置和大小，形成 2x2、3x3 等平铺效果。
         remoteWindow->show();
         remoteWindow->raise();
@@ -6475,6 +6523,7 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
         remoteWindow->setFocus(Qt::ActiveWindowFocusReason);
         rememberRemoteWindowActivation(remoteWindow);
     }
+    refreshOpenedRemoteUpdateAvailability(); // wjy: 一批平铺窗口创建完后统一查询去重后的目标 IP，避免每个窗口各发一轮请求。
 // ===end====
 }
 
@@ -6500,6 +6549,78 @@ QVector<QPointer<RemoteDesktopWindow>> DeviceGrid::openedRemoteWindows() const
         appendWindow(window);
     }
     return windows;
+}
+
+void DeviceGrid::setRemoteUpdateAvailability(const QString& hostIp, bool available)
+{
+    const QString targetIp = hostIp.trimmed();
+    if (targetIp.isEmpty()) {
+        return;
+    }
+    const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
+    bool updateActive = false;
+    for (const QPointer<RemoteDesktopWindow>& window : windows) {
+        if (window && window->hostIp().compare(targetIp, Qt::CaseInsensitive) == 0
+            && window->isRemoteUpdateActive()) {
+            updateActive = true;
+            break; // wjy: 查询结果可能晚于用户点击，更新状态机已启动时禁止旧结果重新点亮按钮。
+        }
+    }
+    const bool effectiveAvailable = available && !updateActive;
+    m_deviceUpdateAvailability.insert(targetIp, effectiveAvailable); // wjy: 缓存供稍后新建的普通或平铺远控窗口直接使用。
+    for (const QPointer<RemoteDesktopWindow>& window : windows) {
+        if (window && window->hostIp().compare(targetIp, Qt::CaseInsensitive) == 0) {
+            window->setRemoteUpdateAvailable(effectiveAvailable); // wjy: 同一设备可能同时存在多个窗口，状态刷新时统一显示或隐藏按钮。
+        }
+    }
+}
+
+void DeviceGrid::refreshOpenedRemoteUpdateAvailability()
+{
+    if (m_statusRefreshInProgress || m_remoteUpdateAvailabilityRefreshInProgress) {
+        return; // wjy: 全量设备刷新已包含更新查询，两类任务不并发占用目标命令端口。
+    }
+
+    QStringList ips;
+    for (const QPointer<RemoteDesktopWindow>& window : openedRemoteWindows()) {
+        if (!window || window->isRemoteUpdateActive()) {
+            continue;
+        }
+        const QString ip = window->hostIp().trimmed();
+        if (!ip.isEmpty() && !ips.contains(ip, Qt::CaseInsensitive)) {
+            ips.append(ip);
+        }
+    }
+    if (ips.isEmpty()) {
+        return;
+    }
+
+    m_remoteUpdateAvailabilityRefreshInProgress = true;
+    QPointer<DeviceGrid> self(this);
+    runBackgroundTask([self, ips] {
+        QHash<QString, bool> availability;
+        availability.reserve(ips.size());
+        for (const QString& ip : ips) {
+            const platform::RemoteUpdateStatus status =
+                platform::DeviceCommandService::queryUpdateStatus(ip, nullptr, 49102, 500);
+            availability.insert(ip,
+                status == platform::RemoteUpdateStatus::Idle
+                    || status == platform::RemoteUpdateStatus::Failed); // wjy: 每 10 秒只读查询，不发送 update 命令，也不接触远控流对象。
+        }
+        if (!self) {
+            return;
+        }
+        QMetaObject::invokeMethod(self, [self, availability = std::move(availability)] {
+            if (!self) {
+                return;
+            }
+            DeviceGrid* grid = self.data();
+            grid->m_remoteUpdateAvailabilityRefreshInProgress = false;
+            for (auto it = availability.cbegin(); it != availability.cend(); ++it) {
+                grid->setRemoteUpdateAvailability(it.key(), it.value()); // wjy: 网络查询完成后回到 UI 线程统一刷新标题栏按钮。
+            }
+        }, Qt::QueuedConnection);
+    });
 }
 
 void DeviceGrid::rememberRemoteWindowActivation(RemoteDesktopWindow* window)
@@ -6581,8 +6702,8 @@ void DeviceGrid::toggleRemoteWindowTiling()
     const int count = windows.size();
     const int columnCount = qMax(1, static_cast<int>(std::ceil(std::sqrt(static_cast<double>(count)))));
     const int rowCount = qMax(1, static_cast<int>(std::ceil(count / static_cast<double>(columnCount))));
-    const int tileWidth = qMax(320, availableRect.width() / columnCount);
-    const int tileHeight = qMax(240, availableRect.height() / rowCount);
+    const int tileWidth = qMax(1, availableRect.width() / columnCount); // wjy: 快捷键平铺同样取消 320px 宽度下限，窗口数量多时仍严格落在屏幕内。
+    const int tileHeight = qMax(1, availableRect.height() / rowCount); // wjy: 取消 240px 高度下限，12 个窗口可按 4x3 网格完整铺开且互不重叠。
 
     m_remoteTileRestoreGeometries.clear();
     for (int i = 0; i < windows.size(); ++i) {
@@ -6726,7 +6847,19 @@ bool DeviceGrid::updateDeviceForIndex(int deviceIndex, bool showMessages)
     const platform::RemoteUpdateRequestResult result =
         platform::DeviceCommandService::requestUpdate(device.ip, &errorMessage);
     if (result == platform::RemoteUpdateRequestResult::Accepted) {
-        if (showMessages) {
+        // =====wjy====
+        bool remoteWindowNotified = false;
+        const QString targetIp = device.ip.trimmed();
+        setRemoteUpdateAvailability(targetIp, false); // wjy: 受理后立即隐藏同 IP 所有窗口按钮，防止重复提交更新任务。
+        for (const QPointer<RemoteDesktopWindow>& window : openedRemoteWindows()) {
+            if (!window || window->hostIp() != targetIp) {
+                continue;
+            }
+            window->beginRemoteUpdateWait(); // wjy: 无论更新来自设备菜单还是远控标题栏菜单，同 IP 的所有窗口都进入更新遮罩。
+            remoteWindowNotified = true;
+        }
+        // ===end====
+        if (showMessages && !remoteWindowNotified) {
             QMessageBox messageBox(
                 QMessageBox::Information,
                 QString(),
@@ -6734,11 +6867,12 @@ bool DeviceGrid::updateDeviceForIndex(int deviceIndex, bool showMessages)
                 QMessageBox::NoButton,
                 this);
             messageBox.addButton(QString::fromUtf8("知道了"), QMessageBox::AcceptRole);
-            messageBox.exec(); // wjy: 远端暂存是异步的，单设备操作明确告知“已受理”而不误报为已经安装完成。
+            messageBox.exec(); // wjy: 没有打开远控窗口时仍保留受理提示；有窗口时由中央更新遮罩持续反馈。
         }
-        return true; // wjy: 目标机已异步接管暂存、退出、替换和重启，控制端无需保持连接。
+        return true; // wjy: 目标机异步执行更新，打开的远控窗口由自身状态机持续等待并自动恢复。
     }
     if (result == platform::RemoteUpdateRequestResult::UpToDate) {
+        setRemoteUpdateAvailability(device.ip, false); // wjy: 缓存可能滞后时以目标端最新答复为准，立即移除标题栏按钮。
         if (showMessages) {
             QMessageBox messageBox(
                 QMessageBox::Information,
@@ -6875,6 +7009,7 @@ void DeviceGrid::deleteDeviceForIndex(int deviceIndex)
     g_devices.removeAt(deviceIndex); // wjy: 只从本机设备集合移除，不向目标设备发送任何关机、卸载或删除文件命令。
     saveDevices();
     m_deviceStatuses.remove(removedIp);
+    m_deviceUpdateAvailability.remove(removedIp); // wjy: 删除设备时同步清理更新按钮缓存，避免以后复用 IP 继承旧状态。
     m_deviceRemoteSessionCounts.remove(removedIp); // wjy: 删除设备时同步清掉远控人数缓存。
     m_deviceRemoteControllerNames.remove(removedIp);
     m_poweringOnDeviceIps.remove(removedIp);

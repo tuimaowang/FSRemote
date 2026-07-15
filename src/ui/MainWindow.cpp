@@ -82,9 +82,6 @@ void MainWindow::setupTrayIcon()
     m_trayQuitAction = m_trayMenu->addAction(QString::fromUtf8("退出"));
     // =====wjy====
     connect(m_trayMenu, &QMenu::triggered, this, [this](QAction* action) {
-        writeWindowStartupLog(QStringLiteral("[wjy-tray] menu triggered action=%1 ptr=%2")
-            .arg(action ? action->text() : QStringLiteral("<null>"))
-            .arg(reinterpret_cast<quintptr>(action))); // wjy: 统一监听菜单级 triggered，绕开当前设备上单个 QAction 回调未送达的问题。
         if (action == m_trayQuitAction) {
             writeWindowStartupLog(QStringLiteral("[wjy-exit] tray quit action triggered"));
             requestApplicationExit(); // wjy: 只有精确匹配“退出”动作时进入统一退出流程，避免菜单关闭等事件误触发。
@@ -101,22 +98,27 @@ void MainWindow::setupTrayIcon()
     m_trayIcon->setToolTip(windowTitle());
     m_trayIcon->setContextMenu(m_trayMenu); // wjy: 恢复 Windows/Qt 原生右键菜单显示；动作执行仍由上面的 QMenu::triggered 统一接管。
     connect(m_trayIcon, &QSystemTrayIcon::activated, this, [this](QSystemTrayIcon::ActivationReason reason) {
-        writeWindowStartupLog(QStringLiteral("[wjy-tray] activated reason=%1").arg(static_cast<int>(reason))); // wjy: 记录 Windows 实际回传的托盘点击类型，右键应为 Context。
         if (reason == QSystemTrayIcon::Context) {
-            writeWindowStartupLog(QStringLiteral("[wjy-tray] native context menu requested")); // wjy: 菜单显示由 setContextMenu 负责，避免手动 popup 在部分 Qt/Windows 组合下完全收不到右键事件。
             return; // wjy: 右键只负责菜单，不执行打开主窗口逻辑。
         }
-        // wjy: Windows 上单击/双击仍恢复主窗口。
-        if (reason == QSystemTrayIcon::Trigger
-            || reason == QSystemTrayIcon::DoubleClick
-            || reason == QSystemTrayIcon::MiddleClick) {
-            // 延迟一拍，避开托盘消息与窗口激活抢焦点。
-            QTimer::singleShot(0, this, [this] { showFromTray(); });
+        if (reason == QSystemTrayIcon::DoubleClick) {
+            // =====wjy====
+            if (isVisible() && !isMinimized()) {
+                hideToTray(); // wjy: 左键双击时主窗口已正常显示，则隐藏回托盘，实现打开/关闭切换。
+            } else if (m_trayShowAction) {
+                m_trayShowAction->trigger(); // wjy: 左键双击时窗口隐藏或最小化，则复用右键菜单动作恢复主窗口。
+            }
+            // ===end====
+            return;
         }
-    }, Qt::UniqueConnection);
+        if (reason == QSystemTrayIcon::Trigger
+            || reason == QSystemTrayIcon::MiddleClick) {
+            if (m_trayShowAction) {
+                m_trayShowAction->trigger(); // wjy: 通过“打开主窗口”菜单动作恢复、置前并激活主窗口。
+            }
+        }
+    }); // wjy: activated 使用 lambda，不能依赖 Qt::UniqueConnection；保持普通连接才能确保 Windows 托盘事件进入回调。
     m_trayIcon->show();
-    writeWindowStartupLog(QStringLiteral("[wjy-tray] tray icon shown ptr=%1")
-        .arg(reinterpret_cast<quintptr>(m_trayIcon))); // wjy: 每个进程只应出现一条 shown，可据此判断是否重复创建托盘对象。
 }
 
 void MainWindow::removeTrayIcon()

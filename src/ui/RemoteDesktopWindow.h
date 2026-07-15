@@ -50,6 +50,12 @@ public:
     bool isWaitingShortcutRelease() const;
     void updateShortcutReleaseGuard();
     // =====wjy====
+    QString hostIp() const; // wjy: 设备菜单更新成功后按固定 IP 找到所有对应远控窗口。
+    void beginRemoteUpdateWait(); // wjy: 远控窗口进入更新遮罩、暂停输入并自动等待目标设备重启。
+    bool isRemoteUpdateActive() const; // wjy: 供设备状态刷新识别“预期更新离线”，避免把正在等待重启的远控窗口当作普通断线关闭。
+    void setRemoteUpdateAvailable(bool available); // wjy: 主界面统一探测目标版本后控制标题栏更新按钮，不让远控流线程参与版本检测。
+    // ===end====
+    // =====wjy====
     void setClipboardSyncEnabled(bool enabled);
     bool isClipboardSyncEnabled() const;
     void pushLocalClipboardIfNeeded();
@@ -65,6 +71,7 @@ signals:
     // =====wjy====
     void shortcutClipboardSyncRequested();
     void titleBarContextMenuRequested(const QString& hostIp, const QPoint& globalPosition); // wjy: 标题栏右键只上报本窗口绑定的目标 IP 和屏幕坐标，由设备主界面复用统一菜单逻辑。
+    void titleBarUpdateRequested(const QString& hostIp); // wjy: 标题栏更新按钮只上报固定目标 IP，由 DeviceGrid 复用设备右键菜单的更新入口。
     // ===end====
 
 protected:
@@ -84,13 +91,33 @@ protected:
     void leaveEvent(QEvent* event) override;
 
 private:
+    // =====wjy====
+    enum class RemoteUpdateState {
+        None,
+        Preparing,
+        Installing,
+        Reconnecting,
+        Failed,
+    }; // wjy: 把更新过程与普通连接状态分开，避免目标重启被误显示为普通断线。
+    // ===end====
     void startViewerConnection();
+    // =====wjy====
+    void pollRemoteUpdateStatus();
+    void stopViewerConnectionAsync(bool deleteAfterStop);
+    void startViewerAfterUpdate();
+    void finishRemoteUpdateWait();
+    bool remoteUpdateActive() const;
+    bool remoteUpdateAcceptsFrames() const;
+    QString remoteUpdateTitle() const;
+    QString remoteUpdateDetail() const;
+    // ===end====
     // =====wjy====
     // wjy: 远控标题栏已删除“虚拟屏”标签和“+”入口，因此不再保留标签命中类型。
     // ===end====
 
     // =====wjy====
     int titleBarHeight() const; // wjy: 远控标题栏高度与主窗口 28px 对齐。
+    QRect remoteUpdateButtonRect() const; // wjy: 更新按钮位于剪切板按钮左侧，对应用户标出的标题栏空白区域。
     QRect clipboardSyncRect() const;
     // ===end====
     QRect minimizeRect() const;
@@ -135,6 +162,20 @@ private:
     QImage m_pendingRemoteFrame; // wjy: Holds only the newest decoded frame so slow full-screen painting cannot build a stale-frame queue.
     FsRemoteStreamHandle m_viewerHandle = nullptr;
     bool m_closeInProgress = false;
+    // =====wjy====
+    RemoteUpdateState m_remoteUpdateState = RemoteUpdateState::None;
+    QString m_remoteUpdateFailure;
+    QTimer* m_remoteUpdateTimer = nullptr;
+    QElapsedTimer m_remoteUpdateClock;
+    qint64 m_nextRemoteUpdateProbeAtMs = 0;
+    bool m_remoteUpdateProbeInProgress = false;
+    bool m_remoteUpdateReconnectRequested = false;
+    bool m_viewerStopInProgress = false;
+    bool m_deleteAfterViewerStop = false;
+    int m_remoteUpdateSpinnerStep = 0; // wjy: 更新遮罩状态及异步停流标志都由远控窗口自身维护，窗口不会因目标重启而销毁。
+    int m_remoteUpdateGeneration = 0; // wjy: 每次重新发起更新递增，丢弃上一轮迟到的后台查询结果。
+    bool m_remoteUpdateAvailable = false; // wjy: 仅保存 DeviceGrid 最近一次状态刷新结果，不在远控连接回调中主动探测更新。
+    // ===end====
     bool m_rememberGeometry = true;
     bool m_textureFrameActive = false;
     std::atomic_bool m_texturePresentFailed = false;
