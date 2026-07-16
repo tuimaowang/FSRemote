@@ -34,7 +34,7 @@ void writeWindowStartupLog(const QString& message)
 
 namespace ui {
 
-MainWindow::MainWindow(QWidget* parent)
+MainWindow::MainWindow(platform::DeviceRealtimeStateService* realtimeStateService, QWidget* parent)
     : QMainWindow(parent)
 {
     writeWindowStartupLog(QStringLiteral("[wjy-window] MainWindow ctor begin"));
@@ -49,7 +49,7 @@ MainWindow::MainWindow(QWidget* parent)
 
     m_remoteControllerOverlay = new RemoteControllerOverlay(); // wjy: 被控端即使主窗口隐藏到托盘，右下角远控状态提示仍作为独立顶层窗口持续可见。
 
-    DeviceGrid* deviceGrid = new DeviceGrid(this); // wjy: Main window always owns the real DeviceGrid now that startup isolation is complete.
+    DeviceGrid* deviceGrid = new DeviceGrid(realtimeStateService, this); // wjy: 设备列表消费 main 生命周期内的统一实时状态服务，退出顺序不会悬空。
     writeWindowStartupLog(QStringLiteral("[wjy-window] after DeviceGrid create"));
     setCentralWidget(deviceGrid); // wjy: Restore the normal central widget path and remove the placeholder isolation branch.
 

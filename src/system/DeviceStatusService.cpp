@@ -11,6 +11,7 @@
 #include <QHostAddress>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QNetworkProxy>
 #include <QRegularExpression>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -37,6 +38,13 @@ namespace {
 void writeStatusServerLog(const QString& message)
 {
     writeWjyDiagnosticLog(message); // wjy: 状态服务关闭阶段写入统一诊断日志，用来确认 main 返回后的析构链路。
+}
+// ===end====
+
+// =====wjy====
+void configureLanStatusSocket(QTcpSocket& socket)
+{
+    socket.setProxy(QNetworkProxy(QNetworkProxy::NoProxy)); // wjy: 49101 状态校准只面向局域网设备，禁止 Qt 使用 Clash、PAC 或系统代理处理原始 TCP。
 }
 // ===end====
 
@@ -284,6 +292,7 @@ DeviceStatusInfo queryStatusInfo(const QString& hostIp, uint16_t port, int timeo
     }
 
     QTcpSocket socket;
+    configureLanStatusSocket(socket); // wjy: 手动状态校准直接连接目标设备，代理配置不能再制造假离线或无效代理错误。
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)) {
         return info;
@@ -446,6 +455,13 @@ QString DeviceStatusService::terminalUser(const QString& hostIp, uint16_t port, 
 {
     return queryStatusInfo(hostIp, port, timeoutMs).terminalUser;
 }
+
+// =====wjy====
+RemoteScriptRuntimeInfo DeviceStatusService::localScriptRuntime()
+{
+    return localScriptRuntimeInfo(); // wjy: 对外只暴露验证后的三态事实，清单路径和 Windows 进程校验细节仍封装在本服务内部。
+}
+// ===end====
 
 DeviceStatusInfo DeviceStatusService::query(const QString& hostIp, uint16_t port, int timeoutMs)
 {

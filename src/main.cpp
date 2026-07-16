@@ -4,6 +4,7 @@
 #include "stream/StreamRuntime.h"
 #include "system/AppSettings.h"
 #include "system/DeviceCommandService.h"
+#include "system/DeviceRealtimeStateService.h"
 #include "system/DeviceStatusService.h"
 #include "system/ParsecVddInstaller.h"
 #include "system/PowerManager.h"
@@ -14,6 +15,7 @@
 
 #include <QApplication>
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QFont>
 #include <QLocalServer>
 #include <QLocalSocket>
@@ -21,6 +23,9 @@
 #include <QObject>
 #include <QStringList>
 #include <QTimer>
+
+#include <algorithm>
+#include <utility>
 
 #if defined(Q_OS_WIN)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -77,6 +82,60 @@ void waitForRestartParentIfRequested()
 #else
     Q_UNUSED(parentPid)
 #endif
+}
+
+platform::DeviceRealtimeScriptRuntime currentRealtimeScriptRuntime()
+{
+    const platform::RemoteScriptRuntimeInfo runtime = platform::DeviceStatusService::localScriptRuntime();
+    platform::DeviceRealtimeScriptRuntime realtime;
+    if (!runtime.supported || !runtime.statusKnown) {
+        realtime.state = platform::RealtimeScriptState::Unknown;
+    } else {
+        realtime.state = runtime.running
+            ? platform::RealtimeScriptState::Running
+            : platform::RealtimeScriptState::Idle;
+    }
+    realtime.runId = runtime.runId;
+    realtime.workName = runtime.workName;
+    realtime.scriptName = runtime.scriptName;
+    realtime.controllerPid = runtime.controllerPid;
+    realtime.startedAtEpochMs = runtime.startedAtEpochMs;
+    return realtime; // wjy: 广播只转换已验证结果，不根据控制端本地脚本 UI 缓存推测目标状态。
+}
+
+platform::DeviceRealtimeLocalState currentRealtimeLocalState(FsRemoteStreamHandle hostHandle)
+{
+    platform::DeviceRealtimeLocalState state;
+    state.script = currentRealtimeScriptRuntime();
+    if (!hostHandle) {
+        return state;
+    }
+
+    const int activeCount = qBound(0,
+        static_cast<int>(stream::StreamRuntime::instance().activeSessionCount(hostHandle)),
+        10);
+    QStringList details = stream::StreamRuntime::instance()
+        .activeControllerDetails(hostHandle)
+        .split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+    std::sort(details.begin(), details.end(), [](const QString& left, const QString& right) {
+        return left.compare(right, Qt::CaseInsensitive) < 0;
+    });
+
+    for (int index = 0; index < activeCount; ++index) {
+        const QString detail = details.value(index).trimmed();
+        const int separator = detail.indexOf(QLatin1Char('\t'));
+        platform::DeviceRealtimeHostSession session;
+        session.controllerName = (separator < 0 ? detail : detail.left(separator)).trimmed();
+        session.sourceIp = (separator < 0 ? QString() : detail.mid(separator + 1)).trimmed();
+        const QByteArray identityText = QStringLiteral("%1|%2|%3")
+            .arg(session.controllerName, session.sourceIp)
+            .arg(index)
+            .toUtf8();
+        session.sessionId = QStringLiteral("host-%1")
+            .arg(QString::fromLatin1(QCryptographicHash::hash(identityText, QCryptographicHash::Sha256).toHex())); // wjy: 原生导出暂无会话 ID 时，用当前详情和槽位生成快照内唯一 ID；真实人数仍完全由主机会话表决定。
+        state.hostSessions.append(std::move(session));
+    }
+    return state;
 }
 // ===end====
 
@@ -173,6 +232,15 @@ int main(int argc, char* argv[])
     statusServer.start(49101); // wjy: Port 49101 is queried by other FSRemote clients during refresh.
     writeStartupLog(QStringLiteral("[wjy-main] after status server start"));
 
+    // =====wjy====
+    platform::DeviceRealtimeStateService realtimeStateService;
+    writeStartupLog(QStringLiteral("[wjy-main] before realtime state service start"));
+    const bool realtimeStateStarted = realtimeStateService.start([hostHandle] {
+        return currentRealtimeLocalState(hostHandle); // wjy: 主机会话和脚本进程只在本机读取，网络层始终发送一份完整权威快照。
+    });
+    writeStartupLog(QStringLiteral("[wjy-main] after realtime state service start ok=%1").arg(realtimeStateStarted ? 1 : 0));
+    // ===end====
+
     writeStartupLog(QStringLiteral("[wjy-main] before command server start")); // wjy: Start the remote command endpoint.
     commandServer.start(49102); // wjy: Port 49102 handles shutdown, restart, and wake proxy commands.
     writeStartupLog(QStringLiteral("[wjy-main] after command server start"));
@@ -186,7 +254,7 @@ int main(int argc, char* argv[])
     }
 
     writeStartupLog(QStringLiteral("[wjy-main] before MainWindow create"));
-    ui::MainWindow window;
+    ui::MainWindow window(&realtimeStateService);
 
     // =====wjy====
     QTimer remoteControllerOverlayTimer;
@@ -285,6 +353,12 @@ int main(int argc, char* argv[])
     writeStartupLog(QStringLiteral("[wjy-main] before status server stop")); // wjy: Stop the status TCP server before the stream host is released.
     statusServer.stop(); // wjy: Releases the 49101 listener synchronously.
     writeStartupLog(QStringLiteral("[wjy-main] after status server stop"));
+
+    // =====wjy====
+    writeStartupLog(QStringLiteral("[wjy-main] before realtime state service stop"));
+    realtimeStateService.stop(); // wjy: 先停止本机状态采样、补发、心跳和 UDP 接收，再释放其依赖的原生流主机会话表。
+    writeStartupLog(QStringLiteral("[wjy-main] after realtime state service stop"));
+    // ===end====
 
     if (hostHandle) {
         stream::StreamRuntime::instance().stop(hostHandle); // wjy: Stop the native desktop stream host after all listeners are closed.

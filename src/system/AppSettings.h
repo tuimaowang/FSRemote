@@ -12,10 +12,6 @@ public:
     static void setPreventSleepEnabled(bool enabled);
     static bool remoteWakeupEnabled();
     static void setRemoteWakeupEnabled(bool enabled);
-    static bool statusAutoRefreshEnabled();
-    static void setStatusAutoRefreshEnabled(bool enabled);
-    static int statusAutoRefreshIntervalSeconds();
-    static void setStatusAutoRefreshIntervalSeconds(int seconds);
     // =====wjy====
     static bool periodicDeviceDiscoveryEnabled();
     static void setPeriodicDeviceDiscoveryEnabled(bool enabled);

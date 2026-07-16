@@ -71,6 +71,9 @@ public:
     static DeviceStatusInfo query(const QString& hostIp, uint16_t port = 49101, int timeoutMs = 900);
     static DevicePresenceState probe(const QString& hostIp, uint16_t port = 49101, int timeoutMs = 900);
     static QString terminalUser(const QString& hostIp, uint16_t port = 49101, int timeoutMs = 900);
+    // =====wjy====
+    static RemoteScriptRuntimeInfo localScriptRuntime(); // wjy: 实时广播复用与 TCP 状态服务完全相同的本机清单/PID 校验，不建立第二套脚本判断逻辑。
+    // ===end====
 };
 
 } // namespace platform

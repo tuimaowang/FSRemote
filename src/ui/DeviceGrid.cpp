@@ -2478,11 +2478,6 @@ QRect settingsPublishUpdateButtonRect()
 }
 // ===end====
 
-QRect settingsStatusRefreshIntervalInputRect()
-{
-    return QRect(contentLeft() + contentWidth() - 224, 364 + (kDetailScriptPanelTop - 120), 112, 32); // wjy: 自动刷新秒数输入框与自动刷新开关保持同一行。
-}
-
 // =====wjy====
 QRect settingsPeriodicDeviceDiscoveryIntervalInputRect()
 {
@@ -2589,7 +2584,6 @@ void drawSettingsPage(
     bool autoRunEnabled,
     bool remoteWakeupEnabled,
     bool preventSleepEnabled,
-    bool statusAutoRefreshEnabled,
     bool periodicDeviceDiscoveryEnabled,
     bool localInfoExpanded,
     bool addDeviceExpanded,
@@ -2707,7 +2701,7 @@ void drawSettingsPage(
     painter.drawText(QRectF(contentLeft() + 60, startupCard.y() + 26, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("开机自动启动"));
     painter.drawText(QRectF(contentLeft() + 60, startupCard.y() + 88, 230, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("允许通过远程开机启动"));
     painter.drawText(QRectF(contentLeft() + 60, sleepCard.y() + 16, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("防止电脑休眠"));
-    painter.drawText(QRectF(contentLeft() + 60, refreshCard.y() + 16, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("列表自动刷新"));
+    painter.drawText(QRectF(contentLeft() + 60, refreshCard.y() + 16, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("实时状态同步")); // wjy: 旧“列表自动刷新”改为只读实时广播说明，不再暗示周期 TCP 轮询。
     painter.drawText(QRectF(contentLeft() + 60, batchCard.y() + 24, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("批量新增设备"));
     painter.drawText(QRectF(contentLeft() + 60, periodicDiscoveryCard.y() + 16, 220, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("周期检查新增设备"));
     // =====wjy====
@@ -2731,7 +2725,7 @@ void drawSettingsPage(
     painter.setPen(QColor(QStringLiteral("#687384")));
     painter.drawText(QRectF(contentLeft() + 60, startupCard.y() + 109, qMax(260, contentWidth() - 220), 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("协助配置本设备进行远程开机"));
     painter.drawText(QRectF(contentLeft() + 60, sleepCard.y() + 37, qMax(260, contentWidth() - 220), 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("休眠将导致电脑无法远程控制"));
-    painter.drawText(QRectF(contentLeft() + 60, refreshCard.y() + 37, qMax(260, contentWidth() - 340), 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("按选定时间周期检测设备在线状态"));
+    painter.drawText(QRectF(contentLeft() + 60, refreshCard.y() + 37, qMax(260, contentWidth() - 260), 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("状态变化立即同步，心跳仅用于识别异常退出和离线")); // wjy: 明确业务变化是事件驱动，1/5 秒心跳不是全设备轮询。
     painter.drawText(QRectF(contentLeft() + 60, batchCard.y() + 45, 220, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("可输入多个网段，用空格、逗号或换行分隔"));
     painter.drawText(QRectF(contentLeft() + 60, periodicDiscoveryCard.y() + 37, qMax(260, contentWidth() - 340), 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("按批量新增网段自动发现并加入新设备"));
 
@@ -2744,8 +2738,10 @@ void drawSettingsPage(
     drawSwitchWithLabel(settingsAutoRunSwitchRect(), autoRunEnabled);
     drawSwitchWithLabel(settingsRemoteWakeupSwitchRect(), remoteWakeupEnabled);
     drawSwitchWithLabel(settingsPreventSleepSwitchRect(), preventSleepEnabled);
-    drawSwitchWithLabel(settingsAutoRefreshSwitchRect(), statusAutoRefreshEnabled);
     drawSwitchWithLabel(settingsPeriodicDeviceDiscoverySwitchRect(), periodicDeviceDiscoveryEnabled); // wjy: 开关绘制与列表自动刷新完全一致。
+    painter.setFont(textFont);
+    painter.setPen(QColor(QStringLiteral("#16A34A")));
+    painter.drawText(QRectF(settingsAutoRefreshSwitchRect()), Qt::AlignCenter, QString::fromUtf8("已启用")); // wjy: 实时总线为固定基础能力，设置页只读展示，不提供重新开启旧轮询的入口。
     // =====wjy====
     if (canPublishUpdates) {
         painter.setPen(Qt::NoPen);
@@ -2758,11 +2754,6 @@ void drawSettingsPage(
         painter.drawText(settingsPublishUpdateButtonRect(), Qt::AlignCenter, QString::fromUtf8("发布更新")); // wjy: 普通设备不会绘制按钮文字，也不会留下可误认的空按钮。
     }
     // ===end====
-    if (statusAutoRefreshEnabled) {
-        painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
-        painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
-        painter.drawRoundedRect(QRectF(settingsStatusRefreshIntervalInputRect()), 4, 4);
-    }
     if (periodicDeviceDiscoveryEnabled) {
         painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
         painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
@@ -2859,8 +2850,9 @@ void drawSettingsPage(
 
 } // namespace
 
-DeviceGrid::DeviceGrid(QWidget* parent)
+DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateService, QWidget* parent)
     : QFrame(parent)
+    , m_realtimeStateService(realtimeStateService)
 {
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] DeviceGrid ctor begin")); // wjy: 进入 DeviceGrid 构造函数，定位 MainWindow 创建内部崩溃。
     setObjectName(QStringLiteral("DeviceGrid")); // wjy: 恢复正常 QObject 名称，便于样式、调试和对象树识别。
@@ -2891,8 +2883,6 @@ DeviceGrid::DeviceGrid(QWidget* parent)
     m_remoteWakeupEnabled = platform::AppSettings::remoteWakeupEnabled(); // wjy: 读取远程开机设置，恢复用户上次选择。
 
     m_preventSleepEnabled = platform::AppSettings::preventSleepEnabled(); // wjy: 读取防睡眠设置，后续同步应用到系统执行状态。
-    m_statusAutoRefreshEnabled = platform::AppSettings::statusAutoRefreshEnabled(); // wjy: 读取设备状态自动刷新开关。
-    m_statusAutoRefreshIntervalSeconds = platform::AppSettings::statusAutoRefreshIntervalSeconds(); // wjy: 读取自动刷新间隔，非法值由 AppSettings 兜底为 60 秒。
     // =====wjy====
     m_periodicDeviceDiscoveryEnabled = platform::AppSettings::periodicDeviceDiscoveryEnabled();
     m_periodicDeviceDiscoveryIntervalSeconds = platform::AppSettings::periodicDeviceDiscoveryIntervalSeconds(); // wjy: 恢复周期新增开关和秒数，新安装默认关闭且为 60 秒。
@@ -2901,6 +2891,17 @@ DeviceGrid::DeviceGrid(QWidget* parent)
     platform::PowerManager::setPreventSleepEnabled(m_preventSleepEnabled); // wjy: 根据保存的设置恢复防睡眠，保证重启程序后行为一致。
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before loadDevices restore")); // wjy: 加载设备文件前打点，验证 devices.json 读写路径是否稳定。
     loadDevices(); // wjy: 恢复读取已保存设备和分组，避免每次启动都丢失设备列表。
+    // =====wjy====
+    updateRealtimeConfiguredDevices();
+    if (m_realtimeStateService) {
+        connect(m_realtimeStateService, &platform::DeviceRealtimeStateService::deviceStateChanged,
+            this, &DeviceGrid::applyRealtimeDeviceState); // wjy: UDP 接收和 TTL 已在服务内归并，UI 线程只接收按设备 IP 的最终状态。
+        connect(m_realtimeStateService, &platform::DeviceRealtimeStateService::deviceExpired,
+            this, [this](const QString& deviceIp) {
+                writeDeviceGridStartupLog(QStringLiteral("[wjy-realtime] device expired ip=%1").arg(deviceIp)); // wjy: 记录异常退出/断电触发的 TTL 离线，便于区分用户手动刷新结果。
+            });
+    }
+    // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] defer DeviceInfoService::local")); // wjy: Release 堆损坏诊断：构造函数里先不读取网卡信息，避免窗口创建阶段触发 GetAdaptersAddresses。
     if (g_devices.isEmpty()) {
         m_settingsSelected = true;
@@ -3032,13 +3033,6 @@ DeviceGrid::DeviceGrid(QWidget* parent)
     });
     // ===end====
 
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before status auto refresh timer")); // wjy: 记录自动刷新定时器创建前的位置。
-    m_statusAutoRefreshTimer = new QTimer(this);
-    connect(m_statusAutoRefreshTimer, &QTimer::timeout, this, [this] {
-        refreshDeviceStatuses();
-    });
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status auto refresh timer")); // wjy: 记录自动刷新定时器创建完成。
-
     // =====wjy====
     m_remoteUpdateAvailabilityTimer = new QTimer(this);
     m_remoteUpdateAvailabilityTimer->setInterval(10000);
@@ -3109,11 +3103,8 @@ DeviceGrid::DeviceGrid(QWidget* parent)
         update(scriptTerminalPanelRect().toAlignedRect().adjusted(-2, -2, 2, 2));
     }); // wjy: Batch script output repaint into a short timer, keeping the UI responsive while still feeling live.
 
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before applyStatusAutoRefreshSetting")); // wjy: 记录应用自动刷新设置前的位置。
-    applyStatusAutoRefreshSetting(false);
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after applyStatusAutoRefreshSetting")); // wjy: 记录自动刷新设置应用完成。
     applyPeriodicDeviceDiscoverySetting(false); // wjy: 启动时只恢复周期，不立即扫描，第一次检查发生在设置的 60 秒之后。
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before delayed refreshDeviceStatuses setup")); // wjy: Release 堆损坏诊断：首次状态刷新不再卡在构造函数里立即启动。
+    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before delayed local device info setup"));
     QTimer::singleShot(500, this, [this] { // wjy: 窗口创建后再读取本机 IP/MAC，隔离 DeviceInfoService::local 是否导致 Release 启动阶段堆损坏。
         writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] delayed before DeviceInfoService::local")); // wjy: 延迟读取本机信息前打点。
         refreshLocalDeviceInfo();
@@ -3121,12 +3112,7 @@ DeviceGrid::DeviceGrid(QWidget* parent)
         update();
         writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] delayed after DeviceInfoService::local")); // wjy: 延迟读取本机信息完成。
     });
-    QTimer::singleShot(1000, this, [this] { // wjy: 等窗口 show 和首次绘制基本完成后再探测设备状态，隔离启动阶段并发线程是否触发 Release 偶发崩溃。
-        writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] delayed before refreshDeviceStatuses")); // wjy: 延迟刷新真正开始前打点，确认崩溃是否发生在状态探测启动前后。
-        refreshDeviceStatuses();
-        writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] delayed after refreshDeviceStatuses call")); // wjy: 记录首次状态刷新已发起，不代表后台线程已完成。
-    });
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after delayed refreshDeviceStatuses setup")); // wjy: 延迟刷新定时器已安排，DeviceGrid 构造可以先结束。
+    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after delayed local device info setup")); // wjy: 启动不再安排全设备 TCP 探测，状态等待 UDP 快照或用户手动刷新。
     registerGlobalShortcuts();
     // =====wjy====
     connect(&platform::DeviceListSyncService::instance(), &platform::DeviceListSyncService::snapshotAvailable,
@@ -3191,6 +3177,7 @@ void DeviceGrid::applySyncedDeviceSnapshot(const QJsonObject& snapshot)
     applyDeviceSnapshotToGlobals(snapshot, true);
     saveDevices(); // wjy: 远端快照也原子保存到本机 devices.json，但 applying 标志阻止形成循环 pending。
     g_deviceSyncApplyingRemote = false;
+    updateRealtimeConfiguredDevices(); // wjy: 同步快照可能新增、删除或修改 IP，立即重建广播来源白名单。
 
     m_selectedDeviceIndexes.clear();
     m_selectedDeviceIndex = -1;
@@ -3229,8 +3216,83 @@ void DeviceGrid::applySyncedDeviceSnapshot(const QJsonObject& snapshot)
     updateAddDeviceControls();
     updateLocalInfoControls();
     update();
-    if (payloadChanged && !m_statusRefreshInProgress) {
-        QTimer::singleShot(0, this, &DeviceGrid::refreshDeviceStatuses); // wjy: 新增、删除或改 IP 后立即刷新一次状态；仅 revision 变化时不重复探测。
+    Q_UNUSED(payloadChanged); // wjy: 设备集合变化后等待实时广播或用户手动刷新，不再自动发起全设备 TCP 轮询。
+}
+// ===end====
+
+// =====wjy====
+void DeviceGrid::updateRealtimeConfiguredDevices()
+{
+    if (!m_realtimeStateService) {
+        return;
+    }
+    QSet<QString> configuredIps;
+    for (const DeviceEntry& device : std::as_const(g_devices)) {
+        const QString ip = device.ip.trimmed();
+        if (!ip.isEmpty()) {
+            configuredIps.insert(ip);
+        }
+    }
+    m_realtimeStateService->setConfiguredDeviceIps(configuredIps); // wjy: 来源过滤与设备列表共用一份 IP 集合，未知广播不会写入任何 UI 缓存。
+}
+
+void DeviceGrid::applyRealtimeDeviceState(
+    const QString& deviceIp,
+    const platform::DeviceRealtimeReducedState& state)
+{
+    const QString ip = deviceIp.trimmed();
+    if (m_shuttingDown || ip.isEmpty() || deviceIndexForIp(ip) < 0) {
+        return;
+    }
+
+    m_deviceStatuses.insert(ip, state.presence);
+    m_deviceRemoteSessionCounts.insert(ip, qBound(0, state.remoteSessionCount, 10)); // wjy: 徽标人数只接收目标主机快照里的会话数。
+    m_deviceRemoteControllerNames.insert(ip, state.remoteControllerLabels.join(QLatin1Char(',')));
+    m_deviceRealtimeScriptStates.insert(ip, state.script.state);
+
+    if (state.script.state != platform::RealtimeScriptState::Unknown) {
+        platform::RemoteScriptRuntimeInfo runtime;
+        runtime.supported = true;
+        runtime.statusKnown = true;
+        runtime.running = state.script.state == platform::RealtimeScriptState::Running;
+        runtime.runId = state.script.runId;
+        runtime.workName = state.script.workName;
+        runtime.scriptName = state.script.scriptName;
+        runtime.controllerPid = state.script.controllerPid;
+        runtime.startedAtEpochMs = state.script.startedAtEpochMs;
+        applyRemoteScriptRuntimeState(ip, state.loginUser, runtime); // wjy: Running/Idle 使用目标本机验证结果恢复或结束脚本；Unknown 只隐藏图标并保留可恢复元数据。
+    }
+
+    if (state.presence == platform::DevicePresenceState::Online
+        || state.presence == platform::DevicePresenceState::Busy) {
+        m_poweringOnDeviceIps.remove(ip);
+        m_poweringOnStartedAtMs.remove(ip); // wjy: 实时心跳到达即确认开机完成，不等待两秒 TCP 唤醒探测。
+    }
+    update(deviceListViewportRect(m_deviceGroupExpanded));
+}
+
+void DeviceGrid::publishRemoteControllerTarget(
+    RemoteDesktopWindow* window,
+    const QString& deviceName,
+    const QString& deviceIp)
+{
+    if (!window || !m_realtimeStateService) {
+        return;
+    }
+    const QString sessionId = m_realtimeStateService->publishControllerTarget(deviceIp, deviceName);
+    if (!sessionId.isEmpty()) {
+        m_realtimeControllerTargetSessionIds.insert(window, sessionId); // wjy: 本机窗口与广播租约一一对应，同一目标的多个窗口也不会互相覆盖。
+    }
+}
+
+void DeviceGrid::removeRemoteControllerTarget(RemoteDesktopWindow* window)
+{
+    if (!window) {
+        return;
+    }
+    const QString sessionId = m_realtimeControllerTargetSessionIds.take(window);
+    if (m_realtimeStateService && !sessionId.isEmpty()) {
+        m_realtimeStateService->removeControllerTarget(sessionId);
     }
 }
 // ===end====
@@ -4400,43 +4462,7 @@ void DeviceGrid::setupSettingsControls()
 {
     // =====wjy====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] setupSettingsControls begin")); // wjy: 进入设置控件初始化，细分 Release 偶发崩溃发生在设置页的哪一步。
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before status interval edit create")); // wjy: 判断是否崩在自动刷新间隔输入框创建。
-    // ===end====
-    m_statusRefreshIntervalEdit = new QLineEdit(this);
-    // =====wjy====
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status interval edit create")); // wjy: 自动刷新间隔输入框对象创建完成。
-    // ===end====
-    m_statusRefreshIntervalEdit->setGeometry(654, 364, 112, 32);
-    m_statusRefreshIntervalEdit->setValidator(new QIntValidator(1, 86400, m_statusRefreshIntervalEdit)); // wjy: 只允许输入正整数秒数，避免用户输入字母或符号导致定时器间隔异常。
-    m_statusRefreshIntervalEdit->setText(QString::number(qMax(1, m_statusAutoRefreshIntervalSeconds)));
-    m_statusRefreshIntervalEdit->setAlignment(Qt::AlignCenter);
-    m_statusRefreshIntervalEdit->setPlaceholderText(QStringLiteral("60"));
-    m_statusRefreshIntervalEdit->setStyleSheet(QStringLiteral(
-        "QLineEdit{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;padding:0 10px;"
-        "font-family:'Microsoft YaHei UI';font-size:14px;color:#040B18;}"
-        "QLineEdit:focus{border:1px solid #3A7BFC;}"
-        "QLineEdit:disabled{background:#F5F7FA;border:1px solid #DDE3EA;color:#687384;}"));
-    // =====wjy====
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status interval edit basic setup")); // wjy: 输入框位置、校验器、初始值和样式设置完成。
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before status interval edit signal connect")); // wjy: 判断是否崩在输入框保存逻辑信号连接。
-    // ===end====
-    const auto saveStatusRefreshInterval = [this] {
-        if (!m_statusRefreshIntervalEdit) {
-            return; // wjy: 防御性判空，避免关闭阶段信号触发访问已释放控件。
-        }
-        int seconds = m_statusRefreshIntervalEdit->text().trimmed().toInt();
-        if (seconds <= 0) {
-            seconds = 60; // wjy: 输入为空或非法时回到默认 60 秒。
-            m_statusRefreshIntervalEdit->setText(QString::number(seconds));
-        }
-        m_statusAutoRefreshIntervalSeconds = seconds;
-        platform::AppSettings::setStatusAutoRefreshIntervalSeconds(m_statusAutoRefreshIntervalSeconds);
-        applyStatusAutoRefreshSetting(false); // wjy: 保存后立即重启自动刷新定时器，让新的秒数马上生效。
-    };
-    connect(m_statusRefreshIntervalEdit, &QLineEdit::editingFinished, this, saveStatusRefreshInterval);
-    connect(m_statusRefreshIntervalEdit, &QLineEdit::returnPressed, this, saveStatusRefreshInterval);
-    // =====wjy====
-    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after status interval edit signal connect")); // wjy: 自动刷新间隔输入框信号连接完成。
+    writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] status polling controls removed; realtime state is always enabled")); // wjy: 不再创建自动刷新秒数框或开关信号，旧 QSettings 值仅保留为无效历史数据。
 
     m_periodicDeviceDiscoveryIntervalEdit = new QLineEdit(this);
     m_periodicDeviceDiscoveryIntervalEdit->setGeometry(settingsPeriodicDeviceDiscoveryIntervalInputRect());
@@ -4619,25 +4645,9 @@ void DeviceGrid::refreshLocalDeviceInfo()
 void DeviceGrid::updateSettingsControls()
 {
     syncResponsiveLayoutState();
-    if (!m_statusRefreshIntervalEdit) {
-        return;
-    }
 // =====wjy====
     m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded));
     const QRect viewport = settingsScrollViewportRect();
-    const QRect intervalRect = settingsScrolledRect(settingsStatusRefreshIntervalInputRect(), m_settingsScrollOffset);
-    const bool visible =
-        m_settingsSelected
-        && m_settingsTab == SettingsTab::General
-        && m_statusAutoRefreshEnabled
-        && viewport.contains(intervalRect); // wjy: 自动刷新关闭或滚出设置页视口时隐藏真实输入框，避免控件漂在固定标题上。
-    m_statusRefreshIntervalEdit->setGeometry(intervalRect);
-    m_statusRefreshIntervalEdit->setVisible(visible);
-    m_statusRefreshIntervalEdit->setEnabled(m_statusAutoRefreshEnabled);
-    if (visible) {
-        m_statusRefreshIntervalEdit->raise(); // wjy: 输入框是 Qt 子控件，显示时提升到手绘设置页上层，避免被父控件重绘视觉上盖住。
-    }
-
     if (m_periodicDeviceDiscoveryIntervalEdit) {
         const QRect discoveryIntervalRect = settingsScrolledRect(settingsPeriodicDeviceDiscoveryIntervalInputRect(), m_settingsScrollOffset);
         const bool discoveryIntervalVisible = m_settingsSelected
@@ -4704,25 +4714,6 @@ void DeviceGrid::saveShortcutKeySetting(int shortcutIndex, const QString& shortc
     update();
 }
 // ===end====
-
-void DeviceGrid::applyStatusAutoRefreshSetting(bool refreshImmediately)
-{
-    if (!m_statusAutoRefreshTimer) {
-        return;
-    }
-
-    if (m_statusAutoRefreshEnabled) {
-        const int intervalMs = qMax(1, m_statusAutoRefreshIntervalSeconds) * 1000;
-        m_statusAutoRefreshTimer->start(intervalMs);
-        if (refreshImmediately) {
-            refreshDeviceStatuses();
-        }
-    } else {
-        m_statusAutoRefreshTimer->stop();
-    }
-
-    updateSettingsControls();
-}
 
 // =====wjy====
 void DeviceGrid::applyPeriodicDeviceDiscoverySetting(bool scanImmediately)
@@ -4898,6 +4889,7 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
 
             if (addedCount > 0 || updatedCount > 0) {
                 saveDevices();
+                grid->updateRealtimeConfiguredDevices(); // wjy: 批量新增完成后立即允许这些 IP 的实时广播进入，不再自动对全部设备做 TCP 状态刷新。
             }
 
             if (addedCount > 0 && userInitiated) {
@@ -5084,6 +5076,7 @@ void DeviceGrid::saveNewDevice()
     const bool addingFirstDevice = g_devices.isEmpty(); // wjy: First device has no previous detail page, so switching animation would draw the same device twice.
     g_devices.append({name, ip, mac, {}, m_deviceRemarkEdit->text().trimmed(), {}}); // wjy: 新增设备默认无分组，只有后续拖入具体分组时才写 group。
     saveDevices();
+    updateRealtimeConfiguredDevices(); // wjy: 手动新增后把新 IP 加入广播白名单，下一份心跳即可实时显示状态。
     m_deviceStatuses.remove(ip);
     m_deviceUpdateAvailability.remove(ip); // wjy: 新增同 IP 记录时清掉旧版本判断，等待下一轮目标状态刷新重新确认。
     m_deviceRemoteSessionCounts.remove(ip); // wjy: 新增同 IP 前清掉旧远控人数，避免误显示上一次会话徽标。
@@ -5127,7 +5120,7 @@ void DeviceGrid::saveNewDevice()
     }
     updateAddDeviceControls();
     updateLocalInfoControls();
-    refreshDeviceStatuses();
+    update(); // wjy: 新设备等待下一份 UDP 心跳；只有标题栏刷新按钮才执行一次全设备 TCP 校准。
 }
 
 void DeviceGrid::cancelNewDevice()
@@ -5340,11 +5333,28 @@ void DeviceGrid::refreshDeviceStatuses()
                 return;
             }
             DeviceGrid* grid = self.data();
-            grid->m_deviceStatuses = std::move(statuses);
             // =====wjy====
             grid->m_deviceUpdateAvailability.clear();
-            grid->m_deviceRemoteSessionCounts = std::move(remoteSessionCounts); // wjy: 刷新完成后整表替换远控人数缓存，设备行徽标立即反映 1-10 路变化。
-            grid->m_deviceRemoteControllerNames = std::move(remoteControllerNames);
+            const bool realtimeAvailable = grid->m_realtimeStateService
+                && grid->m_realtimeStateService->isRunning();
+            if (realtimeAvailable) {
+                for (auto it = statuses.cbegin(); it != statuses.cend(); ++it) {
+                    platform::DeviceStatusInfo calibration;
+                    calibration.state = it.value();
+                    calibration.deviceName = remoteDeviceNames.value(it.key());
+                    calibration.mac = remoteDeviceMacs.value(it.key());
+                    calibration.broadcastIp = remoteDeviceBroadcastIps.value(it.key());
+                    calibration.terminalUser = remoteTerminalUsers.value(it.key());
+                    calibration.remoteSessionCount = remoteSessionCounts.value(it.key(), 0);
+                    calibration.remoteControllerNames = remoteControllerNames.value(it.key());
+                    calibration.scriptRuntime = remoteScriptRuntimes.value(it.key());
+                    grid->m_realtimeStateService->applyManualCalibration(it.key(), calibration); // wjy: 标题栏手动刷新结果进入同一归并器；已有新鲜广播时不会被一次 TCP 超时覆盖。
+                }
+            } else {
+                grid->m_deviceStatuses = std::move(statuses);
+                grid->m_deviceRemoteSessionCounts = std::move(remoteSessionCounts);
+                grid->m_deviceRemoteControllerNames = std::move(remoteControllerNames); // wjy: 仅在实时服务启动失败时保留一次手动 TCP 结果的直接显示兜底。
+            }
             for (auto it = remoteUpdateAvailability.cbegin(); it != remoteUpdateAvailability.cend(); ++it) {
                 grid->setRemoteUpdateAvailability(it.key(), it.value()); // wjy: 通过统一入口过滤更新任务启动后的迟到结果，再刷新普通和平铺窗口按钮。
             }
@@ -5400,11 +5410,13 @@ void DeviceGrid::refreshDeviceStatuses()
                 }
             }
             // =====wjy====
-            for (auto it = remoteScriptRuntimes.cbegin(); it != remoteScriptRuntimes.cend(); ++it) {
-                grid->applyRemoteScriptRuntimeState(
-                    it.key(),
-                    remoteTerminalUsers.value(it.key()),
-                    it.value()); // wjy: 启动首次刷新和定时刷新共用同一恢复入口，确认运行时重建图标/停止元数据，确认空闲时清理陈旧状态。
+            if (!realtimeAvailable) {
+                for (auto it = remoteScriptRuntimes.cbegin(); it != remoteScriptRuntimes.cend(); ++it) {
+                    grid->applyRemoteScriptRuntimeState(
+                        it.key(),
+                        remoteTerminalUsers.value(it.key()),
+                        it.value()); // wjy: 实时服务不可用时，用户手动校准仍可直接恢复一次脚本状态。
+                }
             }
             // ===end====
             for (auto it = grid->m_poweringOnDeviceIps.begin(); it != grid->m_poweringOnDeviceIps.end();) {
@@ -5466,8 +5478,16 @@ void DeviceGrid::probePoweringOnDevices()
 
             DeviceGrid* grid = self.data();
             grid->m_wakeProbeInProgress = false;
-            for (auto it = statuses.cbegin(); it != statuses.cend(); ++it) {
-                grid->m_deviceStatuses.insert(it.key(), it.value());
+            if (grid->m_realtimeStateService && grid->m_realtimeStateService->isRunning()) {
+                for (auto it = statuses.cbegin(); it != statuses.cend(); ++it) {
+                    platform::DeviceStatusInfo calibration;
+                    calibration.state = it.value();
+                    grid->m_realtimeStateService->applyManualCalibration(it.key(), calibration); // wjy: 唤醒探测也进入归并器，新鲜广播状态不会被一次 TCP 结果回滚。
+                }
+            } else {
+                for (auto it = statuses.cbegin(); it != statuses.cend(); ++it) {
+                    grid->m_deviceStatuses.insert(it.key(), it.value());
+                }
             }
             for (auto it = grid->m_poweringOnDeviceIps.begin(); it != grid->m_poweringOnDeviceIps.end();) {
                 const platform::DevicePresenceState state = grid->m_deviceStatuses.value(*it, platform::DevicePresenceState::Offline);
@@ -6332,7 +6352,9 @@ void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex)
         deviceDisplayName(g_devices.at(deviceIndex)),
         deviceIp);
     m_remoteDesktopWindows.insert(deviceIp, remoteWindow);
+    publishRemoteControllerTarget(remoteWindow, deviceDisplayName(g_devices.at(deviceIndex)), deviceIp); // wjy: 窗口建立即发布本机正在控制的目标租约，目标人数仍只看目标主机自己的会话表。
     connect(remoteWindow, &QObject::destroyed, this, [this, deviceIp, remoteWindow] {
+        removeRemoteControllerTarget(remoteWindow); // wjy: 异常关闭或正常关闭都由 QObject 生命周期删除同一租约。
         m_remoteDesktopWindows.remove(deviceIp);
         for (auto it = m_remoteWindowActivationOrder.begin(); it != m_remoteWindowActivationOrder.end();) {
             if (!*it) {
@@ -6465,7 +6487,9 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
             g_devices.at(deviceIndex).ip); // wjy: 复用现有远程桌面窗口，每台设备各自启动自己的 viewer 连接。
         remoteWindow->setRememberGeometryEnabled(false);
         m_tiledRemoteWindows.append(remoteWindow); // wjy: 记录本次平铺创建的窗口，下一次设备平铺前统一关闭并重排。
+        publishRemoteControllerTarget(remoteWindow, deviceDisplayName(g_devices.at(deviceIndex)), g_devices.at(deviceIndex).ip); // wjy: 每个平铺窗口拥有独立诊断租约，不会与普通窗口覆盖。
         connect(remoteWindow, &QObject::destroyed, this, [this, remoteWindow] {
+            removeRemoteControllerTarget(remoteWindow);
             for (auto it = m_tiledRemoteWindows.begin(); it != m_tiledRemoteWindows.end();) {
                 if (!*it || it->data() == remoteWindow) {
                     it = m_tiledRemoteWindows.erase(it);
@@ -6757,6 +6781,7 @@ bool DeviceGrid::shutdownDeviceForIndex(int deviceIndex, bool showMessages)
         m_deviceStatuses.insert(device.ip.trimmed(), platform::DevicePresenceState::Offline);
         m_deviceRemoteSessionCounts.insert(device.ip.trimmed(), 0); // wjy: 关机后远控人数归零，徽标立即消失。
         m_deviceRemoteControllerNames.insert(device.ip.trimmed(), {});
+        m_deviceRealtimeScriptStates.insert(device.ip.trimmed(), platform::RealtimeScriptState::Unknown); // wjy: 已接受关机命令后本机无法继续确认目标脚本，立即隐藏 Logo 并等待 TTL/新快照定论。
         update();
         return true;
     }
@@ -6794,6 +6819,7 @@ bool DeviceGrid::restartDeviceForIndex(int deviceIndex, bool showMessages)
         m_deviceStatuses.insert(device.ip.trimmed(), platform::DevicePresenceState::Offline);
         m_deviceRemoteSessionCounts.insert(device.ip.trimmed(), 0); // wjy: 重启后远控人数归零，徽标立即消失。
         m_deviceRemoteControllerNames.insert(device.ip.trimmed(), {});
+        m_deviceRealtimeScriptStates.insert(device.ip.trimmed(), platform::RealtimeScriptState::Unknown); // wjy: 重启切换 bootId 期间脚本状态必须是未知，不能沿用重启前 Running 图标。
         update();
         return true;
     }
@@ -6817,12 +6843,10 @@ bool DeviceGrid::updateDeviceForIndex(int deviceIndex, bool showMessages)
     if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
         return false;
     }
-    if (devicePresenceForIndex(deviceIndex) == platform::DevicePresenceState::Offline) {
-        return false;
-    }
 
     const DeviceEntry& device = g_devices.at(deviceIndex);
     QString errorMessage;
+    // wjy: 更新是用户明确触发的一次 TCP 49102 探测，不能因旧广播缓存显示 Offline 就提前拦截；真实不可达由 requestUpdate 返回错误。
     const platform::RemoteUpdateRequestResult result =
         platform::DeviceCommandService::requestUpdate(device.ip, &errorMessage);
     if (result == platform::RemoteUpdateRequestResult::Accepted) {
@@ -6987,10 +7011,12 @@ void DeviceGrid::deleteDeviceForIndex(int deviceIndex)
     saveCurrentScriptUiState(); // wjy: 删除当前设备前先收拢编辑框未保存文本和终端状态，随后按 IP 清理缓存。
     g_devices.removeAt(deviceIndex); // wjy: 只从本机设备集合移除，不向目标设备发送任何关机、卸载或删除文件命令。
     saveDevices();
+    updateRealtimeConfiguredDevices(); // wjy: 删除后立即拒绝该 IP 的后续广播并清理服务端序号/TTL 状态。
     m_deviceStatuses.remove(removedIp);
     m_deviceUpdateAvailability.remove(removedIp); // wjy: 删除设备时同步清理更新按钮缓存，避免以后复用 IP 继承旧状态。
     m_deviceRemoteSessionCounts.remove(removedIp); // wjy: 删除设备时同步清掉远控人数缓存。
     m_deviceRemoteControllerNames.remove(removedIp);
+    m_deviceRealtimeScriptStates.remove(removedIp); // wjy: 删除设备时同步清掉实时脚本三态，未来复用该 IP 不继承旧 Logo。
     m_poweringOnDeviceIps.remove(removedIp);
     m_poweringOnStartedAtMs.remove(removedIp);
     m_scriptUiStates.remove(removedIp); // wjy: 被删除设备的脚本 UI 不再保留，避免后续同 IP 之外的设备误用旧状态。
@@ -7197,8 +7223,7 @@ bool DeviceGrid::wakeDeviceForIndex(int deviceIndex, bool showMessages)
 
             if (sent) {
                 self->startDeviceWakeVisual(targetIp);
-                self->refreshDeviceStatuses();
-                return;
+                return; // wjy: 唤醒动画已有目标 IP 的轻量探测；不再借机启动一次全设备 TCP 状态轮询。
             }
 
             if (showMessages) {
@@ -7451,7 +7476,8 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                 const bool deviceInsideGroup = row.groupIndex >= 0; // wjy: 分组内设备稍微右移，视觉上表示它属于上方分组。
                 const QString deviceIp = g_devices.at(deviceIndex).ip.trimmed(); // wjy: 运行状态按设备 IP 查询，分组排序或视觉行变化不会串到其它设备。
                 const bool scriptRunning = !deviceIp.isEmpty()
-                    && m_scriptUiStates.value(deviceIp).outputRunning; // wjy: 只有该设备的脚本任务仍处于执行中时才显示右侧状态图标。
+                    && m_deviceRealtimeScriptStates.value(deviceIp, platform::RealtimeScriptState::Unknown)
+                        == platform::RealtimeScriptState::Running; // wjy: Logo 只由目标设备广播的 Running 驱动；Offline/Unknown 隐藏但不删除可恢复脚本 UI 元数据。
                 const bool deviceSelected =
                     m_selectedDeviceIndexes.contains(deviceIndex);
 
@@ -7597,7 +7623,6 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             m_autoRunEnabled,
             m_remoteWakeupEnabled,
             m_preventSleepEnabled,
-            m_statusAutoRefreshEnabled,
             m_periodicDeviceDiscoveryEnabled,
             m_settingsLocalInfoExpanded,
             m_settingsAddDeviceExpanded,
@@ -7925,12 +7950,6 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         return;
     }
 
-    if (m_statusRefreshIntervalEdit
-        && m_statusRefreshIntervalEdit->hasFocus()
-        && !m_statusRefreshIntervalEdit->geometry().contains(event->pos())) {
-        m_statusRefreshIntervalEdit->clearFocus(); // wjy: 设置页是手绘区域，点击空白/开关不会天然抢焦点，这里主动让秒数输入框失焦并触发保存。
-        setFocus(Qt::MouseFocusReason); // wjy: 父控件接管焦点，避免输入框清焦后马上继续接收键盘输入。
-    }
     if (m_periodicDeviceDiscoveryIntervalEdit
         && m_periodicDeviceDiscoveryIntervalEdit->hasFocus()
         && !m_periodicDeviceDiscoveryIntervalEdit->geometry().contains(event->pos())) {
@@ -8385,7 +8404,6 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
         && (settingsScrolledRect(settingsAutoRunSwitchRect(), m_settingsScrollOffset).contains(event->pos())
             || settingsScrolledRect(settingsRemoteWakeupSwitchRect(), m_settingsScrollOffset).contains(event->pos())
             || settingsScrolledRect(settingsPreventSleepSwitchRect(), m_settingsScrollOffset).contains(event->pos())
-            || settingsScrolledRect(settingsAutoRefreshSwitchRect(), m_settingsScrollOffset).contains(event->pos())
             || settingsScrolledRect(settingsPeriodicDeviceDiscoverySwitchRect(), m_settingsScrollOffset).contains(event->pos())
             || (platform::UpdateService::canPublishCurrentBuild()
                 && settingsScrolledRect(settingsPublishUpdateButtonRect(), m_settingsScrollOffset).contains(event->pos())) // wjy: 只有构建版本的可见发布按钮提供点击光标。
@@ -9229,14 +9247,6 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 m_preventSleepEnabled = !m_preventSleepEnabled;
                 platform::AppSettings::setPreventSleepEnabled(m_preventSleepEnabled);
                 platform::PowerManager::setPreventSleepEnabled(m_preventSleepEnabled);
-                update();
-                event->accept();
-                return;
-            }
-            if (settingsScrolledRect(settingsAutoRefreshSwitchRect(), m_settingsScrollOffset).contains(event->pos())) {
-                m_statusAutoRefreshEnabled = !m_statusAutoRefreshEnabled;
-                platform::AppSettings::setStatusAutoRefreshEnabled(m_statusAutoRefreshEnabled);
-                applyStatusAutoRefreshSetting(m_statusAutoRefreshEnabled);
                 update();
                 event->accept();
                 return;

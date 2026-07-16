@@ -1,6 +1,7 @@
 #pragma once
 
 #include "system/DeviceInfoService.h"
+#include "system/DeviceRealtimeStateService.h"
 #include "system/DeviceStatusService.h"
 
 #include <atomic>
@@ -50,7 +51,7 @@ class DeviceGrid final : public QFrame {
     Q_OBJECT
 
 public:
-    explicit DeviceGrid(QWidget* parent = nullptr);
+    explicit DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateService, QWidget* parent = nullptr);
     ~DeviceGrid() override; // wjy: Used to record DeviceGrid destroy timing and wait background threads safely.
     void prepareForApplicationExit();
 
@@ -135,6 +136,12 @@ private:
     void toggleRemoteWakeup();
     void refreshDeviceStatuses();
     void probePoweringOnDevices();
+    // =====wjy====
+    void updateRealtimeConfiguredDevices(); // wjy: 把当前 devices.json 中的 IP 白名单同步给 UDP 接收器，广播不能创建未配置设备。
+    void applyRealtimeDeviceState(const QString& deviceIp, const platform::DeviceRealtimeReducedState& state); // wjy: 只消费单线程归并后的最终状态，统一刷新在线、人数、提示和脚本三态。
+    void publishRemoteControllerTarget(RemoteDesktopWindow* window, const QString& deviceName, const QString& deviceIp); // wjy: 远控窗口创建时发布本机目标租约，仅用于双向诊断。
+    void removeRemoteControllerTarget(RemoteDesktopWindow* window); // wjy: 窗口销毁立即移除对应租约并广播最新完整快照。
+    // ===end====
     platform::DevicePresenceState devicePresenceForIndex(int index) const;
     bool devicePoweringOnForIndex(int index) const;
     int devicePoweringOnRemainingSecondsForIndex(int index) const;
@@ -145,7 +152,6 @@ private:
     void unregisterGlobalShortcuts();
     void triggerShortcutAction(int shortcutIndex);
     void releaseRemoteShortcutKeyState(int shortcutIndex);
-    void applyStatusAutoRefreshSetting(bool refreshImmediately);
     // =====wjy====
     void applyPeriodicDeviceDiscoverySetting(bool scanImmediately);
     void startBatchAddDevices(bool userInitiated = true); // wjy: 手动按钮和周期定时器复用同一网段扫描；周期触发时不跳转当前页面或选择新设备。
@@ -215,6 +221,11 @@ private:
         bool editorModified = false;
     };
 
+    // =====wjy====
+    platform::DeviceRealtimeStateService* m_realtimeStateService = nullptr; // wjy: 由 main 持有且晚于 MainWindow 销毁，DeviceGrid 只连接和调用，不负责释放。
+    QHash<RemoteDesktopWindow*, QString> m_realtimeControllerTargetSessionIds; // wjy: 每个普通/平铺窗口映射一个唯一目标租约，关闭时精确删除。
+    QHash<QString, platform::RealtimeScriptState> m_deviceRealtimeScriptStates; // wjy: Unknown/Idle/Running 独立于可恢复脚本 UI 元数据，离线只隐藏 Logo 不破坏恢复信息。
+    // ===end====
     QString m_currentDeviceName;
     bool m_scriptOutputVisible = false; // wjy: Show the in-page script terminal after a device script is selected.
     bool m_scriptOutputRunning = false; // wjy: True while the remote script command is still executing.
@@ -236,7 +247,6 @@ private:
     QString m_scriptEditorLoginUser;
     QString m_scriptEditorWorkName;
     QHash<QString, ScriptUiState> m_scriptUiStates; // wjy: Keep script output/editor state isolated per device IP so switching devices does not mix panels.
-    QLineEdit* m_statusRefreshIntervalEdit = nullptr; // wjy: Auto refresh interval edit.
     QLineEdit* m_periodicDeviceDiscoveryIntervalEdit = nullptr; // wjy: 周期检查新增设备的秒数输入框，默认 60 秒。
     QLineEdit* m_batchSubnetEdit = nullptr; // wjy: 批量新增网段输入框，支持以空格分隔多个 IPv4 通配网段。
     QPushButton* m_batchAddButton = nullptr; // wjy: 批量新增按钮，扫描期间禁用避免重复启动。
@@ -289,13 +299,11 @@ private:
     bool m_remoteWakeupEnabled = false;
     bool m_wolDetectionInProgress = false;
     bool m_preventSleepEnabled = true;
-    bool m_statusAutoRefreshEnabled = false;
     bool m_periodicDeviceDiscoveryEnabled = false; // wjy: 默认关闭，开启后按批量新增输入框中的网段周期扫描。
     bool m_statusRefreshInProgress = false;
     bool m_remoteUpdateAvailabilityRefreshInProgress = false; // wjy: 防止上一轮目标版本查询未结束时重复创建后台任务。
     bool m_wakeProbeInProgress = false;
     bool m_batchAddInProgress = false; // wjy: 标记批量新增扫描是否正在后台执行。
-    int m_statusAutoRefreshIntervalSeconds = 60; // wjy: Default auto refresh interval is 60 seconds.
     int m_periodicDeviceDiscoveryIntervalSeconds = 60; // wjy: 周期新增设备默认每 60 秒扫描一次。
     // =====wjy====
     bool m_updateAvailable = false; // wjy: 后台检测到更高版本时显示标题栏更新按钮，用户点击前绝不开始安装。
@@ -332,7 +340,6 @@ private:
     // =====wjy====
     QTimer* m_settingsGearTimer = nullptr; // wjy: 设置齿轮点击后旋转半圈的动画定时器。
     // ===end====
-    QTimer* m_statusAutoRefreshTimer = nullptr;
     QTimer* m_remoteUpdateAvailabilityTimer = nullptr; // wjy: 打开远控窗口期间每 10 秒检查一次目标是否发现共享新版。
     QTimer* m_periodicDeviceDiscoveryTimer = nullptr; // wjy: 到期后复用批量新增扫描，已有扫描进行中时自动跳过本轮。
     QTimer* m_wakeVisualTimer = nullptr;

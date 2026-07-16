@@ -8,6 +8,7 @@
 #include "system/WjyDiagnosticLog.h"
 
 #include <QAbstractSocket>
+#include <QNetworkProxy>
 #include <QPointer>
 #include <QProcess>
 #include <QTcpServer>
@@ -39,6 +40,13 @@ QString g_remoteUpdateFailure; // wjy: 暂存失败时保存可查询的错误�
 void writeCommandServerLog(const QString& message)
 {
     writeWjyDiagnosticLog(message); // wjy: 命令服务关闭阶段写入统一诊断日志，用来确认 main 返回后的析构是否触发 Release 堆损坏。
+}
+// ===end====
+
+// =====wjy====
+void configureLanTcpSocket(QTcpSocket& socket)
+{
+    socket.setProxy(QNetworkProxy(QNetworkProxy::NoProxy)); // wjy: 设备命令只连接局域网目标，强制绕过 Clash、PAC 和 Qt 默认代理，避免原始 TCP 被无效代理类型拦截。
 }
 // ===end====
 
@@ -133,6 +141,7 @@ bool sendCommandPayload(const QString& hostIp, const QByteArray& payload, QStrin
     }
 
     QTcpSocket socket;
+    configureLanTcpSocket(socket); // wjy: 公钥授权、改名和列表同步等统一命令必须直连目标 49102。
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)) {
         if (errorMessage) {
@@ -465,6 +474,7 @@ bool DeviceCommandService::send(const QString& hostIp, DeviceControlAction actio
     }
 
     QTcpSocket socket;
+    configureLanTcpSocket(socket); // wjy: 关机和重启命令不经过任何应用层代理，失败时返回真实局域网连接结果。
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)) {
         return false;
@@ -496,6 +506,7 @@ RemoteUpdateRequestResult DeviceCommandService::requestUpdate(const QString& hos
     }
 
     QTcpSocket socket;
+    configureLanTcpSocket(socket); // wjy: 用户明确触发的远程更新直接连接目标命令端口，不受系统代理开关影响。
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)) {
         if (errorMessage) *errorMessage = socket.errorString().trimmed();
@@ -541,6 +552,7 @@ RemoteUpdateStatus DeviceCommandService::queryUpdateStatus(const QString& hostIp
     }
 
     QTcpSocket socket;
+    configureLanTcpSocket(socket); // wjy: 更新状态查询与更新请求使用相同直连策略，避免查询和执行得到不同网络结果。
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)) {
         if (errorMessage) *errorMessage = socket.errorString().trimmed();
@@ -599,6 +611,7 @@ bool DeviceCommandService::sendWakeProxy(const QString& hostIp, const QString& m
     }
 
     QTcpSocket socket;
+    configureLanTcpSocket(socket); // wjy: 远程开机代理命令固定走局域网直连，不向代理暴露目标 IP 和 MAC 信息。
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)) {
         if (errorMessage) {

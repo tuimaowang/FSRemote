@@ -180,6 +180,10 @@ qt_add_executable(FSRemote WIN32
     src/system/DeviceInfoService.h
     src/system/DeviceStatusService.cpp
     src/system/DeviceStatusService.h
+    # =====wjy====
+    src/system/DeviceRealtimeStateService.cpp
+    src/system/DeviceRealtimeStateService.h
+    # ===end====
     src/system/WakeOnLanSender.cpp
     src/system/WakeOnLanSender.h
     src/system/WolDetector.cpp

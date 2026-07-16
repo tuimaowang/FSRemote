@@ -9,6 +9,10 @@ class QSystemTrayIcon;
 class QMenu;
 class QAction;
 
+namespace platform {
+class DeviceRealtimeStateService;
+}
+
 namespace ui {
 
 class RemoteControllerOverlay;
@@ -17,7 +21,7 @@ class MainWindow final : public QMainWindow {
     Q_OBJECT
 
 public:
-    explicit MainWindow(QWidget* parent = nullptr);
+    explicit MainWindow(platform::DeviceRealtimeStateService* realtimeStateService, QWidget* parent = nullptr);
     // =====wjy====
     ~MainWindow() override;
     void showFromTray();

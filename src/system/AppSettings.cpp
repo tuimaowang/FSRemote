@@ -131,29 +131,6 @@ void AppSettings::setRemoteWakeupEnabled(bool enabled)
     appSettings.setValue(QStringLiteral("remoteWakeupEnabled"), enabled);
 }
 
-bool AppSettings::statusAutoRefreshEnabled()
-{
-    return settings().value(QStringLiteral("statusAutoRefreshEnabled"), true).toBool();
-}
-
-void AppSettings::setStatusAutoRefreshEnabled(bool enabled)
-{
-    QSettings appSettings = settings();
-    appSettings.setValue(QStringLiteral("statusAutoRefreshEnabled"), enabled);
-}
-
-int AppSettings::statusAutoRefreshIntervalSeconds()
-{
-    const int seconds = settings().value(QStringLiteral("statusAutoRefreshIntervalSeconds"), 60).toInt();
-    return seconds > 0 ? seconds : 60;
-}
-
-void AppSettings::setStatusAutoRefreshIntervalSeconds(int seconds)
-{
-    QSettings appSettings = settings();
-    appSettings.setValue(QStringLiteral("statusAutoRefreshIntervalSeconds"), seconds > 0 ? seconds : 60);
-}
-
 // =====wjy====
 bool AppSettings::periodicDeviceDiscoveryEnabled()
 {
