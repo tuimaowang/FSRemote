@@ -7,6 +7,7 @@
 #include <QWidget>
 #include <QElapsedTimer>
 #include <QImage>
+#include <QHash>
 #include <QMutex>
 #include <QSize>
 
@@ -22,6 +23,7 @@ class QKeySequence;
 class QMouseEvent;
 class QPaintEvent;
 class QResizeEvent;
+class QRubberBand;
 class QTimer;
 class QWheelEvent;
 
@@ -49,6 +51,10 @@ public:
     void shutdownForApplicationExit();
     bool isWaitingShortcutRelease() const;
     void updateShortcutReleaseGuard();
+    // =====wjy====
+    QSize remoteFrameSize() const; // wjy: 整组吸附重排时读取每个窗口自己的远端分辨率，保证批量缩放后仍无黑边。
+    int titleBarHeight() const; // wjy: 整组布局计算需要扣除每个远控窗口的实际标题栏高度。
+    // ===end====
     // =====wjy====
     QString hostIp() const; // wjy: 设备菜单更新成功后按固定 IP 找到所有对应远控窗口。
     void beginRemoteUpdateWait(); // wjy: 远控窗口进入更新遮罩、暂停输入并自动等待目标设备重启。
@@ -116,7 +122,6 @@ private:
     // ===end====
 
     // =====wjy====
-    int titleBarHeight() const; // wjy: 远控标题栏高度与主窗口 28px 对齐。
     QRect remoteUpdateButtonRect() const; // wjy: 更新按钮位于剪切板按钮左侧，对应用户标出的标题栏空白区域。
     QRect clipboardSyncRect() const;
     // ===end====
@@ -129,7 +134,6 @@ private:
     void toggleClipboardSync();
     // ===end====
     QRect remoteImageRect() const;
-    QSize remoteFrameSize() const;
     bool normalizedRemotePoint(const QPoint& position, int* x, int* y) const;
     void sendInputMessage(const QByteArray& message);
     bool sendRemoteMouseMove(const QPoint& position, Qt::MouseButtons buttons);
@@ -147,6 +151,8 @@ private:
     void updateResizeCursor(const QPoint& position);
     void updateWindowMask();
     void updateTexturePresenterGeometry();
+    void showSnapPreviews(const QHash<RemoteDesktopWindow*, QRect>& geometries); // wjy: 拖拽越界重排时同时显示整组窗口的最终虚影。
+    void clearSnapPreviews(); // wjy: 拖离、释放、双击或关闭时统一清理整组吸附预览。
     void flushPendingRemoteFrame();
     void saveWindowGeometry();
     void updateFrameStats(const QImage& image); // wjy: Update the bottom-right stream stats overlay from each received remote frame.
@@ -187,6 +193,10 @@ private:
     bool m_resizingWindow = false;
     int m_resizeEdges = 0;
     QPoint m_dragOffset;
+    // =====wjy====
+    QVector<QRubberBand*> m_snapPreviews; // wjy: 一个吸附方案可能同时调整多个窗口，因此为整组目标矩形分别显示虚影。
+    QHash<RemoteDesktopWindow*, QRect> m_pendingSnapGeometries; // wjy: 保存整组待提交几何，只有松开左键时才批量应用。
+    // ===end====
     QPoint m_resizeStartGlobal;
     QRect m_resizeStartGeometry;
     QElapsedTimer m_sessionClock;

@@ -6,6 +6,7 @@
 #include "ui/D3D11FramePresenter.h"
 
 #include <QByteArray>
+#include <QApplication>
 #include <QClipboard>
 #include <QCloseEvent>
 #include <QCoreApplication>
@@ -26,6 +27,7 @@
 #include <QPointer>
 #include <QRegion>
 #include <QResizeEvent>
+#include <QRubberBand>
 #include <QScreen>
 #include <QStringList>
 #include <QTextStream>
@@ -34,6 +36,9 @@
 #include <QWheelEvent>
 
 #include <thread>
+
+#include <algorithm>
+#include <limits>
 
 #if defined(Q_OS_WIN)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -64,6 +69,46 @@ enum ResizeEdge {
 };
 
 constexpr int kWindowResizeMargin = 6; // wjy: 无边框远控窗口四周统一保留 6px 缩放带，标题栏按钮不得覆盖这一区域。
+constexpr int kWindowEdgeSnapDistance = 16; // wjy: 标题栏拖动到屏幕可用区域 16px 内时自动贴边，既容易触发又不会在远处突然跳动。
+constexpr int kWindowGroupJoinTolerance = 2; // wjy: 已贴齐窗口允许 2px 的系统边框/缩放误差，超过后不再视为同一连续窗口组。
+
+enum class NearbyWindowSnapSide {
+    None,
+    Above,
+    Below,
+    Left,
+    Right,
+};
+
+struct NearbyWindowSnapCandidate {
+    RemoteDesktopWindow* target = nullptr;
+    NearbyWindowSnapSide side = NearbyWindowSnapSide::None;
+    int distance = std::numeric_limits<int>::max();
+    int pointerAxisDistance = std::numeric_limits<int>::max(); // wjy: 鼠标在目标窗口对应轴范围内时为 0，优先选择鼠标当前指向的那一格。
+    int pointerCenterDistance = std::numeric_limits<int>::max(); // wjy: 鼠标不在任何目标范围内或位于公共边界时，用到目标中心的距离稳定判定。
+};
+
+struct SnapGeometryResult {
+    bool snapped = false;
+    QRect movingGeometry;
+    QHash<RemoteDesktopWindow*, QRect> geometries; // wjy: 普通吸附只有拖动窗口，越界重排时包含整个关联窗口组。
+};
+
+struct GroupSnapNode {
+    RemoteDesktopWindow* window = nullptr;
+    QRect originalGeometry;
+};
+
+struct GroupSnapContact {
+    int first = -1;
+    int second = -1;
+    NearbyWindowSnapSide secondSide = NearbyWindowSnapSide::None; // wjy: 记录第二个窗口位于第一个窗口的哪一侧，用于缩放后恢复紧贴关系。
+};
+
+struct BuiltGroupLayout {
+    QHash<RemoteDesktopWindow*, QRect> geometries;
+    QRect bounds;
+};
 
 QString zh(const char* utf8)
 {
@@ -73,6 +118,597 @@ QString zh(const char* utf8)
 QPixmap icon(const QString& name)
 {
     return QPixmap(QStringLiteral(":/UUGuest/resource/images/titlebar/") + name);
+}
+
+QSize aspectWindowSizeForWidth(
+    int windowWidth,
+    const QSize& remoteFrameSize,
+    int titleBarHeight,
+    const QSize& minimumSize)
+{
+    if (!remoteFrameSize.isValid() || remoteFrameSize.width() <= 0 || remoteFrameSize.height() <= 0) {
+        return QSize(qMax(windowWidth, minimumSize.width()), minimumSize.height());
+    }
+
+    int width = qMax(windowWidth, minimumSize.width());
+    int contentHeight = qMax(1, int((qint64(width) * remoteFrameSize.height()
+        + remoteFrameSize.width() / 2) / remoteFrameSize.width()));
+    int height = contentHeight + titleBarHeight;
+    if (height < minimumSize.height()) {
+        height = minimumSize.height();
+        contentHeight = qMax(1, height - titleBarHeight);
+        width = qMax(minimumSize.width(), int((qint64(contentHeight) * remoteFrameSize.width()
+            + remoteFrameSize.height() / 2) / remoteFrameSize.height()));
+    }
+    return QSize(width, height); // wjy: 固定吸附宽度后按被控设备分辨率计算内容高度，窗口内容区不再产生上下或左右黑边。
+}
+
+QSize aspectWindowSizeForHeight(
+    int windowHeight,
+    const QSize& remoteFrameSize,
+    int titleBarHeight,
+    const QSize& minimumSize)
+{
+    if (!remoteFrameSize.isValid() || remoteFrameSize.width() <= 0 || remoteFrameSize.height() <= 0) {
+        return QSize(minimumSize.width(), qMax(windowHeight, minimumSize.height()));
+    }
+
+    int height = qMax(windowHeight, minimumSize.height());
+    int contentHeight = qMax(1, height - titleBarHeight);
+    int width = qMax(1, int((qint64(contentHeight) * remoteFrameSize.width()
+        + remoteFrameSize.height() / 2) / remoteFrameSize.height()));
+    if (width < minimumSize.width()) {
+        width = minimumSize.width();
+        contentHeight = qMax(1, int((qint64(width) * remoteFrameSize.height()
+            + remoteFrameSize.width() / 2) / remoteFrameSize.width()));
+        height = qMax(minimumSize.height(), contentHeight + titleBarHeight);
+    }
+    return QSize(width, height); // wjy: 固定吸附高度后按被控设备分辨率计算窗口宽度，标题栏不参与远控画面宽高比。
+}
+
+QSize aspectWindowSizeByShrinking(
+    const QSize& currentWindowSize,
+    const QSize& remoteFrameSize,
+    int titleBarHeight,
+    const QSize& minimumSize)
+{
+    if (!remoteFrameSize.isValid() || remoteFrameSize.width() <= 0 || remoteFrameSize.height() <= 0) {
+        return currentWindowSize;
+    }
+    const int contentHeight = qMax(1, currentWindowSize.height() - titleBarHeight);
+    const qint64 currentAspectLeft = qint64(currentWindowSize.width()) * remoteFrameSize.height();
+    const qint64 currentAspectRight = qint64(contentHeight) * remoteFrameSize.width();
+    return currentAspectLeft > currentAspectRight
+        ? aspectWindowSizeForHeight(currentWindowSize.height(), remoteFrameSize, titleBarHeight, minimumSize)
+        : aspectWindowSizeForWidth(currentWindowSize.width(), remoteFrameSize, titleBarHeight, minimumSize); // wjy: 屏幕边缘吸附只缩掉产生黑边的多余方向，不主动放大用户当前窗口。
+}
+
+QRect snappedToScreenEdges(
+    const QRect& proposed,
+    const QPoint& cursorGlobal,
+    const QSize& remoteFrameSize,
+    int titleBarHeight,
+    const QSize& minimumSize,
+    bool* snapped)
+{
+    if (snapped) *snapped = false;
+    QScreen* targetScreen = QGuiApplication::screenAt(cursorGlobal); // wjy: 多显示器拖动时以鼠标当前所在屏幕为目标，跨屏后立即使用新屏幕边界。
+    if (!targetScreen) {
+        targetScreen = QGuiApplication::screenAt(proposed.center());
+    }
+    if (!targetScreen) return proposed;
+
+    const QRect available = targetScreen->availableGeometry();
+    const int leftDistance = qAbs(proposed.left() - available.left());
+    const int rightDistance = qAbs(proposed.right() - available.right());
+    const int topDistance = qAbs(proposed.top() - available.top());
+    const int bottomDistance = qAbs(proposed.bottom() - available.bottom());
+    const bool snapHorizontal = qMin(leftDistance, rightDistance) <= kWindowEdgeSnapDistance;
+    const bool snapVertical = qMin(topDistance, bottomDistance) <= kWindowEdgeSnapDistance;
+    if (!snapHorizontal && !snapVertical) return proposed;
+
+    QRect result(proposed.topLeft(), aspectWindowSizeByShrinking(
+        proposed.size(), remoteFrameSize, titleBarHeight, minimumSize)); // wjy: 第一个窗口触发屏幕吸附时立即按远端屏幕比例缩掉黑边。
+    if (snapHorizontal) {
+        leftDistance <= rightDistance ? result.moveLeft(available.left()) : result.moveRight(available.right());
+    }
+    if (snapVertical) {
+        topDistance <= bottomDistance ? result.moveTop(available.top()) : result.moveBottom(available.bottom());
+    }
+    if (snapped) *snapped = true;
+    return result;
+}
+
+bool rangesOverlap(int firstStart, int firstEnd, int secondStart, int secondEnd)
+{
+    return qMin(firstEnd, secondEnd) >= qMax(firstStart, secondStart); // wjy: 只有窗口在另一方向存在实际交叠时才允许边缘互吸，避免斜对角远距离跳动。
+}
+
+int distanceToRange(int value, int rangeStart, int rangeEnd)
+{
+    if (value < rangeStart) return rangeStart - value;
+    if (value > rangeEnd) return value - rangeEnd;
+    return 0; // wjy: 鼠标落在目标窗口投影范围内时距离为 0，直接把该窗口视为鼠标指向的吸附目标。
+}
+
+QList<RemoteDesktopWindow*> visibleSnapWindows(RemoteDesktopWindow* movingWindow)
+{
+    QList<RemoteDesktopWindow*> windows;
+    for (QWidget* widget : QApplication::topLevelWidgets()) {
+        auto* remoteWindow = qobject_cast<RemoteDesktopWindow*>(widget);
+        if (!remoteWindow || remoteWindow == movingWindow || !remoteWindow->isVisible()
+            || remoteWindow->isMinimized() || remoteWindow->isMaximized()
+            || remoteWindow->isFullScreen() || remoteWindow->isClosingConnection()) {
+            continue; // wjy: 隐藏、最小化、全屏、最大化和正在关闭的远控窗口都不能作为吸附目标。
+        }
+        windows.append(remoteWindow);
+    }
+    return windows;
+}
+
+NearbyWindowSnapCandidate nearestWindowSnapCandidate(
+    const QRect& proposed,
+    const QList<RemoteDesktopWindow*>& windows,
+    const QPoint& cursorGlobal)
+{
+    NearbyWindowSnapCandidate nearest;
+    const auto consider = [&nearest](
+                              RemoteDesktopWindow* target,
+                              NearbyWindowSnapSide side,
+                              int distance,
+                              int pointerAxisDistance,
+                              int pointerCenterDistance) {
+        if (distance > kWindowEdgeSnapDistance) return;
+        const bool betterCandidate = !nearest.target
+            || distance < nearest.distance
+            || (distance == nearest.distance
+                && pointerAxisDistance < nearest.pointerAxisDistance)
+            || (distance == nearest.distance
+                && pointerAxisDistance == nearest.pointerAxisDistance
+                && pointerCenterDistance < nearest.pointerCenterDistance); // wjy: 边缘距离相同时完全依据鼠标所在目标范围和鼠标到目标中心的距离选择，不再比较窗口交叉长度。
+        if (betterCandidate) {
+            nearest.target = target;
+            nearest.side = side;
+            nearest.distance = distance;
+            nearest.pointerAxisDistance = pointerAxisDistance;
+            nearest.pointerCenterDistance = pointerCenterDistance; // wjy: 保存鼠标方向排序依据，使虚影随鼠标跨过相邻窗口边界时切换到对应位置。
+        }
+    };
+
+    for (RemoteDesktopWindow* target : windows) {
+        const QRect targetGeometry = target->frameGeometry();
+        if (rangesOverlap(proposed.left(), proposed.right(), targetGeometry.left(), targetGeometry.right())) {
+            const int pointerHorizontalDistance = distanceToRange(
+                cursorGlobal.x(), targetGeometry.left(), targetGeometry.right()); // wjy: 上下吸附只看鼠标横坐标当前指向左侧还是右侧目标窗口。
+            const int pointerHorizontalCenterDistance = qAbs(
+                cursorGlobal.x() - targetGeometry.center().x());
+            consider(target, NearbyWindowSnapSide::Above,
+                qAbs(proposed.bottom() + 1 - targetGeometry.top()),
+                pointerHorizontalDistance,
+                pointerHorizontalCenterDistance);
+            consider(target, NearbyWindowSnapSide::Below,
+                qAbs(proposed.top() - targetGeometry.bottom() - 1),
+                pointerHorizontalDistance,
+                pointerHorizontalCenterDistance);
+        }
+        if (rangesOverlap(proposed.top(), proposed.bottom(), targetGeometry.top(), targetGeometry.bottom())) {
+            const int pointerVerticalDistance = distanceToRange(
+                cursorGlobal.y(), targetGeometry.top(), targetGeometry.bottom()); // wjy: 左右吸附只看鼠标纵坐标当前指向上方还是下方目标窗口。
+            const int pointerVerticalCenterDistance = qAbs(
+                cursorGlobal.y() - targetGeometry.center().y());
+            consider(target, NearbyWindowSnapSide::Left,
+                qAbs(proposed.right() + 1 - targetGeometry.left()),
+                pointerVerticalDistance,
+                pointerVerticalCenterDistance);
+            consider(target, NearbyWindowSnapSide::Right,
+                qAbs(proposed.left() - targetGeometry.right() - 1),
+                pointerVerticalDistance,
+                pointerVerticalCenterDistance);
+        }
+    }
+    return nearest;
+}
+
+bool windowsAreJoined(const QRect& first, const QRect& second, bool horizontalGroup)
+{
+    if (horizontalGroup) {
+        const bool sameRow = qAbs(first.top() - second.top()) <= kWindowGroupJoinTolerance
+            && qAbs(first.bottom() - second.bottom()) <= kWindowGroupJoinTolerance;
+        const bool touching = qAbs(first.right() + 1 - second.left()) <= kWindowGroupJoinTolerance
+            || qAbs(second.right() + 1 - first.left()) <= kWindowGroupJoinTolerance;
+        return sameRow && touching; // wjy: 上下吸附只把同高且左右相连的窗口识别为横向组。
+    }
+
+    const bool sameColumn = qAbs(first.left() - second.left()) <= kWindowGroupJoinTolerance
+        && qAbs(first.right() - second.right()) <= kWindowGroupJoinTolerance;
+    const bool touching = qAbs(first.bottom() + 1 - second.top()) <= kWindowGroupJoinTolerance
+        || qAbs(second.bottom() + 1 - first.top()) <= kWindowGroupJoinTolerance;
+    return sameColumn && touching; // wjy: 左右吸附只把同宽且上下相连的窗口识别为纵向组。
+}
+
+QRect selectedWindowGroupGeometry(
+    RemoteDesktopWindow* target,
+    const QList<RemoteDesktopWindow*>& windows,
+    bool horizontalGroup,
+    const QRect& proposed)
+{
+    QSet<RemoteDesktopWindow*> connected;
+    connected.insert(target);
+    bool addedWindow = true;
+    while (addedWindow) {
+        addedWindow = false;
+        for (RemoteDesktopWindow* candidate : windows) {
+            if (connected.contains(candidate)) continue;
+            const QList<RemoteDesktopWindow*> currentMembers = connected.values(); // wjy: 遍历快照，避免循环中扩展 QSet 导致迭代器失效。
+            for (RemoteDesktopWindow* member : currentMembers) {
+                if (windowsAreJoined(member->frameGeometry(), candidate->frameGeometry(), horizontalGroup)) {
+                    connected.insert(candidate); // wjy: 递归收集与目标直接或间接相连的整行/整列窗口。
+                    addedWindow = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    QList<RemoteDesktopWindow*> ordered = connected.values();
+    std::sort(ordered.begin(), ordered.end(), [horizontalGroup](RemoteDesktopWindow* first, RemoteDesktopWindow* second) {
+        return horizontalGroup
+            ? first->frameGeometry().left() < second->frameGeometry().left()
+            : first->frameGeometry().top() < second->frameGeometry().top();
+    });
+
+    const QRect targetGeometry = target->frameGeometry();
+    const int unitSpan = horizontalGroup ? targetGeometry.width() : targetGeometry.height();
+    const int draggedSpan = horizontalGroup ? proposed.width() : proposed.height();
+    int desiredUnits = 1;
+    for (int units = 2; units <= ordered.size(); ++units) {
+        if (draggedSpan * 2 > (units * 2 - 1) * unitSpan) {
+            desiredUnits = units; // wjy: 1.5/2.5/3.5 倍分别匹配 2/3/4 个连续窗口单元。
+        }
+    }
+
+    const int targetIndex = ordered.indexOf(target);
+    const int firstStart = qMax(0, targetIndex - desiredUnits + 1);
+    const int lastStart = qMin(targetIndex, ordered.size() - desiredUnits);
+    QRect bestGroup;
+    int bestCenterDistance = std::numeric_limits<int>::max();
+    for (int start = firstStart; start <= lastStart; ++start) {
+        QRect groupGeometry = ordered.at(start)->frameGeometry();
+        for (int offset = 1; offset < desiredUnits; ++offset) {
+            groupGeometry = groupGeometry.united(ordered.at(start + offset)->frameGeometry());
+        }
+        const int centerDistance = horizontalGroup
+            ? qAbs(groupGeometry.center().x() - proposed.center().x())
+            : qAbs(groupGeometry.center().y() - proposed.center().y());
+        if (centerDistance < bestCenterDistance) {
+            bestCenterDistance = centerDistance;
+            bestGroup = groupGeometry; // wjy: 大组中选择包含目标且最靠近拖动窗口中心的连续子组进行对齐。
+        }
+    }
+    return bestGroup.isValid() ? bestGroup : targetGeometry;
+}
+
+NearbyWindowSnapSide oppositeSnapSide(NearbyWindowSnapSide side)
+{
+    switch (side) {
+    case NearbyWindowSnapSide::Above: return NearbyWindowSnapSide::Below;
+    case NearbyWindowSnapSide::Below: return NearbyWindowSnapSide::Above;
+    case NearbyWindowSnapSide::Left: return NearbyWindowSnapSide::Right;
+    case NearbyWindowSnapSide::Right: return NearbyWindowSnapSide::Left;
+    default: return NearbyWindowSnapSide::None;
+    }
+}
+
+NearbyWindowSnapSide touchingSide(const QRect& first, const QRect& second)
+{
+    NearbyWindowSnapSide bestSide = NearbyWindowSnapSide::None;
+    int bestDistance = std::numeric_limits<int>::max();
+    const auto consider = [&bestSide, &bestDistance](NearbyWindowSnapSide side, int distance) {
+        if (distance <= kWindowGroupJoinTolerance && distance < bestDistance) {
+            bestSide = side;
+            bestDistance = distance;
+        }
+    };
+
+    if (rangesOverlap(first.left(), first.right(), second.left(), second.right())) {
+        consider(NearbyWindowSnapSide::Above, qAbs(second.bottom() + 1 - first.top()));
+        consider(NearbyWindowSnapSide::Below, qAbs(second.top() - first.bottom() - 1));
+    }
+    if (rangesOverlap(first.top(), first.bottom(), second.top(), second.bottom())) {
+        consider(NearbyWindowSnapSide::Left, qAbs(second.right() + 1 - first.left()));
+        consider(NearbyWindowSnapSide::Right, qAbs(second.left() - first.right() - 1));
+    }
+    return bestSide; // wjy: 返回第二个窗口相对第一个窗口的接触方向，横竖复杂布局也能形成统一连接图。
+}
+
+QList<RemoteDesktopWindow*> connectedSnapComponent(
+    RemoteDesktopWindow* target,
+    const QList<RemoteDesktopWindow*>& windows)
+{
+    QList<RemoteDesktopWindow*> connected;
+    if (!target) return connected;
+    connected.append(target);
+    for (int index = 0; index < connected.size(); ++index) {
+        RemoteDesktopWindow* member = connected.at(index);
+        for (RemoteDesktopWindow* candidate : windows) {
+            if (!candidate || connected.contains(candidate)) continue;
+            if (touchingSide(member->frameGeometry(), candidate->frameGeometry())
+                != NearbyWindowSnapSide::None) {
+                connected.append(candidate); // wjy: 递归收集所有直接或间接贴在目标上的窗口，只调整真正属于同一吸附组的设备。
+            }
+        }
+    }
+    return connected;
+}
+
+QSize scaledAspectWindowSize(RemoteDesktopWindow* window, const QRect& original, double scale)
+{
+    if (!window) return original.size();
+    const QSize minimumSize = window->minimumSize();
+    const int scaledWidth = qMax(minimumSize.width(), qRound(original.width() * scale));
+    const QSize remoteSize = window->remoteFrameSize();
+    if (remoteSize.isValid()) {
+        return aspectWindowSizeForWidth(
+            scaledWidth, remoteSize, window->titleBarHeight(), minimumSize); // wjy: 每个窗口都用自己的设备分辨率重算高度，整组压缩后仍保持画面比例无黑边。
+    }
+    return QSize(
+        scaledWidth,
+        qMax(minimumSize.height(), qRound(original.height() * scale))); // wjy: 尚未收到远端分辨率时按原外框比例缩放，避免无法形成完整布局。
+}
+
+QRect placeRelativeGeometry(
+    const QRect& anchorGeometry,
+    const QRect& anchorOriginal,
+    const QRect& childOriginal,
+    const QSize& childSize,
+    NearbyWindowSnapSide childSide,
+    double scale)
+{
+    QRect child(QPoint(0, 0), childSize);
+    if (childSide == NearbyWindowSnapSide::Above || childSide == NearbyWindowSnapSide::Below) {
+        child.moveLeft(anchorGeometry.left()
+            + qRound((childOriginal.left() - anchorOriginal.left()) * scale)); // wjy: 上下相连时按原横向相对位置缩放，保留跨多个窗口单元的布局关系。
+        childSide == NearbyWindowSnapSide::Above
+            ? child.moveBottom(anchorGeometry.top() - 1)
+            : child.moveTop(anchorGeometry.bottom() + 1);
+    } else {
+        child.moveTop(anchorGeometry.top()
+            + qRound((childOriginal.top() - anchorOriginal.top()) * scale)); // wjy: 左右相连时按原纵向相对位置缩放，保留上下错位或多层窗口关系。
+        childSide == NearbyWindowSnapSide::Left
+            ? child.moveRight(anchorGeometry.left() - 1)
+            : child.moveLeft(anchorGeometry.right() + 1);
+    }
+    return child;
+}
+
+BuiltGroupLayout buildGroupLayoutAtScale(
+    const QList<GroupSnapNode>& nodes,
+    int rootIndex,
+    double scale)
+{
+    BuiltGroupLayout layout;
+    if (nodes.isEmpty() || rootIndex < 0 || rootIndex >= nodes.size()) return layout;
+
+    QVector<QSize> sizes;
+    sizes.reserve(nodes.size());
+    for (const GroupSnapNode& node : nodes) {
+        sizes.append(scaledAspectWindowSize(node.window, node.originalGeometry, scale));
+    }
+
+    QList<GroupSnapContact> contacts;
+    for (int first = 0; first < nodes.size(); ++first) {
+        for (int second = first + 1; second < nodes.size(); ++second) {
+            const NearbyWindowSnapSide side = touchingSide(
+                nodes.at(first).originalGeometry, nodes.at(second).originalGeometry);
+            if (side != NearbyWindowSnapSide::None) {
+                contacts.append({first, second, side});
+            }
+        }
+    }
+
+    QVector<QRect> placedGeometries(nodes.size());
+    QVector<bool> placed(nodes.size(), false);
+    placedGeometries[rootIndex] = QRect(QPoint(0, 0), sizes.at(rootIndex));
+    placed[rootIndex] = true;
+    int placedCount = 1;
+    bool madeProgress = true;
+    while (madeProgress && placedCount < nodes.size()) {
+        madeProgress = false;
+        for (const GroupSnapContact& contact : contacts) {
+            int anchor = -1;
+            int child = -1;
+            NearbyWindowSnapSide childSide = NearbyWindowSnapSide::None;
+            if (placed.at(contact.first) && !placed.at(contact.second)) {
+                anchor = contact.first;
+                child = contact.second;
+                childSide = contact.secondSide;
+            } else if (placed.at(contact.second) && !placed.at(contact.first)) {
+                anchor = contact.second;
+                child = contact.first;
+                childSide = oppositeSnapSide(contact.secondSide);
+            }
+            if (anchor < 0 || child < 0) continue;
+
+            placedGeometries[child] = placeRelativeGeometry(
+                placedGeometries.at(anchor),
+                nodes.at(anchor).originalGeometry,
+                nodes.at(child).originalGeometry,
+                sizes.at(child),
+                childSide,
+                scale);
+            placed[child] = true;
+            ++placedCount;
+            madeProgress = true; // wjy: 沿吸附连接图逐个放置窗口，保证至少一条原有接触边在重排后仍然完全贴合。
+        }
+    }
+
+    const QRect rootOriginal = nodes.at(rootIndex).originalGeometry;
+    for (int index = 0; index < nodes.size(); ++index) {
+        if (!placed.at(index)) {
+            placedGeometries[index] = QRect(
+                QPoint(
+                    qRound((nodes.at(index).originalGeometry.left() - rootOriginal.left()) * scale),
+                    qRound((nodes.at(index).originalGeometry.top() - rootOriginal.top()) * scale)),
+                sizes.at(index)); // wjy: 极端异常连接图下仍按原相对位置放置，避免漏掉任何需要调整的窗口。
+        }
+        layout.geometries.insert(nodes.at(index).window, placedGeometries.at(index));
+        layout.bounds = layout.bounds.isValid()
+            ? layout.bounds.united(placedGeometries.at(index))
+            : placedGeometries.at(index);
+    }
+    return layout;
+}
+
+bool fitConnectedSnapLayout(
+    RemoteDesktopWindow* movingWindow,
+    RemoteDesktopWindow* target,
+    const QList<RemoteDesktopWindow*>& windows,
+    const QRect& movingGeometry,
+    const QRect& available,
+    QHash<RemoteDesktopWindow*, QRect>* fittedGeometries)
+{
+    if (!movingWindow || !target || !available.isValid() || !fittedGeometries) return false;
+    QList<RemoteDesktopWindow*> component = connectedSnapComponent(target, windows);
+    if (!component.contains(target)) component.append(target);
+
+    QList<GroupSnapNode> nodes;
+    nodes.reserve(component.size() + 1);
+    int rootIndex = -1;
+    for (RemoteDesktopWindow* window : component) {
+        if (window == target) rootIndex = nodes.size();
+        nodes.append({window, window->frameGeometry()});
+    }
+    nodes.append({movingWindow, movingGeometry}); // wjy: 先把新窗口按原吸附结果接入连接图，再整体判断需要缩小多少。
+    if (rootIndex < 0) return false;
+
+    BuiltGroupLayout smallest = buildGroupLayoutAtScale(nodes, rootIndex, 0.0);
+    if (!smallest.bounds.isValid()
+        || smallest.bounds.width() > available.width()
+        || smallest.bounds.height() > available.height()) {
+        return false; // wjy: 所有窗口都达到 100x100 最小限制后仍放不下时，物理上无法完成整组吸附。
+    }
+
+    BuiltGroupLayout best = smallest;
+    double low = 0.0;
+    double high = 1.0;
+    for (int iteration = 0; iteration < 28; ++iteration) {
+        const double middle = (low + high) * 0.5;
+        BuiltGroupLayout candidate = buildGroupLayoutAtScale(nodes, rootIndex, middle);
+        const bool fits = candidate.bounds.isValid()
+            && candidate.bounds.width() <= available.width()
+            && candidate.bounds.height() <= available.height();
+        if (fits) {
+            low = middle;
+            best = candidate; // wjy: 二分寻找屏幕内可容纳的最大整组尺寸，尽量减少已有窗口被缩小的幅度。
+        } else {
+            high = middle;
+        }
+    }
+
+    const int maximumLeft = available.right() - best.bounds.width() + 1;
+    const int maximumTop = available.bottom() - best.bounds.height() + 1;
+    const int desiredLeft = qBound(available.left(), movingGeometry.united(target->frameGeometry()).left(), maximumLeft);
+    const int desiredTop = qBound(available.top(), movingGeometry.united(target->frameGeometry()).top(), maximumTop);
+    const QPoint translation = QPoint(desiredLeft, desiredTop) - best.bounds.topLeft();
+    fittedGeometries->clear();
+    for (auto it = best.geometries.cbegin(); it != best.geometries.cend(); ++it) {
+        fittedGeometries->insert(it.key(), it.value().translated(translation)); // wjy: 将完整布局整体平移回目标附近，并确保所有窗口都位于屏幕可用区域内。
+    }
+    return fittedGeometries->contains(movingWindow);
+}
+
+SnapGeometryResult snappedToNearbyWindows(
+    RemoteDesktopWindow* movingWindow,
+    const QRect& proposed,
+    const QPoint& cursorGlobal,
+    const QSize& remoteFrameSize,
+    int titleBarHeight,
+    const QSize& minimumSize)
+{
+    SnapGeometryResult snapResult;
+    snapResult.movingGeometry = proposed;
+    const QList<RemoteDesktopWindow*> windows = visibleSnapWindows(movingWindow);
+    const NearbyWindowSnapCandidate candidate = nearestWindowSnapCandidate(
+        proposed, windows, cursorGlobal); // wjy: 将拖拽鼠标的全局坐标传入候选选择，虚影跟随鼠标指向的目标格切换。
+    if (!candidate.target || candidate.side == NearbyWindowSnapSide::None) {
+        return snapResult;
+    }
+
+    const bool verticalSnap = candidate.side == NearbyWindowSnapSide::Above
+        || candidate.side == NearbyWindowSnapSide::Below;
+    const QRect targetGeometry = candidate.target->frameGeometry();
+    const QRect groupGeometry = selectedWindowGroupGeometry(
+        candidate.target, windows, verticalSnap, proposed);
+    QRect result = proposed;
+    if (verticalSnap) {
+        result.setSize(remoteFrameSize.isValid()
+            ? aspectWindowSizeForWidth(groupGeometry.width(), remoteFrameSize, titleBarHeight, minimumSize)
+            : QSize(groupGeometry.width(), targetGeometry.height())); // wjy: 上下吸附先沿用 1 倍/2 倍组宽，再按当前被控设备比例计算无黑边高度。
+        result.moveLeft(groupGeometry.left());
+        if (candidate.side == NearbyWindowSnapSide::Above) {
+            result.moveBottom(groupGeometry.top() - 1);
+        } else {
+            result.moveTop(groupGeometry.bottom() + 1);
+        }
+    } else {
+        result.setSize(remoteFrameSize.isValid()
+            ? aspectWindowSizeForHeight(groupGeometry.height(), remoteFrameSize, titleBarHeight, minimumSize)
+            : QSize(targetGeometry.width(), groupGeometry.height())); // wjy: 左右吸附先沿用 1 倍/2 倍组高，再按当前被控设备比例计算无黑边宽度。
+        result.moveTop(groupGeometry.top());
+        if (candidate.side == NearbyWindowSnapSide::Left) {
+            result.moveRight(groupGeometry.left() - 1);
+        } else {
+            result.moveLeft(groupGeometry.right() + 1);
+        }
+    }
+
+    QScreen* targetScreen = QGuiApplication::screenAt(groupGeometry.center());
+    if (targetScreen && !targetScreen->availableGeometry().contains(result)) {
+        QHash<RemoteDesktopWindow*, QRect> fittedGeometries;
+        if (!fitConnectedSnapLayout(
+                movingWindow,
+                candidate.target,
+                windows,
+                result,
+                targetScreen->availableGeometry(),
+                &fittedGeometries)) {
+            return snapResult; // wjy: 达到全部窗口最小尺寸后仍无法容纳时，才真正取消这次窗口间吸附。
+        }
+        snapResult.snapped = true;
+        snapResult.geometries = fittedGeometries;
+        snapResult.movingGeometry = fittedGeometries.value(movingWindow, result);
+        return snapResult; // wjy: 新窗口越界时返回整组重排方案，拖拽阶段显示所有目标虚影，松开后批量提交。
+    }
+    snapResult.snapped = true;
+    snapResult.movingGeometry = result;
+    snapResult.geometries.insert(movingWindow, result);
+    return snapResult;
+}
+
+SnapGeometryResult snappedDraggedWindowGeometry(
+    RemoteDesktopWindow* movingWindow,
+    const QRect& proposed,
+    const QPoint& cursorGlobal,
+    const QSize& remoteFrameSize,
+    int titleBarHeight,
+    const QSize& minimumSize)
+{
+    SnapGeometryResult nearbyResult = snappedToNearbyWindows(
+        movingWindow, proposed, cursorGlobal, remoteFrameSize, titleBarHeight, minimumSize);
+    if (nearbyResult.snapped) {
+        return nearbyResult; // wjy: 窗口之间吸附优先于屏幕边缘，整组越界重排方案也在这里直接返回。
+    }
+
+    bool snappedToScreen = false;
+    const QRect screenResult = snappedToScreenEdges(
+        proposed, cursorGlobal, remoteFrameSize, titleBarHeight, minimumSize, &snappedToScreen);
+    SnapGeometryResult result;
+    result.snapped = snappedToScreen;
+    result.movingGeometry = screenResult;
+    if (snappedToScreen) {
+        result.geometries.insert(movingWindow, screenResult); // wjy: 普通屏幕边缘吸附仍只预览和提交当前拖动窗口。
+    }
+    return result;
 }
 
 QRect normalizedSavedWindowGeometry(const QRect& geometry, const QSize& minimumSize)
@@ -632,12 +1268,48 @@ RemoteDesktopWindow::RemoteDesktopWindow(const QString& deviceName, const QStrin
     m_framePresentTimer->start(); // wjy: Fixed latest-frame presentation prevents full-screen repaint pressure from building visible latency.
     m_texturePresenter = new D3D11FramePresenter(this);
     m_texturePresenter->setMouseMoveCallback([this](const QPoint& parentPosition, Qt::MouseButtons buttons) {
+        if (m_resizingWindow && (buttons & Qt::LeftButton)) {
+            QMouseEvent forwardedEvent(
+                QEvent::MouseMove,
+                QPointF(parentPosition),
+                QPointF(parentPosition),
+                QPointF(mapToGlobal(parentPosition)),
+                Qt::NoButton,
+                buttons,
+                Qt::NoModifier);
+            mouseMoveEvent(&forwardedEvent); // wjy: 缩放开始后鼠标仍由纹理子控件接收，必须把连续移动交回父窗口才能更新窗口几何。
+            return;
+        }
         m_hoveredPos = parentPosition;
         if (!isFullScreen()) {
             update(QRect(0, 0, width(), titleBarHeight())); // wjy: 共享纹理模式的鼠标移动只在普通窗口刷新标题栏。
         }
+        updateResizeCursor(parentPosition); // wjy: D3D 子控件会截获远控画面内的移动事件，必须在转发前同步本地边缘光标状态。
         sendRemoteMouseMove(parentPosition, buttons);
     });
+    m_texturePresenter->setMouseButtonCallbacks(
+        [this](const QPoint& parentPosition, Qt::MouseButton button, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
+            QMouseEvent forwardedEvent(
+                QEvent::MouseButtonPress,
+                QPointF(parentPosition),
+                QPointF(parentPosition),
+                QPointF(mapToGlobal(parentPosition)),
+                button,
+                buttons,
+                modifiers);
+            mousePressEvent(&forwardedEvent); // wjy: 纹理子控件的按下事件复用父窗口逻辑，边缘位置即可进入窗口缩放状态。
+        },
+        [this](const QPoint& parentPosition, Qt::MouseButton button, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
+            QMouseEvent forwardedEvent(
+                QEvent::MouseButtonRelease,
+                QPointF(parentPosition),
+                QPointF(parentPosition),
+                QPointF(mapToGlobal(parentPosition)),
+                button,
+                buttons,
+                modifiers);
+            mouseReleaseEvent(&forwardedEvent); // wjy: 纹理子控件的释放事件复用父窗口逻辑，确保缩放结束和远端按钮释放一致。
+        });
     m_sessionTimer = new QTimer(this);
     m_sessionTimer->setInterval(1000);
     connect(m_sessionTimer, &QTimer::timeout, this, [this] {
@@ -695,6 +1367,13 @@ RemoteDesktopWindow::~RemoteDesktopWindow()
     if (m_texturePresenter) {
         m_texturePresenter->reset();
     }
+    // =====wjy====
+    clearSnapPreviews();
+    for (QRubberBand* preview : m_snapPreviews) {
+        delete preview; // wjy: 整组虚影都是无父对象顶层窗口，析构时逐个释放，避免残留在桌面上。
+    }
+    m_snapPreviews.clear();
+    // ===end====
     appendViewerDebugLog(QStringLiteral("RemoteDesktopWindow dtor end")); // wjy: teardown completed.
 }
 
@@ -990,6 +1669,40 @@ int RemoteDesktopWindow::titleBarHeight() const
     return isFullScreen() ? 0 : 28; // wjy: 与主窗口 kTitleBarHeight=28 对齐，全屏时不占画面。
 }
 
+void RemoteDesktopWindow::showSnapPreviews(
+    const QHash<RemoteDesktopWindow*, QRect>& geometries)
+{
+    m_pendingSnapGeometries = geometries;
+    while (m_snapPreviews.size() < geometries.size()) {
+        auto* preview = new QRubberBand(QRubberBand::Rectangle); // wjy: 按整组调整数量按需创建顶层虚影，普通单窗口吸附仍只使用一个。
+        preview->setAttribute(Qt::WA_TransparentForMouseEvents);
+        preview->setAttribute(Qt::WA_ShowWithoutActivating);
+        preview->setWindowFlag(Qt::WindowTransparentForInput, true); // wjy: 每个虚影都完全鼠标穿透，不会打断当前窗口持续拖拽。
+        preview->setStyleSheet(QStringLiteral(
+            "QRubberBand { border: 2px solid #2f8cff; background-color: rgba(47, 140, 255, 48); }"));
+        m_snapPreviews.append(preview);
+    }
+
+    int previewIndex = 0;
+    for (auto it = geometries.cbegin(); it != geometries.cend(); ++it, ++previewIndex) {
+        QRubberBand* preview = m_snapPreviews.at(previewIndex);
+        preview->setGeometry(it.value());
+        preview->show();
+        preview->raise(); // wjy: 同时显示新窗口和所有将被调整窗口的最终位置，松开前真实窗口保持不变。
+    }
+    for (; previewIndex < m_snapPreviews.size(); ++previewIndex) {
+        m_snapPreviews.at(previewIndex)->hide();
+    }
+}
+
+void RemoteDesktopWindow::clearSnapPreviews()
+{
+    for (QRubberBand* preview : m_snapPreviews) {
+        if (preview) preview->hide();
+    }
+    m_pendingSnapGeometries.clear(); // wjy: 拖离吸附范围时同时撤销整组待提交数据，避免释放后应用过期布局。
+}
+
 QRect RemoteDesktopWindow::remoteUpdateButtonRect() const
 {
     const QRect clipboardRect = clipboardSyncRect();
@@ -1030,8 +1743,7 @@ bool RemoteDesktopWindow::isTitleBarBlankArea(const QPoint& position) const
 
 void RemoteDesktopWindow::toggleMaximizedState()
 {
-    isMaximized() ? showNormal() : showMaximized();
-    saveWindowGeometry();
+    isMaximized() ? showNormal() : showMaximized(); // wjy: 最大化和恢复只切换显示状态，不把系统最大化矩形写入设备窗口 JSON。
 }
 
 void RemoteDesktopWindow::setClipboardSyncEnabled(bool enabled)
@@ -1153,9 +1865,9 @@ void RemoteDesktopWindow::setRememberGeometryEnabled(bool enabled)
 
 void RemoteDesktopWindow::saveWindowGeometry()
 {
-    if (!m_rememberGeometry || isMinimized()) {
+    if (!m_rememberGeometry || isMinimized() || isMaximized() || isFullScreen()) {
         return;
-    }
+    } // wjy: 最大化、最小化和全屏都属于临时显示状态，JSON 始终保留最后一次普通窗口的位置与大小。
     platform::AppSettings::setRemoteDesktopWindowGeometry(m_hostIp, frameGeometry());
 }
 
@@ -1445,6 +2157,9 @@ int RemoteDesktopWindow::resizeEdgesAt(const QPoint& position) const
 
 void RemoteDesktopWindow::updateResizeCursor(const QPoint& position)
 {
+    if (m_remoteMouseCaptureActive) {
+        return; // wjy: 相对鼠标捕获模式由 BlankCursor 统一控制，不能被普通边缘缩放光标覆盖。
+    }
     if (!isFullScreen() && m_remoteUpdateAvailable && remoteUpdateButtonRect().contains(position)) {
         setCursor(Qt::PointingHandCursor);
         return; // wjy: 更新入口使用手型指针；按钮远离 6px 缩放边缘，不影响窗口缩放命中。
@@ -2040,11 +2755,61 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     drawTitleButton(minimizeRect(), QStringLiteral("rd_minimize.svg"), false);
     drawTitleButton(maximizeRect(), QStringLiteral("rd_maximize.svg"), false);
     drawTitleButton(closeRect(), QStringLiteral("rd_close.svg"), true); // wjy: 三个按钮共用尺寸与居中规则，仅关闭按钮使用警示悬停色。
+
+    QFont identityFont(QStringLiteral("Microsoft YaHei UI"));
+    identityFont.setPixelSize(12);
+    bool showIdentityLogo = true;
+    int identityTextX = 34;
+    const auto identityTextWidth = [this](const QFont& font) {
+        const QFontMetrics metrics(font);
+        return metrics.horizontalAdvance(m_deviceName)
+            + (m_hostIp.isEmpty() ? 0 : 10 + metrics.horizontalAdvance(m_hostIp));
+    };
+    if (identityTextX + identityTextWidth(identityFont) + 6 > width()) {
+        showIdentityLogo = false;
+        identityTextX = 6; // wjy: 窗口变窄时先让出非必要 Logo 空间，设备名和 IP 的显示优先级最高。
+    }
+    while (identityFont.pixelSize() > 7
+        && identityTextWidth(identityFont) > qMax(0, width() - identityTextX - 6)) {
+        identityFont.setPixelSize(identityFont.pixelSize() - 1); // wjy: 继续缩小时逐级压缩设备信息字号，尽量在最小窗口中完整保留名称和 IP。
+    }
+
+    const QFontMetrics identityMetrics(identityFont);
+    const int identityNameWidth = identityMetrics.horizontalAdvance(m_deviceName);
+    const int identityIpX = identityTextX + identityNameWidth + (m_hostIp.isEmpty() ? 0 : 10);
+    const int identityIpWidth = identityMetrics.horizontalAdvance(m_hostIp);
+    const int identityRight = qMin(
+        width() - 1,
+        identityIpX + identityIpWidth + 6);
+    if (identityRight > 1) {
+        painter.fillRect(
+            QRect(1, 1, identityRight - 1, qMax(0, barH - 2)),
+            QColor(QStringLiteral("#E9EEF2"))); // wjy: 最后覆盖计时、更新入口和窗口按钮的视觉内容，为设备名/IP 保留最高绘制层级。
+    }
+    if (showIdentityLogo) {
+        painter.drawPixmap(QRect(12, logoY, 16, 16), icon(QStringLiteral("fs_session_logo.svg")));
+    }
+    painter.setFont(identityFont);
+    painter.setPen(QColor(QStringLiteral("#111820")));
+    painter.drawText(
+        QRectF(identityTextX, 0, identityNameWidth, barH),
+        Qt::AlignVCenter | Qt::AlignLeft,
+        m_deviceName); // wjy: 设备名在所有标题栏元素之后绘制，窗口再窄也不会被按钮覆盖。
+    if (!m_hostIp.isEmpty()) {
+        painter.setPen(QColor(QStringLiteral("#667085")));
+        painter.drawText(
+            QRectF(identityIpX, 0, identityIpWidth, barH),
+            Qt::AlignVCenter | Qt::AlignLeft,
+            m_hostIp); // wjy: IP 使用完整原文且不省略，允许覆盖右侧低优先级按钮和状态内容。
+    }
     // ===end====
 }
 
 void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
 {
+    // =====wjy====
+    clearSnapPreviews(); // wjy: 拖拽过程中关闭窗口时立即清除整组吸附虚影和待提交布局。
+    // ===end====
     saveWindowGeometry();
     // =====wjy====
     appendViewerDebugLog(QStringLiteral("closeEvent handle=%1 closing=%2")
@@ -2085,6 +2850,9 @@ void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
     if (event->button() == Qt::LeftButton) {
         m_resizeEdges = resizeEdgesAt(event->pos());
         if (m_resizeEdges != ResizeNone) {
+            // =====wjy====
+            clearSnapPreviews(); // wjy: 开始手动缩放时取消上一次整组拖拽候选，缩放操作不参与吸附提交。
+            // ===end====
             m_resizingWindow = true;
             m_resizeStartGlobal = event->globalPosition().toPoint();
             m_resizeStartGeometry = frameGeometry();
@@ -2093,6 +2861,9 @@ void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
         }
 
         if (isTitleBarBlankArea(event->pos())) { // wjy: 标题栏空白区域同时支持拖动和双击最大化，命中规则集中到同一个函数里维护。
+            // =====wjy====
+            clearSnapPreviews(); // wjy: 每次开始拖拽都从无候选状态重新判断，防止提交旧的整组吸附位置。
+            // ===end====
             m_draggingWindow = true;
             m_dragOffset = event->globalPosition().toPoint() - frameGeometry().topLeft();
             event->accept();
@@ -2122,6 +2893,9 @@ void RemoteDesktopWindow::mouseDoubleClickEvent(QMouseEvent* event)
     emit activated(this);
     if (event->button() == Qt::LeftButton && isTitleBarBlankArea(event->pos())) {
         m_draggingWindow = false; // wjy: 双击时取消前一次按下建立的拖动状态，避免最大化后继续按拖动逻辑移动窗口。
+        // =====wjy====
+        clearSnapPreviews(); // wjy: 双击最大化不会沿用第一次按下时产生的整组吸附虚影。
+        // ===end====
         toggleMaximizedState(); // wjy: 双击标题栏空白处复用右侧最大化图标的 showMaximized/showNormal 切换逻辑。
         event->accept();
         return;
@@ -2192,17 +2966,32 @@ void RemoteDesktopWindow::mouseMoveEvent(QMouseEvent* event)
     }
 
     if (m_draggingWindow && (event->buttons() & Qt::LeftButton)) {
-        move(event->globalPosition().toPoint() - m_dragOffset);
+        const QPoint cursorGlobal = event->globalPosition().toPoint();
+        const QPoint proposedTopLeft = cursorGlobal - m_dragOffset;
+        const QRect proposedGeometry(proposedTopLeft, frameGeometry().size());
+        const SnapGeometryResult snapResult = snappedDraggedWindowGeometry(
+            this,
+            proposedGeometry,
+            cursorGlobal,
+            remoteFrameSize(),
+            titleBarHeight(),
+            minimumSize()); // wjy: 拖拽过程中计算单窗口或整组候选目标，不直接改变任何窗口大小。
+        move(proposedTopLeft); // wjy: 无论是否经过吸附范围，真实窗口都保持原大小并连续跟随鼠标移动。
+        if (snapResult.snapped) {
+            showSnapPreviews(snapResult.geometries); // wjy: 越界重排时显示所有相关窗口的最终虚影，普通吸附仍显示当前窗口一个虚影。
+        } else {
+            clearSnapPreviews(); // wjy: 未松开并拖离吸附范围后立即撤销整组候选，所有真实窗口保持不变。
+        }
         event->accept();
         return;
     }
 
+    updateResizeCursor(event->pos()); // wjy: 先刷新本地光标，再决定是否把当前位置转发到远端，避免远端画面路径提前返回留下旧的缩放光标。
     if (sendRemoteMouseMove(event->pos(), event->buttons())) {
         event->accept();
         return;
     }
 
-    updateResizeCursor(event->pos());
     QWidget::mouseMoveEvent(event);
 }
 
@@ -2211,10 +3000,25 @@ void RemoteDesktopWindow::mouseReleaseEvent(QMouseEvent* event)
     if (event->button() == Qt::LeftButton) {
         const bool wasDraggingWindow = m_draggingWindow;
         const bool wasResizingWindow = m_resizingWindow;
+        const QHash<RemoteDesktopWindow*, QRect> snapGeometries = m_pendingSnapGeometries; // wjy: 先复制释放瞬间的完整布局，再统一隐藏虚影和清空候选。
+        clearSnapPreviews();
         m_draggingWindow = false;
         m_resizingWindow = false;
         m_resizeEdges = ResizeNone;
         if (wasDraggingWindow || wasResizingWindow) {
+            if (wasDraggingWindow && !snapGeometries.isEmpty()) {
+                const QList<QWidget*> topLevelWindows = QApplication::topLevelWidgets();
+                for (auto it = snapGeometries.cbegin(); it != snapGeometries.cend(); ++it) {
+                    if (it.key() && topLevelWindows.contains(it.key()) && it.value().isValid()) {
+                        it.key()->setGeometry(it.value()); // wjy: 在鼠标释放这一刻批量应用整组最终位置和大小，拖拽期间真实窗口完全不动。
+                    }
+                }
+                for (auto it = snapGeometries.cbegin(); it != snapGeometries.cend(); ++it) {
+                    if (it.key() && topLevelWindows.contains(it.key())) {
+                        it.key()->saveWindowGeometry(); // wjy: 为所有被整组重排的设备分别保存新几何，重开远控时恢复一致布局。
+                    }
+                }
+            }
             saveWindowGeometry(); // wjy: 拖动或缩放完成后只保存新几何，不再把这次鼠标释放解释为标题栏按钮点击。
             updateResizeCursor(event->pos());
             event->accept();

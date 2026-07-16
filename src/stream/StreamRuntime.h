@@ -63,6 +63,7 @@ public:
     // =====wjy====
     uint32_t activeSessionCount(FsRemoteStreamHandle handle) const; // wjy: 查询主机当前活动远控会话数，驱动设备行人数徽标。
     QString activeControllerNames(FsRemoteStreamHandle handle) const; // wjy: 逗号分隔控制端设备名，供状态气泡展示。
+    QString activeControllerDetails(FsRemoteStreamHandle handle) const; // wjy: 每行“设备名\tIP”，供目标端右下角远控提示层展示。
     // ===end====
 
 private:
@@ -95,6 +96,7 @@ private:
     // =====wjy====
     using ActiveSessionCountFn = uint32_t(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
     using ActiveControllerNamesFn = uint32_t(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, char*, uint32_t);
+    using ActiveControllerDetailsFn = uint32_t(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, char*, uint32_t);
     // ===end====
     using LastErrorFn = const char*(FSREMOTE_STREAM_CALL*)();
 
@@ -112,6 +114,7 @@ private:
     // =====wjy====
     ActiveSessionCountFn m_activeSessionCount = nullptr;
     ActiveControllerNamesFn m_activeControllerNames = nullptr;
+    ActiveControllerDetailsFn m_activeControllerDetails = nullptr;
     // ===end====
     LastErrorFn m_lastError = nullptr;
 };

@@ -291,6 +291,7 @@ struct SessionAdmission {
     std::string audio_token; // wjy: 单次短期音频令牌先随准入结果下发，音频中心阶段再强制消费。
     std::string client_id;
     std::string client_device_name; // wjy: 控制端在 hello 中上报的设备名，用于状态气泡展示“谁在控制”。
+    std::string client_ip; // wjy: TCP 已连接对端的 IPv4/IPv6 地址，供目标端右下角提示层显示控制端来源。
     std::string public_key;
     std::string host_id; // wjy: 保存签名上下文中的受控设备身份，供 ViewerInstance 后续状态和诊断使用。
     std::string requested_role; // wjy: 保存本次经过验证的请求角色，避免 WebRTC 阶段重新猜测客户端意图。
@@ -335,6 +336,30 @@ std::string local_device_name()
     char name[MAX_COMPUTERNAME_LENGTH + 1] = {};
     DWORD size = static_cast<DWORD>(std::size(name));
     return ::GetComputerNameA(name, &size) ? std::string(name, size) : std::string("unknown-device");
+}
+
+std::string socket_peer_ip(uintptr_t socket)
+{
+    sockaddr_storage address = {};
+    int address_length = sizeof(address);
+    if (::getpeername(static_cast<SOCKET>(socket), reinterpret_cast<sockaddr*>(&address), &address_length) != 0) {
+        return {};
+    }
+
+    char text[INET6_ADDRSTRLEN] = {};
+    if (address.ss_family == AF_INET) {
+        const auto* ipv4 = reinterpret_cast<const sockaddr_in*>(&address);
+        return ::InetNtopA(AF_INET, &ipv4->sin_addr, text, static_cast<DWORD>(std::size(text)))
+            ? std::string(text)
+            : std::string(); // wjy: 控制端通常通过 IPv4 局域网连接，直接保存系统返回的规范文本地址。
+    }
+    if (address.ss_family == AF_INET6) {
+        const auto* ipv6 = reinterpret_cast<const sockaddr_in6*>(&address);
+        return ::InetNtopA(AF_INET6, &ipv6->sin6_addr, text, static_cast<DWORD>(std::size(text)))
+            ? std::string(text)
+            : std::string(); // wjy: 兼容 IPv6 环境；显示层不需要自行判断地址族。
+    }
+    return {};
 }
 
 std::string build_challenge_context(
@@ -1398,6 +1423,7 @@ public:
     // =====wjy====
     virtual uint32_t activeSessionCount() const { return 0; } // wjy: Viewer 无会话表；Host 覆盖为当前登记会话数。
     virtual std::string activeControllerNamesCsv() const { return {}; } // wjy: 逗号分隔的控制端设备名列表。
+    virtual std::string activeControllerDetailsCsv() const { return {}; } // wjy: 每行“设备名\tIP”，仅供目标端本机提示层读取。
     // ===end====
 
 protected:
@@ -1467,10 +1493,13 @@ public:
     uint32_t activeSessionCount() const override
     {
         std::lock_guard lock(sessions_mutex_);
-        // wjy: 仅统计尚未完成的会话，避免已断开但未 reap 的条目把远控人数卡在旧值。
+        // wjy: 只统计已取得控制权且没有进入取消/完成状态的会话，ICE 断开回调一触发，人数无需等待 worker 完全回收即可归零。
         uint32_t count = 0;
         for (const auto& [id, session] : sessions_) {
-            if (session && !session->completed) {
+            if (session
+                && !session->cancelled // wjy: socket 已被 ICE 或同设备重连取消时立即排除，消除异常退出后的僵尸人数。
+                && !session->completed
+                && session->admission.ownership == "control_granted") { // wjy: 握手中和只读观看会话不属于“正在控制”的人数。
                 ++count;
             }
         }
@@ -1482,7 +1511,7 @@ public:
         std::lock_guard lock(sessions_mutex_);
         std::string names;
         for (const auto& [id, session] : sessions_) {
-            if (!session || session->completed) continue;
+            if (!session || session->cancelled || session->completed) continue; // wjy: 已触发断线清理的会话不再出现在控制端名称气泡中。
             // wjy: 气泡优先展示“有控制权”的端；没有设备名时回退 client_id 前 8 位。
             if (session->admission.ownership != "control_granted"
                 && session->admission.requested_role != "control") {
@@ -1504,7 +1533,67 @@ public:
         return names;
     }
 
+    std::string activeControllerDetailsCsv() const override
+    {
+        std::lock_guard lock(sessions_mutex_);
+        std::string details;
+        for (const auto& [id, session] : sessions_) {
+            if (!session || session->cancelled || session->completed) continue; // wjy: 人数和详情使用同一存活条件，避免徽标为 1 但气泡仍残留两条记录。
+            if (session->admission.ownership != "control_granted") continue; // wjy: 只有真正取得控制权的认证会话才在目标机提示，握手中和只读观看不会误显示为正在控制。
+
+            std::string name = session->admission.client_device_name;
+            if (name.empty()) {
+                name = session->admission.client_id.empty()
+                    ? std::string("unknown")
+                    : session->admission.client_id.substr(0, std::min<size_t>(8, session->admission.client_id.size()));
+            }
+            std::string ip = session->admission.client_ip.empty()
+                ? std::string("unknown")
+                : session->admission.client_ip;
+            for (char& ch : name) {
+                if (ch == '\t' || ch == '\n' || ch == '\r') ch = ' ';
+            }
+            for (char& ch : ip) {
+                if (ch == '\t' || ch == '\n' || ch == '\r') ch = ' ';
+            }
+            if (!details.empty()) details.push_back('\n');
+            details += name;
+            details.push_back('\t');
+            details += ip; // wjy: 一个会话一行，Qt 端可无歧义拆成设备名和来源 IP。
+        }
+        return details;
+    }
+
 private:
+    // =====wjy====
+    void cancelSupersededControllerSessions(const std::shared_ptr<HostClientSession>& current)
+    {
+        if (!current || current->admission.public_key.empty()) {
+            return; // wjy: 没有稳定授权公钥时不能仅凭设备名误踢其它同名控制端。
+        }
+
+        std::vector<std::shared_ptr<HostClientSession>> superseded;
+        {
+            std::lock_guard lock(sessions_mutex_); // wjy: 在会话表锁内只收集旧会话，真正关闭 socket 放到锁外执行。
+            for (const auto& [id, session] : sessions_) {
+                if (!session
+                    || session.get() == current.get()
+                    || session->cancelled
+                    || session->completed
+                    || session->admission.public_key != current->admission.public_key) {
+                    continue; // wjy: 公钥代表同一已授权控制设备，只替换它自己的旧连接，不影响其它控制端并发。
+                }
+                superseded.push_back(session); // wjy: 同一控制设备重连时，新会话接管，旧会话立即退出人数和气泡。
+            }
+        }
+        for (const auto& session : superseded) {
+            append_log("host replacing stale controller session old=" + session->admission.session_id
+                + " new=" + current->admission.session_id); // wjy: 保留替换日志，实机可确认异常退出后的旧会话是否被新连接命中。
+            session->cancel(); // wjy: 关闭旧信令 socket，解除其 recv 阻塞并进入原有完整资源清理流程。
+        }
+    }
+    // ===end====
+
     uintptr_t createListener(uint16_t port, std::string* error)
     {
         if (!ensure_wsa()) {
@@ -1563,6 +1652,7 @@ private:
                 }
             }
             auto session = std::make_shared<HostClientSession>(static_cast<uintptr_t>(accepted));
+            session->admission.client_ip = socket_peer_ip(static_cast<uintptr_t>(accepted)); // wjy: 在 socket 仍有效时立即记录控制端来源地址，后续 WebRTC 阶段不再依赖信令连接状态。
             {
                 std::lock_guard lock(sessions_mutex_);
                 sessions_.emplace(session->admission.session_id, session); // wjy: map 只保存共享上下文，worker 和 manager 都能安全完成清理。
@@ -1588,6 +1678,7 @@ private:
         }
         append_log("host admission accepted session=" + context->admission.session_id + " client=" + context->admission.client_id);
         // =====wjy====
+        cancelSupersededControllerSessions(context); // wjy: 同一授权设备重新连接时先踢掉旧会话，避免异常退出记录和新连接同时显示为两台相同设备。
         context->media_subscription = media_pipeline_.subscribe(&error); // wjy: 认证成功后才加入共享桌面源，未授权连接不会启动或占用采集资源。
         if (!context->media_subscription) {
             append_log("host media subscribe failed session=" + context->admission.session_id + " error=" + error);
@@ -1614,6 +1705,20 @@ private:
         context->webrtc->set_signal_callback([weak = std::weak_ptr<HostClientSession>(context)](const std::string& kind, const std::string& body) {
             if (const auto locked = weak.lock()) locked->send(kind + "\n" + body); // wjy: 回调只持弱引用，会话销毁后不会访问悬空 socket。
         });
+        // =====wjy====
+        context->webrtc->set_connection_state_callback([weak = std::weak_ptr<HostClientSession>(context)](webrtc::PeerConnectionInterface::IceConnectionState state) {
+            if (state != webrtc::PeerConnectionInterface::kIceConnectionDisconnected
+                && state != webrtc::PeerConnectionInterface::kIceConnectionFailed
+                && state != webrtc::PeerConnectionInterface::kIceConnectionClosed) {
+                return; // wjy: new/checking/connected/completed 都是正常建连或存活状态，不能误清理有效远控。
+            }
+            if (const auto locked = weak.lock(); locked && !locked->cancelled) {
+                append_log("host ICE ended session=" + locked->admission.session_id
+                    + " state=" + std::to_string(static_cast<int>(state))); // wjy: 记录 ICE 终止原因，排查异常退出后人数归零时序。
+                locked->cancel(); // wjy: ICE 已断开时立即关闭信令 socket，使会话退出计数并唤醒阻塞中的 recv 循环。
+            }
+        });
+        // ===end====
         if (has_control) {
             // =====wjy====
             input_dispatcher_.registerSession(
@@ -2174,6 +2279,25 @@ uint32_t FSREMOTE_STREAM_CALL fsremote_stream_active_controller_names(
         std::memcpy(output, names.data(), required);
     }
     return required;
+}
+
+uint32_t FSREMOTE_STREAM_CALL fsremote_stream_active_controller_details(
+    FsRemoteStreamHandle handle,
+    char* output,
+    uint32_t output_capacity)
+{
+    if (!handle) {
+        return 0;
+    }
+    const std::string details = static_cast<StreamInstance*>(handle)->activeControllerDetailsCsv();
+    const uint32_t required = static_cast<uint32_t>(details.size());
+    if (!output || output_capacity < required) {
+        return required;
+    }
+    if (required > 0) {
+        std::memcpy(output, details.data(), required);
+    }
+    return required; // wjy: 调用方先传空缓冲查询长度，再一次性复制 UTF-8“设备名\tIP”详情列表。
 }
 // ===end====
 

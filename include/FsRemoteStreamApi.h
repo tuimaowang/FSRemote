@@ -117,6 +117,11 @@ uint32_t FSREMOTE_STREAM_CALL fsremote_stream_active_controller_names(
     FsRemoteStreamHandle handle,
     char* output,
     uint32_t output_capacity);
+// wjy: 复制当前控制端详情（每行“设备名\tIP”）到 output；目标端本机提示层用它显示是谁正在远控。
+uint32_t FSREMOTE_STREAM_CALL fsremote_stream_active_controller_details(
+    FsRemoteStreamHandle handle,
+    char* output,
+    uint32_t output_capacity);
 // ===end====
 const char* FSREMOTE_STREAM_CALL fsremote_stream_last_error(void);
 

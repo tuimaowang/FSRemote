@@ -97,6 +97,7 @@ StreamRuntime::StreamRuntime()
     // =====wjy====
     m_activeSessionCount = reinterpret_cast<ActiveSessionCountFn>(library->resolve("fsremote_stream_active_session_count")); // wjy: 新 DLL 导出真实会话数；旧 DLL 缺失时状态服务回退 busy 布尔。
     m_activeControllerNames = reinterpret_cast<ActiveControllerNamesFn>(library->resolve("fsremote_stream_active_controller_names"));
+    m_activeControllerDetails = reinterpret_cast<ActiveControllerDetailsFn>(library->resolve("fsremote_stream_active_controller_details")); // wjy: 目标端提示层读取控制端设备名与来源 IP；旧 DLL 缺失时安全回退为空。
     // ===end====
     m_lastError = reinterpret_cast<LastErrorFn>(library->resolve("fsremote_stream_last_error"));
     m_loaded = m_startHost && m_startViewer && m_stop && m_lastError;
@@ -230,6 +231,23 @@ QString StreamRuntime::activeControllerNames(FsRemoteStreamHandle handle) const
     }
     QByteArray buffer(static_cast<int>(needed), Qt::Uninitialized);
     const uint32_t written = m_activeControllerNames(handle, buffer.data(), needed);
+    if (written == 0) {
+        return {};
+    }
+    return QString::fromUtf8(buffer.constData(), static_cast<int>(written));
+}
+
+QString StreamRuntime::activeControllerDetails(FsRemoteStreamHandle handle) const
+{
+    if (!m_activeControllerDetails || !handle) {
+        return {};
+    }
+    const uint32_t needed = m_activeControllerDetails(handle, nullptr, 0);
+    if (needed == 0) {
+        return {};
+    }
+    QByteArray buffer(static_cast<int>(needed), Qt::Uninitialized);
+    const uint32_t written = m_activeControllerDetails(handle, buffer.data(), needed);
     if (written == 0) {
         return {};
     }

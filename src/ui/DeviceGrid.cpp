@@ -383,6 +383,8 @@ void drawResourceIcon(QPainter& painter, const QRect& target, const QString& nam
 
 // =====wjy====
 constexpr int kRemoteShortcutCount = 5; // wjy: 增加剪切板同步快捷键编辑项。
+constexpr int kShortcutEditorCount = 6; // wjy: 五个远控全局快捷键加一个仅主窗口生效的删除设备快捷键都使用相同编辑控件。
+constexpr int kDeleteDeviceShortcutIndex = 5;
 constexpr int kGlobalShortcutIdBase = 0x5100;
 
 bool isShortcutModifierKey(int key)
@@ -432,6 +434,7 @@ QKeySequence remoteShortcutForIndex(int index)
     case 2: return platform::AppSettings::remoteShortcutCloseTopmost();
     case 3: return platform::AppSettings::remoteShortcutCloseAll();
     case 4: return platform::AppSettings::remoteShortcutClipboardSync();
+    case kDeleteDeviceShortcutIndex: return platform::AppSettings::deviceShortcutDelete();
     default: return {};
     }
 }
@@ -444,6 +447,7 @@ void setRemoteShortcutForIndex(int index, const QKeySequence& shortcut)
     case 2: platform::AppSettings::setRemoteShortcutCloseTopmost(shortcut); break;
     case 3: platform::AppSettings::setRemoteShortcutCloseAll(shortcut); break;
     case 4: platform::AppSettings::setRemoteShortcutClipboardSync(shortcut); break;
+    case kDeleteDeviceShortcutIndex: platform::AppSettings::setDeviceShortcutDelete(shortcut); break;
     default: break;
     }
 }
@@ -619,7 +623,8 @@ public:
     {
         m_committedText = text.trimmed(); // wjy: 记录已经保存的文本，Esc 或非法输入时可以恢复。
         setText(m_committedText);
-        selectAll();
+        deselect(); // wjy: 初始化和页面刷新只同步文字，不让所有未聚焦的快捷键输入框保持蓝色全选状态。
+        setCursorPosition(m_committedText.size()); // wjy: 未进入修改状态时把光标停在末尾；真正获得焦点后仍由 focusInEvent 全选。
     }
 
     std::function<QString(int, const QString&)> commitCallback;
@@ -2619,7 +2624,7 @@ void drawSettingsPage(
         painter.setPen(QColor(QStringLiteral("#040B18")));
         painter.drawText(QRectF(keyboardCard.x() + 28, keyboardCard.y() + 18, keyboardCard.width() - 56, 22),
             Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("键盘快捷键")); // wjy: 键盘页现在同时展示远控窗口快捷键和设备列表固定 Delete 操作，标题改为通用名称。
+            QString::fromUtf8("键盘快捷键")); // wjy: 键盘页统一展示并编辑远控窗口快捷键和删除设备快捷键。
 
         const struct ShortcutRow {
             const char* action;
@@ -2630,13 +2635,14 @@ void drawSettingsPage(
             {"关闭最上方窗口", "关闭当前最上方的一个远控窗口"},
             {"关闭全部窗口", "关闭所有已经调出的远控窗口"},
             {"剪切板同步", "开启或关闭远控窗口剪切板同步"},
+            {"删除设备", "从本机设备列表中移除当前选中的设备"},
         };
 
         QFont rowTitle(textFont);
         rowTitle.setPixelSize(13);
         QFont rowDetail(textFont);
         rowDetail.setPixelSize(12);
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < kShortcutEditorCount; ++i) {
             const int y = keyboardCard.y() + 64 + i * 48;
             const QRect keyRect = settingsShortcutKeyEditRect(i); // wjy: 绘制背景和真实输入框共用同一矩形，避免视觉/点击区域错位。
             // wjy: 快捷键行之间不再画分隔横线，界面更紧凑。
@@ -2649,20 +2655,6 @@ void drawSettingsPage(
             painter.drawText(QRectF(keyboardCard.x() + 72, y + 20, qMax(120, keyRect.left() - keyboardCard.x() - 88), 18), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8(rows[i].detail));
             drawShortcutKey(painter, keyRect, remoteShortcutDisplayText(i));
         }
-        // =====wjy====
-        const int deleteRowIndex = 5;
-        const int deleteRowY = keyboardCard.y() + 64 + deleteRowIndex * 48;
-        const QRect deleteKeyRect = settingsShortcutKeyEditRect(deleteRowIndex); // wjy: 固定 Delete 键沿用可编辑快捷键的右侧按键块位置，视觉与上方五行保持一致。
-        drawSettingsOptionIcon(painter, QRect(keyboardCard.x() + 28, deleteRowY + 2, 28, 28), 5);
-        painter.setFont(rowTitle);
-        painter.setPen(QColor(QStringLiteral("#111827")));
-        painter.drawText(QRectF(keyboardCard.x() + 72, deleteRowY, 180, 18), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("删除设备"));
-        painter.setFont(rowDetail);
-        painter.setPen(QColor(QStringLiteral("#687384")));
-        painter.drawText(QRectF(keyboardCard.x() + 72, deleteRowY + 20, qMax(120, deleteKeyRect.left() - keyboardCard.x() - 88), 18),
-            Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("从本机设备列表中移除当前选中的设备"));
-        drawShortcutKey(painter, deleteKeyRect, QStringLiteral("Delete")); // wjy: 删除设备是固定主界面快捷键，只展示不提供编辑，避免与删除语义不一致。
-        // ===end====
         painter.restore();
         return;
     }
@@ -4503,8 +4495,8 @@ void DeviceGrid::setupSettingsControls()
         "QLineEdit:focus{background:#FFFFFF;border:1px solid #3A7BFC;color:#040B18;}"
         "QLineEdit:disabled{background:#F5F7FA;border:1px solid #DDE3EA;color:#94A3B8;}"); // wjy: 快捷键输入框复用键盘页按键块视觉，聚焦时用蓝框提示正在录入。
     m_shortcutKeyEdits.clear();
-    m_shortcutKeyEdits.reserve(kRemoteShortcutCount);
-    for (int i = 0; i < kRemoteShortcutCount; ++i) {
+    m_shortcutKeyEdits.reserve(kShortcutEditorCount);
+    for (int i = 0; i < kShortcutEditorCount; ++i) {
         auto* shortcutEdit = new ShortcutKeyEdit(i, this);
         shortcutEdit->setGeometry(settingsShortcutKeyEditRect(i));
         shortcutEdit->setPlaceholderText(QStringLiteral("按快捷键"));
@@ -4514,7 +4506,7 @@ void DeviceGrid::setupSettingsControls()
             saveShortcutKeySetting(shortcutIndex, shortcutText);
             return remoteShortcutDisplayText(shortcutIndex); // wjy: 保存后把输入框文本同步成最终应用的快捷键显示。
         };
-        m_shortcutKeyEdits.append(shortcutEdit); // wjy: 四个输入框按行号映射全屏/平铺/关闭单个/关闭全部。
+        m_shortcutKeyEdits.append(shortcutEdit); // wjy: 六个输入框按行号映射五项远控操作和删除设备操作。
     }
     // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after batch add controls create")); // wjy: 批量新增输入框和按钮创建完成。
@@ -5356,22 +5348,9 @@ void DeviceGrid::refreshDeviceStatuses()
             for (auto it = remoteUpdateAvailability.cbegin(); it != remoteUpdateAvailability.cend(); ++it) {
                 grid->setRemoteUpdateAvailability(it.key(), it.value()); // wjy: 通过统一入口过滤更新任务启动后的迟到结果，再刷新普通和平铺窗口按钮。
             }
-            // wjy: 普通设备离线时关闭悬挂窗口；更新造成的预期离线必须保留原窗口继续等待重连。
-            for (auto it = grid->m_remoteDesktopWindows.begin(); it != grid->m_remoteDesktopWindows.end();) {
-                const QString ip = it.key().trimmed();
-                const platform::DevicePresenceState state = grid->m_deviceStatuses.value(ip, platform::DevicePresenceState::Unknown);
-                QPointer<RemoteDesktopWindow> window = it.value();
-                const bool keepForRemoteUpdate = window && window->isRemoteUpdateActive(); // wjy: 更新准备、安装、重连和失败提示阶段都保留窗口，防止状态机随窗口销毁。
-                if (state == platform::DevicePresenceState::Offline
-                    && window
-                    && !window->isClosingConnection()
-                    && !keepForRemoteUpdate) {
-                    window->close(); // wjy: 只有非更新状态的普通断线沿用原来的自动关闭行为。
-                    it = grid->m_remoteDesktopWindows.erase(it);
-                    continue;
-                }
-                ++it;
-            }
+            // wjy: 状态自动刷新只更新设备列表状态，不再依据单次 Offline 结果关闭远控窗口。
+            // wjy: 设备状态探测服务的超时或瞬时失败不等于 WebRTC 会话已经断开，避免多窗口刷新时被批量误关。
+            // wjy: 远控窗口继续由用户操作、窗口自身连接流程、重新平铺或应用退出管理生命周期。
             // ===end====
             bool deviceRecordChanged = false;
             for (DeviceEntry& device : g_devices) {
@@ -8580,15 +8559,14 @@ void DeviceGrid::wheelEvent(QWheelEvent* event)
 void DeviceGrid::keyPressEvent(QKeyEvent* event)
 {
 // =====wjy====
-    if (event->key() == Qt::Key_Delete
-        && event->modifiers() == Qt::NoModifier
+    if (matchesShortcut(event, platform::AppSettings::deviceShortcutDelete())
         && !event->isAutoRepeat()
         && !m_settingsSelected
         && !m_remoteAssistSelected
         && !m_localInfoSelected
         && m_selectedDeviceIndex >= 0
         && m_selectedDeviceIndex < g_devices.size()) {
-        deleteCurrentDevice(); // wjy: 主界面设备详情处于选中状态时，单次 Delete 直接从本机列表移除当前主选设备；长按不会连续误删多台。
+        deleteCurrentDevice(); // wjy: 主界面设备详情处于选中状态时按用户设置的快捷键删除当前设备；长按不会连续误删多台。
         event->accept();
         return;
     }

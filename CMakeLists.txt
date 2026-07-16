@@ -150,6 +150,8 @@ qt_add_executable(FSRemote WIN32
     src/main.cpp
     src/ui/MainWindow.cpp
     src/ui/MainWindow.h
+    src/ui/RemoteControllerOverlay.cpp
+    src/ui/RemoteControllerOverlay.h
     src/ui/DeviceGrid.cpp
     src/ui/DeviceGrid.h
     src/ui/RemoteDesktopWindow.cpp

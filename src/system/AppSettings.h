@@ -43,6 +43,8 @@ public:
     // =====wjy====
     static QKeySequence remoteShortcutClipboardSync();
     static void setRemoteShortcutClipboardSync(const QKeySequence& shortcut);
+    static QKeySequence deviceShortcutDelete();
+    static void setDeviceShortcutDelete(const QKeySequence& shortcut);
     static bool remoteClipboardSyncEnabled();
     static void setRemoteClipboardSyncEnabled(bool enabled);
     static bool autoUpdateCheckEnabled();

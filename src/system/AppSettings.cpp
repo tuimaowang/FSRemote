@@ -279,6 +279,16 @@ void AppSettings::setRemoteShortcutClipboardSync(const QKeySequence& shortcut)
     setShortcutToSettings(QStringLiteral("remoteShortcutClipboardSync"), shortcut, QKeySequence(QStringLiteral("Ctrl+B")));
 }
 
+QKeySequence AppSettings::deviceShortcutDelete()
+{
+    return shortcutFromSettings(QStringLiteral("deviceShortcutDelete"), QKeySequence(QStringLiteral("Delete"))); // wjy: 删除设备默认保持 Delete，同时允许从键盘设置页持久化为其它组合键。
+}
+
+void AppSettings::setDeviceShortcutDelete(const QKeySequence& shortcut)
+{
+    setShortcutToSettings(QStringLiteral("deviceShortcutDelete"), shortcut, QKeySequence(QStringLiteral("Delete"))); // wjy: 复用统一快捷键存储格式，重启软件后继续使用用户设置。
+}
+
 bool AppSettings::remoteClipboardSyncEnabled()
 {
     return settings().value(QStringLiteral("remoteClipboardSyncEnabled"), true).toBool(); // wjy: 默认开启剪切板同步。

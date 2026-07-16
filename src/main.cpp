@@ -22,6 +22,13 @@
 #include <QStringList>
 #include <QTimer>
 
+#if defined(Q_OS_WIN)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace {
 
 void writeStartupLog(const QString& message)
@@ -44,6 +51,33 @@ bool activateExistingInstance()
     socket.waitForBytesWritten(300);
     return true;
 }
+
+void waitForRestartParentIfRequested()
+{
+    const QStringList arguments = QCoreApplication::arguments();
+    const int pidArgumentIndex = arguments.indexOf(QStringLiteral("--restart-after-pid"));
+    if (pidArgumentIndex < 0 || pidArgumentIndex + 1 >= arguments.size()) {
+        return;
+    }
+
+    bool validPid = false;
+    const qint64 parentPid = arguments.at(pidArgumentIndex + 1).toLongLong(&validPid);
+    if (!validPid || parentPid <= 0 || parentPid == QCoreApplication::applicationPid()) {
+        return; // wjy: 参数异常时跳过等待，后续仍由原有单实例逻辑保证不会重复运行。
+    }
+
+#if defined(Q_OS_WIN)
+    const HANDLE parentProcess = ::OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(parentPid));
+    if (!parentProcess) {
+        return; // wjy: 旧进程已经退出时直接继续启动，不额外延迟。
+    }
+    writeStartupLog(QStringLiteral("[wjy-restart] waiting for parent pid=%1").arg(parentPid));
+    ::WaitForSingleObject(parentProcess, 15000); // wjy: 正常清理最多 8 秒，15 秒上限同时避免异常 PID 导致新实例永久等待。
+    ::CloseHandle(parentProcess);
+#else
+    Q_UNUSED(parentPid)
+#endif
+}
 // ===end====
 
 } // namespace
@@ -60,6 +94,7 @@ int main(int argc, char* argv[])
         .arg(QCoreApplication::applicationFilePath(), QCoreApplication::arguments().join(QStringLiteral(" | ")))); // wjy: 日志明确记录实际运行路径，优先排除用户仍启动旧目录 EXE 的情况。
 
     // =====wjy====
+    waitForRestartParentIfRequested(); // wjy: 托盘重启产生的新实例必须先等旧进程释放单实例服务、端口和 DLL 资源。
     // wjy: 禁止重复启动；二次启动只唤醒已有主窗口。
     if (activateExistingInstance()) {
         writeStartupLog(QStringLiteral("[wjy-main] another instance is running, activate and exit"));
@@ -103,9 +138,25 @@ int main(int argc, char* argv[])
         if (!hostHandle) {
             return snapshot;
         }
-        // wjy: 会话数 + 控制端设备名一并上报，驱动徽标与悬停气泡。
+        // wjy: 会话数 + 控制端设备名/IP 一并上报，驱动徽标与悬停气泡。
         snapshot.sessionCount = static_cast<int>(stream::StreamRuntime::instance().activeSessionCount(hostHandle));
-        snapshot.controllerNames = stream::StreamRuntime::instance().activeControllerNames(hostHandle);
+        const QString controllerDetails = stream::StreamRuntime::instance().activeControllerDetails(hostHandle);
+        QStringList controllerLabels;
+        for (const QString& detail : controllerDetails.split(QLatin1Char('\n'), Qt::SkipEmptyParts)) {
+            const int separator = detail.indexOf(QLatin1Char('\t'));
+            QString deviceName = (separator < 0 ? detail : detail.left(separator)).trimmed();
+            const QString deviceIp = (separator < 0 ? QString() : detail.mid(separator + 1)).trimmed();
+            deviceName.replace(QLatin1Char(','), QLatin1Char(' ')); // wjy: 状态字段仍以逗号分隔多台控制端，设备名自身的逗号必须先替换以免气泡错误换行。
+            if (deviceName.isEmpty()) {
+                deviceName = QString::fromUtf8("未知设备");
+            }
+            controllerLabels.append(deviceIp.isEmpty()
+                ? deviceName
+                : QString::fromUtf8("%1  IP：%2").arg(deviceName, deviceIp)); // wjy: 气泡每行在控制设备名后追加来源 IP，便于区分同名设备。
+        }
+        snapshot.controllerNames = controllerLabels.isEmpty()
+            ? stream::StreamRuntime::instance().activeControllerNames(hostHandle)
+            : controllerLabels.join(QLatin1Char(',')); // wjy: 旧 DLL 没有详情导出时继续回退纯设备名，保证混合版本仍能显示气泡。
         return snapshot;
     });
     // ===end====
@@ -138,6 +189,29 @@ int main(int argc, char* argv[])
     ui::MainWindow window;
 
     // =====wjy====
+    QTimer remoteControllerOverlayTimer;
+    const auto refreshRemoteControllerOverlay = [&window, hostHandle] {
+        QStringList controllers;
+        if (hostHandle) {
+            const QString details = stream::StreamRuntime::instance().activeControllerDetails(hostHandle);
+            controllers = details.split(QLatin1Char('\n'), Qt::SkipEmptyParts);
+            if (controllers.isEmpty()
+                && stream::StreamRuntime::instance().activeSessionCount(hostHandle) > 0) {
+                const QString names = stream::StreamRuntime::instance().activeControllerNames(hostHandle);
+                for (const QString& name : names.split(QLatin1Char(','), Qt::SkipEmptyParts)) {
+                    controllers.append(name.trimmed() + QLatin1Char('\t') + QString::fromUtf8("未知")); // wjy: 旧 DLL 没有详情接口时仍显示设备名，IP 明确标为未知。
+                }
+            }
+        }
+        window.setRemoteControllerOverlayEntries(controllers); // wjy: 非空列表显示目标端提示，全部会话结束后自动隐藏。
+    };
+    QObject::connect(&remoteControllerOverlayTimer, &QTimer::timeout, &window, refreshRemoteControllerOverlay);
+    remoteControllerOverlayTimer.setInterval(600); // wjy: 600ms 足够及时反映连接变化，同时避免高频锁定 DLL 会话表。
+    remoteControllerOverlayTimer.start();
+    refreshRemoteControllerOverlay();
+    // ===end====
+
+    // =====wjy====
     QObject::connect(&platform::UpdateService::instance(), &platform::UpdateService::updateReadyToQuit,
         &app, [&window] {
             window.requestApplicationExit(); // wjy: 更新退出恢复为本机直接退出；控制端仅在设备右键菜单主动更新时维护远控等待窗口。
@@ -168,13 +242,9 @@ int main(int argc, char* argv[])
 
     const QStringList args = QCoreApplication::arguments();
     // =====wjy====
-    const int updatedToIndex = args.indexOf(QStringLiteral("--updated-to"));
     const int rollbackIndex = args.indexOf(QStringLiteral("--update-rollback"));
-    if (updatedToIndex >= 0 && updatedToIndex + 1 < args.size()) {
-        QTimer::singleShot(0, &window, [&window, version = args.at(updatedToIndex + 1)] {
-            QMessageBox::information(&window, QString(), QString::fromUtf8("已成功更新到 v%1。").arg(version)); // wjy: 自动重启后向用户确认新版本已实际安装完成。
-        });
-    } else if (rollbackIndex >= 0) {
+    // wjy: 更新成功后静默进入新版本，不再显示“已成功更新”弹窗；失败回滚仍保留明确警告。
+    if (rollbackIndex >= 0) {
         QTimer::singleShot(0, &window, [&window] {
             QMessageBox::warning(&window, QString(), QString::fromUtf8("更新安装失败，已恢复并重新启动原版本。")); // wjy: 回滚重启后明确反馈，避免用户误以为已升级。
         });

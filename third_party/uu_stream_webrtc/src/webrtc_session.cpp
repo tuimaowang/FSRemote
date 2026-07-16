@@ -397,6 +397,14 @@ void WebrtcSession::set_control_callback(ControlCallback callback)
     control_callback_ = std::move(callback);
 }
 
+// =====wjy====
+void WebrtcSession::set_connection_state_callback(ConnectionStateCallback callback)
+{
+    std::lock_guard lock(callback_mutex_); // wjy: ICE 回调可能来自 WebRTC 网络线程，注册时必须和读取端串行化。
+    connection_state_callback_ = std::move(callback); // wjy: 保存 Host 提供的弱引用回调，不让 WebrtcSession 持有上层会话对象。
+}
+// ===end====
+
 bool WebrtcSession::send_control_message(const std::string& message)
 {
     auto channel = control_channel_;
@@ -685,6 +693,14 @@ void WebrtcSession::OnIceConnectionChange(webrtc::PeerConnectionInterface::IceCo
 {
     std::cout << "ice connection state=" << static_cast<int>(state) << "\n";
     append_viewer_log("session ice connection state=" + std::to_string(static_cast<int>(state))); // wjy: durable ICE state sequence.
+    // =====wjy====
+    ConnectionStateCallback callback;
+    {
+        std::lock_guard lock(callback_mutex_); // wjy: 复制函数对象后再离开锁调用，防止上层取消 socket 时反向进入 WebRTC 造成锁重入。
+        callback = connection_state_callback_;
+    }
+    if (callback) callback(state); // wjy: Host 根据 disconnected/failed/closed 立即结束僵尸会话；Viewer 未注册时不会产生额外动作。
+    // ===end====
 }
 void WebrtcSession::OnIceGatheringChange(webrtc::PeerConnectionInterface::IceGatheringState state)
 {

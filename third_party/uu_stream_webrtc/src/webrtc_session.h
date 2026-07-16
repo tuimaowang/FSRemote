@@ -37,6 +37,9 @@ public:
     using SignalCallback = std::function<void(const std::string& kind, const std::string& body)>;
     using FrameCallback = std::function<void(const webrtc::VideoFrame& frame)>;
     using ControlCallback = std::function<void(const std::string& message)>;
+    // =====wjy====
+    using ConnectionStateCallback = std::function<void(webrtc::PeerConnectionInterface::IceConnectionState state)>; // wjy: 把 ICE 存活状态上报给 Host 会话管理器，异常断网后可立即清理人数记录。
+    // ===end====
 
     WebrtcSession(NativeWebrtcRuntime* runtime, SessionConfig config);
     ~WebrtcSession() override;
@@ -48,6 +51,9 @@ public:
     void set_signal_callback(SignalCallback callback);
     void set_frame_callback(FrameCallback callback);
     void set_control_callback(ControlCallback callback);
+    // =====wjy====
+    void set_connection_state_callback(ConnectionStateCallback callback); // wjy: Host 注册断线回调；Viewer 未注册时保持原有行为。
+    // ===end====
     bool send_control_message(const std::string& message);
 
     bool start_offer(std::string* error);
@@ -84,6 +90,9 @@ private:
     SignalCallback signal_callback_;
     FrameCallback frame_callback_;
     ControlCallback control_callback_;
+    // =====wjy====
+    ConnectionStateCallback connection_state_callback_; // wjy: 回调与其它会话回调共用互斥锁，避免 ICE 线程和析构线程并发读写函数对象。
+    // ===end====
     std::mutex callback_mutex_;
     webrtc::scoped_refptr<webrtc::DataChannelInterface> control_channel_;
     std::unique_ptr<ControlDataObserver> control_observer_;

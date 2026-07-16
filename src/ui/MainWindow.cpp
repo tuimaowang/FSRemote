@@ -2,12 +2,14 @@
 
 #include "system/WjyDiagnosticLog.h"
 #include "ui/DeviceGrid.h"
+#include "ui/RemoteControllerOverlay.h"
 
 #include <QApplication>
 #include <QCloseEvent>
 #include <QEvent>
 #include <QIcon>
 #include <QMenu>
+#include <QProcess>
 #include <QSystemTrayIcon>
 #include <QTimer>
 
@@ -45,6 +47,8 @@ MainWindow::MainWindow(QWidget* parent)
     resize(920, 680);
     writeWindowStartupLog(QStringLiteral("[wjy-window] window basics set"));
 
+    m_remoteControllerOverlay = new RemoteControllerOverlay(); // wjy: 被控端即使主窗口隐藏到托盘，右下角远控状态提示仍作为独立顶层窗口持续可见。
+
     DeviceGrid* deviceGrid = new DeviceGrid(this); // wjy: Main window always owns the real DeviceGrid now that startup isolation is complete.
     writeWindowStartupLog(QStringLiteral("[wjy-window] after DeviceGrid create"));
     setCentralWidget(deviceGrid); // wjy: Restore the normal central widget path and remove the placeholder isolation branch.
@@ -59,6 +63,8 @@ MainWindow::MainWindow(QWidget* parent)
 // =====wjy====
 MainWindow::~MainWindow()
 {
+    delete m_remoteControllerOverlay;
+    m_remoteControllerOverlay = nullptr;
     removeTrayIcon(); // wjy: 正常析构也复用同步注销逻辑，保证所有退出路径都向系统托盘发送删除消息。
     // wjy: 托盘菜单未挂到 this，需手动释放。
     delete m_trayMenu;
@@ -79,12 +85,17 @@ void MainWindow::setupTrayIcon()
     m_trayMenu = new QMenu();
     m_trayMenu->setAttribute(Qt::WA_QuitOnClose, false);
     m_trayShowAction = m_trayMenu->addAction(QString::fromUtf8("打开主窗口"));
+    m_trayRestartAction = m_trayMenu->addAction(QString::fromUtf8("重启")); // wjy: 托盘菜单提供本软件重启入口，不影响设备列表中的远端系统重启功能。
     m_trayQuitAction = m_trayMenu->addAction(QString::fromUtf8("退出"));
     // =====wjy====
     connect(m_trayMenu, &QMenu::triggered, this, [this](QAction* action) {
         if (action == m_trayQuitAction) {
             writeWindowStartupLog(QStringLiteral("[wjy-exit] tray quit action triggered"));
             requestApplicationExit(); // wjy: 只有精确匹配“退出”动作时进入统一退出流程，避免菜单关闭等事件误触发。
+            return;
+        }
+        if (action == m_trayRestartAction) {
+            requestApplicationRestart(); // wjy: 新实例等待当前进程退出后再启动，避免被单实例服务当作重复启动而直接关闭。
             return;
         }
         if (action == m_trayShowAction) {
@@ -139,6 +150,37 @@ void MainWindow::removeTrayIcon()
     writeWindowStartupLog(QStringLiteral("[wjy-exit] remove tray end")); // wjy: 有 begin 无 end 表示卡在 Windows 托盘注销或对象析构。
 }
 
+void MainWindow::requestApplicationRestart()
+{
+    if (m_exitRequested) {
+        return; // wjy: 已经进入退出或重启清理时忽略重复菜单操作，防止创建多个等待中的新实例。
+    }
+
+    QStringList arguments;
+    arguments.append(QStringLiteral("--restart-after-pid"));
+    arguments.append(QString::number(QCoreApplication::applicationPid())); // wjy: 新进程用旧进程 PID 等待完整清理完成，再建立单实例服务。
+    if (isHidden()) {
+        arguments.append(QStringLiteral("--minimized")); // wjy: 从隐藏状态执行重启时保持托盘状态，不突然弹出主窗口。
+    }
+
+    qint64 restartedProcessId = 0;
+    const bool started = QProcess::startDetached(
+        QCoreApplication::applicationFilePath(),
+        arguments,
+        QCoreApplication::applicationDirPath(),
+        &restartedProcessId);
+    if (!started) {
+        writeWindowStartupLog(QStringLiteral("[wjy-restart] failed to create waiting instance"));
+        if (m_trayIcon) {
+            m_trayIcon->showMessage(windowTitle(), QString::fromUtf8("重启失败，无法启动新进程。")); // wjy: 创建失败时保留当前软件继续运行，并通过托盘直接反馈。
+        }
+        return;
+    }
+
+    writeWindowStartupLog(QStringLiteral("[wjy-restart] waiting instance created pid=%1").arg(restartedProcessId));
+    requestApplicationExit(); // wjy: 新实例已成功创建后才退出当前进程，避免启动失败造成软件直接关闭。
+}
+
 void MainWindow::requestApplicationExit()
 {
     if (m_exitRequested) {
@@ -183,6 +225,13 @@ void MainWindow::showFromTray()
     // wjy: Windows 托盘恢复时强制置前，否则常被其它窗口压住看起来“没打开”。
     ::SetForegroundWindow(reinterpret_cast<HWND>(winId()));
 #endif
+}
+
+void MainWindow::setRemoteControllerOverlayEntries(const QStringList& controllers)
+{
+    if (m_remoteControllerOverlay) {
+        m_remoteControllerOverlay->setControllers(controllers); // wjy: 主程序按当前会话快照更新提示；空列表由提示层自行隐藏。
+    }
 }
 
 void MainWindow::hideToTray()

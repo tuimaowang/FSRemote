@@ -5,7 +5,7 @@
 namespace platform {
 
 // =====wjy====
-void writeWjyDiagnosticLog(const QString& message); // wjy: 统一追加到 LOCALAPPDATA 诊断日志，使用 Win32 立即落盘以覆盖卡死和强杀场景。
+void writeWjyDiagnosticLog(const QString& message); // wjy: 保留兼容调用入口，当前为空实现，不再生成统一诊断日志。
 // ===end====
 
 } // namespace platform
