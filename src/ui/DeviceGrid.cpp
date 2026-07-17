@@ -1440,6 +1440,9 @@ int visibleDeviceListContentHeight();
 int visibleDeviceListViewportHeight(bool deviceGroupExpanded);
 int maxDeviceListScrollOffset();
 QRect deviceListViewportRect(bool deviceGroupExpanded);
+QRect deviceListScrollbarTrackRect(); // wjy: 绘制与鼠标拖拽共用同一条设备列表滚动轨道。
+QRect deviceListScrollbarThumbRect(int scrollOffset); // wjy: 按当前列表偏移计算滑块位置，避免视觉和命中区域错位。
+int deviceListScrollOffsetForThumbTop(int thumbTop); // wjy: 把拖拽后的滑块顶部位置映射回完整列表滚动范围。
 QRect scrolledVisibleDeviceRowRect(int rowIndex, int scrollOffset);
 QRect scrolledDeviceGroupReservedBlankRect(int scrollOffset);
 QRect groupNameTextRect(int rowY, const QFont& font);
@@ -1875,6 +1878,48 @@ QRect deviceListViewportRect(bool deviceGroupExpanded)
     return QRect(0, deviceGroupHeaderRect().top(), 236, visibleDeviceListViewportHeight(deviceGroupExpanded)); // wjy: 去掉“我的设备”标题后，设备和分组直接从原标题位置开始绘制和命中。
 // ===end====
 }
+
+// =====wjy====
+QRect deviceListScrollbarTrackRect()
+{
+    const QRect viewport = deviceListViewportRect(true); // wjy: 滚动条始终基于设备列表展开时的真实可见高度计算。
+    return QRect(231, viewport.y() + 5, 5, qMax(1, viewport.height() - 10)); // wjy: 保持原来的 5 像素轨道位置，让新拖拽命中与现有绘制完全一致。
+}
+
+QRect deviceListScrollbarThumbRect(int scrollOffset)
+{
+    const int maxScrollOffset = maxDeviceListScrollOffset();
+    const QRect viewport = deviceListViewportRect(true);
+    if (maxScrollOffset <= 0 || viewport.height() <= 0) {
+        return {}; // wjy: 内容未溢出时没有可拖动滑块，鼠标逻辑也不会误命中。
+    }
+
+    const QRect track = deviceListScrollbarTrackRect();
+    const int thumbHeight = qMax(28, track.height() * viewport.height() / qMax(1, visibleDeviceListContentHeight())); // wjy: 继续沿用按可见比例计算且最小 28 像素的滑块高度。
+    const int thumbTravel = qMax(0, track.height() - thumbHeight);
+    const int boundedOffset = qBound(0, scrollOffset, maxScrollOffset); // wjy: 布局变化后旧偏移也先夹紧，避免滑块绘制跑出轨道。
+    const int thumbY = track.y() + static_cast<int>(static_cast<qint64>(thumbTravel) * boundedOffset / maxScrollOffset); // wjy: 使用 64 位中间值，长列表映射不会整数乘法溢出。
+    return QRect(track.x(), thumbY, track.width(), thumbHeight);
+}
+
+int deviceListScrollOffsetForThumbTop(int thumbTop)
+{
+    const int maxScrollOffset = maxDeviceListScrollOffset();
+    if (maxScrollOffset <= 0) {
+        return 0; // wjy: 内容不再溢出时直接回到顶部，避免除以零。
+    }
+
+    const QRect track = deviceListScrollbarTrackRect();
+    const QRect thumb = deviceListScrollbarThumbRect(0); // wjy: 滑块高度与偏移无关，用顶部位置即可取得当前可移动距离。
+    const int thumbTravel = qMax(0, track.height() - thumb.height());
+    if (thumbTravel <= 0) {
+        return 0;
+    }
+
+    const int relativeTop = qBound(0, thumbTop - track.y(), thumbTravel); // wjy: 鼠标拖到轨道上下之外时固定到首尾位置。
+    return static_cast<int>((static_cast<qint64>(relativeTop) * maxScrollOffset + thumbTravel / 2) / thumbTravel); // wjy: 四舍五入的比例映射确保首端为 0、末端精确等于最大偏移。
+}
+// ===end====
 
 QRect scrolledVisibleDeviceRowRect(int rowIndex, int scrollOffset)
 {
@@ -5399,6 +5444,99 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
 // ===end====
 }
 
+// =====wjy====
+QString DeviceGrid::nextDefaultDeviceGroupName() const
+{
+    int suffix = 1; // wjy: 默认从“默认分组1”开始寻找，保持原有空白区建组命名习惯。
+    QString candidate;
+    do {
+        candidate = QString::fromUtf8("默认分组%1").arg(suffix++); // wjy: 每次递增后检查完整名称，已有编号不会被重复使用。
+    } while (g_deviceGroupNames.contains(candidate));
+    return candidate;
+}
+
+int DeviceGrid::createDefaultDeviceGroup()
+{
+    const int groupIndex = g_deviceGroupNames.size(); // wjy: 新分组追加到当前分组列表末尾，返回真实分组下标供后续归组和定位。
+    g_deviceGroupNames.append(nextDefaultDeviceGroupName()); // wjy: 创建时先写入唯一默认名称，行内编辑可直接全选覆盖。
+    g_deviceGroupIds.append(QUuid::createUuid().toString(QUuid::WithoutBraces).toLower()); // wjy: 新分组立即拥有稳定 UUID，后续重命名不会改变设备关联实体。
+    g_deviceGroupExpandedStates.append(true); // wjy: 新分组默认展开，设备归入后立即可见。
+    return groupIndex;
+}
+
+bool DeviceGrid::assignDevicesToGroup(const QVector<int>& deviceIndexes, int groupIndex)
+{
+    if (groupIndex < 0 || groupIndex >= g_deviceGroupNames.size()) {
+        return false; // wjy: 菜单关闭前若目标分组失效，禁止把设备写入错误下标。
+    }
+
+    while (g_deviceGroupIds.size() < g_deviceGroupNames.size()) {
+        g_deviceGroupIds.append(QUuid::createUuid().toString(QUuid::WithoutBraces).toLower()); // wjy: 兼容旧内存数据缺失稳定 ID 的情况，归组前补齐一一对应关系。
+    }
+    while (g_deviceGroupExpandedStates.size() < g_deviceGroupNames.size()) {
+        g_deviceGroupExpandedStates.append(true); // wjy: 防御性补齐展开数组，避免按分组下标访问越界。
+    }
+
+    const QString groupName = g_deviceGroupNames.at(groupIndex).trimmed(); // wjy: group 名继续写入兼容字段，旧界面排序和显示逻辑保持不变。
+    const QString groupId = g_deviceGroupIds.at(groupIndex); // wjy: groupId 是真正的稳定归属，重命名后仍指向同一分组。
+    bool changed = !g_deviceGroupExpandedStates.at(groupIndex); // wjy: 选择已有折叠组也属于状态变化，需要持久化展开状态。
+    g_deviceGroupExpandedStates[groupIndex] = true; // wjy: 无论设备是否已在组内，选中目标组后都保证展开。
+
+    QSet<int> assignedIndexes; // wjy: 菜单目标可能重复，确保每台有效设备最多处理一次。
+    for (int deviceIndex : deviceIndexes) {
+        if (deviceIndex < 0 || deviceIndex >= g_devices.size() || assignedIndexes.contains(deviceIndex)) {
+            continue; // wjy: 忽略菜单打开后已失效的下标和重复下标，不影响其它设备。
+        }
+        assignedIndexes.insert(deviceIndex);
+
+        DeviceEntry& device = g_devices[deviceIndex];
+        if (device.group.trimmed() == groupName && device.groupId == groupId) {
+            continue; // wjy: 设备已经属于目标稳定分组时保持数据不变，只在后续执行展开和定位。
+        }
+        device.group = groupName; // wjy: 更新兼容分组名，让现有绘制和拖拽逻辑立即把设备排到目标组下。
+        device.groupId = groupId; // wjy: 同步写入稳定 ID，跨端同步和重命名不依赖名称匹配。
+        changed = true;
+    }
+
+    if (changed) {
+        saveDevices(); // wjy: 所有目标处理完后只保存一次，避免多选设备逐台写文件和触发同步。
+    }
+    return true;
+}
+
+void DeviceGrid::revealDeviceGroup(int groupIndex, bool beginRename)
+{
+    if (groupIndex < 0 || groupIndex >= g_deviceGroupNames.size()) {
+        return; // wjy: 分组下标失效时不改变侧栏滚动或编辑状态。
+    }
+
+    if (m_renamingDeviceGroupIndex >= 0 && m_renamingDeviceGroupIndex != groupIndex) {
+        finishDeviceGroupRename(true); // wjy: 定位新目标前提交旧分组编辑，避免同一个输入框残留两个分组下标。
+    }
+    finishDeviceRename(true); // wjy: 分组定位会改变设备行位置，先结束设备名编辑以免输入框悬浮在错误行。
+    m_deviceGroupExpanded = true; // wjy: 若整个设备列表被收起，操作后自动打开以展示目标分组。
+    while (g_deviceGroupExpandedStates.size() < g_deviceGroupNames.size()) {
+        g_deviceGroupExpandedStates.append(true);
+    }
+    g_deviceGroupExpandedStates[groupIndex] = true; // wjy: 目标组始终展开，归入的多选设备立即出现在组标题下。
+
+    const int rowIndex = visualRowIndexForGroupIndex(groupIndex); // wjy: 设备归组会重排可见行，因此必须在归组完成后重新解析目标视觉行。
+    if (rowIndex < 0) {
+        update();
+        return;
+    }
+
+    const QRect viewport = deviceListViewportRect(true); // wjy: 以展开后的真实侧栏视口计算目标位置。
+    const int requestedOffset = visibleDeviceRowRect(rowIndex).top() - viewport.top(); // wjy: 优先把目标分组标题对齐到视口顶部，便于用户确认归组结果。
+    m_deviceListScrollOffset = qBound(0, requestedOffset, maxDeviceListScrollOffset()); // wjy: 最后一个分组剩余内容不足一屏时夹紧到最大偏移，仍保证标题可见。
+    update(); // wjy: 先重绘展开与滚动结果，再按最终屏幕坐标摆放编辑框。
+
+    if (beginRename) {
+        beginDeviceGroupRename(groupIndex); // wjy: 新建组直接进入行内重命名，现有函数会填入默认名并全选获得焦点。
+    }
+}
+// ===end====
+
 void DeviceGrid::beginDeviceGroupRename(int groupIndex)
 {
 // =====wjy====
@@ -6047,11 +6185,38 @@ void DeviceGrid::showDeviceContextMenuForIndexes(
     QAction* restartAction = systemMenu->addAction(menuIcon(QStringLiteral("restart.svg")), batchDeviceMenu ? QString::fromUtf8("批量重启") : QString::fromUtf8("重启"));
     QAction* updateAction = systemMenu->addAction(menuIcon(QStringLiteral("update.svg")), batchDeviceMenu ? QString::fromUtf8("批量更新") : QString::fromUtf8("更新"));
     QAction* terminalAction = systemMenu->addAction(menuIcon(QStringLiteral("terminal.svg")), QString::fromUtf8("终端")); // wjy: 系统设置顺序固定为开机、关机、重启、更新、终端。
+    // =====wjy====
+    QAction* createGroupAction = nullptr; // wjy: 单设备菜单保持空指针，因此不会出现或误触发批量归组流程。
+    QVector<QAction*> existingGroupActions; // wjy: 按菜单创建时的分组顺序保存动作指针，不能占用脚本动作使用的 data 字段。
+    if (batchDeviceMenu) {
+        QMenu* addGroupMenu = menu.addMenu(QString::fromUtf8("添加分组")); // wjy: 多选菜单在“系统设置”正下方增加悬浮展开的分组子菜单。
+        createGroupAction = addGroupMenu->addAction(QString::fromUtf8("新建分组")); // wjy: 新建入口固定为子菜单首行，下面才显示当前分组名。
+        if (!g_deviceGroupNames.isEmpty()) {
+            addGroupMenu->addSeparator(); // wjy: 用分隔线区分创建动作和现有目标组，组名顺序保持侧栏顺序。
+        }
+        existingGroupActions.reserve(g_deviceGroupNames.size());
+        for (const QString& groupName : std::as_const(g_deviceGroupNames)) {
+            existingGroupActions.append(addGroupMenu->addAction(groupName)); // wjy: 悬浮子菜单实时列出全部当前分组名称。
+        }
+    }
+    // ===end====
     menu.addSeparator();
     QAction* deleteDeviceAction = menu.addAction(menuIcon(QStringLiteral("delete.svg")), QString::fromUtf8("删除设备")); // wjy: 设备列表和远控标题栏共享删除入口，只从本机列表移除触发菜单的这台设备。
 
-    const QAction* selectedAction = menu.exec(globalPosition); // wjy: 设备列表使用列表右键屏幕坐标，远控窗口使用其标题栏右键屏幕坐标。
-    if (selectedAction && selectedAction->data().isValid()) {
+    QAction* selectedAction = menu.exec(globalPosition); // wjy: 设备列表使用列表右键屏幕坐标，远控窗口使用其标题栏右键屏幕坐标。
+    // =====wjy====
+    const int selectedGroupIndex = existingGroupActions.indexOf(selectedAction); // wjy: 动作数组下标与菜单创建时的真实分组下标一一对应。
+    if (selectedAction == createGroupAction && createGroupAction) {
+        const int newGroupIndex = createDefaultDeviceGroup(); // wjy: 先追加带默认名和稳定 ID 的新组，再把本次菜单目标一次性归入。
+        if (assignDevicesToGroup(validTargetIndexes, newGroupIndex)) {
+            revealDeviceGroup(newGroupIndex, true); // wjy: 保存完成后跳到新组，并让默认组名进入全选输入状态。
+        }
+    } else if (selectedGroupIndex >= 0) {
+        if (assignDevicesToGroup(validTargetIndexes, selectedGroupIndex)) {
+            revealDeviceGroup(selectedGroupIndex, false); // wjy: 已在该组时不重复写归属，但仍展开并滚动到目标组标题。
+        }
+    // ===end====
+    } else if (selectedAction && selectedAction->data().isValid()) {
         executeDeviceScriptFolder(deviceIndex, selectedAction->data().toString(), true); // wjy: 脚本始终发送给触发菜单的真实设备，不读取 m_selectedDeviceIndex。
     } else if (selectedAction == wakeAction) {
         batchWakeDevices(validTargetIndexes);
@@ -6819,7 +6984,8 @@ void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex)
     auto* remoteWindow = new RemoteDesktopWindow(
         deviceDisplayName(g_devices.at(deviceIndex)),
         deviceIp,
-        m_remoteViewerLifecycleManager.get()); // wjy: 普通远控窗口接入共享4路初始化准入和可等待stop工作池。
+        m_remoteViewerLifecycleManager.get(),
+        &m_remoteInputBroadcastCoordinator); // wjy: 普通远控窗口同时接入共享生命周期管理器和唯一键鼠同步协调器。
     m_remoteDesktopWindows.insert(deviceIp, remoteWindow);
     publishRemoteControllerTarget(remoteWindow, deviceDisplayName(g_devices.at(deviceIndex)), deviceIp); // wjy: 窗口建立即发布本机正在控制的目标租约，目标人数仍只看目标主机自己的会话表。
     connect(remoteWindow, &QObject::destroyed, this, [this, deviceIp, remoteWindow] {
@@ -6955,7 +7121,8 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
         auto* remoteWindow = new RemoteDesktopWindow(
             deviceDisplayName(g_devices.at(deviceIndex)),
             g_devices.at(deviceIndex).ip,
-            m_remoteViewerLifecycleManager.get()); // wjy: 平铺窗口也共享同一初始化预算，但连接成功后不计入上限，最终可保持20路在线。
+            m_remoteViewerLifecycleManager.get(),
+            &m_remoteInputBroadcastCoordinator); // wjy: 平铺窗口与普通窗口处于同一同步成员集合，任一标题栏按钮都能原子切换主控。
         remoteWindow->setRememberGeometryEnabled(false);
         m_tiledRemoteWindows.append(remoteWindow); // wjy: 记录本次平铺创建的窗口，下一次设备平铺前统一关闭并重排。
         publishRemoteControllerTarget(remoteWindow, deviceDisplayName(g_devices.at(deviceIndex)), g_devices.at(deviceIndex).ip); // wjy: 每个平铺窗口拥有独立诊断租约，不会与普通窗口覆盖。
@@ -8069,13 +8236,10 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
 
         const int maxScrollOffset = maxDeviceListScrollOffset(); // wjy: 大于 0 表示内容高度超过视口，需要显示滚动条。
         if (maxScrollOffset > 0 && deviceListClip.height() > 0) {
-            const QRect scrollTrack(231, deviceListClip.y() + 5, 5, qMax(1, deviceListClip.height() - 10)); // wjy: 滚动条移到设备行和左侧边框之间的缝隙中间。
-            const int thumbHeight = qMax(28, scrollTrack.height() * deviceListClip.height() / qMax(1, visibleDeviceListContentHeight())); // wjy: 滑块高度按可见比例计算，太短时固定最小高度方便观察。
-            const int thumbTravel = qMax(0, scrollTrack.height() - thumbHeight);
-            const int thumbY = scrollTrack.y() + (thumbTravel * m_deviceListScrollOffset / maxScrollOffset); // wjy: 当前滚动偏移映射成滑块在轨道中的位置。
+            const QRect scrollThumb = deviceListScrollbarThumbRect(m_deviceListScrollOffset); // wjy: 绘制直接复用拖拽命中的滑块矩形，滚动位置只有一个权威计算来源。
             painter.setPen(Qt::NoPen);
-            painter.setBrush(QColor(172, 184, 198, 120));
-            painter.drawRoundedRect(QRectF(scrollTrack.x(), thumbY, scrollTrack.width(), thumbHeight), 1.5, 1.5);
+            painter.setBrush(m_draggingDeviceListScrollbar ? QColor(120, 139, 161, 190) : QColor(172, 184, 198, 120)); // wjy: 拖拽期间加深滑块，明确反馈当前抓取状态。
+            painter.drawRoundedRect(QRectF(scrollThumb), 1.5, 1.5);
         }
     }
 // ===end====
@@ -8407,6 +8571,28 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         }
     }
 
+    // =====wjy====
+    if (event->button() == Qt::LeftButton && !m_leftSidebarCollapsed && m_deviceGroupExpanded) {
+        const int maxScrollOffset = maxDeviceListScrollOffset();
+        const QRect thumb = deviceListScrollbarThumbRect(m_deviceListScrollOffset);
+        const QRect thumbHitRect = thumb.adjusted(-4, -2, 1, 2).intersected(deviceListViewportRect(true)); // wjy: 视觉仍是 5 像素宽，但向左扩展命中区让滑块更容易抓住且不覆盖设备行。
+        if (maxScrollOffset > 0 && thumbHitRect.contains(event->pos())) {
+            finishDeviceGroupRename(true); // wjy: 滚动会改变行坐标，抓取前先提交并关闭正在显示的分组编辑框。
+            finishDeviceRename(true);
+            m_draggingDeviceListScrollbar = true; // wjy: 从此处起本次左键手势只控制滚动条。
+            m_deviceListScrollbarGrabOffsetY = qBound(0, event->pos().y() - thumb.top(), qMax(0, thumb.height() - 1)); // wjy: 点击扩大命中区上下边缘时也夹紧到真实滑块内部。
+            m_groupDragCandidateActive = false; // wjy: 清除任何残留行拖拽候选，滚动条手势不能移动分组。
+            m_deviceDragCandidateActive = false;
+            m_draggingGroup = false;
+            m_draggingDevice = false;
+            setCursor(Qt::ClosedHandCursor); // wjy: 闭合手型表示滑块已经被抓住。
+            update(deviceListViewportRect(true));
+            event->accept();
+            return;
+        }
+    }
+    // ===end====
+
     if (event->button() == Qt::LeftButton
         && !m_settingsSelected
         && !m_remoteAssistSelected
@@ -8595,20 +8781,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         QAction* createGroupAction = menu.addAction(QString::fromUtf8("新建分组")); // wjy: 保存菜单项指针，用来判断用户是否真的点击了“新建分组”。
         const QAction* selectedAction = menu.exec(mapToGlobal(event->pos())); // wjy: 在鼠标当前位置弹出菜单，点空白取消时返回空指针。
         if (selectedAction == createGroupAction) {
-            int suffix = 1;
-            QString newGroupName;
-
-            do {
-                newGroupName =
-                    QString::fromUtf8("默认分组%1")
-                        .arg(suffix);
-                ++suffix;
-            } while (g_deviceGroupNames.contains(
-                newGroupName));
-
-            g_deviceGroupNames.append(newGroupName);// wjy: 点击菜单后创建空分组，例如 默认分组1、默认分组2。
-            g_deviceGroupIds.append(QUuid::createUuid().toString(QUuid::WithoutBraces).toLower()); // wjy: 新建分组立即分配稳定 UUID，之后改名和重排都保持同一实体。
-            g_deviceGroupExpandedStates.append(true); // wjy: 新建分组默认展开，所以初始显示上箭头。
+            createDefaultDeviceGroup(); // wjy: 空白区继续只创建空分组，但命名、稳定 ID 和展开规则与多选菜单共用同一入口。
             saveDevices(); // wjy: 保存 groups 字段，让新建分组关闭程序后还能恢复。
             update(); // wjy: 新增分组后重绘左侧列表，让分组立即显示在设备下面。
         }
@@ -8749,6 +8922,31 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
         return;
     }
 
+    // =====wjy====
+    if (m_draggingDeviceListScrollbar) {
+        const int maxScrollOffset = maxDeviceListScrollOffset(); // wjy: 分组展开或窗口尺寸可能在拖动中变化，每次移动都读取最新滚动范围。
+        if (!(event->buttons() & Qt::LeftButton) || maxScrollOffset <= 0) {
+            m_draggingDeviceListScrollbar = false; // wjy: 左键状态丢失或内容不再溢出时立即结束，避免除以零和卡住抓取光标。
+            m_deviceListScrollbarGrabOffsetY = 0;
+            m_deviceListScrollOffset = qBound(0, m_deviceListScrollOffset, qMax(0, maxScrollOffset));
+            unsetCursor();
+            update(deviceListViewportRect(true));
+            event->accept();
+            return;
+        }
+
+        const int requestedThumbTop = event->pos().y() - m_deviceListScrollbarGrabOffsetY; // wjy: 保留按下点到滑块顶部的距离，拖动不会跳位。
+        const int newOffset = deviceListScrollOffsetForThumbTop(requestedThumbTop); // wjy: 鼠标越过轨道上下端时映射函数会直接夹到 0 或最大偏移。
+        if (newOffset != m_deviceListScrollOffset) {
+            m_deviceListScrollOffset = newOffset; // wjy: 直接更新手绘列表偏移，拖到最底端即可立即看到最后内容。
+            update(deviceListViewportRect(true));
+        }
+        setCursor(Qt::ClosedHandCursor);
+        event->accept();
+        return;
+    }
+    // ===end====
+
     if (m_draggingWindow && (event->buttons() & Qt::LeftButton)) {
         window()->move(event->globalPosition().toPoint() - m_dragOffset);
         event->accept();
@@ -8866,6 +9064,14 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
         QFrame::mouseMoveEvent(event);
         return;
     }
+    // =====wjy====
+    const int deviceListMaxScrollOffset = maxDeviceListScrollOffset();
+    const QRect deviceListScrollbarThumb = deviceListScrollbarThumbRect(m_deviceListScrollOffset);
+    const bool deviceListScrollbarHovered = !m_leftSidebarCollapsed
+        && m_deviceGroupExpanded
+        && deviceListMaxScrollOffset > 0
+        && deviceListScrollbarThumb.adjusted(-4, -2, 1, 2).intersected(deviceListViewportRect(true)).contains(event->pos()); // wjy: 悬停和按下使用相同扩大命中区，用户看到手型的位置都能开始拖拽。
+    // ===end====
     const bool sidebarButtonHovered = sidebarCollapseButtonRect(m_leftSidebarCollapsed).contains(event->pos());
     const bool titlebarButtonHovered = titlebarLaunchButtonRect().contains(event->pos())
         || (m_updateAvailable && titlebarUpdateRect().contains(event->pos())) // wjy: 更新入口出现后使用按钮指针反馈。
@@ -8897,7 +9103,9 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
         && m_deviceDetailTab == DeviceDetailTab::ScriptLog
         && (scriptTerminalExecuteButtonRect().contains(event->position())
             || scriptTerminalStopButtonRect().contains(event->position()));
-    if (m_desktopHovered
+    if (deviceListScrollbarHovered) {
+        setCursor(Qt::OpenHandCursor); // wjy: 未按下时用张开手型提示滑块可以抓取。
+    } else if (m_desktopHovered
         || sidebarButtonHovered
         || titlebarButtonHovered
         || wakeButtonHovered
@@ -9118,7 +9326,9 @@ void DeviceGrid::leaveEvent(QEvent* event)
 {
     setDesktopHoverActive(false);
     clearBottomActionHover();
-    unsetCursor();
+    if (!m_draggingDeviceListScrollbar) {
+        unsetCursor(); // wjy: 隐式鼠标抓取把指针带出控件时保持闭合手型，直到真正松开滑块。
+    }
     QFrame::leaveEvent(event);
 }
 
@@ -9132,6 +9342,16 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
             event->accept();
             return;
         }
+        // =====wjy====
+        if (m_draggingDeviceListScrollbar) {
+            m_draggingDeviceListScrollbar = false; // wjy: 左键松开结束滚动条独占手势，后续点击恢复设备和分组交互。
+            m_deviceListScrollbarGrabOffsetY = 0;
+            unsetCursor();
+            update(deviceListViewportRect(true)); // wjy: 恢复普通颜色的滑块并保留最终列表偏移。
+            event->accept();
+            return;
+        }
+        // ===end====
         m_draggingWindow = false;
 
 // =====wjy====

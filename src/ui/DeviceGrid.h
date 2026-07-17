@@ -5,6 +5,7 @@
 #include "system/DeviceStatusService.h"
 #include "stream/RemoteQualityPolicy.h"
 #include "ui/RemoteQualityCoordinator.h"
+#include "ui/RemoteInputBroadcastCoordinator.h"
 
 #include <atomic>
 #include <functional>
@@ -167,6 +168,12 @@ private:
     void applyPeriodicDeviceDiscoverySetting(bool scanImmediately);
     void startBatchAddDevices(bool userInitiated = true); // wjy: 手动按钮和周期定时器复用同一网段扫描；周期触发时不跳转当前页面或选择新设备。
     // ===end====
+    // =====wjy====
+    QString nextDefaultDeviceGroupName() const; // wjy: 为所有新建分组入口生成不重复的“默认分组N”名称。
+    int createDefaultDeviceGroup(); // wjy: 只创建带稳定 ID 且默认展开的分组，保存和设备归属由调用流程统一提交。
+    bool assignDevicesToGroup(const QVector<int>& deviceIndexes, int groupIndex); // wjy: 去重并过滤菜单目标，把有效设备一次性写入指定分组。
+    void revealDeviceGroup(int groupIndex, bool beginRename); // wjy: 展开并滚动到目标分组，按需进入默认名称全选编辑状态。
+    // ===end====
     void beginDeviceGroupRename(int groupIndex); // wjy: Show the group rename editor in place.
     void finishDeviceGroupRename(bool saveText); // wjy: Finish group rename on Enter or focus loss.
     bool beginDeviceRename(int deviceIndex);
@@ -234,6 +241,7 @@ private:
 
     // =====wjy====
     platform::DeviceRealtimeStateService* m_realtimeStateService = nullptr; // wjy: 由 main 持有且晚于 MainWindow 销毁，DeviceGrid 只连接和调用，不负责释放。
+    RemoteInputBroadcastCoordinator m_remoteInputBroadcastCoordinator; // wjy: 单一协调器覆盖普通和平铺窗口，DeviceGrid 析构前先由窗口注销并完成同步输入释放。
     std::unique_ptr<RemoteViewerLifecycleManager> m_remoteViewerLifecycleManager; // wjy: 生命周期晚于窗口批量stop，析构时再次兜底join固定工作线程。
     RemoteQualityCoordinator m_remoteQualityCoordinator; // wjy: 一个控制端统一协调全部远控窗口，高质量锁定按优先级最后降级但不能突破稳定性硬边界。
     QTimer* m_remoteQualityTimer = nullptr; // wjy: 1秒采样接收FPS/码率，最小化和用户切换模式另走即时重算信号。
@@ -342,6 +350,10 @@ private:
     QString m_availableUpdateVersion; // wjy: 保存检测到的远端版本，供标题栏更新状态使用。
     // ===end====
     int m_deviceListScrollOffset = 0; // wjy: Scroll offset for the hand-painted device list.
+    // =====wjy====
+    bool m_draggingDeviceListScrollbar = false; // wjy: 按住左侧设备列表滑块时独占鼠标移动，避免同时触发设备或分组拖拽。
+    int m_deviceListScrollbarGrabOffsetY = 0; // wjy: 保存鼠标相对滑块顶部的位置，开始拖动时滑块不会突然跳到鼠标中心。
+    // ===end====
     int m_settingsScrollOffset = 0; // wjy: Scroll offset for the Settings > General content area.
     int m_renamingDeviceGroupIndex = -1; // wjy: Current renaming group index, -1 means none.
     int m_renamingDeviceIndex = -1; // wjy: Current inline-renaming device index, -1 means none.

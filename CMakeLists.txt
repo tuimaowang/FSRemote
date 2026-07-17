@@ -151,6 +151,20 @@ if(FSREMOTE_BUILD_VIEWER_STABILITY_TESTS)
         target_compile_options(fsremote_remote_quality_coordinator_tests PRIVATE /utf-8)
     endif()
     add_test(NAME fsremote_remote_quality_coordinator_tests COMMAND fsremote_remote_quality_coordinator_tests)
+
+    # =====wjy====
+    add_executable(fsremote_remote_input_broadcast_tests
+        tests/remote_input_broadcast_coordinator_tests.cpp
+        src/ui/RemoteInputBroadcastCoordinator.cpp
+        src/ui/RemoteInputBroadcastCoordinator.h
+    ) # wjy: 使用无网络端点覆盖唯一主控、动态扇出、混合分辨率映射、代际拒绝和安全抬键，不启动真实远控会话。
+    target_include_directories(fsremote_remote_input_broadcast_tests PRIVATE src)
+    target_link_libraries(fsremote_remote_input_broadcast_tests PRIVATE Qt6::Core)
+    if(MSVC)
+        target_compile_options(fsremote_remote_input_broadcast_tests PRIVATE /utf-8) # wjy: 新增中文所有权注释统一按 UTF-8 编译。
+    endif()
+    add_test(NAME fsremote_remote_input_broadcast_tests COMMAND fsremote_remote_input_broadcast_tests)
+    # ===end====
 endif()
 # ===end====
 
@@ -210,6 +224,10 @@ qt_add_executable(FSRemote WIN32
     src/ui/RemoteViewerLifecycleManager.h
     src/ui/RemoteQualityCoordinator.cpp
     src/ui/RemoteQualityCoordinator.h
+    # =====wjy====
+    src/ui/RemoteInputBroadcastCoordinator.cpp
+    src/ui/RemoteInputBroadcastCoordinator.h
+    # ===end====
     src/ui/D3D11FramePresenter.cpp
     src/ui/D3D11FramePresenter.h
     src/stream/StreamRuntime.cpp

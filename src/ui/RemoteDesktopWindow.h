@@ -18,6 +18,7 @@
 #include "stream/RemoteQualityPolicy.h"
 #include "ui/LatestTextureFrameSlot.h" // wjy: 远控纹理跨线程交接改为可单测的单槽最新帧模型，禁止每帧都堆积Qt任务。
 #include "ui/RemoteQualityCoordinator.h"
+#include "ui/RemoteInputBroadcastCoordinator.h"
 
 class QEvent;
 class QCloseEvent;
@@ -37,7 +38,7 @@ class D3D11FramePresenter;
 class RemoteViewerLifecycleManager; // wjy: DeviceGrid持有的共享管理器统一限制Viewer初始化并发并等待全部stop任务。
 struct RemoteDesktopViewerCallbackContext; // wjy: 每个原生viewer拥有独立回调上下文和代际，旧会话停止完成前上下文仍保持有效。
 
-class RemoteDesktopWindow final : public QWidget {
+class RemoteDesktopWindow final : public QWidget, public RemoteInputEndpoint {
     Q_OBJECT
 
 public:
@@ -45,6 +46,7 @@ public:
         const QString& deviceName,
         const QString& hostIp,
         RemoteViewerLifecycleManager* lifecycleManager,
+        RemoteInputBroadcastCoordinator* inputBroadcastCoordinator,
         QWidget* parent = nullptr); // wjy: 每个窗口共享同一生命周期管理器，不再自行创建无法等待的后台线程。
     ~RemoteDesktopWindow() override;
     void enqueueRemoteFrame(QImage image, quint64 viewerGeneration); // wjy: BGRA回调携带viewer代际，重连后迟到旧帧会在写入pending前被拒绝。
@@ -103,7 +105,7 @@ protected:
     void paintEvent(QPaintEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
-    void mouseDoubleClickEvent(QMouseEvent* event) override; // wjy: 捕获标题栏非按钮区域双击，并复用右侧最大化按钮的窗口切换逻辑。
+    void mouseDoubleClickEvent(QMouseEvent* event) override; // wjy: 最大化按钮删除后，标题栏非按钮区域双击成为最大化/还原的唯一标题栏入口。
     void mouseMoveEvent(QMouseEvent* event) override;
     void mouseReleaseEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
@@ -148,14 +150,16 @@ private:
     QRect remoteUpdateButtonRect() const; // wjy: 更新按钮位于剪切板按钮左侧，对应用户标出的标题栏空白区域。
     QRect qualityButtonRect() const; // wjy: 单窗口画质按钮位于剪切板左侧，菜单设置只影响当前远控窗口。
     QRect clipboardSyncRect() const;
+    QRect inputSyncRect() const; // wjy: 键鼠同步按钮固定在剪切板按钮左侧，并作为标题栏本地点击区排除远端输入。
     // ===end====
     QRect minimizeRect() const;
-    QRect maximizeRect() const;
     QRect closeRect() const;
     // =====wjy====
     bool isTitleBarBlankArea(const QPoint& position) const; // wjy: 统一判断标题栏可拖动/可双击区域，排除右侧窗口控制按钮。
-    void toggleMaximizedState(); // wjy: 最大化图标点击和标题栏双击共用这一段窗口状态切换逻辑。
+    void toggleMaximizedState(); // wjy: 删除最大化图标后仅由标题栏双击调用，统一切换最大化与普通状态。
     void toggleClipboardSync();
+    void toggleInputSynchronization(); // wjy: 标题栏一次点击根据关闭、主控、跟随三态执行开启、关闭或主控切换。
+    QString inputSynchronizationToolTip() const;
     void showQualityMenu(const QPoint& globalPosition); // wjy: 构建自定义/自动/高质量/均衡/流畅菜单，并保存当前窗口临时选择。
     void setQualityOverrideMode(stream::RemoteQualityMode mode); // wjy: 修改当前窗口会话内模式，不写AppSettings也不影响其它窗口。
     stream::RemoteQualityMode effectiveQualityMode() const; // wjy: FollowGlobal解析为最新全局模式，局部覆盖则直接返回覆盖值。
@@ -165,7 +169,12 @@ private:
     // ===end====
     QRect remoteImageRect() const;
     bool normalizedRemotePoint(const QPoint& position, int* x, int* y) const;
-    void sendInputMessage(const QByteArray& message);
+    bool sendInputMessage(const QByteArray& message);
+    bool dispatchRemoteInputEvent(const RemoteInputEvent& event); // wjy: 来源窗口只发送一次，并由共享协调器决定是否向当前跟随窗口扇出。
+    bool synchronizedInputEligible() const override;
+    QSize synchronizedInputFrameSize() const override;
+    bool sendSynchronizedInputEvent(const RemoteInputEvent& event) override;
+    void synchronizedInputRoleChanged(RemoteInputSyncRole role) override;
     bool sendRemoteMouseMove(const QPoint& position, Qt::MouseButtons buttons);
     bool sendRemoteMouseRelativeMove(const QPoint& position, Qt::MouseButtons buttons);
     void recenterRemoteMouseCapture();
@@ -200,6 +209,8 @@ private:
     QImage m_pendingRemoteFrame; // wjy: Holds only the newest decoded frame so slow full-screen painting cannot build a stale-frame queue.
     LatestTextureFrameSlot m_pendingTextureFrames; // wjy: 每个远控窗口最多保留一个纹理描述符和一个Qt drain任务，20路高帧率时队列仍有硬上限。
     RemoteViewerLifecycleManager* m_lifecycleManager = nullptr; // wjy: 由DeviceGrid持有且晚于全部远控窗口停止，窗口只借用它提交可等待任务。
+    RemoteInputBroadcastCoordinator* m_inputBroadcastCoordinator = nullptr; // wjy: DeviceGrid 统一持有协调器，生命周期覆盖普通和平铺远控窗口。
+    RemoteInputSyncRole m_inputSyncRole = RemoteInputSyncRole::Off;
     stream::RemoteQualityConfiguration m_globalQualityConfiguration; // wjy: 当前窗口持有最新全局策略，后续本地覆盖和协调器从这里解析有效值。
     stream::RemoteQualityMode m_qualityOverrideMode = stream::RemoteQualityMode::Automatic; // wjy: 首次远控设备默认“自动”，构造时若存在该设备历史记录则恢复上次选择。
     RemoteQualityDecision m_remoteQualityDecision; // wjy: 保存协调器针对当前窗口的最新目标，Viewer尚未创建时也不会丢失用户选择。
@@ -272,6 +283,7 @@ private:
     bool m_waitingShortcutRelease = false;
     QVector<int> m_shortcutReleaseVirtualKeys;
     QSet<int> m_pressedKeys;
+    bool m_inputSyncButtonPressed = false; // wjy: 仅按下并在同一按钮内释放才切换主控，拖出热区不会误操作同步状态。
     // =====wjy====
     bool m_clipboardSyncEnabled = true; // wjy: 标题栏按钮与 Ctrl+B 共同切换，默认开启。
     QString m_lastLocalClipboardText;
