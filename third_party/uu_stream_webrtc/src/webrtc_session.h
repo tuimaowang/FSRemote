@@ -55,6 +55,13 @@ public:
     void set_connection_state_callback(ConnectionStateCallback callback); // wjy: Host 注册断线回调；Viewer 未注册时保持原有行为。
     // ===end====
     bool send_control_message(const std::string& message);
+    bool apply_sender_quality(
+        uint32_t target_width,
+        uint32_t target_height,
+        uint32_t target_fps,
+        uint32_t max_bitrate_kbps,
+        uint32_t priority,
+        std::string* error); // wjy: Host按会话在线更新sender参数，不停止、不重建PeerConnection或媒体源。
 
     bool start_offer(std::string* error);
     bool accept_remote_description(const std::string& kind, const std::string& sdp, std::string* error);
@@ -97,6 +104,8 @@ private:
     webrtc::scoped_refptr<webrtc::DataChannelInterface> control_channel_;
     std::unique_ptr<ControlDataObserver> control_observer_;
     webrtc::scoped_refptr<webrtc::VideoTrackInterface> local_video_track_;
+    webrtc::scoped_refptr<webrtc::RtpSenderInterface> local_video_sender_; // wjy: 保存每会话独立sender，质量消息只调整对应控制端的编码参数。
+    std::mutex sender_mutex_; // wjy: data-channel质量回调和WebRTC关闭可能并发访问sender，统一串行保护。
     webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> local_video_source_;
     webrtc::scoped_refptr<webrtc::VideoTrackInterface> remote_video_track_;
     std::unique_ptr<webrtc::VideoSinkInterface<webrtc::VideoFrame>> remote_video_sink_;

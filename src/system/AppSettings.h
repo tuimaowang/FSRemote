@@ -4,6 +4,8 @@
 #include <QRect>
 #include <QString>
 
+#include "stream/RemoteQualityPolicy.h"
+
 namespace platform {
 
 class AppSettings final {
@@ -27,6 +29,12 @@ public:
     static void setRemoteHostHandshakeTimeoutMs(int timeoutMs);
     static QString remoteHostOwnershipPolicy();
     static void setRemoteHostOwnershipPolicy(const QString& policy);
+    // ===end====
+    // =====wjy====
+    static stream::RemoteQualityConfiguration remoteQualityConfiguration(); // wjy: 一次读取并归一化控制端全局远控画质默认值。
+    static void setRemoteQualityConfiguration(const stream::RemoteQualityConfiguration& configuration); // wjy: 主窗口设置变更统一持久化完整配置，避免字段间约束被分散写坏。
+    static bool remoteDeviceQualityMode(const QString& deviceKey, stream::RemoteQualityMode* mode); // wjy: 按目标设备读取上次远控窗口画质；首次设备返回false并由窗口使用“自动”。
+    static void setRemoteDeviceQualityMode(const QString& deviceKey, stream::RemoteQualityMode mode); // wjy: 用户切换标题栏画质后立即按设备保存，关闭程序后仍能恢复。
     // ===end====
     static QKeySequence remoteShortcutFullscreen();
     static void setRemoteShortcutFullscreen(const QKeySequence& shortcut);

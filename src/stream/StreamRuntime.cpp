@@ -93,6 +93,8 @@ StreamRuntime::StreamRuntime()
     m_startViewerWithTexture = reinterpret_cast<StartViewerWithTextureFn>(library->resolve("fsremote_stream_start_viewer_with_texture"));
     m_stop = reinterpret_cast<StopFn>(library->resolve("fsremote_stream_stop"));
     m_sendInput = reinterpret_cast<SendInputFn>(library->resolve("fsremote_stream_send_input"));
+    m_setViewerQuality = reinterpret_cast<SetViewerQualityFn>(library->resolve("fsremote_stream_set_viewer_quality")); // wjy: 可选导出支持无重连画质更新，旧DLL继续使用原始流。
+    m_getViewerQualityStatus = reinterpret_cast<GetViewerQualityStatusFn>(library->resolve("fsremote_stream_get_viewer_quality_status"));
     m_isBusy = reinterpret_cast<IsBusyFn>(library->resolve("fsremote_stream_is_busy"));
     // =====wjy====
     m_activeSessionCount = reinterpret_cast<ActiveSessionCountFn>(library->resolve("fsremote_stream_active_session_count")); // wjy: 新 DLL 导出真实会话数；旧 DLL 缺失时状态服务回退 busy 布尔。
@@ -205,6 +207,21 @@ bool StreamRuntime::sendInput(FsRemoteStreamHandle handle, const QByteArray& mes
 {
     return m_sendInput && handle && !message.isEmpty() && m_sendInput(handle, message.constData()) != 0;
 }
+
+// =====wjy====
+bool StreamRuntime::setViewerQuality(FsRemoteStreamHandle handle, const FsRemoteViewerQualityConfig& config)
+{
+    return m_setViewerQuality && handle && m_setViewerQuality(handle, &config) != 0; // wjy: DLL同步复制配置，调用返回后栈上结构即可释放。
+}
+
+bool StreamRuntime::viewerQualityStatus(FsRemoteStreamHandle handle, FsRemoteViewerQualityStatus* status) const
+{
+    if (!m_getViewerQualityStatus || !handle || !status) {
+        return false;
+    }
+    return m_getViewerQualityStatus(handle, status) != 0; // wjy: 缺失导出或尚无确认都返回false，UI保持不断流并显示不支持/等待状态。
+}
+// ===end====
 
 bool StreamRuntime::isBusy(FsRemoteStreamHandle handle) const
 {

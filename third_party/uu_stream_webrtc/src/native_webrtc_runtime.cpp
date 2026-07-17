@@ -14,17 +14,70 @@
 
 #include <exception>
 #include <iostream>
+#include <mutex>
 
 namespace uu {
 
-struct NativeWebrtcRuntime::Impl {
+namespace {
+
+// =====wjy====
+struct SharedWebrtcThreads {
     std::unique_ptr<webrtc::Thread> network_thread;
     std::unique_ptr<webrtc::Thread> worker_thread;
     std::unique_ptr<webrtc::Thread> signaling_thread;
+    std::mutex factory_creation_mutex; // wjy: 最多4个Viewer可同时初始化，但共享线程上的Factory创建按顺序进入，降低底层全局状态并发风险。
+    bool ssl_initialized = false;
+
+    ~SharedWebrtcThreads()
+    {
+        if (worker_thread) worker_thread->Stop(); // wjy: 所有引用方的Factory已先销毁，最后一个runtime释放时才停止共享线程。
+        if (network_thread) network_thread->Stop();
+        if (signaling_thread) signaling_thread->Stop(); // wjy: signaling最后停止，为worker/network退出回投保留依赖队列。
+        if (ssl_initialized) webrtc::CleanupSSL(); // wjy: 全进程只和首次成功InitializeSSL配对一次，20个Viewer不再重复初始化/清理。
+    }
+};
+
+std::mutex g_shared_webrtc_mutex;
+std::weak_ptr<SharedWebrtcThreads> g_shared_webrtc_threads;
+
+std::shared_ptr<SharedWebrtcThreads> acquire_shared_webrtc_threads(std::string* error)
+{
+    std::lock_guard lock(g_shared_webrtc_mutex);
+    if (std::shared_ptr<SharedWebrtcThreads> existing = g_shared_webrtc_threads.lock()) {
+        return existing; // wjy: Host和全部Viewer复用同一组网络/工作/信令线程，最终在线会话数量不受这里限制。
+    }
+
+    auto shared = std::make_shared<SharedWebrtcThreads>();
+    if (!webrtc::InitializeSSL()) {
+        if (error) *error = "webrtc::InitializeSSL failed";
+        return {};
+    }
+    shared->ssl_initialized = true;
+    shared->network_thread = webrtc::Thread::CreateWithSocketServer();
+    shared->worker_thread = webrtc::Thread::Create();
+    shared->signaling_thread = webrtc::Thread::Create();
+    if (!shared->network_thread || !shared->worker_thread || !shared->signaling_thread) {
+        if (error) *error = "failed to create shared WebRTC threads";
+        return {}; // wjy: shared局部对象析构会停止已创建线程并清理SSL，不留下半初始化全局状态。
+    }
+    shared->network_thread->SetName("uu_webrtc_network_shared", nullptr);
+    shared->worker_thread->SetName("uu_webrtc_worker_shared", nullptr);
+    shared->signaling_thread->SetName("uu_webrtc_signaling_shared", nullptr);
+    shared->network_thread->Start();
+    shared->worker_thread->Start();
+    shared->signaling_thread->Start();
+    g_shared_webrtc_threads = shared;
+    return shared;
+}
+// ===end====
+
+} // namespace
+
+struct NativeWebrtcRuntime::Impl {
+    std::shared_ptr<SharedWebrtcThreads> shared_threads; // wjy: 每个runtime保留引用，最后一个Host/Viewer结束时才统一停止3条共享线程。
     webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> factory;
     DecodedBgraCallback decoded_bgra_callback;
     DecodedTextureCallback decoded_texture_callback;
-    bool ssl_initialized = false; // wjy: 记录本 runtime 是否成功执行 InitializeSSL，确保 CleanupSSL 只配对调用一次。
 };
 
 NativeWebrtcRuntime::NativeWebrtcRuntime() = default;
@@ -40,43 +93,22 @@ bool NativeWebrtcRuntime::initialize(std::string* error)
         DecodedBgraCallback decoded_bgra_callback = impl_ ? impl_->decoded_bgra_callback : DecodedBgraCallback{}; // wjy: keep the viewer-owned callback across initialize's shutdown reset.
         DecodedTextureCallback decoded_texture_callback = impl_ ? impl_->decoded_texture_callback : DecodedTextureCallback{};
         shutdown();
-        std::cout << "webrtc runtime: InitializeSSL\n";
-        if (!webrtc::InitializeSSL()) {
-            if (error) *error = "webrtc::InitializeSSL failed";
-            return false;
-        }
-
         impl_ = std::make_unique<Impl>();
-        impl_->ssl_initialized = true; // wjy: 从此处起任一失败路径都由 shutdown 配对清理本次 SSL 初始化。
         impl_->decoded_bgra_callback = std::move(decoded_bgra_callback); // wjy: pass this viewer's callback into its decoder factory.
         impl_->decoded_texture_callback = std::move(decoded_texture_callback);
-        std::cout << "webrtc runtime: create threads\n";
-        impl_->network_thread = webrtc::Thread::CreateWithSocketServer();
-        impl_->worker_thread = webrtc::Thread::Create();
-        impl_->signaling_thread = webrtc::Thread::Create();
-
-        if (!impl_->network_thread || !impl_->worker_thread || !impl_->signaling_thread) {
-            if (error) *error = "failed to create WebRTC threads";
+        impl_->shared_threads = acquire_shared_webrtc_threads(error);
+        if (!impl_->shared_threads) {
             shutdown();
             return false;
         }
-
-        impl_->network_thread->SetName("uu_webrtc_network", nullptr);
-        impl_->worker_thread->SetName("uu_webrtc_worker", nullptr);
-        impl_->signaling_thread->SetName("uu_webrtc_signaling", nullptr);
-
-        std::cout << "webrtc runtime: start threads\n";
-        impl_->network_thread->Start();
-        impl_->worker_thread->Start();
-        impl_->signaling_thread->Start();
 
         // First keep the modular factory media-free to prove the native
         // PeerConnection core is initialized correctly. Media is enabled only
         // after this path is stable.
         webrtc::PeerConnectionFactoryDependencies deps;
-        deps.network_thread = impl_->network_thread.get();
-        deps.worker_thread = impl_->worker_thread.get();
-        deps.signaling_thread = impl_->signaling_thread.get();
+        deps.network_thread = impl_->shared_threads->network_thread.get();
+        deps.worker_thread = impl_->shared_threads->worker_thread.get();
+        deps.signaling_thread = impl_->shared_threads->signaling_thread.get(); // wjy: Factory和解码回调仍按runtime隔离，仅线程调度资源在进程内共享。
         deps.env = webrtc::CreateEnvironment(
             std::make_unique<webrtc::FieldTrials>(std::string(field_trials())));
         deps.video_encoder_factory = CreateUuVideoEncoderFactory();
@@ -84,8 +116,11 @@ bool NativeWebrtcRuntime::initialize(std::string* error)
         std::cout << "webrtc runtime: enable media defaults\n";
         webrtc::EnableMediaWithDefaults(deps);
 
-        std::cout << "webrtc runtime: create modular PeerConnectionFactory\n";
-        impl_->factory = webrtc::CreateModularPeerConnectionFactory(std::move(deps));
+        std::cout << "webrtc runtime: create modular PeerConnectionFactory on shared threads\n";
+        {
+            std::lock_guard lock(impl_->shared_threads->factory_creation_mutex);
+            impl_->factory = webrtc::CreateModularPeerConnectionFactory(std::move(deps)); // wjy: 独立Factory保留当前Viewer专属decoder回调，不会把一台设备画面投递到另一窗口。
+        }
 
         if (!impl_->factory) {
             if (error) *error = "CreatePeerConnectionFactory failed";
@@ -105,13 +140,8 @@ void NativeWebrtcRuntime::shutdown()
 {
     // =====wjy====
     if (impl_) {
-        const bool cleanup_ssl = impl_->ssl_initialized; // wjy: 保存后再 reset，避免析构或重复 shutdown 二次清理全局 SSL。
-        impl_->factory = nullptr; // wjy: 先同步销毁 factory；其代理会在 signaling 上析构内部对象，并调用仍存活的 worker 完成媒体清理。
-        if (impl_->worker_thread) impl_->worker_thread->Stop(); // wjy: factory 已同步完成析构后先停 worker，期间保留 signaling 处理可能的退出回投。
-        if (impl_->network_thread) impl_->network_thread->Stop(); // wjy: 网络线程排在 signaling 前停止，避免其退出路径访问已经销毁的信令队列。
-        if (impl_->signaling_thread) impl_->signaling_thread->Stop(); // wjy: signaling 最后停止，为其他 WebRTC 线程的清理保留依赖线程。
-        impl_.reset();
-        if (cleanup_ssl) webrtc::CleanupSSL(); // wjy: 当前 WebRTC 后端的 CleanupSSL 是幂等空操作，但仍与成功初始化保持明确配对。
+        impl_->factory = nullptr; // wjy: 当前Viewer先释放独立Factory，再放弃共享线程引用；其它十九路Factory和会话不受影响。
+        impl_.reset(); // wjy: 只有最后一个runtime释放shared_ptr时才停止共享线程和清理SSL。
     }
     // ===end====
 }

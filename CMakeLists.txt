@@ -42,6 +42,8 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
     add_library(uu_session_protocol STATIC
         third_party/uu_stream_webrtc/src/session_protocol.cpp
         third_party/uu_stream_webrtc/src/session_protocol.h
+        third_party/uu_stream_webrtc/src/viewer_quality_protocol.cpp
+        third_party/uu_stream_webrtc/src/viewer_quality_protocol.h
     ) # wjy: 协议库独立编译，避免继承 uu_stream_common 面向 WebRTC/libc++ 的特殊宏而污染 MSVC 标准库。
     target_include_directories(uu_session_protocol PUBLIC third_party/uu_stream_webrtc/src)
     target_link_libraries(fsremote_stream PRIVATE uu_session_protocol) # wjy: DLL 后续握手状态机直接复用同一协议实现，测试与运行时不会出现两套解析规则。
@@ -61,6 +63,16 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
             set_property(TARGET uu_session_protocol_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
         endif()
         add_test(NAME uu_session_protocol_tests COMMAND uu_session_protocol_tests) # wjy: CTest 通过退出码判断全部恶意输入边界是否通过。
+
+        add_executable(uu_viewer_quality_protocol_tests
+            third_party/uu_stream_webrtc/tests/viewer_quality_protocol_tests.cpp
+        ) # wjy: 独立覆盖版本化画质请求/确认、畸形字段和不断流的非零FPS约束。
+        target_link_libraries(uu_viewer_quality_protocol_tests PRIVATE uu_session_protocol)
+        if(MSVC)
+            target_compile_options(uu_viewer_quality_protocol_tests PRIVATE /utf-8)
+            set_property(TARGET uu_viewer_quality_protocol_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+        endif()
+        add_test(NAME uu_viewer_quality_protocol_tests COMMAND uu_viewer_quality_protocol_tests)
 
         add_executable(uu_host_session_manager_tests
             third_party/uu_stream_webrtc/tests/host_session_manager_tests.cpp
@@ -103,6 +115,44 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
 endif()
 
 find_package(Qt6 REQUIRED COMPONENTS Widgets Svg Network)
+
+# =====wjy====
+option(FSREMOTE_BUILD_VIEWER_STABILITY_TESTS "Build bounded multi-viewer frame handoff tests" ON)
+if(FSREMOTE_BUILD_VIEWER_STABILITY_TESTS)
+    enable_testing()
+    add_executable(fsremote_latest_texture_frame_slot_tests
+        tests/latest_texture_frame_slot_tests.cpp
+        src/ui/LatestTextureFrameSlot.h
+    ) # wjy: 纯C++测试不启动Qt、WebRTC或显卡即可验证20路场景最关键的单槽覆盖与唯一drain语义。
+    target_include_directories(fsremote_latest_texture_frame_slot_tests PRIVATE src)
+    if(MSVC)
+        target_compile_options(fsremote_latest_texture_frame_slot_tests PRIVATE /utf-8) # wjy: 测试和生产头中的中文所有权注释统一按UTF-8编译。
+    endif()
+    add_test(NAME fsremote_latest_texture_frame_slot_tests COMMAND fsremote_latest_texture_frame_slot_tests) # wjy: CTest通过断言确认上千帧输入仍只有一个pending和一个调度权。
+
+    add_executable(fsremote_remote_quality_policy_tests
+        tests/remote_quality_policy_tests.cpp
+        src/stream/RemoteQualityPolicy.h
+    ) # wjy: 纯C++测试验证FPS优先默认值、最小化不断流和异常持久化值归一化，无需启动Qt或真实设备。
+    target_include_directories(fsremote_remote_quality_policy_tests PRIVATE src)
+    if(MSVC)
+        target_compile_options(fsremote_remote_quality_policy_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME fsremote_remote_quality_policy_tests COMMAND fsremote_remote_quality_policy_tests)
+
+    add_executable(fsremote_remote_quality_coordinator_tests
+        tests/remote_quality_coordinator_tests.cpp
+        src/ui/RemoteQualityCoordinator.cpp
+        src/ui/RemoteQualityCoordinator.h
+        src/stream/RemoteQualityPolicy.h
+    ) # wjy: 纯C++验证最小化立即降FPS、可见先降分辨率、恢复先升FPS和高质量最后降级。
+    target_include_directories(fsremote_remote_quality_coordinator_tests PRIVATE src)
+    if(MSVC)
+        target_compile_options(fsremote_remote_quality_coordinator_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME fsremote_remote_quality_coordinator_tests COMMAND fsremote_remote_quality_coordinator_tests)
+endif()
+# ===end====
 
 # =====wjy====
 option(FSREMOTE_BUILD_DEVICE_SYNC_TESTS "Build device list synchronization model tests" ON)
@@ -156,10 +206,15 @@ qt_add_executable(FSRemote WIN32
     src/ui/DeviceGrid.h
     src/ui/RemoteDesktopWindow.cpp
     src/ui/RemoteDesktopWindow.h
+    src/ui/RemoteViewerLifecycleManager.cpp
+    src/ui/RemoteViewerLifecycleManager.h
+    src/ui/RemoteQualityCoordinator.cpp
+    src/ui/RemoteQualityCoordinator.h
     src/ui/D3D11FramePresenter.cpp
     src/ui/D3D11FramePresenter.h
     src/stream/StreamRuntime.cpp
     src/stream/StreamRuntime.h
+    src/stream/RemoteQualityPolicy.h
     src/system/AppSettings.cpp
     src/system/AppSettings.h
     src/system/PowerManager.cpp
@@ -200,7 +255,7 @@ qt_add_executable(FSRemote WIN32
 target_include_directories(FSRemote PRIVATE src include third_party/parsec_vdd)
 target_link_libraries(FSRemote PRIVATE Qt6::Widgets Qt6::Svg Qt6::Network)
 if(WIN32)
-    target_link_libraries(FSRemote PRIVATE wbemuuid ole32 oleaut32 iphlpapi ws2_32 advapi32 shell32 setupapi cfgmgr32 d3d11 dxgi)
+    target_link_libraries(FSRemote PRIVATE wbemuuid ole32 oleaut32 iphlpapi ws2_32 advapi32 shell32 setupapi cfgmgr32 d3d11 dxgi psapi)
 endif()
 
 if(MSVC)

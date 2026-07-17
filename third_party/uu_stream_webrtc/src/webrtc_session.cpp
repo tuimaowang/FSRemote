@@ -5,6 +5,7 @@
 #include "uu_profile.h"
 
 #include <api/media_stream_interface.h>
+#include <api/rtp_parameters.h>
 #include <api/create_peerconnection_factory.h>
 #include <api/data_channel_interface.h>
 #include <api/field_trials.h>
@@ -351,6 +352,10 @@ WebrtcSession::~WebrtcSession()
     remote_video_sink_.reset();
     // ===end====
     local_video_track_ = nullptr;
+    {
+        std::lock_guard lock(sender_mutex_);
+        local_video_sender_ = nullptr; // wjy: 关闭PeerConnection前先阻止迟到质量消息继续取得sender。
+    }
     local_video_source_ = nullptr;
     if (pc_) {
         pc_->Close();
@@ -413,6 +418,54 @@ bool WebrtcSession::send_control_message(const std::string& message)
     }
     return channel->Send(webrtc::DataBuffer(message));
 }
+
+// =====wjy====
+bool WebrtcSession::apply_sender_quality(
+    uint32_t target_width,
+    uint32_t target_height,
+    uint32_t target_fps,
+    uint32_t max_bitrate_kbps,
+    uint32_t priority,
+    std::string* error)
+{
+    std::lock_guard lock(sender_mutex_);
+    if (!local_video_sender_) {
+        if (error) *error = "video sender is unavailable";
+        return false; // wjy: 会话尚未完成媒体初始化时返回非致命失败，现有连接不被重建。
+    }
+
+    auto parameters = local_video_sender_->GetParameters();
+    if (parameters.encodings.empty()) parameters.encodings.emplace_back();
+    const uint32_t safe_fps = std::clamp(target_fps, 1u, 60u);
+    const uint32_t safe_max_kbps = std::clamp(max_bitrate_kbps, 256u, 240000u);
+    const uint32_t safe_min_kbps = std::min(safe_max_kbps, std::max(256u, safe_max_kbps / 4)); // wjy: 降码率时同步降低自适应下限，静止桌面不会被旧9Mbps下限顶住。
+    const webrtc::Priority network_priority = priority >= 75
+        ? webrtc::Priority::kHigh
+        : (priority >= 40 ? webrtc::Priority::kMedium : webrtc::Priority::kLow); // wjy: 高质量锁定提高发送优先级，但仍服从WebRTC拥塞控制。
+    for (auto& encoding : parameters.encodings) {
+        encoding.active = true;
+        encoding.min_bitrate_bps = static_cast<int>(safe_min_kbps) * 1000;
+        encoding.max_bitrate_bps = static_cast<int>(safe_max_kbps) * 1000;
+        encoding.max_framerate = static_cast<int>(safe_fps); // wjy: 在线SetParameters改变FPS，不执行NVENC shutdown/recreate。
+        encoding.network_priority = network_priority;
+        encoding.scale_resolution_down_by.reset();
+        if (target_width == 0 && target_height == 0) {
+            encoding.scale_resolution_down_to.reset(); // wjy: 成对0恢复共享捕获源的原始分辨率，不影响其它会话sender。
+        } else {
+            encoding.scale_resolution_down_to = webrtc::Resolution{
+                .width = static_cast<int>(target_width),
+                .height = static_cast<int>(target_height),
+            }; // wjy: WebRTC视频适配器在编码前按目标尺寸缩放，多个控制端继续共享同一桌面捕获源。
+        }
+    }
+    const auto result = local_video_sender_->SetParameters(parameters);
+    if (!result.ok()) {
+        if (error) *error = std::string(result.message());
+        return false;
+    }
+    return true;
+}
+// ===end====
 
 bool WebrtcSession::start_offer(std::string* error)
 {
@@ -578,6 +631,10 @@ bool WebrtcSession::configure_host_media(std::string* error)
         return false;
     }
     auto sender = result.MoveValue();
+    {
+        std::lock_guard lock(sender_mutex_);
+        local_video_sender_ = sender; // wjy: 保存本会话sender，后续质量请求只修改这一条RTP发送链路。
+    }
     auto transceivers = pc_->GetTransceivers();
     if (!transceivers.empty()) {
         if (!apply_uu_codec_preferences(transceivers.back().get(), send_caps, "host", error)) {

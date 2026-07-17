@@ -228,6 +228,17 @@ bool H264Decoder::convert_d3d11_frame(DecodedFrame* decoded, std::string* error)
 
     RECT rect = {0, 0, frame_->width, frame_->height};
     video_context_->VideoProcessorSetStreamFrameFormat(processor_.Get(), 0, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE);
+    // =====wjy====
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE input_color_space = {};
+    input_color_space.YCbCr_Matrix = 1; // wjy: HEVC桌面视频按BT.709矩阵解读，避免驱动使用SD色彩矩阵导致灰阶和颜色偏差。
+    input_color_space.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_16_235; // wjy: NV12/P010解码面是视频limited range，显式声明后由视频处理器完成正确扩展。
+    video_context_->VideoProcessorSetStreamColorSpace(processor_.Get(), 0, &input_color_space); // wjy: 不依赖不同显卡驱动的默认颜色范围，保证共享纹理和软件回退得到一致结果。
+    D3D11_VIDEO_PROCESSOR_COLOR_SPACE output_color_space = {};
+    output_color_space.RGB_Range = 1; // wjy: 输出BGRA使用桌面full range，恢复黑位、白位和细节对比度。
+    output_color_space.YCbCr_Matrix = 1; // wjy: 输入输出统一使用BT.709转换语义，适配当前1080p及以上远控桌面。
+    output_color_space.Nominal_Range = D3D11_VIDEO_PROCESSOR_NOMINAL_RANGE_0_255; // wjy: 共享BGRA纹理中的每个通道直接覆盖0到255，后续呈现不再二次扩展。
+    video_context_->VideoProcessorSetOutputColorSpace(processor_.Get(), &output_color_space); // wjy: 色彩修正在解码设备上只执行GPU视频处理，不增加CPU逐像素开销。
+    // ===end====
     video_context_->VideoProcessorSetStreamSourceRect(processor_.Get(), 0, TRUE, &rect);
     video_context_->VideoProcessorSetStreamDestRect(processor_.Get(), 0, TRUE, &rect);
     video_context_->VideoProcessorSetOutputTargetRect(processor_.Get(), TRUE, &rect);
@@ -240,6 +251,7 @@ bool H264Decoder::convert_d3d11_frame(DecodedFrame* decoded, std::string* error)
         if (error) *error = "VideoProcessorBlt failed: 0x" + std::to_string(static_cast<unsigned long>(hr));
         return false;
     }
+    context_->Flush(); // wjy: 跨D3D11设备共享纹理前立即提交生产端Blt，避免控制端读到尚未执行完成的新纹理初始黑色内容。
 
     decoded->size = {static_cast<uint32_t>(frame_->width), static_cast<uint32_t>(frame_->height)};
     decoded->bgra.clear();

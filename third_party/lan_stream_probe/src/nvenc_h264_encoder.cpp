@@ -69,11 +69,14 @@ bool NvencH264Encoder::initialize(ID3D11Device* device, Size size, uint32_t bitr
     config.frameIntervalP = 1;
     config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
     config.rcParams.averageBitRate = bitrate;
-    config.rcParams.maxBitRate = bitrate;
-    config.rcParams.vbvBufferSize = std::max<uint32_t>(bitrate / safe_fps, 1);
+    // =====wjy====
+    config.rcParams.maxBitRate = bitrate + bitrate / 4; // wjy: 复杂运动帧允许最多25%受控峰值，减少雪地、树枝和文字边缘瞬时糊化；WebRTC发送上限仍是最终硬边界。
+    config.rcParams.vbvBufferSize = std::max<uint32_t>(config.rcParams.maxBitRate * 2 / safe_fps, 1); // wjy: 使用约两帧峰值缓冲吸收画面复杂度突变，不引入B帧重排或长lookahead延迟。
     config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
     config.rcParams.enableAQ = 1;
-    config.rcParams.aqStrength = 8;
+    config.rcParams.enableTemporalAQ = 1; // wjy: 时间AQ把码率优先分配给连续帧中的运动与高频细节，提升高质量模式下视频和滚动画面观感。
+    config.rcParams.aqStrength = 10; // wjy: 在默认中值基础上适度增强AQ，避免过强量化造成大面积平坦区域噪声或码率失控。
+    // ===end====
     config.rcParams.zeroReorderDelay = 1;
     config.rcParams.multiPass = NV_ENC_MULTI_PASS_DISABLED;
     config.rcParams.enableLookahead = 0;
@@ -113,7 +116,48 @@ bool NvencH264Encoder::initialize(ID3D11Device* device, Size size, uint32_t bitr
 
     bitstream_ = bitstream.bitstreamBuffer;
     size_ = size;
+    config_ = config;
+    init_ = init;
+    init_.encodeConfig = &config_; // wjy: 修正从栈上init复制后的指针，保存结构始终引用成员config_。
     fps_ = safe_fps;
+    return true;
+}
+
+bool NvencH264Encoder::reconfigure(uint32_t bitrate_kbps, uint32_t fps, std::string* error)
+{
+    if (!encoder_ || !bitstream_ || !fn_.nvEncReconfigureEncoder) {
+        if (error) *error = "NVENC reconfigure is unavailable";
+        return false;
+    }
+    const uint32_t safeFps = std::max(1u, fps);
+    const uint32_t bitrate = std::max(10u, bitrate_kbps) * 1000u;
+    NV_ENC_CONFIG nextConfig = config_;
+    nextConfig.gopLength = safeFps * 5;
+    nextConfig.rcParams.averageBitRate = bitrate;
+    // =====wjy====
+    nextConfig.rcParams.maxBitRate = bitrate + bitrate / 4; // wjy: 在线切换画质后同步保留25%复杂帧峰值，参数变化不重建编码器也不强制IDR。
+    nextConfig.rcParams.vbvBufferSize = std::max<uint32_t>(nextConfig.rcParams.maxBitRate * 2 / safeFps, 1); // wjy: FPS变化时重新按两帧峰值计算VBV，避免低FPS档缓冲时长意外扩大。
+    // ===end====
+    nextConfig.rcParams.vbvInitialDelay = nextConfig.rcParams.vbvBufferSize;
+    nextConfig.encodeCodecConfig.hevcConfig.idrPeriod = nextConfig.gopLength;
+
+    NV_ENC_INITIALIZE_PARAMS nextInit = init_;
+    nextInit.frameRateNum = safeFps;
+    nextInit.frameRateDen = 1;
+    nextInit.encodeConfig = &nextConfig;
+    NV_ENC_RECONFIGURE_PARAMS reconfigure = {};
+    reconfigure.version = nvenc_struct_version(api_version_, 1);
+    reconfigure.reInitEncodeParams = nextInit;
+    reconfigure.resetEncoder = 0; // wjy: 只更新速率控制参数，不重置位流队列或注册输入资源。
+    reconfigure.forceIDR = 0; // wjy: 码率/FPS在线调节不改变画面尺寸，无需周期性强制IDR，避免流畅模式频繁调参放大解码纹理切换和闪黑。
+    if (!check(fn_.nvEncReconfigureEncoder(encoder_, &reconfigure), "NvEncReconfigureEncoder", error)) {
+        return false; // wjy: 驱动拒绝时保留旧编码器完整可用，调用方继续不断流编码。
+    }
+
+    config_ = nextConfig;
+    init_ = nextInit;
+    init_.encodeConfig = &config_;
+    fps_ = safeFps;
     return true;
 }
 
@@ -195,6 +239,8 @@ void NvencH264Encoder::shutdown()
     }
     encoder_ = nullptr;
     size_ = {};
+    config_ = {};
+    init_ = {};
 }
 
 bool NvencH264Encoder::load_api(std::string* error)

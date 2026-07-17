@@ -13,6 +13,7 @@
 #include "system/WolDetector.h"
 #include "system/WjyDiagnosticLog.h"
 #include "ui/RemoteDesktopWindow.h"
+#include "ui/RemoteViewerLifecycleManager.h"
 
 #include <QAction>
 #include <QAbstractItemView>
@@ -20,6 +21,8 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QClipboard>
+#include <QCheckBox>
+#include <QComboBox>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDebug>
@@ -56,14 +59,17 @@
 #include <QResizeEvent>
 #include <QSaveFile>
 #include <QScreen>
+#include <QScrollBar>
 #include <QSet>
 #include <QSignalBlocker>
+#include <QSpinBox>
 #include <QStringList>
 #include <QTimer>
 #include <QToolButton>
 #include <QTextEdit>
 #include <QTextDocument>
 #include <QTextStream>
+#include <QTextCursor>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
 #include <QUuid>
@@ -73,6 +79,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <tuple>
@@ -88,6 +95,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h>
+#include <tlhelp32.h>
 #ifndef MOD_NOREPEAT
 #define MOD_NOREPEAT 0x4000
 #endif
@@ -234,6 +243,40 @@ QIcon menuIcon(const QString& name)
 void writeDeviceGridStartupLog(const QString& message)
 {
     platform::writeWjyDiagnosticLog(message); // wjy: DeviceGrid 和后台线程日志统一走加锁写入，避免多线程日志交叉成半行。
+}
+
+QString currentProcessResourceSummary()
+{
+#if defined(Q_OS_WIN)
+    PROCESS_MEMORY_COUNTERS_EX memory = {};
+    memory.cb = sizeof(memory);
+    K32GetProcessMemoryInfo(
+        GetCurrentProcess(),
+        reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory),
+        sizeof(memory));
+    DWORD handleCount = 0;
+    GetProcessHandleCount(GetCurrentProcess(), &handleCount);
+    int threadCount = 0;
+    const DWORD processId = GetCurrentProcessId();
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot != INVALID_HANDLE_VALUE) {
+        THREADENTRY32 entry = {};
+        entry.dwSize = sizeof(entry);
+        if (Thread32First(snapshot, &entry)) {
+            do {
+                if (entry.th32OwnerProcessID == processId) ++threadCount;
+            } while (Thread32Next(snapshot, &entry));
+        }
+        CloseHandle(snapshot);
+    }
+    return QStringLiteral("working_mb=%1 private_mb=%2 threads=%3 handles=%4")
+        .arg(memory.WorkingSetSize / (1024.0 * 1024.0), 0, 'f', 1)
+        .arg(memory.PrivateUsage / (1024.0 * 1024.0), 0, 'f', 1)
+        .arg(threadCount)
+        .arg(handleCount); // wjy: 30秒级读取进程资源，20窗口soak可直接判断内存、线程或句柄是否持续无恢复增长。
+#else
+    return QStringLiteral("process_metrics=unsupported");
+#endif
 }
 // ===end====
 
@@ -587,22 +630,33 @@ QVector<int> virtualKeysForShortcut(const QKeySequence& shortcut)
         return virtualKeys;
     }
 
+    // =====wjy====
+    const auto appendUniqueKey = [&virtualKeys](int key) {
+        if (key > 0 && !virtualKeys.contains(key)) {
+            virtualKeys.append(key); // wjy: 同一键码只释放一次；主键恰好是修饰键变体时也不会生成重复控制消息。
+        }
+    };
     if ((modifiers & MOD_CONTROL) != 0) {
-        virtualKeys.append(VK_CONTROL);
+        appendUniqueKey(VK_CONTROL);
+        appendUniqueKey(VK_LCONTROL);
+        appendUniqueKey(VK_RCONTROL); // wjy: 被控端按精确虚拟键码持有按键，通用Ctrl不能替代实际转发的左/右Ctrl抬键。
     }
     if ((modifiers & MOD_SHIFT) != 0) {
-        virtualKeys.append(VK_SHIFT);
+        appendUniqueKey(VK_SHIFT);
+        appendUniqueKey(VK_LSHIFT);
+        appendUniqueKey(VK_RSHIFT); // wjy: Shift同样覆盖通用和左右变体，未由本会话按下的额外KeyUp会被被控端状态机忽略。
     }
     if ((modifiers & MOD_ALT) != 0) {
-        virtualKeys.append(VK_MENU);
+        appendUniqueKey(VK_MENU);
+        appendUniqueKey(VK_LMENU);
+        appendUniqueKey(VK_RMENU); // wjy: Alt/Menu保持与Ctrl一致的精确释放语义，防止自定义快捷键留下远端修饰状态。
     }
     if ((modifiers & MOD_WIN) != 0) {
-        virtualKeys.append(VK_LWIN);
-        virtualKeys.append(VK_RWIN);
+        appendUniqueKey(VK_LWIN);
+        appendUniqueKey(VK_RWIN);
     }
-    if (virtualKey > 0) {
-        virtualKeys.append(static_cast<int>(virtualKey));
-    }
+    appendUniqueKey(static_cast<int>(virtualKey));
+    // ===end====
     return virtualKeys;
 }
 #endif
@@ -2279,33 +2333,8 @@ void drawScriptTerminalPanel(
     painter.setBrush(QColor(QStringLiteral("#0F172A")));
     painter.drawRoundedRect(QRectF(treeFrame), 3, 3);
 
-    const QRectF content = scriptTerminalOutputRect();
-    QFont terminalFont(QStringLiteral("Consolas"));
-    terminalFont.setPixelSize(12);
-    painter.setFont(terminalFont);
-    painter.setPen(failed ? QColor(QStringLiteral("#FFB4B4")) : QColor(QStringLiteral("#A7F3D0")));
-    const int maxOffset = maxTerminalScrollOffset(text, painter.fontMetrics(), qRound(content.height()));
-    painter.setClipRect(content);
-    painter.drawText(
-        content,
-        Qt::AlignLeft | Qt::AlignTop,
-        terminalVisibleText(text, painter.fontMetrics(), qRound(content.height()), scrollOffset));
-    painter.setClipping(false);
-
-    if (maxOffset > 0) {
-        const QRectF track(panel.right() - 10, content.y(), 3, content.height());
-        const int visibleLines = terminalVisibleLineCount(painter.fontMetrics(), qRound(content.height()));
-        const int totalLines = terminalOutputLines(stripTerminalControlSequences(text)).size();
-        const qreal thumbHeight = qMax<qreal>(26.0, track.height() * visibleLines / qMax(visibleLines, totalLines));
-        const qreal travel = qMax<qreal>(0.0, track.height() - thumbHeight);
-        const qreal normalizedFromTop = maxOffset == 0 ? 1.0 : 1.0 - (qBound(0, scrollOffset, maxOffset) / qreal(maxOffset));
-        const QRectF thumb(track.x(), track.y() + travel * normalizedFromTop, track.width(), thumbHeight);
-        painter.setPen(Qt::NoPen);
-        painter.setBrush(QColor(90, 109, 132, 150));
-        painter.drawRoundedRect(track, 1.5, 1.5);
-        painter.setBrush(QColor(186, 200, 218, 210));
-        painter.drawRoundedRect(thumb, 1.5, 1.5);
-    }
+    Q_UNUSED(text) // wjy: 日志正文交给只读QTextEdit显示，绘制函数只保留面板、标题和操作按钮。
+    Q_UNUSED(scrollOffset)
     painter.restore();
 }
 
@@ -2508,6 +2537,24 @@ QRect settingsKeyboardTabRect()
 }
 
 // =====wjy====
+QRect settingsRemoteControlTabRect()
+{
+    return QRect(contentLeft() + 144, kDetailScriptTabTop, 84, 36); // wjy: 第三个“远控画质”标签放在键盘右侧，不挤压现有常规/键盘命中区。
+}
+
+QRect settingsRemoteQualityControlRect(int index)
+{
+    const QRect card = settingsScrollViewportRect();
+    const int column = index % 2;
+    const int row = index / 2;
+    const int columnWidth = qMax(220, (card.width() - 84) / 2);
+    const int x = card.x() + 28 + column * (columnWidth + 28) + columnWidth - 150;
+    const int y = card.y() + 66 + row * 58;
+    return QRect(x, y, 150, 32); // wjy: 两列六行使用统一真实控件矩形，窗口缩放时左右列保持等宽且不会互相覆盖。
+}
+// ===end====
+
+// =====wjy====
 QRect settingsShortcutKeyEditRect(int index)
 {
     const QRect keyboardCard = settingsScrollViewportRect(); // wjy: 快捷键页面板和设备详情页主体区域共用同一矩形。
@@ -2588,6 +2635,7 @@ void drawSettingsPage(
     bool localInfoExpanded,
     bool addDeviceExpanded,
     bool keyboardSelected,
+    bool remoteControlSelected,
     const platform::DeviceInfo& localInfo,
     int settingsScrollOffset)
 {
@@ -2600,8 +2648,64 @@ void drawSettingsPage(
     const QRect tabBar(contentLeft(), kDetailScriptTabTop, contentWidth(), 38);
     painter.drawLine(QPointF(tabBar.left(), tabBar.bottom()), QPointF(tabBar.right(), tabBar.bottom())); // wjy: 设置页顶部标签分割线和设备详情页保持一致。
     painter.restore();
-    drawSettingsTab(painter, settingsGeneralTabRect(), QString::fromUtf8("常规"), !keyboardSelected, tabFont);
+    drawSettingsTab(painter, settingsGeneralTabRect(), QString::fromUtf8("常规"), !keyboardSelected && !remoteControlSelected, tabFont);
     drawSettingsTab(painter, settingsKeyboardTabRect(), QString::fromUtf8("键盘"), keyboardSelected, tabFont);
+    drawSettingsTab(painter, settingsRemoteControlTabRect(), QString::fromUtf8("远控画质"), remoteControlSelected, tabFont);
+
+    // =====wjy====
+    if (remoteControlSelected) {
+        const QRect qualityCard = settingsScrollViewportRect();
+        painter.save();
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
+        painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
+        painter.drawRoundedRect(QRectF(qualityCard), 4, 4);
+
+        QFont title(textFont);
+        title.setPixelSize(14);
+        title.setBold(true);
+        painter.setFont(title);
+        painter.setPen(QColor(QStringLiteral("#040B18")));
+        painter.drawText(QRectF(qualityCard.x() + 28, qualityCard.y() + 16, qualityCard.width() - 56, 22),
+            Qt::AlignVCenter | Qt::AlignLeft,
+            QString::fromUtf8("远控画质与资源策略"));
+
+        QFont detail(textFont);
+        detail.setPixelSize(11);
+        painter.setFont(detail);
+        painter.setPen(QColor(QStringLiteral("#687384")));
+        painter.drawText(QRectF(qualityCard.x() + 28, qualityCard.y() + 38, qualityCard.width() - 56, 18),
+            Qt::AlignVCenter | Qt::AlignLeft,
+            QString::fromUtf8("可见窗口先降分辨率再降FPS；最小化立即降FPS；所有连接始终保持不断流。")); // wjy: 在全局设置页明确展示用户确认过的FPS优先和不断流规则。
+
+        const char* labels[] = {
+            "全局模式",
+            "目标FPS",
+            "可见最低FPS",
+            "严重压力最低FPS",
+            "可见最低分辨率",
+            "最小化FPS",
+            "最小化分辨率",
+            "降级持续时间",
+            "恢复稳定时间",
+            "总接收预算",
+            "资源恢复后自动回升",
+        };
+        QFont labelFont(textFont);
+        labelFont.setPixelSize(12);
+        painter.setFont(labelFont);
+        painter.setPen(QColor(QStringLiteral("#111827")));
+        for (int index = 0; index < 11; ++index) {
+            const QRect controlRect = settingsRemoteQualityControlRect(index);
+            painter.drawText(
+                QRectF(controlRect.x() - 142, controlRect.y(), 132, controlRect.height()),
+                Qt::AlignVCenter | Qt::AlignRight,
+                QString::fromUtf8(labels[index])); // wjy: 手绘标签和真实控件共享索引，调整布局时不会出现字段错位。
+        }
+        painter.restore();
+        return;
+    }
+    // ===end====
 
     if (keyboardSelected) {
         const QRect keyboardCard = settingsScrollViewportRect(); // wjy: 键盘页主面板和设备详情页主体面板使用同一位置与高度。
@@ -2853,6 +2957,7 @@ void drawSettingsPage(
 DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateService, QWidget* parent)
     : QFrame(parent)
     , m_realtimeStateService(realtimeStateService)
+    , m_remoteViewerLifecycleManager(std::make_unique<RemoteViewerLifecycleManager>(4, 4)) // wjy: 同时最多4路初始化、4个可等待生命周期线程；最终在线窗口数量不设上限。
 {
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] DeviceGrid ctor begin")); // wjy: 进入 DeviceGrid 构造函数，定位 MainWindow 创建内部崩溃。
     setObjectName(QStringLiteral("DeviceGrid")); // wjy: 恢复正常 QObject 名称，便于样式、调试和对象树识别。
@@ -3039,6 +3144,14 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     connect(m_remoteUpdateAvailabilityTimer, &QTimer::timeout,
         this, &DeviceGrid::refreshOpenedRemoteUpdateAvailability); // wjy: 只要存在远控窗口，就周期确认其目标是否需要更新；不要求用户开启列表自动刷新。
     m_remoteUpdateAvailabilityTimer->start();
+    // ===end====
+
+    // =====wjy====
+    m_remoteQualityTimer = new QTimer(this);
+    m_remoteQualityTimer->setTimerType(Qt::CoarseTimer); // wjy: 质量协调是1秒级资源控制，不使用高精度唤醒，降低20窗口场景下主线程定时器开销。
+    m_remoteQualityTimer->setInterval(1000);
+    connect(m_remoteQualityTimer, &QTimer::timeout, this, &DeviceGrid::evaluateRemoteQuality);
+    m_remoteQualityTimer->start(); // wjy: 周期采样只计算和在线改参，永远不关闭、暂停或拒绝已有远控流。
     // ===end====
 
     // =====wjy====
@@ -3302,6 +3415,13 @@ void DeviceGrid::prepareForApplicationExit()
     writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] DeviceGrid prepareForApplicationExit begin"));
     m_shuttingDown = true; // wjy: 更新退出准备一开始就阻止新增后台任务，避免退出过程中又启动状态探测或 SSH 操作。
     // =====wjy====
+    if (m_remoteQualityTimer) {
+        m_remoteQualityTimer->stop(); // wjy: 退出期间停止质量采样，不再向已经提交stop的窗口发送任何新协议请求。
+    }
+    m_remoteQualityEvaluationQueued = false;
+    if (m_remoteViewerLifecycleManager) {
+        m_remoteViewerLifecycleManager->beginApplicationShutdown(); // wjy: 退出第一步关闭Viewer启动准入，排队中的第5台以后设备不会在清理途中又开始连接。
+    }
     if (g_deviceSyncStarted) {
         g_deviceSyncStarted = false;
         platform::DeviceListSyncService::instance().stop(); // wjy: 停止轮询并等待短时共享任务汇合，退出后不再向已销毁 UI 投递快照。
@@ -3321,22 +3441,53 @@ void DeviceGrid::prepareForApplicationExit()
     }
     unregisterGlobalShortcuts();
 
-    const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
+    // =====wjy====
+    QVector<QPointer<RemoteDesktopWindow>> windows;
+    QSet<RemoteDesktopWindow*> seenWindows;
+    const auto appendShutdownWindow = [&windows, &seenWindows](const QPointer<RemoteDesktopWindow>& window) {
+        if (!window || seenWindows.contains(window.data())) {
+            return;
+        }
+        seenWindows.insert(window.data()); // wjy: 普通、平铺和激活顺序可能引用同一窗口，退出时每个窗口只能提交一次stop并删除一次。
+        windows.append(window);
+    };
+    for (auto it = m_remoteDesktopWindows.cbegin(); it != m_remoteDesktopWindows.cend(); ++it) {
+        appendShutdownWindow(it.value());
+    }
+    for (const QPointer<RemoteDesktopWindow>& window : std::as_const(m_tiledRemoteWindows)) {
+        appendShutdownWindow(window);
+    }
+    for (const QPointer<RemoteDesktopWindow>& window : std::as_const(m_remoteWindowActivationOrder)) {
+        appendShutdownWindow(window); // wjy: 包含已经进入异步关闭状态的窗口，不能像普通业务查询那样过滤isClosingConnection。
+    }
+    // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] remote windows count=%1").arg(windows.size()));
     for (const QPointer<RemoteDesktopWindow>& window : windows) {
         RemoteDesktopWindow* remoteWindow = window.data();
-        if (!remoteWindow || remoteWindow->isClosingConnection()) {
+        if (!remoteWindow) {
             continue;
         }
         writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] remote window shutdown begin ptr=%1")
-            .arg(reinterpret_cast<quintptr>(remoteWindow))); // wjy: 远控流 stop 若阻塞，日志会停在 begin，直接定位到具体窗口关闭阶段。
+            .arg(reinterpret_cast<quintptr>(remoteWindow))); // wjy: 此阶段只取消回调并提交stop，不再逐窗口同步阻塞Qt线程。
         remoteWindow->setAttribute(Qt::WA_QuitOnClose, false);
         remoteWindow->shutdownForApplicationExit();
         writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] remote window shutdown end ptr=%1")
             .arg(reinterpret_cast<quintptr>(remoteWindow)));
-        delete remoteWindow;
-        writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] remote window deleted"));
     }
+
+    // =====wjy====
+    if (m_remoteViewerLifecycleManager) {
+        writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] viewer lifecycle join begin"));
+        m_remoteViewerLifecycleManager->shutdownAndWait(); // wjy: 全部窗口已提交stop后再封闭队列，等待原生回调、更新查询和stop任务完全退出。
+        writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] viewer lifecycle join end"));
+    }
+    for (const QPointer<RemoteDesktopWindow>& window : windows) {
+        if (RemoteDesktopWindow* remoteWindow = window.data()) {
+            delete remoteWindow; // wjy: join完成后才销毁Presenter和Qt对象，后台任务不可能再访问已释放窗口。
+            writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] remote window deleted"));
+        }
+    }
+    // ===end====
 
     m_remoteDesktopWindows.clear();
     m_tiledRemoteWindows.clear();
@@ -3704,6 +3855,27 @@ void DeviceGrid::applyRemoteScriptRuntimeState(
 void DeviceGrid::setupScriptFileEditor()
 {
 // =====wjy====
+    m_scriptOutputEdit = new QTextEdit(this);
+    m_scriptOutputEdit->setGeometry(scriptTerminalOutputRect().toAlignedRect());
+    m_scriptOutputEdit->setReadOnly(true); // wjy: 禁止修改运行日志，但保留标准文本选择、Ctrl+C和右键复制菜单。
+    m_scriptOutputEdit->setAcceptRichText(false);
+    m_scriptOutputEdit->setLineWrapMode(QTextEdit::NoWrap); // wjy: 日志按远端原始行显示，长命令通过水平滚动查看，复制内容不会被视觉换行改变。
+    m_scriptOutputEdit->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
+    QFont outputFont(QStringLiteral("Consolas"));
+    outputFont.setPixelSize(12);
+    m_scriptOutputEdit->setFont(outputFont);
+    m_scriptOutputEdit->setStyleSheet(QStringLiteral(
+        "QTextEdit{background:#0B1018;border:0;padding:0;color:#A7F3D0;font-family:Consolas;font-size:12px;selection-background-color:#2563EB;selection-color:#FFFFFF;}"
+        "QScrollBar:vertical{background:#111827;width:9px;margin:0;}"
+        "QScrollBar::handle:vertical{background:#5A6D84;min-height:26px;border-radius:4px;}"
+        "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"));
+    connect(m_scriptOutputEdit->verticalScrollBar(), &QScrollBar::valueChanged, this, [this](int value) {
+        if (!m_scriptOutputEdit) {
+            return;
+        }
+        m_scriptOutputAutoScroll = value >= m_scriptOutputEdit->verticalScrollBar()->maximum(); // wjy: 用户滚到末尾后继续跟随新日志，向上查看时刷新不会强制抢回底部。
+    });
+
     m_scriptFileEdit = new QTextEdit(this);
     m_scriptFileEdit->setGeometry(scriptFileEditorTextRect());
     m_scriptFileEdit->setAcceptRichText(false);
@@ -3896,6 +4068,40 @@ void DeviceGrid::updateScriptFileEditorControls()
         if (scriptTreeVisible) {
             syncScriptFolderTreeSelection();
             m_scriptFolderTree->raise();
+        }
+    }
+
+    const bool scriptOutputVisible = scriptTreeVisible && m_scriptOutputVisible;
+    if (m_scriptOutputEdit) {
+        m_scriptOutputEdit->setGeometry(scriptTerminalOutputRect().toAlignedRect());
+        m_scriptOutputEdit->setVisible(scriptOutputVisible);
+        m_scriptOutputEdit->setEnabled(scriptOutputVisible);
+        if (scriptOutputVisible) {
+            const QString normalizedOutput = terminalOutputLines(
+                stripTerminalControlSequences(m_scriptOutputText)).join(QLatin1Char('\n'));
+            if (m_scriptOutputEdit->toPlainText() != normalizedOutput) {
+                const QTextCursor oldCursor = m_scriptOutputEdit->textCursor();
+                const bool hadSelection = oldCursor.hasSelection();
+                const int oldPosition = oldCursor.position();
+                const int oldAnchor = oldCursor.anchor();
+                const QScrollBar* oldScrollBar = m_scriptOutputEdit->verticalScrollBar();
+                const bool followNewest = m_scriptOutputAutoScroll
+                    || oldScrollBar->value() >= oldScrollBar->maximum();
+                m_scriptOutputEdit->setPlainText(normalizedOutput); // wjy: 仅日志内容真正变化时刷新控件，避免每次重绘都破坏选择和复制操作。
+                if (hadSelection) {
+                    const int documentLength = qMax(0, m_scriptOutputEdit->document()->characterCount() - 1);
+                    QTextCursor restoredCursor(m_scriptOutputEdit->document());
+                    restoredCursor.setPosition(qBound(0, oldAnchor, documentLength));
+                    restoredCursor.setPosition(qBound(0, oldPosition, documentLength), QTextCursor::KeepAnchor);
+                    m_scriptOutputEdit->setTextCursor(restoredCursor); // wjy: 日志追加期间尽量恢复原选择范围，让用户可以稳定完成Ctrl+C。
+                } else if (followNewest) {
+                    QTextCursor endCursor = m_scriptOutputEdit->textCursor();
+                    endCursor.movePosition(QTextCursor::End);
+                    m_scriptOutputEdit->setTextCursor(endCursor);
+                    m_scriptOutputEdit->ensureCursorVisible();
+                }
+            }
+            m_scriptOutputEdit->raise(); // wjy: 真实文本控件覆盖原自绘正文区域，但不遮挡标题、脚本树和启动/停止按钮。
         }
     }
 
@@ -4535,6 +4741,104 @@ void DeviceGrid::setupSettingsControls()
         m_shortcutKeyEdits.append(shortcutEdit); // wjy: 六个输入框按行号映射五项远控操作和删除设备操作。
     }
     // ===end====
+
+    // =====wjy====
+    m_remoteQualityConfiguration = platform::AppSettings::remoteQualityConfiguration(); // wjy: 创建控件前一次性读取并归一化全局设置，所有字段从同一快照初始化。
+    const QString qualityControlStyle = QStringLiteral(
+        "QComboBox,QSpinBox{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;padding:0 8px;"
+        "font-family:'Microsoft YaHei UI';font-size:13px;color:#040B18;}"
+        "QComboBox:focus,QSpinBox:focus{border:1px solid #3A7BFC;}"
+        "QComboBox:disabled,QSpinBox:disabled{background:#F5F7FA;color:#94A3B8;}"
+        "QCheckBox{font-family:'Microsoft YaHei UI';font-size:13px;color:#040B18;spacing:8px;}"
+        "QCheckBox::indicator{width:18px;height:18px;}"
+        "QCheckBox::indicator:checked{background:#3A7BFC;border:1px solid #3A7BFC;border-radius:3px;}"
+        "QCheckBox::indicator:unchecked{background:#FFFFFF;border:1px solid #CBD5E1;border-radius:3px;}"); // wjy: 远控画质页真实控件与现有设置页的白底蓝色焦点样式保持一致。
+
+    m_remoteQualityModeCombo = new QComboBox(this);
+    m_remoteQualityModeCombo->addItem(QString::fromUtf8("自动"), static_cast<int>(stream::RemoteQualityMode::Automatic));
+    m_remoteQualityModeCombo->addItem(QString::fromUtf8("高质量"), static_cast<int>(stream::RemoteQualityMode::HighQualityLocked)); // wjy: 主窗口全局选项与远控标题栏统一显示“高质量”，内部优先级策略保持不变。
+    m_remoteQualityModeCombo->addItem(QString::fromUtf8("均衡"), static_cast<int>(stream::RemoteQualityMode::Balanced));
+    m_remoteQualityModeCombo->addItem(QString::fromUtf8("流畅"), static_cast<int>(stream::RemoteQualityMode::Smooth)); // wjy: 全局模式不提供FollowGlobal，避免无效递归配置。
+    m_remoteQualityModeCombo->setCurrentIndex(qMax(0, m_remoteQualityModeCombo->findData(static_cast<int>(m_remoteQualityConfiguration.defaultMode))));
+
+    const auto createFpsSpin = [this, &qualityControlStyle](int minimum, int maximum, int value) {
+        auto* spin = new QSpinBox(this);
+        spin->setRange(minimum, maximum);
+        spin->setSuffix(QStringLiteral(" FPS"));
+        spin->setValue(value);
+        spin->setStyleSheet(qualityControlStyle);
+        return spin; // wjy: 所有FPS输入统一范围、单位和视觉，保存时仍会做字段间归一化。
+    };
+    m_remoteTargetFpsSpin = createFpsSpin(15, 60, m_remoteQualityConfiguration.targetFps);
+    m_remoteMinimumVisibleFpsSpin = createFpsSpin(15, 60, m_remoteQualityConfiguration.minimumVisibleFps);
+    m_remoteSevereMinimumFpsSpin = createFpsSpin(5, 60, m_remoteQualityConfiguration.severePressureMinimumFps);
+    m_remoteMinimizedFpsSpin = createFpsSpin(1, 60, m_remoteQualityConfiguration.minimizedFps);
+
+    const auto populateResolutionCombo = [](QComboBox* combo) {
+        combo->addItem(QString::fromUtf8("原始"), static_cast<int>(stream::RemoteResolutionTier::Native));
+        combo->addItem(QStringLiteral("1440p"), static_cast<int>(stream::RemoteResolutionTier::P1440));
+        combo->addItem(QStringLiteral("1080p"), static_cast<int>(stream::RemoteResolutionTier::P1080));
+        combo->addItem(QStringLiteral("900p"), static_cast<int>(stream::RemoteResolutionTier::P900));
+        combo->addItem(QStringLiteral("720p"), static_cast<int>(stream::RemoteResolutionTier::P720));
+        combo->addItem(QStringLiteral("540p"), static_cast<int>(stream::RemoteResolutionTier::P540));
+        combo->addItem(QStringLiteral("360p"), static_cast<int>(stream::RemoteResolutionTier::P360)); // wjy: 固定档位和协调器/协议共用同一枚举顺序。
+    };
+    m_remoteMinimumResolutionCombo = new QComboBox(this);
+    populateResolutionCombo(m_remoteMinimumResolutionCombo);
+    m_remoteMinimumResolutionCombo->setCurrentIndex(qMax(0, m_remoteMinimumResolutionCombo->findData(static_cast<int>(m_remoteQualityConfiguration.minimumVisibleResolution))));
+    m_remoteMinimizedResolutionCombo = new QComboBox(this);
+    populateResolutionCombo(m_remoteMinimizedResolutionCombo);
+    m_remoteMinimizedResolutionCombo->setCurrentIndex(qMax(0, m_remoteMinimizedResolutionCombo->findData(static_cast<int>(m_remoteQualityConfiguration.minimizedResolution))));
+
+    m_remoteDegradationDelaySpin = new QSpinBox(this);
+    m_remoteDegradationDelaySpin->setRange(1, 30);
+    m_remoteDegradationDelaySpin->setSuffix(QString::fromUtf8(" 秒"));
+    m_remoteDegradationDelaySpin->setValue(qMax(1, m_remoteQualityConfiguration.degradationHoldMs / 1000));
+    m_remoteRecoveryDelaySpin = new QSpinBox(this);
+    m_remoteRecoveryDelaySpin->setRange(1, 120);
+    m_remoteRecoveryDelaySpin->setSuffix(QString::fromUtf8(" 秒"));
+    m_remoteRecoveryDelaySpin->setValue(qMax(1, m_remoteQualityConfiguration.recoveryHoldMs / 1000));
+    m_remoteReceiveBudgetSpin = new QSpinBox(this);
+    m_remoteReceiveBudgetSpin->setRange(0, 2000);
+    m_remoteReceiveBudgetSpin->setSuffix(QStringLiteral(" Mbps"));
+    m_remoteReceiveBudgetSpin->setSpecialValueText(QString::fromUtf8("自动"));
+    m_remoteReceiveBudgetSpin->setValue(m_remoteQualityConfiguration.aggregateReceiveBudgetMbps); // wjy: 0显示“自动”，预算只触发降档而绝不作为断开会话条件。
+    m_remoteAutomaticRecoveryCheck = new QCheckBox(QString::fromUtf8("启用"), this);
+    m_remoteAutomaticRecoveryCheck->setChecked(m_remoteQualityConfiguration.automaticRecoveryEnabled);
+
+    const QList<QWidget*> qualityControls = {
+        m_remoteQualityModeCombo,
+        m_remoteTargetFpsSpin,
+        m_remoteMinimumVisibleFpsSpin,
+        m_remoteSevereMinimumFpsSpin,
+        m_remoteMinimumResolutionCombo,
+        m_remoteMinimizedFpsSpin,
+        m_remoteMinimizedResolutionCombo,
+        m_remoteDegradationDelaySpin,
+        m_remoteRecoveryDelaySpin,
+        m_remoteReceiveBudgetSpin,
+        m_remoteAutomaticRecoveryCheck,
+    };
+    for (QWidget* control : qualityControls) {
+        control->setStyleSheet(qualityControlStyle);
+        control->setVisible(false); // wjy: 首次显隐统一交给updateSettingsControls，构造阶段不会闪到常规页上。
+    }
+
+    const auto persistRemoteQuality = [this] {
+        saveRemoteQualitySettingsFromControls(); // wjy: 任一字段变化都保存完整快照，并立即通知当前打开窗口。
+    };
+    connect(m_remoteQualityModeCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, persistRemoteQuality);
+    connect(m_remoteTargetFpsSpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
+    connect(m_remoteMinimumVisibleFpsSpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
+    connect(m_remoteSevereMinimumFpsSpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
+    connect(m_remoteMinimumResolutionCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, persistRemoteQuality);
+    connect(m_remoteMinimizedFpsSpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
+    connect(m_remoteMinimizedResolutionCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, persistRemoteQuality);
+    connect(m_remoteDegradationDelaySpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
+    connect(m_remoteRecoveryDelaySpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
+    connect(m_remoteReceiveBudgetSpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
+    connect(m_remoteAutomaticRecoveryCheck, &QCheckBox::toggled, this, persistRemoteQuality);
+    // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after batch add controls create")); // wjy: 批量新增输入框和按钮创建完成。
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before updateSettingsControls in setup")); // wjy: 判断是否崩在首次刷新设置控件显隐状态。
     // ===end====
@@ -4699,8 +5003,172 @@ void DeviceGrid::updateSettingsControls()
         }
     }
 
+    // =====wjy====
+    const QList<QWidget*> qualityControls = {
+        m_remoteQualityModeCombo,
+        m_remoteTargetFpsSpin,
+        m_remoteMinimumVisibleFpsSpin,
+        m_remoteSevereMinimumFpsSpin,
+        m_remoteMinimumResolutionCombo,
+        m_remoteMinimizedFpsSpin,
+        m_remoteMinimizedResolutionCombo,
+        m_remoteDegradationDelaySpin,
+        m_remoteRecoveryDelaySpin,
+        m_remoteReceiveBudgetSpin,
+        m_remoteAutomaticRecoveryCheck,
+    };
+    const bool qualityVisible = m_settingsSelected && m_settingsTab == SettingsTab::RemoteControl;
+    for (int index = 0; index < qualityControls.size(); ++index) {
+        QWidget* control = qualityControls.at(index);
+        if (!control) {
+            continue;
+        }
+        const QRect controlRect = settingsRemoteQualityControlRect(index);
+        control->setGeometry(controlRect);
+        control->setVisible(qualityVisible);
+        control->setEnabled(qualityVisible);
+        if (qualityVisible) {
+            control->raise(); // wjy: 远控画质真实控件盖在手绘标签卡片之上，切页后其它设置控件全部隐藏。
+        }
+    }
+    // ===end====
+
 // ===end====
 }
+
+// =====wjy====
+void DeviceGrid::saveRemoteQualitySettingsFromControls()
+{
+    if (!m_remoteQualityModeCombo || !m_remoteTargetFpsSpin || !m_remoteMinimumVisibleFpsSpin
+        || !m_remoteSevereMinimumFpsSpin || !m_remoteMinimumResolutionCombo
+        || !m_remoteMinimizedFpsSpin || !m_remoteMinimizedResolutionCombo
+        || !m_remoteDegradationDelaySpin || !m_remoteRecoveryDelaySpin
+        || !m_remoteReceiveBudgetSpin || !m_remoteAutomaticRecoveryCheck) {
+        return; // wjy: 构造中控件尚未齐全时不保存半份配置，避免默认0覆盖用户设置。
+    }
+
+    stream::RemoteQualityConfiguration configuration;
+    configuration.defaultMode = static_cast<stream::RemoteQualityMode>(m_remoteQualityModeCombo->currentData().toInt());
+    configuration.targetFps = m_remoteTargetFpsSpin->value();
+    configuration.minimumVisibleFps = m_remoteMinimumVisibleFpsSpin->value();
+    configuration.severePressureMinimumFps = m_remoteSevereMinimumFpsSpin->value();
+    configuration.minimumVisibleResolution = static_cast<stream::RemoteResolutionTier>(m_remoteMinimumResolutionCombo->currentData().toInt());
+    configuration.minimizedFps = m_remoteMinimizedFpsSpin->value();
+    configuration.minimizedResolution = static_cast<stream::RemoteResolutionTier>(m_remoteMinimizedResolutionCombo->currentData().toInt());
+    configuration.degradationHoldMs = m_remoteDegradationDelaySpin->value() * 1000;
+    configuration.recoveryHoldMs = m_remoteRecoveryDelaySpin->value() * 1000;
+    configuration.aggregateReceiveBudgetMbps = m_remoteReceiveBudgetSpin->value();
+    configuration.automaticRecoveryEnabled = m_remoteAutomaticRecoveryCheck->isChecked();
+    m_remoteQualityConfiguration = stream::normalizedRemoteQualityConfiguration(configuration); // wjy: UI允许独立编辑，最终仍统一保证最低FPS/恢复时间等字段关系安全。
+    platform::AppSettings::setRemoteQualityConfiguration(m_remoteQualityConfiguration);
+
+    const QSignalBlocker targetBlocker(m_remoteTargetFpsSpin);
+    const QSignalBlocker minimumBlocker(m_remoteMinimumVisibleFpsSpin);
+    const QSignalBlocker severeBlocker(m_remoteSevereMinimumFpsSpin);
+    const QSignalBlocker minimizedBlocker(m_remoteMinimizedFpsSpin);
+    const QSignalBlocker degradationBlocker(m_remoteDegradationDelaySpin);
+    const QSignalBlocker recoveryBlocker(m_remoteRecoveryDelaySpin);
+    m_remoteTargetFpsSpin->setValue(m_remoteQualityConfiguration.targetFps);
+    m_remoteMinimumVisibleFpsSpin->setValue(m_remoteQualityConfiguration.minimumVisibleFps);
+    m_remoteSevereMinimumFpsSpin->setValue(m_remoteQualityConfiguration.severePressureMinimumFps);
+    m_remoteMinimizedFpsSpin->setValue(m_remoteQualityConfiguration.minimizedFps);
+    m_remoteDegradationDelaySpin->setValue(qMax(1, m_remoteQualityConfiguration.degradationHoldMs / 1000));
+    m_remoteRecoveryDelaySpin->setValue(qMax(1, m_remoteQualityConfiguration.recoveryHoldMs / 1000)); // wjy: 归一化改变相关字段后立即回写控件，用户看到的值就是实际生效值。
+
+    const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
+    for (const QPointer<RemoteDesktopWindow>& window : windows) {
+        if (window) {
+            window->setGlobalQualityConfiguration(m_remoteQualityConfiguration); // wjy: 已打开窗口无需重连，先更新全局策略快照，后续实时协议直接发送最新请求。
+        }
+    }
+    requestRemoteQualityEvaluation(); // wjy: 全局配置保存后合并所有窗口信号，在当前事件循环结束时只执行一次协调计算。
+    update();
+}
+// ===end====
+
+// =====wjy====
+void DeviceGrid::registerRemoteQualityWindow(RemoteDesktopWindow* window)
+{
+    if (!window) {
+        return;
+    }
+    window->setGlobalQualityConfiguration(m_remoteQualityConfiguration); // wjy: 新窗口读取全局FPS和稳定性边界，但局部模式默认“自动”且只活到本对象关闭。
+    connect(window, &RemoteDesktopWindow::remoteQualityInputsChanged,
+        this, &DeviceGrid::requestRemoteQualityEvaluation); // wjy: 最小化/恢复/模式切换即时生效，不等待下一次1秒采样。
+    connect(window, &QObject::destroyed, this, [this, window] {
+        m_remoteQualityCoordinator.removeWindow(reinterpret_cast<uintptr_t>(window)); // wjy: 删除该窗口滞回历史，之后同设备重开从全局基线重新开始。
+        requestRemoteQualityEvaluation();
+    });
+    requestRemoteQualityEvaluation();
+}
+
+void DeviceGrid::requestRemoteQualityEvaluation()
+{
+    if (m_shuttingDown || m_remoteQualityEvaluationQueued) {
+        return;
+    }
+    m_remoteQualityEvaluationQueued = true; // wjy: 同一批20个窗口的显示/最小化事件最多排队一个Qt任务，防止协调逻辑反向放大事件队列。
+    QTimer::singleShot(0, this, [this] {
+        m_remoteQualityEvaluationQueued = false;
+        evaluateRemoteQuality();
+    });
+}
+
+void DeviceGrid::evaluateRemoteQuality()
+{
+    if (m_shuttingDown) {
+        return;
+    }
+    try {
+        const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
+        std::vector<RemoteQualityWindowMetrics> metrics;
+        metrics.reserve(static_cast<std::size_t>(windows.size()));
+        for (const QPointer<RemoteDesktopWindow>& window : windows) {
+            if (window) {
+                metrics.push_back(window->remoteQualityMetrics()); // wjy: 只在Qt线程读取固定数值快照，不跨线程访问原生WebRTC对象。
+            }
+        }
+        const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+        const std::vector<RemoteQualityDecision> decisions = m_remoteQualityCoordinator.evaluate(
+            m_remoteQualityConfiguration,
+            metrics,
+            nowMs);
+        for (const RemoteQualityDecision& decision : decisions) {
+            auto* window = reinterpret_cast<RemoteDesktopWindow*>(decision.windowId);
+            if (window && windows.contains(QPointer<RemoteDesktopWindow>(window))) {
+                window->applyRemoteQualityDecision(decision); // wjy: 每个窗口内部按Viewer代际去重并在线发送，未连接窗口仅缓存最后决策。
+            }
+        }
+        if (!windows.isEmpty()
+            && (m_lastRemoteResourceDiagnosticAtMs == 0
+                || nowMs - m_lastRemoteResourceDiagnosticAtMs >= 30000)) {
+            m_lastRemoteResourceDiagnosticAtMs = nowMs;
+            const RemoteViewerLifecycleManager::Diagnostics lifecycle = m_remoteViewerLifecycleManager
+                ? m_remoteViewerLifecycleManager->diagnostics()
+                : RemoteViewerLifecycleManager::Diagnostics{};
+            writeDeviceGridStartupLog(QStringLiteral("[wjy-remote-resource] viewers=%1 active_starts=%2 waiting_starts=%3 cleanup_tasks=%4 background_tasks=%5 lifecycle_threads=%6 %7")
+                .arg(windows.size())
+                .arg(lifecycle.activeViewerStarts)
+                .arg(lifecycle.waitingViewerStarts)
+                .arg(lifecycle.cleanupTasks)
+                .arg(lifecycle.backgroundTasks)
+                .arg(lifecycle.workerThreads)
+                .arg(currentProcessResourceSummary()));
+            for (const QPointer<RemoteDesktopWindow>& window : windows) {
+                if (window) {
+                    writeDeviceGridStartupLog(QStringLiteral("[wjy-remote-window] %1")
+                        .arg(window->remoteResourceDiagnosticSummary())); // wjy: 每窗口单行记录队列硬上限、实际画质和D3D失败原因，便于崩溃前定位唯一异常会话。
+                }
+            }
+        }
+    } catch (const std::exception& exception) {
+        writeDeviceGridStartupLog(QStringLiteral("[wjy-quality] coordinator exception=%1")
+            .arg(QString::fromUtf8(exception.what()))); // wjy: 分配或计算异常被限制在本轮协调，不能越过Qt定时器入口导致整个程序退出。
+    } catch (...) {
+        writeDeviceGridStartupLog(QStringLiteral("[wjy-quality] coordinator unknown exception")); // wjy: 未知异常同样降级为诊断日志，下一秒仍可继续重试。
+    }
+}
+// ===end====
 
 // =====wjy====
 void DeviceGrid::saveShortcutKeySetting(int shortcutIndex, const QString& shortcutText)
@@ -6350,7 +6818,8 @@ void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex)
 
     auto* remoteWindow = new RemoteDesktopWindow(
         deviceDisplayName(g_devices.at(deviceIndex)),
-        deviceIp);
+        deviceIp,
+        m_remoteViewerLifecycleManager.get()); // wjy: 普通远控窗口接入共享4路初始化准入和可等待stop工作池。
     m_remoteDesktopWindows.insert(deviceIp, remoteWindow);
     publishRemoteControllerTarget(remoteWindow, deviceDisplayName(g_devices.at(deviceIndex)), deviceIp); // wjy: 窗口建立即发布本机正在控制的目标租约，目标人数仍只看目标主机自己的会话表。
     connect(remoteWindow, &QObject::destroyed, this, [this, deviceIp, remoteWindow] {
@@ -6372,6 +6841,7 @@ void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex)
     connect(remoteWindow, &RemoteDesktopWindow::titleBarUpdateRequested,
         this, &DeviceGrid::updateRemoteWindowDevice); // wjy: 普通远控窗口更新按钮按自身 IP 复用单设备更新逻辑。
     remoteWindow->setRemoteUpdateAvailable(m_deviceUpdateAvailability.value(deviceIp, false)); // wjy: 窗口创建时立即使用最近一次状态刷新结果，不等待下一轮定时刷新。
+    registerRemoteQualityWindow(remoteWindow); // wjy: 普通窗口纳入控制端统一质量预算，最终在线数量不设上限。
     // ===end====
     connect(remoteWindow, &RemoteDesktopWindow::shortcutFullscreenRequested, this, [this] { triggerShortcutAction(0); });
     connect(remoteWindow, &RemoteDesktopWindow::shortcutTileRequested, this, [this] { triggerShortcutAction(1); });
@@ -6484,7 +6954,8 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
 
         auto* remoteWindow = new RemoteDesktopWindow(
             deviceDisplayName(g_devices.at(deviceIndex)),
-            g_devices.at(deviceIndex).ip); // wjy: 复用现有远程桌面窗口，每台设备各自启动自己的 viewer 连接。
+            g_devices.at(deviceIndex).ip,
+            m_remoteViewerLifecycleManager.get()); // wjy: 平铺窗口也共享同一初始化预算，但连接成功后不计入上限，最终可保持20路在线。
         remoteWindow->setRememberGeometryEnabled(false);
         m_tiledRemoteWindows.append(remoteWindow); // wjy: 记录本次平铺创建的窗口，下一次设备平铺前统一关闭并重排。
         publishRemoteControllerTarget(remoteWindow, deviceDisplayName(g_devices.at(deviceIndex)), g_devices.at(deviceIndex).ip); // wjy: 每个平铺窗口拥有独立诊断租约，不会与普通窗口覆盖。
@@ -6513,6 +6984,7 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
         connect(remoteWindow, &RemoteDesktopWindow::titleBarUpdateRequested,
             this, &DeviceGrid::updateRemoteWindowDevice); // wjy: 平铺窗口同样只更新自身绑定设备。
         remoteWindow->setRemoteUpdateAvailable(m_deviceUpdateAvailability.value(g_devices.at(deviceIndex).ip.trimmed(), false)); // wjy: 平铺创建后同步显示该设备最近确认的更新状态。
+        registerRemoteQualityWindow(remoteWindow); // wjy: 平铺小窗口按实际显示高度降分辨率并优先保持FPS，所有窗口仍持续不断流。
         // ===end====
         connect(remoteWindow, &RemoteDesktopWindow::shortcutFullscreenRequested, this, [this] { triggerShortcutAction(0); });
         connect(remoteWindow, &RemoteDesktopWindow::shortcutTileRequested, this, [this] { triggerShortcutAction(1); });
@@ -7627,6 +8099,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             m_settingsLocalInfoExpanded,
             m_settingsAddDeviceExpanded,
             m_settingsTab == SettingsTab::Keyboard,
+            m_settingsTab == SettingsTab::RemoteControl,
             m_localDeviceInfo,
             m_settingsScrollOffset);
     } else if (m_detailAnimationTimer->isActive()) {
@@ -8411,7 +8884,8 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
             || settingsScrolledRect(settingsAddDeviceHeaderRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset).contains(event->pos()));
     const bool settingsTabHovered = m_settingsSelected
         && (settingsGeneralTabRect().contains(event->pos())
-            || settingsKeyboardTabRect().contains(event->pos()));
+            || settingsKeyboardTabRect().contains(event->pos())
+            || settingsRemoteControlTabRect().contains(event->pos())); // wjy: 第三个远控画质标签使用相同手型反馈和点击语义。
     const bool detailTabHovered = !m_settingsSelected
         && !m_remoteAssistSelected
         && !m_localInfoSelected
@@ -9179,10 +9653,14 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         }
 
         if (m_settingsSelected) {
-            if (settingsGeneralTabRect().contains(event->pos()) || settingsKeyboardTabRect().contains(event->pos())) {
-                m_settingsTab = settingsKeyboardTabRect().contains(event->pos())
-                    ? SettingsTab::Keyboard
-                    : SettingsTab::General;
+            if (settingsGeneralTabRect().contains(event->pos())
+                || settingsKeyboardTabRect().contains(event->pos())
+                || settingsRemoteControlTabRect().contains(event->pos())) {
+                m_settingsTab = settingsRemoteControlTabRect().contains(event->pos())
+                    ? SettingsTab::RemoteControl
+                    : (settingsKeyboardTabRect().contains(event->pos())
+                        ? SettingsTab::Keyboard
+                        : SettingsTab::General); // wjy: 三个设置标签互斥切换，远控画质页不会误落入常规页点击处理。
                 m_settingsScrollOffset = 0;
                 updateSettingsControls();
                 updateAddDeviceControls();

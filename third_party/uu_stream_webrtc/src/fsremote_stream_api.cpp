@@ -19,6 +19,7 @@
 #include "signaling.h"
 #include "system_audio_stream.h"
 #include "uu_codec_factory.h"
+#include "viewer_quality_protocol.h"
 #include "webrtc_session.h"
 
 #include <atomic>
@@ -33,6 +34,7 @@
 // ===end====
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -1419,6 +1421,8 @@ public:
     }
 
     virtual bool sendInput(const char*) { return false; }
+    virtual bool setViewerQuality(const FsRemoteViewerQualityConfig*) { return false; } // wjy: 只有Viewer覆盖在线质量更新，Host或旧句柄安全返回false。
+    virtual bool viewerQualityStatus(FsRemoteViewerQualityStatus*) const { return false; } // wjy: 非Viewer句柄没有应用状态。
     virtual bool isBusy() const { return false; }
     // =====wjy====
     virtual uint32_t activeSessionCount() const { return 0; } // wjy: Viewer 无会话表；Host 覆盖为当前登记会话数。
@@ -1473,9 +1477,25 @@ public:
     {
         std::string error;
         if (!runtime_.initialize(&error)) throw std::runtime_error(error.empty() ? "host WebRTC runtime initialization failed" : error); // wjy: runtime 在 HostInstance 创建线程初始化，关闭时回到同一线程清理。
-        worker_ = std::thread([this, port] { runAcceptLoop(port); }); // wjy: manager 线程只负责共享运行时、持久监听和会话登记/回收。
+        worker_ = std::thread([this, port] {
+            try {
+                runAcceptLoop(port); // wjy: manager线程异常统一限制在Host实例，不能越过std::thread入口终止整个程序。
+            } catch (const std::exception& exception) {
+                append_log(std::string("host accept worker exception: ") + exception.what());
+            } catch (...) {
+                append_log("host accept worker unknown exception");
+            }
+        });
         // =====wjy====
-        clipboard_worker_ = std::thread([this] { runClipboardPollLoop(); }); // wjy: 独立轮询本机剪贴板，不依赖信令 recv 是否阻塞。
+        clipboard_worker_ = std::thread([this] {
+            try {
+                runClipboardPollLoop(); // wjy: 剪贴板辅助线程故障只停止同步，不影响视频、输入或Host主循环。
+            } catch (const std::exception& exception) {
+                append_log(std::string("host clipboard worker exception: ") + exception.what());
+            } catch (...) {
+                append_log("host clipboard worker unknown exception");
+            }
+        });
         // ===end====
     }
 
@@ -1657,7 +1677,20 @@ private:
                 std::lock_guard lock(sessions_mutex_);
                 sessions_.emplace(session->admission.session_id, session); // wjy: map 只保存共享上下文，worker 和 manager 都能安全完成清理。
             }
-            session->worker = std::thread([this, session] { runClientSession(session); });
+            session->worker = std::thread([this, session] {
+                try {
+                    runClientSession(session); // wjy: 单个控制端会话的认证/编码/信令异常不得影响其它会话或整个Host进程。
+                } catch (const std::exception& exception) {
+                    append_log(std::string("host client worker exception session=")
+                        + session->admission.session_id + " error=" + exception.what());
+                    session->cancel();
+                    session->completed = true;
+                } catch (...) {
+                    append_log(std::string("host client worker unknown exception session=") + session->admission.session_id);
+                    session->cancel();
+                    session->completed = true;
+                }
+            });
             append_log("host client worker started session=" + session->admission.session_id);
         }
         const uintptr_t published = server_socket_.exchange(0);
@@ -1739,12 +1772,73 @@ private:
                     }
                 });
             // ===end====
-            context->webrtc->set_control_callback([this, weak = std::weak_ptr<HostClientSession>(context)](const std::string& message) {
-                if (const auto locked = weak.lock(); locked && !locked->cancelled) {
-                    input_dispatcher_.dispatch(locked->admission.session_id, message); // wjy: 每个授权会话都可提交输入，但实际 SendInput 统一经过主机级串行调度器。
+        } // wjy: view_only 会话不登记回调，即使发送 data-channel 输入也无法到达系统注入路径。
+        // =====wjy====
+        context->webrtc->set_control_callback(
+            [this, weak = std::weak_ptr<HostClientSession>(context), has_control](const std::string& message) {
+                const auto locked = weak.lock();
+                if (!locked || locked->cancelled) return;
+
+                if (uu::is_viewer_quality_message(message)) {
+                    uu::ViewerQualityRequest request;
+                    std::string parse_error;
+                    if (!uu::parse_viewer_quality_request(message, &request, &parse_error)) {
+                        append_log("host rejected malformed quality message session=" + locked->admission.session_id
+                            + " error=" + parse_error); // wjy: 命中质量前缀的畸形消息只记录并丢弃，绝不送入SendInput。
+                        return;
+                    }
+
+                    const uint32_t applied_bitrate = std::min(
+                        request.max_bitrate_kbps,
+                        config_.max_aggregate_video_kbps); // wjy: 单会话请求不能突破Host总发送硬上限，高质量锁定也只获得优先级而非无界码率。
+                    uu::ViewerQualityAcknowledgement acknowledgement;
+                    acknowledgement.request_id = request.request_id;
+                    acknowledgement.applied_mode = request.mode;
+                    acknowledgement.applied_width = request.target_width;
+                    acknowledgement.applied_height = request.target_height;
+                    acknowledgement.applied_fps = request.target_fps;
+                    acknowledgement.applied_bitrate_kbps = applied_bitrate;
+                    acknowledgement.limitation = applied_bitrate == request.max_bitrate_kbps
+                        ? uu::ViewerQualityLimitation::None
+                        : uu::ViewerQualityLimitation::Clamped;
+
+                    std::string apply_error;
+                    bool applied = false;
+                    {
+                        std::lock_guard webrtc_lock(locked->webrtc_mutex);
+                        applied = locked->webrtc
+                            && locked->webrtc->apply_sender_quality(
+                                request.target_width,
+                                request.target_height,
+                                request.target_fps,
+                                applied_bitrate,
+                                request.priority,
+                                &apply_error); // wjy: 在线SetParameters只调整当前会话sender，媒体源、输入、认证和PeerConnection全部保持连续。
+                        if (!applied) {
+                            acknowledgement.limitation = uu::ViewerQualityLimitation::ApplyFailed;
+                        }
+                        std::string acknowledgement_wire;
+                        std::string acknowledgement_error;
+                        if (locked->webrtc
+                            && uu::serialize_viewer_quality_acknowledgement(
+                                acknowledgement,
+                                &acknowledgement_wire,
+                                &acknowledgement_error)) {
+                            locked->webrtc->send_control_message(acknowledgement_wire); // wjy: 无论成功、夹紧或非致命失败都返回版本化实际结果，现有视频流不停止。
+                        }
+                    }
+                    if (!applied) {
+                        append_log("host quality apply failed session=" + locked->admission.session_id
+                            + " error=" + apply_error);
+                    }
+                    return;
+                }
+
+                if (has_control) {
+                    input_dispatcher_.dispatch(locked->admission.session_id, message); // wjy: 只有非质量消息且拥有控制权时才进入键鼠/剪贴板串行注入路径。
                 }
             });
-        } // wjy: view_only 会话不登记回调，即使发送 data-channel 输入也无法到达系统注入路径。
+        // ===end====
         if (context->webrtc->initialize(&error) && context->webrtc->start_offer(&error)) {
             std::string message;
             while (running_ && !context->cancelled && uu::recv_message(socket, &message)) {
@@ -1906,7 +2000,23 @@ public:
         , status_callback_(statusCallback)
         , user_(user)
     {
-        worker_ = std::thread([this] { run(); });
+        worker_ = std::thread([this] {
+            try {
+                run(); // wjy: 每个Viewer最外层捕获分配、运行和第三方库异常，20路中单路失败只反馈当前窗口。
+            } catch (const std::bad_alloc&) {
+                set_error("viewer allocation failed");
+                append_viewer_log("viewer worker bad_alloc");
+                report_status(status_callback_, user_, FSREMOTE_STATUS_ERROR, "Viewer memory allocation failed");
+            } catch (const std::exception& exception) {
+                set_error(exception.what());
+                append_viewer_log(std::string("viewer worker exception: ") + exception.what());
+                report_status(status_callback_, user_, FSREMOTE_STATUS_ERROR, exception.what());
+            } catch (...) {
+                set_error("viewer unknown runtime failure");
+                append_viewer_log("viewer worker unknown exception");
+                report_status(status_callback_, user_, FSREMOTE_STATUS_ERROR, "Viewer runtime failure");
+            }
+        });
     }
 
     ~ViewerInstance() override
@@ -1928,7 +2038,137 @@ public:
         return active_session_ ? active_session_->send_control_message(message) : false;
     }
 
+    // =====wjy====
+    bool setViewerQuality(const FsRemoteViewerQualityConfig* config) override
+    {
+        if (!config || config->struct_size < sizeof(FsRemoteViewerQualityConfig)
+            || config->version != 1 || config->request_id == 0) {
+            return false;
+        }
+        uu::ViewerQualityRequest request;
+        request.request_id = config->request_id;
+        request.mode = static_cast<uu::ViewerQualityMode>(config->mode);
+        request.target_width = config->target_width;
+        request.target_height = config->target_height;
+        request.target_fps = config->target_fps;
+        request.max_bitrate_kbps = config->max_bitrate_kbps;
+        request.priority = config->priority;
+        std::string wire;
+        std::string error;
+        if (!uu::serialize_viewer_quality_request(request, &wire, &error)) {
+            set_error(error);
+            return false; // wjy: C ABI入口复用同一协议校验，非法尺寸/FPS绝不进入data-channel。
+        }
+        {
+            std::lock_guard lock(quality_mutex_);
+            pending_quality_request_ = request; // wjy: 新请求直接覆盖尚未发送或等待确认的旧请求，队列深度始终为1。
+            pending_quality_sent_ = false;
+            pending_quality_sent_at_ms_ = 0;
+            quality_status_available_ = false;
+        }
+        trySendPendingQualityRequest(); // wjy: data-channel已打开时立即在线发送；尚未打开则由首帧回调自动补发最新值。
+        return true;
+    }
+
+    bool viewerQualityStatus(FsRemoteViewerQualityStatus* status) const override
+    {
+        if (!status || status->struct_size < sizeof(FsRemoteViewerQualityStatus) || status->version != 1) {
+            return false;
+        }
+        std::lock_guard lock(quality_mutex_);
+        if (!quality_status_available_) return false;
+        *status = quality_status_; // wjy: 在互斥区内复制固定POD快照，Qt不会读到一半新一半旧的确认字段。
+        return true;
+    }
+    // ===end====
+
 private:
+    // =====wjy====
+    void trySendPendingQualityRequest()
+    {
+        uu::ViewerQualityRequest request;
+        {
+            std::lock_guard lock(quality_mutex_);
+            if (!pending_quality_request_ || pending_quality_sent_) return;
+            request = *pending_quality_request_;
+        }
+        std::string wire;
+        std::string error;
+        if (!uu::serialize_viewer_quality_request(request, &wire, &error)) return;
+        bool sent = false;
+        {
+            std::lock_guard lock(session_mutex_);
+            sent = active_session_ && active_session_->send_control_message(wire); // wjy: 复用现有可靠有序control data-channel，不触碰TCP信令或重建会话。
+        }
+        if (!sent) return;
+        std::lock_guard lock(quality_mutex_);
+        if (pending_quality_request_ && pending_quality_request_->request_id == request.request_id) {
+            pending_quality_sent_ = true;
+            pending_quality_sent_at_ms_ = GetTickCount64(); // wjy: 只给当前最新请求记录超时，迟到旧请求不能把新请求标成已发送。
+        }
+    }
+
+    void checkPendingQualityTimeout()
+    {
+        uint64_t timed_out_request_id = 0;
+        {
+            std::lock_guard lock(quality_mutex_);
+            if (!pending_quality_request_ || !pending_quality_sent_ || pending_quality_sent_at_ms_ == 0
+                || GetTickCount64() - pending_quality_sent_at_ms_ < 3000) {
+                return;
+            }
+            const uu::ViewerQualityRequest request = *pending_quality_request_;
+            quality_status_ = {};
+            quality_status_.struct_size = sizeof(quality_status_);
+            quality_status_.version = 1;
+            quality_status_.request_id = request.request_id;
+            quality_status_.supported = 0;
+            quality_status_.applied_mode = static_cast<uint32_t>(request.mode);
+            quality_status_.applied_width = request.target_width;
+            quality_status_.applied_height = request.target_height;
+            quality_status_.applied_fps = request.target_fps;
+            quality_status_.applied_bitrate_kbps = request.max_bitrate_kbps;
+            quality_status_.limitation = FSREMOTE_VIEWER_QUALITY_LIMIT_UNSUPPORTED; // wjy: 旧Host三秒无确认只标记不支持，视频、输入和连接全部继续。
+            quality_status_available_ = true;
+            timed_out_request_id = request.request_id;
+            pending_quality_request_.reset();
+            pending_quality_sent_ = false;
+        }
+        if (timed_out_request_id != 0) {
+            const std::string message = "QUALITY " + std::to_string(timed_out_request_id);
+            report_status(status_callback_, user_, FSREMOTE_STATUS_QUALITY_APPLIED, message.c_str());
+        }
+    }
+
+    void acceptQualityAcknowledgement(const uu::ViewerQualityAcknowledgement& acknowledgement)
+    {
+        {
+            std::lock_guard lock(quality_mutex_);
+            if (!pending_quality_request_
+                || pending_quality_request_->request_id != acknowledgement.request_id) {
+                return; // wjy: 用户连续切换模式时，旧Host确认不能覆盖更新请求的标题栏状态。
+            }
+            quality_status_ = {};
+            quality_status_.struct_size = sizeof(quality_status_);
+            quality_status_.version = 1;
+            quality_status_.request_id = acknowledgement.request_id;
+            quality_status_.supported = acknowledgement.supported ? 1u : 0u;
+            quality_status_.applied_mode = static_cast<uint32_t>(acknowledgement.applied_mode);
+            quality_status_.applied_width = acknowledgement.applied_width;
+            quality_status_.applied_height = acknowledgement.applied_height;
+            quality_status_.applied_fps = acknowledgement.applied_fps;
+            quality_status_.applied_bitrate_kbps = acknowledgement.applied_bitrate_kbps;
+            quality_status_.limitation = static_cast<uint32_t>(acknowledgement.limitation);
+            quality_status_available_ = true;
+            pending_quality_request_.reset();
+            pending_quality_sent_ = false;
+            pending_quality_sent_at_ms_ = 0;
+        }
+        const std::string message = "QUALITY " + std::to_string(acknowledgement.request_id);
+        report_status(status_callback_, user_, FSREMOTE_STATUS_QUALITY_APPLIED, message.c_str()); // wjy: 现有状态回调只作“有新快照”通知，实际字段通过类型化C ABI读取。
+    }
+    // ===end====
+
     uintptr_t connectTcp(std::string* error)
     {
         if (!ensure_wsa()) {
@@ -2014,6 +2254,8 @@ private:
                 std::snprintf(stats, sizeof(stats), "ENC %.2f", encoded_mbps);
                 report_status(status_callback_, user_, 60, stats);
             }
+            trySendPendingQualityRequest(); // wjy: data-channel通常在首帧前后打开，未发送请求在每帧以单槽状态低成本重试。
+            checkPendingQualityTimeout();
             return texture_callback_(user_, width, height, shared_handle, frame_id, encoded_mbps) != 0;
         });
         // =====wjy====
@@ -2029,6 +2271,8 @@ private:
                 std::snprintf(stats, sizeof(stats), "ENC %.2f", encoded_mbps);
                 report_status(status_callback_, user_, 60, stats); // wjy: code 60 carries viewer-side compressed video bitrate for the Qt overlay.
             }
+            trySendPendingQualityRequest();
+            checkPendingQualityTimeout(); // wjy: BGRA回退路径和共享纹理路径使用相同质量发送/超时语义。
             if (frame_callback_ && running_) {
                 frame_callback_(user_, width, height, bgra, static_cast<uint32_t>(size)); // wjy: send only this runtime/decoder's frame to this RemoteDesktopWindow.
             }
@@ -2053,7 +2297,13 @@ private:
             uu::send_message(socket, kind + "\n" + body);
         });
         session.set_control_callback([this](const std::string& message) {
-            if (message == "__fsremote_mouse_mode relative") {
+            if (uu::is_viewer_quality_message(message)) {
+                uu::ViewerQualityAcknowledgement acknowledgement;
+                std::string error;
+                if (uu::parse_viewer_quality_acknowledgement(message, &acknowledgement, &error)) {
+                    acceptQualityAcknowledgement(acknowledgement); // wjy: 质量确认和鼠标/剪贴板共享data-channel，但使用保留前缀严格分流。
+                }
+            } else if (message == "__fsremote_mouse_mode relative") {
                 report_status(status_callback_, user_, 61, "MOUSE relative");
             } else if (message == "__fsremote_mouse_mode desktop") {
                 report_status(status_callback_, user_, 61, "MOUSE desktop");
@@ -2071,6 +2321,7 @@ private:
             report_status(status_callback_, user_, 90, error.empty() ? "WebRTC session initialization failed" : error.c_str());
             return;
         }
+        trySendPendingQualityRequest(); // wjy: 会话初始化完成立即尝试，若channel尚未open则由首帧继续补发。
 
         append_viewer_log("viewer session initialized waiting stream"); // wjy: last checkpoint before remote signaling/media loop.
         report_status(status_callback_, user_, 40, "Waiting for remote stream");
@@ -2100,6 +2351,12 @@ private:
     std::atomic_bool control_allowed_ = false; // wjy: 原子权限位跨 UI 与 viewer worker 线程读取，避免直接并发访问 admission_ 字符串。
     std::mutex session_mutex_;
     uu::WebrtcSession* active_session_ = nullptr;
+    mutable std::mutex quality_mutex_;
+    std::optional<uu::ViewerQualityRequest> pending_quality_request_; // wjy: 只保留最新请求，连接中多次修改不会积压消息。
+    bool pending_quality_sent_ = false;
+    uint64_t pending_quality_sent_at_ms_ = 0;
+    FsRemoteViewerQualityStatus quality_status_ = {};
+    bool quality_status_available_ = false;
     uint64_t last_stats_status_ms_ = 0;
     std::unique_ptr<uu::ViewerAudioPlayer> audio_player_;
 };
@@ -2244,6 +2501,24 @@ int FSREMOTE_STREAM_CALL fsremote_stream_send_input(FsRemoteStreamHandle handle,
     }
     return static_cast<StreamInstance*>(handle)->sendInput(message) ? 1 : 0;
 }
+
+// =====wjy====
+int FSREMOTE_STREAM_CALL fsremote_stream_set_viewer_quality(
+    FsRemoteStreamHandle handle,
+    const FsRemoteViewerQualityConfig* config)
+{
+    if (!handle || !config) return 0;
+    return static_cast<StreamInstance*>(handle)->setViewerQuality(config) ? 1 : 0; // wjy: Viewer同步复制最新配置，Host或错误句柄安全拒绝且不影响现有流。
+}
+
+int FSREMOTE_STREAM_CALL fsremote_stream_get_viewer_quality_status(
+    FsRemoteStreamHandle handle,
+    FsRemoteViewerQualityStatus* status)
+{
+    if (!handle || !status) return 0;
+    return static_cast<StreamInstance*>(handle)->viewerQualityStatus(status) ? 1 : 0; // wjy: 返回固定POD快照，调用方无需解析data-channel文本。
+}
+// ===end====
 
 int FSREMOTE_STREAM_CALL fsremote_stream_is_busy(FsRemoteStreamHandle handle)
 {

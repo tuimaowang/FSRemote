@@ -63,6 +63,10 @@ MainWindow::MainWindow(platform::DeviceRealtimeStateService* realtimeStateServic
 // =====wjy====
 MainWindow::~MainWindow()
 {
+    if (m_exitWatchdog.joinable()) {
+        m_exitWatchdog.request_stop();
+        m_exitWatchdog.join(); // wjy: 正常退出取消看门狗并确定性汇合，不让后台线程越过MainWindow/日志生命周期。
+    }
     delete m_remoteControllerOverlay;
     m_remoteControllerOverlay = nullptr;
     removeTrayIcon(); // wjy: 正常析构也复用同步注销逻辑，保证所有退出路径都向系统托盘发送删除消息。
@@ -193,12 +197,18 @@ void MainWindow::requestApplicationExit()
     removeTrayIcon(); // wjy: 第一优先级注销托盘图标，后续即使后台清理卡住也不会产生幽灵图标。
 
 #if defined(Q_OS_WIN)
-    std::thread([] {
-        writeWindowStartupLog(QStringLiteral("[wjy-exit] watchdog thread armed timeoutMs=8000")); // wjy: 确认兜底线程确实创建并开始计时。
-        std::this_thread::sleep_for(std::chrono::seconds(8)); // wjy: 正常清理最多保留 8 秒；托盘退出没有外部更新器，因此需要进程内兜底。
-        writeWindowStartupLog(QStringLiteral("[wjy-exit] watchdog firing TerminateProcess")); // wjy: 若日志以此结尾，说明正常退出链路在此前某一步卡满 8 秒。
+    m_exitWatchdog = std::jthread([](std::stop_token stopToken) {
+        constexpr int timeoutSteps = 300;
+        writeWindowStartupLog(QStringLiteral("[wjy-exit] watchdog thread armed timeoutMs=30000")); // wjy: 20路stop允许更充足的有界汇合时间，仍保留卡死兜底。
+        for (int step = 0; step < timeoutSteps; ++step) {
+            if (stopToken.stop_requested()) {
+                return; // wjy: MainWindow正常析构时立即取消，不会在进程清理完成后误触发TerminateProcess。
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        writeWindowStartupLog(QStringLiteral("[wjy-exit] watchdog firing TerminateProcess")); // wjy: 若日志以此结尾，说明正常退出链路在此前某一步卡满30秒。
         ::TerminateProcess(::GetCurrentProcess(), 0); // wjy: 若代码还能执行到这里说明主进程仍未退出，强制结束避免托盘“退出”永久无效。
-    }).detach();
+    });
 #endif
 
     QApplication::quit(); // wjy: 事件循环已运行时立即登记退出，即便下面的清理短暂阻塞，返回后也不会重新进入普通运行状态。

@@ -7,6 +7,7 @@
 #include <QKeySequence>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QUrl>
 
 namespace platform {
 namespace {
@@ -14,6 +15,18 @@ namespace {
 QSettings settings()
 {
     return QSettings(QStringLiteral("FSRemote"), QStringLiteral("FSRemote"));
+}
+
+QString remoteDeviceQualityModeKey(const QString& deviceKey)
+{
+    const QByteArray encodedKey = QUrl::toPercentEncoding(deviceKey.trimmed().toLower()); // wjy: 对IP或设备键做百分号编码，避免IPv6冒号等字符破坏QSettings层级。
+    return QStringLiteral("remoteQuality/deviceModes/%1").arg(QString::fromLatin1(encodedKey));
+}
+
+bool isRemoteWindowQualityMode(stream::RemoteQualityMode mode)
+{
+    return mode == stream::RemoteQualityMode::FollowGlobal
+        || stream::isPersistentGlobalQualityMode(mode); // wjy: 允许保存标题栏提供的全部模式，同时拒绝未知枚举污染后续会话。
 }
 
 QString configDirectoryPath()
@@ -205,6 +218,77 @@ void AppSettings::setRemoteHostOwnershipPolicy(const QString& policy)
 // ===end====
 
 // =====wjy====
+stream::RemoteQualityConfiguration AppSettings::remoteQualityConfiguration()
+{
+    QSettings appSettings = settings();
+    stream::RemoteQualityConfiguration configuration;
+    configuration.defaultMode = static_cast<stream::RemoteQualityMode>(
+        appSettings.value(QStringLiteral("remoteQuality/defaultMode"), static_cast<int>(stream::RemoteQualityMode::Automatic)).toInt()); // wjy: 全局默认模式读取整数枚举，未知值在统一归一化阶段回退自动。
+    configuration.targetFps = appSettings.value(QStringLiteral("remoteQuality/targetFps"), 60).toInt();
+    configuration.minimumVisibleFps = appSettings.value(QStringLiteral("remoteQuality/minimumVisibleFps"), 30).toInt();
+    configuration.severePressureMinimumFps = appSettings.value(QStringLiteral("remoteQuality/severePressureMinimumFps"), 15).toInt();
+    configuration.minimizedFps = appSettings.value(QStringLiteral("remoteQuality/minimizedFps"), 15).toInt();
+    configuration.minimumVisibleResolution = static_cast<stream::RemoteResolutionTier>(
+        appSettings.value(QStringLiteral("remoteQuality/minimumVisibleResolution"), static_cast<int>(stream::RemoteResolutionTier::P720)).toInt());
+    configuration.minimizedResolution = static_cast<stream::RemoteResolutionTier>(
+        appSettings.value(QStringLiteral("remoteQuality/minimizedResolution"), static_cast<int>(stream::RemoteResolutionTier::P540)).toInt());
+    configuration.degradationHoldMs = appSettings.value(QStringLiteral("remoteQuality/degradationHoldMs"), 2500).toInt();
+    configuration.recoveryHoldMs = appSettings.value(QStringLiteral("remoteQuality/recoveryHoldMs"), 10000).toInt();
+    configuration.automaticRecoveryEnabled = appSettings.value(QStringLiteral("remoteQuality/automaticRecoveryEnabled"), true).toBool();
+    configuration.aggregateReceiveBudgetMbps = appSettings.value(QStringLiteral("remoteQuality/aggregateReceiveBudgetMbps"), 0).toInt();
+    return stream::normalizedRemoteQualityConfiguration(configuration); // wjy: 旧注册表、手工篡改或未来版本值都先夹紧再进入协调器。
+}
+
+void AppSettings::setRemoteQualityConfiguration(const stream::RemoteQualityConfiguration& configuration)
+{
+    const stream::RemoteQualityConfiguration normalized =
+        stream::normalizedRemoteQualityConfiguration(configuration); // wjy: 保存前再次执行字段间约束，保证最低FPS不会高于目标FPS。
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("remoteQuality/defaultMode"), static_cast<int>(normalized.defaultMode));
+    appSettings.setValue(QStringLiteral("remoteQuality/targetFps"), normalized.targetFps);
+    appSettings.setValue(QStringLiteral("remoteQuality/minimumVisibleFps"), normalized.minimumVisibleFps);
+    appSettings.setValue(QStringLiteral("remoteQuality/severePressureMinimumFps"), normalized.severePressureMinimumFps);
+    appSettings.setValue(QStringLiteral("remoteQuality/minimizedFps"), normalized.minimizedFps);
+    appSettings.setValue(QStringLiteral("remoteQuality/minimumVisibleResolution"), static_cast<int>(normalized.minimumVisibleResolution));
+    appSettings.setValue(QStringLiteral("remoteQuality/minimizedResolution"), static_cast<int>(normalized.minimizedResolution));
+    appSettings.setValue(QStringLiteral("remoteQuality/degradationHoldMs"), normalized.degradationHoldMs);
+    appSettings.setValue(QStringLiteral("remoteQuality/recoveryHoldMs"), normalized.recoveryHoldMs);
+    appSettings.setValue(QStringLiteral("remoteQuality/automaticRecoveryEnabled"), normalized.automaticRecoveryEnabled);
+    appSettings.setValue(QStringLiteral("remoteQuality/aggregateReceiveBudgetMbps"), normalized.aggregateReceiveBudgetMbps); // wjy: 0保留“自动预算”语义，绝不据此断开健康会话。
+}
+// ===end====
+
+// =====wjy====
+bool AppSettings::remoteDeviceQualityMode(const QString& deviceKey, stream::RemoteQualityMode* mode)
+{
+    if (!mode || deviceKey.trimmed().isEmpty()) {
+        return false; // wjy: 空设备键或空输出指针不读取共享配置，调用方继续使用“自动”默认值。
+    }
+    const QVariant stored = settings().value(remoteDeviceQualityModeKey(deviceKey));
+    if (!stored.isValid()) {
+        return false; // wjy: 首次远控该设备没有记录，明确让窗口保持“自动”。
+    }
+    bool parsed = false;
+    const int storedValue = stored.toInt(&parsed); // wjy: 显式检查整数转换，损坏字符串不能静默变成FollowGlobal枚举0。
+    const stream::RemoteQualityMode storedMode = static_cast<stream::RemoteQualityMode>(storedValue);
+    if (!parsed || !isRemoteWindowQualityMode(storedMode)) {
+        return false; // wjy: 旧版本或损坏枚举不参与恢复，防止下发未定义画质模式。
+    }
+    *mode = storedMode;
+    return true;
+}
+
+void AppSettings::setRemoteDeviceQualityMode(const QString& deviceKey, stream::RemoteQualityMode mode)
+{
+    if (deviceKey.trimmed().isEmpty() || !isRemoteWindowQualityMode(mode)) {
+        return; // wjy: 只保存有稳定设备键且属于标题栏菜单的合法模式。
+    }
+    QSettings appSettings = settings();
+    appSettings.setValue(remoteDeviceQualityModeKey(deviceKey), static_cast<int>(mode)); // wjy: 每台设备独立覆盖同一键，模式切换立即落盘且不会影响其它设备。
+}
+// ===end====
+
+// =====wjy====
 QKeySequence AppSettings::remoteShortcutFullscreen()
 {
     return shortcutFromSettings(QStringLiteral("remoteShortcutFullscreen"), QKeySequence(QStringLiteral("Ctrl+D"))); // wjy: 默认保持现有全屏切换快捷键。
@@ -227,12 +311,12 @@ void AppSettings::setRemoteShortcutTile(const QKeySequence& shortcut)
 
 QKeySequence AppSettings::remoteShortcutCloseTopmost()
 {
-    return shortcutFromSettings(QStringLiteral("remoteShortcutCloseTopmost"), QKeySequence(QStringLiteral("F4"))); // wjy: 默认保持现有关闭最上方窗口快捷键。
+    return shortcutFromSettings(QStringLiteral("remoteShortcutCloseTopmost"), QKeySequence(QStringLiteral("Ctrl+W"))); // wjy: 未保存自定义值时使用Ctrl+W关闭最上方远控窗口，符合常见标签页关闭习惯。
 }
 
 void AppSettings::setRemoteShortcutCloseTopmost(const QKeySequence& shortcut)
 {
-    setShortcutToSettings(QStringLiteral("remoteShortcutCloseTopmost"), shortcut, QKeySequence(QStringLiteral("F4"))); // wjy: 保存设置页录入的关闭单个窗口快捷键。
+    setShortcutToSettings(QStringLiteral("remoteShortcutCloseTopmost"), shortcut, QKeySequence(QStringLiteral("Ctrl+W"))); // wjy: 保存设置页录入值；空值回退到新的Ctrl+W默认组合。
 }
 
 QKeySequence AppSettings::remoteShortcutCloseAll()

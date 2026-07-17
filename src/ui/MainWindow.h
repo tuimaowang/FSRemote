@@ -3,6 +3,8 @@
 #include <QMainWindow>
 #include <QStringList>
 
+#include <thread>
+
 class QCloseEvent;
 class QEvent;
 class QSystemTrayIcon;
@@ -49,6 +51,7 @@ private:
     RemoteControllerOverlay* m_remoteControllerOverlay = nullptr;
     bool m_forceQuit = false;
     bool m_exitRequested = false; // wjy: 防止托盘动作、窗口关闭和更新信号重复进入清理流程或重复创建退出看门狗。
+    std::jthread m_exitWatchdog; // wjy: 可请求停止且析构会join的退出看门狗，替代无法管理的detach线程。
     // ===end====
 };
 

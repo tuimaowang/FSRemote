@@ -17,6 +17,7 @@ enum class StreamStatusCode : int {
     ReceivingVideo = FSREMOTE_STATUS_RECEIVING_VIDEO,
     VideoStats = FSREMOTE_STATUS_VIDEO_STATS,
     MouseMode = FSREMOTE_STATUS_MOUSE_MODE,
+    QualityApplied = FSREMOTE_STATUS_QUALITY_APPLIED,
     Admitted = FSREMOTE_STATUS_ADMITTED,
     ViewOnly = FSREMOTE_STATUS_VIEW_ONLY,
     ControlGranted = FSREMOTE_STATUS_CONTROL_GRANTED,
@@ -59,6 +60,8 @@ public:
         void* user);
     void stop(FsRemoteStreamHandle handle);
     bool sendInput(FsRemoteStreamHandle handle, const QByteArray& message);
+    bool setViewerQuality(FsRemoteStreamHandle handle, const FsRemoteViewerQualityConfig& config); // wjy: 新DLL在线发送质量请求，旧DLL缺失导出时返回false但不停止当前流。
+    bool viewerQualityStatus(FsRemoteStreamHandle handle, FsRemoteViewerQualityStatus* status) const; // wjy: 读取Host实际应用结果供标题栏反馈。
     bool isBusy(FsRemoteStreamHandle handle) const;
     // =====wjy====
     uint32_t activeSessionCount(FsRemoteStreamHandle handle) const; // wjy: 查询主机当前活动远控会话数，驱动设备行人数徽标。
@@ -92,6 +95,8 @@ private:
         void*);
     using StopFn = void(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
     using SendInputFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, const char*);
+    using SetViewerQualityFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, const FsRemoteViewerQualityConfig*);
+    using GetViewerQualityStatusFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, FsRemoteViewerQualityStatus*);
     using IsBusyFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
     // =====wjy====
     using ActiveSessionCountFn = uint32_t(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
@@ -110,6 +115,8 @@ private:
     StartViewerWithTextureFn m_startViewerWithTexture = nullptr;
     StopFn m_stop = nullptr;
     SendInputFn m_sendInput = nullptr;
+    SetViewerQualityFn m_setViewerQuality = nullptr;
+    GetViewerQualityStatusFn m_getViewerQualityStatus = nullptr;
     IsBusyFn m_isBusy = nullptr;
     // =====wjy====
     ActiveSessionCountFn m_activeSessionCount = nullptr;

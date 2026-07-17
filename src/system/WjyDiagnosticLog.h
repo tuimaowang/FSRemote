@@ -5,7 +5,7 @@
 namespace platform {
 
 // =====wjy====
-void writeWjyDiagnosticLog(const QString& message); // wjy: 保留兼容调用入口，当前为空实现，不再生成统一诊断日志。
+void writeWjyDiagnosticLog(const QString& message); // wjy: 写入有4MB硬上限的低频轮转诊断日志，禁止在逐帧热路径调用。
 // ===end====
 
 } // namespace platform

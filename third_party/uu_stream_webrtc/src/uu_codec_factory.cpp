@@ -154,6 +154,7 @@ public:
     {
         encoder_.shutdown();
         encoder_bitrate_kbps_ = 0; // wjy: Clear the active NVENC bitrate marker when the encoder session is released.
+        encoder_fps_ = 0;
         texture_.Reset();
         argb_.clear();
         callback_ = nullptr;
@@ -162,6 +163,22 @@ public:
 
     int32_t Encode(const webrtc::VideoFrame& frame,
                    const std::vector<webrtc::VideoFrameType>* frame_types) override
+    {
+        try {
+            return encodeFrame(frame, frame_types); // wjy: 编码线程所有分配/驱动异常在VideoEncoder边界转为错误码，不触发std::terminate。
+        } catch (const std::bad_alloc&) {
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        } catch (const std::exception& exception) {
+            std::cerr << "NVENC encode exception: " << exception.what() << "\n";
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        } catch (...) {
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        }
+    }
+
+private:
+    int32_t encodeFrame(const webrtc::VideoFrame& frame,
+                        const std::vector<webrtc::VideoFrameType>* frame_types)
     {
         if (!callback_) return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
         auto i420 = frame.video_frame_buffer()->ToI420();
@@ -172,9 +189,15 @@ public:
         if (width <= 0 || height <= 0) return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
         if (!ensure_device()) return WEBRTC_VIDEO_CODEC_ERROR;
         if (!ensure_texture(width, height)) return WEBRTC_VIDEO_CODEC_ERROR;
-        if (encoder_.ready() && should_reconfigure_bitrate()) {
-            encoder_.shutdown(); // wjy: WebRTC SetRates() changed the target bitrate; rebuild NVENC so the new adaptive rate takes effect.
-            last_bitrate_reconfigure_ms_ = GetTickCount64(); // wjy: Throttle bitrate-driven rebuilds so small WebRTC rate changes do not cause repeated encoder stalls.
+        if (encoder_.ready() && should_reconfigure_rate()) {
+            std::string reconfigure_error;
+            if (encoder_.reconfigure(bitrate_kbps_, fps_, &reconfigure_error)) {
+                encoder_bitrate_kbps_ = bitrate_kbps_; // wjy: NVENC会话、纹理注册和bitstream全部保留，只更新实时码率/FPS。
+                encoder_fps_ = fps_;
+            } else {
+                std::cerr << "NVENC live reconfigure skipped: " << reconfigure_error << "\n"; // wjy: 驱动不支持时继续使用旧会话，绝不shutdown造成断流。
+            }
+            last_bitrate_reconfigure_ms_ = GetTickCount64(); // wjy: 成功或失败都短暂冷却，避免每帧重复调用不支持的驱动入口。
         }
         if (!encoder_.ready() || size_.width != static_cast<uint32_t>(width) || size_.height != static_cast<uint32_t>(height)) {
             std::string error;
@@ -184,6 +207,7 @@ public:
                 return WEBRTC_VIDEO_CODEC_ERROR;
             }
             encoder_bitrate_kbps_ = bitrate_kbps_; // wjy: Remember which bitrate the active NVENC session was initialized with.
+            encoder_fps_ = fps_;
         }
 
         argb_.resize(static_cast<size_t>(width) * height * 4);
@@ -255,16 +279,17 @@ public:
     }
 
 private:
-    bool should_reconfigure_bitrate() const
+    bool should_reconfigure_rate() const
     {
-        if (encoder_bitrate_kbps_ == 0 || encoder_bitrate_kbps_ == bitrate_kbps_) {
+        if (encoder_bitrate_kbps_ == 0) {
             return false;
         }
         const uint32_t lower = std::min(encoder_bitrate_kbps_, bitrate_kbps_);
         const uint32_t upper = std::max(encoder_bitrate_kbps_, bitrate_kbps_);
         const bool changed_enough = (upper - lower) * 100 >= std::max(upper, 1u) * 15; // wjy: Ignore tiny target-rate jitter; only rebuild NVENC for meaningful adaptive bitrate movement.
+        const bool fps_changed = encoder_fps_ != fps_; // wjy: 在线质量协议改变目标FPS时同步更新NVENC帧率字段，不重建编码器。
         const bool cooled_down = GetTickCount64() - last_bitrate_reconfigure_ms_ >= 500; // wjy: Keep reconfiguration below roughly twice per second to protect remote-control smoothness.
-        return changed_enough && cooled_down;
+        return (changed_enough || fps_changed) && cooled_down;
     }
 
     bool ensure_device()
@@ -298,6 +323,7 @@ private:
         tex_h_ = height;
         encoder_.shutdown();
         encoder_bitrate_kbps_ = 0; // wjy: Force NVENC reinitialization after texture size changes.
+        encoder_fps_ = 0;
         return true;
     }
 
@@ -311,6 +337,7 @@ private:
     lsp::Size target_size_;
     uint32_t bitrate_kbps_ = 120000;
     uint32_t encoder_bitrate_kbps_ = 0;
+    uint32_t encoder_fps_ = 0;
     uint64_t last_bitrate_reconfigure_ms_ = 0;
     uint32_t fps_ = 60;
     uint32_t frame_id_ = 0;
@@ -338,6 +365,23 @@ public:
     }
 
     int32_t Decode(const webrtc::EncodedImage& input_image, int64_t render_time_ms) override
+    {
+        try {
+            return decodeFrame(input_image, render_time_ms); // wjy: 单路解码分配/FFmpeg/D3D异常统一变成可恢复错误码，其它Viewer继续工作。
+        } catch (const std::bad_alloc&) {
+            append_viewer_log("decoder bad_alloc");
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        } catch (const std::exception& exception) {
+            append_viewer_log(std::string("decoder exception: ") + exception.what());
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        } catch (...) {
+            append_viewer_log("decoder unknown exception");
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        }
+    }
+
+private:
+    int32_t decodeFrame(const webrtc::EncodedImage& input_image, int64_t render_time_ms)
     {
         // =====wjy====
         // if (decode_calls_ < 5 || decode_calls_ % 120 == 0) {
@@ -604,12 +648,10 @@ private:
             auto* dst_row = dst + static_cast<size_t>(y) * row_bytes;
             // =====wjy====
             for (uint32_t x = 0; x < width; ++x) {
-                const auto* src_pixel = src_row + static_cast<size_t>(x) * 4; // wjy: D3D11 output texture is BGRA.
+                const auto* src_pixel = src_row + static_cast<size_t>(x) * 4; // wjy: 解码视频处理器已经输出full-range BGRA，软件回退只需保持原值。
                 auto* dst_pixel = dst_row + static_cast<size_t>(x) * 4;
                 for (int channel = 0; channel < 3; ++channel) {
-                    const int value = src_pixel[channel];
-                    const int expanded = (value - 16) * 255 / 219; // wjy: Restore video limited range 16-235 to desktop full range 0-255 while copying out of D3D11.
-                    dst_pixel[channel] = static_cast<uint8_t>(std::clamp(expanded, 0, 255));
+                    dst_pixel[channel] = src_pixel[channel]; // wjy: 禁止再次执行limited到full扩展，避免回退画面黑位压死、亮部过曝并与共享纹理路径不一致。
                 }
                 dst_pixel[3] = 255; // wjy: Remote desktop frames should be opaque when Qt wraps them as RGB32.
             }

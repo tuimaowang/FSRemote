@@ -3,6 +3,8 @@
 #include "system/DeviceInfoService.h"
 #include "system/DeviceRealtimeStateService.h"
 #include "system/DeviceStatusService.h"
+#include "stream/RemoteQualityPolicy.h"
+#include "ui/RemoteQualityCoordinator.h"
 
 #include <atomic>
 #include <functional>
@@ -24,6 +26,8 @@
 
 class QEvent;
 class QByteArray;
+class QCheckBox;
+class QComboBox;
 class QKeyEvent;
 class QJsonObject;
 class QLineEdit;
@@ -31,6 +35,7 @@ class QMouseEvent;
 class QPaintEvent;
 class QPushButton;
 class QResizeEvent;
+class QSpinBox;
 class QTextEdit;
 class QTimer;
 class QTreeWidget;
@@ -40,6 +45,7 @@ class QWheelEvent;
 namespace ui {
 
 class RemoteDesktopWindow;
+class RemoteViewerLifecycleManager; // wjy: DeviceGrid统一拥有远控初始化准入和可等待生命周期工作池。
 
 enum class BottomAction {
     None,
@@ -71,6 +77,7 @@ private:
     enum class SettingsTab {
         General,
         Keyboard,
+        RemoteControl,
     };
 
     enum class DeviceDetailTab {
@@ -147,6 +154,10 @@ private:
     int devicePoweringOnRemainingSecondsForIndex(int index) const;
     void setupSettingsControls();
     void updateSettingsControls();
+    void saveRemoteQualitySettingsFromControls(); // wjy: 收集远控画质页字段、统一归一化持久化并立即通知跟随全局的窗口。
+    void registerRemoteQualityWindow(RemoteDesktopWindow* window); // wjy: 普通和平铺窗口共用同一套质量注册、销毁清理和即时重算逻辑。
+    void requestRemoteQualityEvaluation(); // wjy: 合并同一事件循环内多次窗口变化，最多排队一个全局质量计算任务。
+    void evaluateRemoteQuality(); // wjy: 每秒汇总全部不断流窗口并下发分辨率优先、FPS次级的在线质量决策。
     void saveShortcutKeySetting(int shortcutIndex, const QString& shortcutText); // wjy: Save one keyboard shortcut when its editor loses focus or receives Enter.
     void registerGlobalShortcuts();
     void unregisterGlobalShortcuts();
@@ -223,6 +234,11 @@ private:
 
     // =====wjy====
     platform::DeviceRealtimeStateService* m_realtimeStateService = nullptr; // wjy: 由 main 持有且晚于 MainWindow 销毁，DeviceGrid 只连接和调用，不负责释放。
+    std::unique_ptr<RemoteViewerLifecycleManager> m_remoteViewerLifecycleManager; // wjy: 生命周期晚于窗口批量stop，析构时再次兜底join固定工作线程。
+    RemoteQualityCoordinator m_remoteQualityCoordinator; // wjy: 一个控制端统一协调全部远控窗口，高质量锁定按优先级最后降级但不能突破稳定性硬边界。
+    QTimer* m_remoteQualityTimer = nullptr; // wjy: 1秒采样接收FPS/码率，最小化和用户切换模式另走即时重算信号。
+    bool m_remoteQualityEvaluationQueued = false; // wjy: 多窗口同时最小化或创建时合并为一个Qt任务，避免事件队列放大。
+    qint64 m_lastRemoteResourceDiagnosticAtMs = 0; // wjy: 资源快照限制为30秒一次，避免稳定性诊断本身成为性能热点。
     QHash<RemoteDesktopWindow*, QString> m_realtimeControllerTargetSessionIds; // wjy: 每个普通/平铺窗口映射一个唯一目标租约，关闭时精确删除。
     QHash<QString, platform::RealtimeScriptState> m_deviceRealtimeScriptStates; // wjy: Unknown/Idle/Running 独立于可恢复脚本 UI 元数据，离线只隐藏 Logo 不破坏恢复信息。
     // ===end====
@@ -251,6 +267,20 @@ private:
     QLineEdit* m_batchSubnetEdit = nullptr; // wjy: 批量新增网段输入框，支持以空格分隔多个 IPv4 通配网段。
     QPushButton* m_batchAddButton = nullptr; // wjy: 批量新增按钮，扫描期间禁用避免重复启动。
     QVector<QLineEdit*> m_shortcutKeyEdits; // wjy: Keyboard settings shortcut editors, one per remote-window action.
+    // =====wjy====
+    stream::RemoteQualityConfiguration m_remoteQualityConfiguration; // wjy: 主窗口缓存当前持久化全局画质，所有跟随全局窗口读取同一份值。
+    QComboBox* m_remoteQualityModeCombo = nullptr;
+    QSpinBox* m_remoteTargetFpsSpin = nullptr;
+    QSpinBox* m_remoteMinimumVisibleFpsSpin = nullptr;
+    QSpinBox* m_remoteSevereMinimumFpsSpin = nullptr;
+    QComboBox* m_remoteMinimumResolutionCombo = nullptr;
+    QSpinBox* m_remoteMinimizedFpsSpin = nullptr;
+    QComboBox* m_remoteMinimizedResolutionCombo = nullptr;
+    QSpinBox* m_remoteDegradationDelaySpin = nullptr;
+    QSpinBox* m_remoteRecoveryDelaySpin = nullptr;
+    QSpinBox* m_remoteReceiveBudgetSpin = nullptr;
+    QCheckBox* m_remoteAutomaticRecoveryCheck = nullptr; // wjy: 数值和下拉框使用真实Qt控件，保证键盘输入和可访问性可靠。
+    // ===end====
     QSet<int> m_registeredGlobalShortcutIds;
     quintptr m_globalShortcutWindowHandle = 0;
     QLineEdit* m_deviceIpEdit = nullptr;
@@ -260,6 +290,7 @@ private:
     QLineEdit* m_deviceGroupNameEdit = nullptr; // wjy: Group rename editor.
     QLineEdit* m_deviceListNameEdit = nullptr; // wjy: Device rename editor shown directly on the left list row.
     QTextEdit* m_scriptFileEdit = nullptr;
+    QTextEdit* m_scriptOutputEdit = nullptr; // wjy: 脚本日志正文使用只读文本控件，支持鼠标选择、Ctrl+C和右键复制。
     QPushButton* m_scriptFileSaveButton = nullptr;
     QTreeWidget* m_scriptFolderTree = nullptr; // wjy: Script Log tab tree used to choose a shared script folder before execution.
     QPushButton* m_saveDeviceButton = nullptr;

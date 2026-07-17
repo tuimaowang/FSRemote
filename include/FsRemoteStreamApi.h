@@ -44,6 +44,7 @@ enum FsRemoteStreamStatusCode {
     FSREMOTE_STATUS_RECEIVING_VIDEO = 50,
     FSREMOTE_STATUS_VIDEO_STATS = 60,
     FSREMOTE_STATUS_MOUSE_MODE = 61,
+    FSREMOTE_STATUS_QUALITY_APPLIED = 63,
     FSREMOTE_STATUS_ADMITTED = 70,
     FSREMOTE_STATUS_VIEW_ONLY = 71,
     FSREMOTE_STATUS_CONTROL_GRANTED = 72,
@@ -84,6 +85,46 @@ typedef struct FsRemoteIdentityCallbacks {
     FsRemoteIsPublicKeyAuthorizedCallback is_public_key_authorized;
     FsRemoteVerifyChallengeCallback verify_challenge;
 } FsRemoteIdentityCallbacks; // wjy: DLL 不直接依赖 Qt/OpenSSH 路径，通过稳定回调桥接现有设备密钥能力。
+
+enum FsRemoteViewerQualityMode {
+    FSREMOTE_VIEWER_QUALITY_AUTOMATIC = 1,
+    FSREMOTE_VIEWER_QUALITY_HIGH_LOCKED = 2,
+    FSREMOTE_VIEWER_QUALITY_BALANCED = 3,
+    FSREMOTE_VIEWER_QUALITY_SMOOTH = 4,
+};
+
+enum FsRemoteViewerQualityLimitation {
+    FSREMOTE_VIEWER_QUALITY_LIMIT_NONE = 0,
+    FSREMOTE_VIEWER_QUALITY_LIMIT_UNSUPPORTED = 1,
+    FSREMOTE_VIEWER_QUALITY_LIMIT_INVALID_REQUEST = 2,
+    FSREMOTE_VIEWER_QUALITY_LIMIT_APPLY_FAILED = 3,
+    FSREMOTE_VIEWER_QUALITY_LIMIT_CLAMPED = 4,
+};
+
+typedef struct FsRemoteViewerQualityConfig {
+    uint32_t struct_size; // wjy: 调用方填写结构大小，未来版本追加字段时旧DLL可安全拒绝或只读取已知部分。
+    uint32_t version; // wjy: 当前固定为1，与data-channel画质协议版本独立但同步演进。
+    uint64_t request_id; // wjy: 单窗口单调递增，迟到确认不能覆盖更新的用户选择。
+    uint32_t mode;
+    uint32_t target_width; // wjy: 宽高同时为0表示原始分辨率；非0时由Host按固定档位应用。
+    uint32_t target_height;
+    uint32_t target_fps;
+    uint32_t max_bitrate_kbps;
+    uint32_t priority; // wjy: 0到100；高质量锁定优先降级更晚，但不能越过硬资源边界。
+} FsRemoteViewerQualityConfig;
+
+typedef struct FsRemoteViewerQualityStatus {
+    uint32_t struct_size;
+    uint32_t version;
+    uint64_t request_id;
+    uint32_t supported; // wjy: 0表示旧Host/超时/明确不支持，现有流继续运行。
+    uint32_t applied_mode;
+    uint32_t applied_width;
+    uint32_t applied_height;
+    uint32_t applied_fps;
+    uint32_t applied_bitrate_kbps;
+    uint32_t limitation;
+} FsRemoteViewerQualityStatus; // wjy: Qt读取Host确认的实际值，标题栏不会把“请求值”冒充“已应用值”。
 // ===end====
 
 FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_host(uint16_t port);
@@ -109,6 +150,10 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_text
     void* user);
 void FSREMOTE_STREAM_CALL fsremote_stream_stop(FsRemoteStreamHandle handle);
 int FSREMOTE_STREAM_CALL fsremote_stream_send_input(FsRemoteStreamHandle handle, const char* message);
+// =====wjy====
+int FSREMOTE_STREAM_CALL fsremote_stream_set_viewer_quality(FsRemoteStreamHandle handle, const FsRemoteViewerQualityConfig* config);
+int FSREMOTE_STREAM_CALL fsremote_stream_get_viewer_quality_status(FsRemoteStreamHandle handle, FsRemoteViewerQualityStatus* status);
+// ===end====
 int FSREMOTE_STREAM_CALL fsremote_stream_is_busy(FsRemoteStreamHandle handle);
 // =====wjy====
 uint32_t FSREMOTE_STREAM_CALL fsremote_stream_active_session_count(FsRemoteStreamHandle handle); // wjy: 返回主机当前已登记会话数，供状态服务上报远控人数徽标。
