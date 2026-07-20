@@ -21,6 +21,9 @@
 #include "uu_codec_factory.h"
 #include "viewer_quality_protocol.h"
 #include "webrtc_session.h"
+// =====wjy====
+#include "windows_cursor_classifier.h"
+// ===end====
 
 #include <atomic>
 #include <algorithm>
@@ -787,13 +790,19 @@ bool handle_message(uu::WebrtcSession& session, const std::string& message)
     return true;
 }
 
+// =====wjy====
+constexpr DWORD kCapturedPrimaryAbsoluteMouseFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE; // wjy: 远控视频只采集被设为主屏的 Parsec 显示器，绝对鼠标必须使用主屏坐标语义。
+static_assert((kCapturedPrimaryAbsoluteMouseFlags & MOUSEEVENTF_VIRTUALDESK) == 0,
+    "single-source remote input must not target the whole virtual desktop"); // wjy: 编译期回归保护，防止以后再次把单屏画面坐标扩展到多显示器虚拟桌面。
+// ===end====
+
 void move_mouse_absolute(int x, int y, bool log_result)
 {
     INPUT input = {};
     input.type = INPUT_MOUSE;
     input.mi.dx = x;
     input.mi.dy = y;
-    input.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+    input.mi.dwFlags = kCapturedPrimaryAbsoluteMouseFlags; // wjy: 统一使用受编译期约束的主屏注入标志，避免多显示器设备把鼠标移动到远控画面之外。
     ::SetLastError(ERROR_SUCCESS);
     const UINT sent = SendInput(1, &input, sizeof(input));
     const DWORD error = ::GetLastError();
@@ -845,6 +854,81 @@ struct SessionPointerState {
     int last_viewer_y = 0;
     uint64_t relative_generation = 0;
 }; // wjy: 相对鼠标坐标必须按会话隔离，否则两个控制端交替移动会把彼此的绝对坐标误算成巨大位移。
+
+// =====wjy====
+std::optional<uu::StandardCursorShape> standard_cursor_shape_from_handle(HCURSOR cursor)
+{
+    if (!cursor) return std::nullopt; // wjy: 隐藏或暂不可读的光标没有句柄，交给窗口边缘命中回退。
+    if (cursor == ::LoadCursorW(nullptr, IDC_ARROW)) return uu::StandardCursorShape::Arrow;
+    if (cursor == ::LoadCursorW(nullptr, IDC_IBEAM)) return uu::StandardCursorShape::IBeam;
+    if (cursor == ::LoadCursorW(nullptr, IDC_WAIT)) return uu::StandardCursorShape::Wait;
+    if (cursor == ::LoadCursorW(nullptr, IDC_APPSTARTING)) return uu::StandardCursorShape::Busy;
+    if (cursor == ::LoadCursorW(nullptr, IDC_CROSS)) return uu::StandardCursorShape::Cross;
+    if (cursor == ::LoadCursorW(nullptr, IDC_HAND)) return uu::StandardCursorShape::Hand;
+    if (cursor == ::LoadCursorW(nullptr, IDC_NO)) return uu::StandardCursorShape::Forbidden;
+    if (cursor == ::LoadCursorW(nullptr, IDC_HELP)) return uu::StandardCursorShape::Help;
+    if (cursor == ::LoadCursorW(nullptr, IDC_UPARROW)) return uu::StandardCursorShape::UpArrow;
+    if (cursor == ::LoadCursorW(nullptr, IDC_SIZEALL)) return uu::StandardCursorShape::SizeAll;
+    if (cursor == ::LoadCursorW(nullptr, IDC_SIZEWE)) return uu::StandardCursorShape::SizeHorizontal; // wjy: Windows 左右双箭头映射 Qt 横向缩放。
+    if (cursor == ::LoadCursorW(nullptr, IDC_SIZENS)) return uu::StandardCursorShape::SizeVertical; // wjy: Windows 上下双箭头映射 Qt 纵向缩放。
+    if (cursor == ::LoadCursorW(nullptr, IDC_SIZENWSE)) return uu::StandardCursorShape::SizeNorthwestSoutheast; // wjy: 左上到右下对角线单独编码，禁止与另一方向混淆。
+    if (cursor == ::LoadCursorW(nullptr, IDC_SIZENESW)) return uu::StandardCursorShape::SizeNortheastSouthwest;
+    return std::nullopt; // wjy: 自定义句柄不再提前降级为箭头，先尝试由窗口的标准边框语义补齐缩放形状。
+}
+
+std::optional<uu::StandardCursorShape> standard_resize_cursor_shape_at_pointer()
+{
+    POINT point = {};
+    if (!::GetCursorPos(&point)) {
+        return std::nullopt;
+    }
+
+    HWND window = ::WindowFromPoint(point);
+    if (!window) {
+        return std::nullopt;
+    }
+    if (HWND root = ::GetAncestor(window, GA_ROOT)) {
+        window = root; // wjy: 子控件通常只返回 HTCLIENT，必须询问所属顶层窗口才能得到真实非客户区缩放边缘。
+    }
+
+    DWORD_PTR raw_hit_test = 0;
+    const LPARAM screen_position = MAKELPARAM(
+        static_cast<WORD>(point.x),
+        static_cast<WORD>(point.y)); // wjy: WM_NCHITTEST 按 Windows 约定接收两个有符号 16 位屏幕坐标，负数多屏坐标保留其补码位。
+    constexpr UINT kHitTestTimeoutMs = 12;
+    if (!::SendMessageTimeoutW(
+            window,
+            WM_NCHITTEST,
+            0,
+            screen_position,
+            SMTO_ABORTIFHUNG | SMTO_BLOCK | SMTO_ERRORONEXIT,
+            kHitTestTimeoutMs,
+            &raw_hit_test)) {
+        return std::nullopt; // wjy: 目标 GUI 线程卡死、退出或被权限隔离时快速回退，不阻塞 Host 状态线程。
+    }
+
+    return uu::standard_resize_cursor_shape_from_hit_test(static_cast<LRESULT>(raw_hit_test)); // wjy: 只接受八个标准可缩放边缘，标题栏和客户区继续保持实际光标。
+}
+
+uu::StandardCursorShape current_standard_cursor_shape()
+{
+    CURSORINFO info = {};
+    info.cbSize = sizeof(info);
+    const bool has_visible_cursor = ::GetCursorInfo(&info)
+        && (info.flags & CURSOR_SHOWING)
+        && info.hCursor; // wjy: 隐藏、读取失败和空句柄统一进入有界窗口命中回退。
+    const std::optional<uu::StandardCursorShape> handle_shape = has_visible_cursor
+        ? standard_cursor_shape_from_handle(info.hCursor)
+        : std::nullopt;
+    if (handle_shape.has_value() && *handle_shape != uu::StandardCursorShape::Arrow) {
+        return *handle_shape; // wjy: 已得到文本、手型或标准缩放句柄时直接使用，避免无意义的跨进程窗口消息。
+    }
+    if (const auto resize_shape = standard_resize_cursor_shape_at_pointer()) {
+        return *resize_shape; // wjy: 箭头、隐藏或自定义句柄仍可依据 Windows 非客户区语义显示正确双箭头。
+    }
+    return handle_shape.value_or(uu::StandardCursorShape::Arrow); // wjy: 命中查询失败或位于普通客户区时安全回退普通箭头。
+}
+// ===end====
 
 bool get_cursor_center_distance(int& dx, int& dy, int& screen_w, int& screen_h)
 {
@@ -1298,12 +1382,36 @@ class InputDispatcher final {
 public:
     using MouseModeCallback = std::function<void(bool relative, const char* reason)>;
     using ClipboardCallback = std::function<void(const std::string& encodedText)>;
+    using CursorShapeCallback = std::function<bool(uu::StandardCursorShape shape)>; // wjy: 回调返回可靠通道是否真正接收消息，未打开的会话保留待发送状态并在下一轮重试。
+    struct CursorSubscription {
+        CursorShapeCallback callback;
+        std::optional<uu::StandardCursorShape> last_sent_shape;
+        uint64_t generation = 0;
+    };
+    struct PendingCursorPublish {
+        std::string session_id;
+        CursorShapeCallback callback;
+        uint64_t generation = 0;
+    };
 
-    void registerSession(const std::string& session_id, MouseModeCallback callback, ClipboardCallback clipboard_callback = {})
+    void registerSession(
+        const std::string& session_id,
+        MouseModeCallback callback,
+        ClipboardCallback clipboard_callback = {})
     {
         std::lock_guard lock(mutex_);
         mouse_mode_callbacks_[session_id] = std::move(callback); // wjy: 每个已授权会话登记弱引用通知，鼠标模式变化时所有控制窗口保持一致。
         if (clipboard_callback) clipboard_callbacks_[session_id] = std::move(clipboard_callback);
+    }
+
+    void registerCursorSession(const std::string& session_id, CursorShapeCallback callback)
+    {
+        if (!callback) return;
+        std::lock_guard lock(mutex_);
+        CursorSubscription subscription;
+        subscription.callback = std::move(callback);
+        subscription.generation = ++next_cursor_subscription_generation_;
+        cursor_shape_callbacks_[session_id] = std::move(subscription); // wjy: 每个授权 Viewer 独立去重，新会话不能借用旧会话的“已发送”状态。
     }
 
     void dispatch(const std::string& session_id, const std::string& message)
@@ -1356,6 +1464,45 @@ public:
         for (const auto& callback : callbacks) callback(encoded);
     }
 
+    // =====wjy====
+    void pollHostCursor()
+    {
+        {
+            std::lock_guard lock(mutex_);
+            if (cursor_shape_callbacks_.empty()) {
+                return; // wjy: 没有 Viewer 订阅时不读取光标，更不会向桌面程序发送 WM_NCHITTEST。
+            }
+        }
+        const uu::StandardCursorShape shape = current_standard_cursor_shape(); // wjy: 系统调用和有界窗口命中都放在调度器锁外，不阻塞串行 SendInput。
+        std::vector<PendingCursorPublish> pending;
+        {
+            std::lock_guard lock(mutex_);
+            for (const auto& [session_id, subscription] : cursor_shape_callbacks_) {
+                if (subscription.callback
+                    && (!subscription.last_sent_shape.has_value() || *subscription.last_sent_shape != shape)) {
+                    pending.push_back({session_id, subscription.callback, subscription.generation}); // wjy: 仅复制未确认该形状的会话，锁外发送避免 WebRTC 反向阻塞串行输入。
+                }
+            }
+        }
+
+        std::vector<std::pair<std::string, uint64_t>> succeeded;
+        for (const PendingCursorPublish& publish : pending) {
+            if (publish.callback(shape)) {
+                succeeded.emplace_back(publish.session_id, publish.generation); // wjy: 只有 DataChannel::Send 成功才允许提交去重状态，通道尚未打开会在 25ms 后重试。
+            }
+        }
+        if (succeeded.empty()) return;
+
+        std::lock_guard lock(mutex_);
+        for (const auto& [session_id, generation] : succeeded) {
+            const auto iterator = cursor_shape_callbacks_.find(session_id);
+            if (iterator != cursor_shape_callbacks_.end() && iterator->second.generation == generation) {
+                iterator->second.last_sent_shape = shape; // wjy: 代际匹配防止旧发送结果覆盖同 ID 重新注册的新会话。
+            }
+        }
+    }
+    // ===end====
+
     void releaseSession(const std::string& session_id)
     {
         std::lock_guard lock(mutex_);
@@ -1366,6 +1513,12 @@ public:
         mouse_mode_callbacks_.erase(session_id);
         clipboard_callbacks_.erase(session_id);
         if (mouse_mode_callbacks_.empty()) reset_mouse_relative_mode("last-controller-left", false, nullptr);
+    }
+
+    void releaseCursorSession(const std::string& session_id)
+    {
+        std::lock_guard lock(mutex_);
+        cursor_shape_callbacks_.erase(session_id); // wjy: 查看权限与控制权限分离释放，只移除目标会话且不会改变其它 Viewer 的已确认形状。
     }
 
     void shutdown()
@@ -1379,6 +1532,7 @@ public:
         pointer_by_session_.clear();
         mouse_mode_callbacks_.clear();
         clipboard_callbacks_.clear();
+        cursor_shape_callbacks_.clear();
         reset_mouse_relative_mode("host-shutdown", false, nullptr); // wjy: Host 资源销毁前兜底清空所有会话输入与相对鼠标状态。
     }
 
@@ -1395,6 +1549,8 @@ private:
     std::unordered_map<std::string, SessionPointerState> pointer_by_session_;
     std::unordered_map<std::string, MouseModeCallback> mouse_mode_callbacks_;
     std::unordered_map<std::string, ClipboardCallback> clipboard_callbacks_;
+    std::unordered_map<std::string, CursorSubscription> cursor_shape_callbacks_; // wjy: 每个 Viewer 独立保存最后成功形状，新增或暂未打开通道的会话不会被全局去重漏发。
+    uint64_t next_cursor_subscription_generation_ = 0;
     DWORD last_clipboard_sequence_ = 0;
     std::string last_clipboard_payload_;
 };
@@ -1487,13 +1643,13 @@ public:
             }
         });
         // =====wjy====
-        clipboard_worker_ = std::thread([this] {
+        host_state_worker_ = std::thread([this] {
             try {
-                runClipboardPollLoop(); // wjy: 剪贴板辅助线程故障只停止同步，不影响视频、输入或Host主循环。
+                runHostStatePollLoop(); // wjy: 辅助线程同时同步低延迟光标和低频剪贴板，故障不影响视频、输入或 Host 主循环。
             } catch (const std::exception& exception) {
-                append_log(std::string("host clipboard worker exception: ") + exception.what());
+                append_log(std::string("host state worker exception: ") + exception.what());
             } catch (...) {
-                append_log("host clipboard worker unknown exception");
+                append_log("host state worker unknown exception");
             }
         });
         // ===end====
@@ -1772,7 +1928,21 @@ private:
                     }
                 });
             // ===end====
-        } // wjy: view_only 会话不登记回调，即使发送 data-channel 输入也无法到达系统注入路径。
+        } // wjy: view_only 会话不登记输入回调，即使发送 data-channel 输入也无法到达系统注入路径。
+        // =====wjy====
+        input_dispatcher_.registerCursorSession(
+            context->admission.session_id,
+            [weak = std::weak_ptr<HostClientSession>(context)](uu::StandardCursorShape shape) -> bool {
+                std::string wire;
+                std::string error;
+                if (!uu::serialize_cursor_shape_message(shape, &wire, &error)) return false; // wjy: 非法枚举不发送，Viewer 保持上一次有效光标。
+                if (const auto locked = weak.lock(); locked && !locked->cancelled) {
+                    std::lock_guard webrtc_lock(locked->webrtc_mutex);
+                    return locked->webrtc && locked->webrtc->send_control_message(wire); // wjy: 控制与只读授权窗口都接收光标；通道未打开时返回 false 触发后续重试。
+                }
+                return false;
+            });
+        // ===end====
         // =====wjy====
         context->webrtc->set_control_callback(
             [this, weak = std::weak_ptr<HostClientSession>(context), has_control](const std::string& message) {
@@ -1854,6 +2024,7 @@ private:
         }
         retiring_webrtc.reset(); // wjy: 在锁外执行 PeerConnection 析构，避免析构等待 data-channel 回调时与模式通知锁形成互等。
         if (has_control) input_dispatcher_.releaseSession(context->admission.session_id); // wjy: 销毁输入回调后释放该会话独有的键、按钮和相对坐标状态。
+        input_dispatcher_.releaseCursorSession(context->admission.session_id); // wjy: 无论控制或只读会话都精确注销光标订阅，避免后台轮询继续尝试已关闭通道。
         context->media_subscription.reset(); // wjy: 先销毁 PeerConnection/track，再减少共享 source 订阅计数，避免捕获线程提前停止。
         context->cancel();
         if (owns_audio) stopAudioForSingleSession(); // wjy: 非音频主会话退出不能停止首个会话仍在使用的音频连接。
@@ -1941,13 +2112,17 @@ private:
     }
 
     // =====wjy====
-    void runClipboardPollLoop()
+    void runHostStatePollLoop()
     {
+        int clipboardCountdown = 0;
         while (running_) {
-            input_dispatcher_.pollHostClipboard();
-            for (int i = 0; i < 7 && running_; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(50)); // wjy: 约 350ms 一轮，关闭时尽快退出。
+            input_dispatcher_.pollHostCursor(); // wjy: 25ms 采样使应用边缘缩放光标变化接近本地 Windows 反馈速度。
+            if (clipboardCountdown <= 0) {
+                input_dispatcher_.pollHostClipboard();
+                clipboardCountdown = 14; // wjy: 14×25ms 保持原约 350ms 剪贴板轮询节奏，不因光标同步增加剪贴板流量。
             }
+            --clipboardCountdown;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));
         }
     }
     // ===end====
@@ -1962,7 +2137,7 @@ private:
         if (worker_.joinable()) worker_.join(); // wjy: 第二步先等待 accept manager 退出，杜绝它与关闭线程同时回收并 join 同一个 worker。
         append_log("host shutdown accept worker joined");
         // =====wjy====
-        if (clipboard_worker_.joinable()) clipboard_worker_.join(); // wjy: 剪贴板轮询线程在 accept worker 之后 join，避免关闭竞态。
+        if (host_state_worker_.joinable()) host_state_worker_.join(); // wjy: 光标/剪贴板状态线程在 accept worker 之后 join，避免关闭竞态。
         // ===end====
         runtime_.shutdown(); // wjy: 全部会话对象销毁后，由 HostInstance 创建线程配对关闭共享 WebRTC/SSL runtime。
         append_log("host shutdown completed");
@@ -1973,7 +2148,7 @@ private:
     uu::HostMediaPipeline media_pipeline_; // wjy: manager 独占 VDD/桌面捕获启停权，会话只能通过订阅令牌引用共享 source。
     InputDispatcher input_dispatcher_; // wjy: HostInstance 唯一持有输入调度器，三个会话共享同一确定性 SendInput 顺序。
     // =====wjy====
-    std::thread clipboard_worker_;
+    std::thread host_state_worker_;
     // ===end====
     mutable std::mutex sessions_mutex_;
     std::unordered_map<std::string, std::shared_ptr<HostClientSession>> sessions_;
@@ -2307,6 +2482,12 @@ private:
                 report_status(status_callback_, user_, 61, "MOUSE relative");
             } else if (message == "__fsremote_mouse_mode desktop") {
                 report_status(status_callback_, user_, 61, "MOUSE desktop");
+            } else if (uu::is_cursor_shape_message(message)) {
+                uu::StandardCursorShape shape = uu::StandardCursorShape::Arrow;
+                std::string error;
+                if (uu::parse_cursor_shape_message(message, &shape, &error)) {
+                    report_status(status_callback_, user_, FSREMOTE_STATUS_CURSOR_SHAPE, message.c_str()); // wjy: 严格解析通过后才把版本化消息交给 Qt，畸形 token 不改变当前光标。
+                }
             } else if (message.rfind("cb ", 0) == 0) {
                 // wjy: Host -> Viewer 文本剪贴板：通过状态回调把 payload 交给 Qt 层写入本机剪贴板。
                 report_status(status_callback_, user_, 62, message.c_str());

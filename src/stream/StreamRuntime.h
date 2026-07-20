@@ -18,6 +18,7 @@ enum class StreamStatusCode : int {
     VideoStats = FSREMOTE_STATUS_VIDEO_STATS,
     MouseMode = FSREMOTE_STATUS_MOUSE_MODE,
     QualityApplied = FSREMOTE_STATUS_QUALITY_APPLIED,
+    CursorShape = FSREMOTE_STATUS_CURSOR_SHAPE, // wjy: 强类型状态枚举同步公开 DLL 的远端光标形状通知。
     Admitted = FSREMOTE_STATUS_ADMITTED,
     ViewOnly = FSREMOTE_STATUS_VIEW_ONLY,
     ControlGranted = FSREMOTE_STATUS_CONTROL_GRANTED,

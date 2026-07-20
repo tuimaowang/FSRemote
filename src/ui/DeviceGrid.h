@@ -155,6 +155,8 @@ private:
     int devicePoweringOnRemainingSecondsForIndex(int index) const;
     void setupSettingsControls();
     void updateSettingsControls();
+    void applyDesktopWallpaperRotationSetting(bool rotateImmediately); // wjy: 根据持久化开关启停分钟定时器，用户开启时可立即触发首轮。
+    void startDesktopWallpaperRotation(bool userInitiated); // wjy: 后台选择并应用下一张共享图片，防止网络访问阻塞设置界面或产生重叠任务。
     void saveRemoteQualitySettingsFromControls(); // wjy: 收集远控画质页字段、统一归一化持久化并立即通知跟随全局的窗口。
     void registerRemoteQualityWindow(RemoteDesktopWindow* window); // wjy: 普通和平铺窗口共用同一套质量注册、销毁清理和即时重算逻辑。
     void requestRemoteQualityEvaluation(); // wjy: 合并同一事件循环内多次窗口变化，最多排队一个全局质量计算任务。
@@ -274,6 +276,7 @@ private:
     QLineEdit* m_periodicDeviceDiscoveryIntervalEdit = nullptr; // wjy: 周期检查新增设备的秒数输入框，默认 60 秒。
     QLineEdit* m_batchSubnetEdit = nullptr; // wjy: 批量新增网段输入框，支持以空格分隔多个 IPv4 通配网段。
     QPushButton* m_batchAddButton = nullptr; // wjy: 批量新增按钮，扫描期间禁用避免重复启动。
+    QLineEdit* m_wallpaperRotationIntervalEdit = nullptr; // wjy: 自动壁纸轮换分钟输入框，仅在开关开启且卡片可见时显示。
     QVector<QLineEdit*> m_shortcutKeyEdits; // wjy: Keyboard settings shortcut editors, one per remote-window action.
     // =====wjy====
     stream::RemoteQualityConfiguration m_remoteQualityConfiguration; // wjy: 主窗口缓存当前持久化全局画质，所有跟随全局窗口读取同一份值。
@@ -343,7 +346,12 @@ private:
     bool m_remoteUpdateAvailabilityRefreshInProgress = false; // wjy: 防止上一轮目标版本查询未结束时重复创建后台任务。
     bool m_wakeProbeInProgress = false;
     bool m_batchAddInProgress = false; // wjy: 标记批量新增扫描是否正在后台执行。
+    bool m_wallpaperRotationEnabled = false; // wjy: 新安装默认关闭，避免未经用户选择就修改当前桌面。
+    bool m_wallpaperRotationInProgress = false; // wjy: 网络目录访问和缓存写入期间阻止定时器启动重叠任务。
     int m_periodicDeviceDiscoveryIntervalSeconds = 60; // wjy: 周期新增设备默认每 60 秒扫描一次。
+    int m_wallpaperRotationIntervalMinutes = 1; // wjy: 自动壁纸默认每 1 分钟切换一次，设置页允许修改。
+    QString m_lastWallpaperSourcePath; // wjy: 只记录最后成功应用的共享源文件，下一轮据此按稳定顺序继续。
+    QString m_wallpaperRotationStatusText; // wjy: 在设置卡片展示正在切换、成功文件名或最近失败原因，定时失败不使用重复弹窗。
     // =====wjy====
     bool m_updateAvailable = false; // wjy: 后台检测到更高版本时显示标题栏更新按钮，用户点击前绝不开始安装。
     bool m_updatePreparing = false; // wjy: 防止用户连续点击重复创建多个更新任务和更新器进程。
@@ -385,6 +393,7 @@ private:
     // ===end====
     QTimer* m_remoteUpdateAvailabilityTimer = nullptr; // wjy: 打开远控窗口期间每 10 秒检查一次目标是否发现共享新版。
     QTimer* m_periodicDeviceDiscoveryTimer = nullptr; // wjy: 到期后复用批量新增扫描，已有扫描进行中时自动跳过本轮。
+    QTimer* m_wallpaperRotationTimer = nullptr; // wjy: 开关开启后按用户分钟数触发下一张壁纸，关闭或退出时立即停止。
     QTimer* m_wakeVisualTimer = nullptr;
     QTimer* m_scriptOutputFlushTimer = nullptr;
     QElapsedTimer m_detailAnimationClock;

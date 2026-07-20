@@ -30,7 +30,8 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
     target_sources(fsremote_stream PRIVATE
         third_party/uu_stream_webrtc/src/control_admission_policy.h
         third_party/uu_stream_webrtc/src/shared_input_state.h
-    ) # wjy: DLL 的协同准入与输入调度器复用可独立测试的策略和逐会话按键/按钮状态。
+        third_party/uu_stream_webrtc/src/windows_cursor_classifier.h
+    ) # wjy: DLL 的协同准入、输入状态与 Windows 边缘光标映射都登记为可独立测试的生产策略。
     if(MSVC)
         target_compile_options(uu_stream_common PRIVATE /utf-8) # wjy: 原生公共库已有中文 WJY 注释，统一 UTF-8 可避免系统代码页把多字节尾部误判为续行反斜杠。
         target_compile_options(fsremote_stream PRIVATE /utf-8) # wjy: DLL API 和实现新增中文说明后也必须按 UTF-8 编译，否则可能破坏 extern "C" 边界。
@@ -114,7 +115,28 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
     # ===end====
 endif()
 
-find_package(Qt6 REQUIRED COMPONENTS Widgets Svg Network)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Svg Network Gui) # wjy: 壁纸服务测试直接使用 QImage/QImageReader，因此显式声明 Qt Gui 组件。
+
+# =====wjy====
+option(FSREMOTE_BUILD_WALLPAPER_TESTS "Build shared wallpaper discovery tests" ON)
+if(FSREMOTE_BUILD_WALLPAPER_TESTS)
+    enable_testing()
+    add_executable(fsremote_desktop_wallpaper_service_tests
+        tests/desktop_wallpaper_service_tests.cpp
+        src/system/DesktopWallpaperService.cpp
+        src/system/DesktopWallpaperService.h
+    ) # wjy: 测试直接编译生产服务，只调用无副作用的候选筛选入口，不修改开发机真实桌面。
+    target_include_directories(fsremote_desktop_wallpaper_service_tests PRIVATE src)
+    target_link_libraries(fsremote_desktop_wallpaper_service_tests PRIVATE Qt6::Gui)
+    if(WIN32)
+        target_link_libraries(fsremote_desktop_wallpaper_service_tests PRIVATE user32) # wjy: 生产服务包含 SystemParametersInfoW，测试虽不调用仍需解析链接符号。
+    endif()
+    if(MSVC)
+        target_compile_options(fsremote_desktop_wallpaper_service_tests PRIVATE /utf-8) # wjy: 服务错误提示和注释包含中文，MSVC 必须按 UTF-8 编译。
+    endif()
+    add_test(NAME fsremote_desktop_wallpaper_service_tests COMMAND fsremote_desktop_wallpaper_service_tests)
+endif()
+# ===end====
 
 # =====wjy====
 option(FSREMOTE_BUILD_VIEWER_STABILITY_TESTS "Build bounded multi-viewer frame handoff tests" ON)
@@ -164,6 +186,17 @@ if(FSREMOTE_BUILD_VIEWER_STABILITY_TESTS)
         target_compile_options(fsremote_remote_input_broadcast_tests PRIVATE /utf-8) # wjy: 新增中文所有权注释统一按 UTF-8 编译。
     endif()
     add_test(NAME fsremote_remote_input_broadcast_tests COMMAND fsremote_remote_input_broadcast_tests)
+
+    add_executable(fsremote_remote_cursor_shape_tests
+        tests/remote_cursor_shape_tests.cpp
+        src/ui/RemoteCursorShape.h
+    ) # wjy: 无需启动远控会话即可验证全部 Windows 标准光标的 Qt 映射及版本、未知形状和多余字段拒绝规则。
+    target_include_directories(fsremote_remote_cursor_shape_tests PRIVATE src)
+    target_link_libraries(fsremote_remote_cursor_shape_tests PRIVATE Qt6::Core)
+    if(MSVC)
+        target_compile_options(fsremote_remote_cursor_shape_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME fsremote_remote_cursor_shape_tests COMMAND fsremote_remote_cursor_shape_tests)
     # ===end====
 endif()
 # ===end====
@@ -220,6 +253,7 @@ qt_add_executable(FSRemote WIN32
     src/ui/DeviceGrid.h
     src/ui/RemoteDesktopWindow.cpp
     src/ui/RemoteDesktopWindow.h
+    src/ui/RemoteCursorShape.h
     src/ui/RemoteViewerLifecycleManager.cpp
     src/ui/RemoteViewerLifecycleManager.h
     src/ui/RemoteQualityCoordinator.cpp
@@ -237,6 +271,10 @@ qt_add_executable(FSRemote WIN32
     src/system/AppSettings.h
     src/system/PowerManager.cpp
     src/system/PowerManager.h
+    # =====wjy====
+    src/system/DesktopWallpaperService.cpp
+    src/system/DesktopWallpaperService.h
+    # ===end====
     src/system/PortableOpenSshManager.cpp
     src/system/PortableOpenSshManager.h
     src/system/StartupManager.cpp
@@ -273,7 +311,7 @@ qt_add_executable(FSRemote WIN32
 target_include_directories(FSRemote PRIVATE src include third_party/parsec_vdd)
 target_link_libraries(FSRemote PRIVATE Qt6::Widgets Qt6::Svg Qt6::Network)
 if(WIN32)
-    target_link_libraries(FSRemote PRIVATE wbemuuid ole32 oleaut32 iphlpapi ws2_32 advapi32 shell32 setupapi cfgmgr32 d3d11 dxgi psapi)
+    target_link_libraries(FSRemote PRIVATE wbemuuid ole32 oleaut32 iphlpapi ws2_32 advapi32 shell32 setupapi cfgmgr32 d3d11 dxgi psapi user32) # wjy: 壁纸服务调用 SystemParametersInfoW，显式链接其 User32 实现。
 endif()
 
 if(MSVC)

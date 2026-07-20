@@ -4,6 +4,7 @@
 #include "system/DeviceCommandService.h"
 #include "stream/StreamRuntime.h"
 #include "ui/D3D11FramePresenter.h"
+#include "ui/RemoteCursorShape.h"
 #include "ui/RemoteViewerLifecycleManager.h"
 
 #include <QByteArray>
@@ -1275,8 +1276,8 @@ void FSREMOTE_STREAM_CALL onViewerStatus(void* user, int code, const char* messa
 
     const QString text = message ? QString::fromUtf8(message) : QString();
     // =====wjy====
-    if (code != 60) {
-        appendViewerDebugLog(QStringLiteral("viewer status code=%1 message=%2").arg(code).arg(text)); // wjy: correlate UI status text with native stream checkpoints while avoiding bitrate log spam.
+    if (code != 60 && code != FSREMOTE_STATUS_CURSOR_SHAPE) {
+        appendViewerDebugLog(QStringLiteral("viewer status code=%1 message=%2").arg(code).arg(text)); // wjy: 保留低频连接检查点，同时跳过逐帧码率和高频光标变化，避免鼠标经过窗口边缘时产生磁盘日志压力。
     }
     // ===end====
     QMetaObject::invokeMethod(window.data(), [window, generation, code, text] {
@@ -1299,6 +1300,12 @@ void FSREMOTE_STREAM_CALL onViewerStatus(void* user, int code, const char* messa
             window->applyRemoteClipboardPayload(text.mid(3)); // wjy: Host 推送的文本剪贴板。
             return;
         }
+        // =====wjy====
+        if (code == FSREMOTE_STATUS_CURSOR_SHAPE) {
+            window->setRemoteCursorShape(text); // wjy: 原生层已严格验证协议；Qt 层仍按完整版本消息映射，避免状态码复用时误改光标。
+            return;
+        }
+        // ===end====
         if (code == FSREMOTE_STATUS_QUALITY_APPLIED) {
             window->refreshAppliedRemoteQualityStatus(); // wjy: 状态回调只通知“有新快照”，实际值通过稳定C ABI读取，避免解析脆弱文本。
             return;
@@ -2465,21 +2472,30 @@ void RemoteDesktopWindow::setRemoteMouseCaptureActive(bool active)
 
     m_remoteMouseCaptureActive = active;
     if (active) {
-        setCursor(Qt::BlankCursor);
-        if (m_texturePresenter) {
-            m_texturePresenter->setCursor(Qt::BlankCursor);
-        }
+        setWindowAndPresenterCursor(Qt::BlankCursor); // wjy: 相对鼠标模式始终拥有最高优先级，远端形状更新只能缓存不能显示。
         recenterRemoteMouseCapture();
     } else {
-        unsetCursor();
-        if (m_texturePresenter) {
-            m_texturePresenter->unsetCursor();
-        }
+        updateResizeCursor(mapFromGlobal(QCursor::pos())); // wjy: 退出捕获后立即按当前位置恢复本地边框或已缓存的远端桌面光标。
         RemoteInputEvent event;
         event.type = RemoteInputEventType::CaptureRelease;
         dispatchRemoteInputEvent(event); // wjy: 主控退出相对鼠标模式时把释放同步到所有跟随端，避免其它目标继续隐藏或锁定鼠标。
     }
 }
+
+// =====wjy====
+void RemoteDesktopWindow::setRemoteCursorShape(const QString& statusMessage)
+{
+    const std::optional<Qt::CursorShape> shape = remoteCursorShapeFromStatus(QStringView(statusMessage));
+    if (!shape.has_value()) {
+        return; // wjy: 非法、未知或未来版本消息不覆盖最后一个有效形状，保证当前会话显示稳定。
+    }
+
+    m_remoteCursorShape = *shape;
+    if (!m_remoteMouseCaptureActive) {
+        updateResizeCursor(mapFromGlobal(QCursor::pos())); // wjy: 状态到达时鼠标可能静止，主动刷新才能无需再次移动就看到远端窗口缩放光标。
+    }
+}
+// ===end====
 
 bool RemoteDesktopWindow::sendRemoteMouseMove(const QPoint& position, Qt::MouseButtons buttons)
 {
@@ -2742,22 +2758,42 @@ void RemoteDesktopWindow::updateResizeCursor(const QPoint& position)
         return; // wjy: 相对鼠标捕获模式由 BlankCursor 统一控制，不能被普通边缘缩放光标覆盖。
     }
     if (!isFullScreen() && m_remoteUpdateAvailable && remoteUpdateButtonRect().contains(position)) {
-        setCursor(Qt::PointingHandCursor);
+        setWindowAndPresenterCursor(Qt::PointingHandCursor);
         return; // wjy: 更新入口使用手型指针；按钮远离 6px 缩放边缘，不影响窗口缩放命中。
     }
     const int edges = resizeEdgesAt(position);
     if ((edges & ResizeLeft && edges & ResizeTop) || (edges & ResizeRight && edges & ResizeBottom)) {
-        setCursor(Qt::SizeFDiagCursor);
+        setWindowAndPresenterCursor(Qt::SizeFDiagCursor);
     } else if ((edges & ResizeRight && edges & ResizeTop) || (edges & ResizeLeft && edges & ResizeBottom)) {
-        setCursor(Qt::SizeBDiagCursor);
+        setWindowAndPresenterCursor(Qt::SizeBDiagCursor);
     } else if (edges & (ResizeLeft | ResizeRight)) {
-        setCursor(Qt::SizeHorCursor);
+        setWindowAndPresenterCursor(Qt::SizeHorCursor);
     } else if (edges & (ResizeTop | ResizeBottom)) {
-        setCursor(Qt::SizeVerCursor);
+        setWindowAndPresenterCursor(Qt::SizeVerCursor);
+    } else if (remoteImageRect().contains(position)) {
+        setWindowAndPresenterCursor(m_remoteCursorShape); // wjy: 只有远端图像区域跟随受控 Windows 光标，标题栏与黑边继续保持本地界面语义。
     } else {
-        unsetCursor();
+        unsetWindowAndPresenterCursor();
     }
 }
+
+// =====wjy====
+void RemoteDesktopWindow::setWindowAndPresenterCursor(Qt::CursorShape shape)
+{
+    setCursor(shape);
+    if (m_texturePresenter) {
+        m_texturePresenter->setCursor(shape); // wjy: D3D 子控件直接接收远控画面鼠标事件，显式同步可避免其系统箭头遮盖父窗口形状。
+    }
+}
+
+void RemoteDesktopWindow::unsetWindowAndPresenterCursor()
+{
+    unsetCursor();
+    if (m_texturePresenter) {
+        m_texturePresenter->unsetCursor();
+    }
+}
+// ===end====
 
 void RemoteDesktopWindow::updateWindowMask()
 {
@@ -3159,6 +3195,10 @@ void RemoteDesktopWindow::startViewerConnectionWithAdmission()
     // =====wjy====
     m_viewerStartQueued = false;
     m_viewerStartAdmissionActive = true; // wjy: 从此刻到连接成功/失败/stop完成期间占用一个初始化预算。
+    m_remoteCursorShape = Qt::ArrowCursor; // wjy: 替换 Viewer 会话不得继承旧 Host 最后的缩放形状；旧 Host 或暂未发送状态时保持普通箭头。
+    if (!m_remoteMouseCaptureActive) {
+        updateResizeCursor(mapFromGlobal(QCursor::pos())); // wjy: 鼠标静止在远端画面内时也立即清除上一会话遗留光标，无需等待下一次移动。
+    }
     appendViewerDebugLog(QStringLiteral("startViewerConnection admitted host=%1").arg(m_hostIp));
     if (m_viewerHandle || m_viewerStopInProgress || m_closeInProgress) {
         releaseViewerStartupAdmission(); // wjy: 排队期间状态已变化时不再创建原生Viewer，并立即把名额交给下一窗口。

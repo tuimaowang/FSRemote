@@ -21,6 +21,12 @@ public:
     static void setPeriodicDeviceDiscoveryIntervalSeconds(int seconds);
     // ===end====
     // =====wjy====
+    static bool desktopWallpaperRotationEnabled(); // wjy: 自动桌面壁纸轮换默认关闭，仅在用户主动开启后跨启动恢复。
+    static void setDesktopWallpaperRotationEnabled(bool enabled);
+    static int desktopWallpaperRotationIntervalMinutes(); // wjy: 壁纸周期统一使用整分钟，默认 1 分钟。
+    static void setDesktopWallpaperRotationIntervalMinutes(int minutes);
+    // ===end====
+    // =====wjy====
     static int remoteHostMaxSessions();
     static void setRemoteHostMaxSessions(int sessions);
     static int remoteHostAggregateVideoKbps();

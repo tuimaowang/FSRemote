@@ -101,8 +101,11 @@ private:
     ConnectionStateCallback connection_state_callback_; // wjy: 回调与其它会话回调共用互斥锁，避免 ICE 线程和析构线程并发读写函数对象。
     // ===end====
     std::mutex callback_mutex_;
+    // =====wjy====
+    std::mutex control_channel_mutex_; // wjy: 初始化、WebRTC 回调、Host 状态轮询发送和析构可能位于不同线程，统一保护通道引用及观察者。
     webrtc::scoped_refptr<webrtc::DataChannelInterface> control_channel_;
     std::unique_ptr<ControlDataObserver> control_observer_;
+    // ===end====
     webrtc::scoped_refptr<webrtc::VideoTrackInterface> local_video_track_;
     webrtc::scoped_refptr<webrtc::RtpSenderInterface> local_video_sender_; // wjy: 保存每会话独立sender，质量消息只调整对应控制端的编码参数。
     std::mutex sender_mutex_; // wjy: data-channel质量回调和WebRTC关闭可能并发访问sender，统一串行保护。

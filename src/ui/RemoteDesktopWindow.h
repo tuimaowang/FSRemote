@@ -55,6 +55,9 @@ public:
     void setConnectionStatus(int code, const QString& message);
     void setEncodedBitrateMbps(double mbps);
     void setRemoteMouseCaptureActive(bool active);
+    // =====wjy====
+    void setRemoteCursorShape(const QString& statusMessage); // wjy: 查看器状态回调在 Qt 主线程缓存远端 Windows 标准光标，并按当前命中区域安全刷新。
+    // ===end====
     void setRememberGeometryEnabled(bool enabled);
     bool isClosingConnection() const;
     bool acceptsViewerGeneration(quint64 viewerGeneration) const; // wjy: 原生工作线程通过原子代际判断当前回调是否仍属于本窗口现用viewer。
@@ -188,6 +191,10 @@ private:
     // ===end====
     int resizeEdgesAt(const QPoint& position) const;
     void updateResizeCursor(const QPoint& position);
+    // =====wjy====
+    void setWindowAndPresenterCursor(Qt::CursorShape shape); // wjy: 软件绘制父窗口与 D3D 纹理子窗口必须使用同一光标，否则共享纹理区域会覆盖父窗口设置。
+    void unsetWindowAndPresenterCursor();
+    // ===end====
     void updateWindowMask();
     void updateTexturePresenterGeometry();
     void showSnapPreviews(const QHash<RemoteDesktopWindow*, QRect>& geometries); // wjy: 拖拽越界重排时同时显示整组窗口的最终虚影。
@@ -278,6 +285,9 @@ private:
     int m_centerRgbAvg = 0; // wjy: Center-region average sampled RGB value for black-page testing.
     int m_centerRgbMax = 0; // wjy: Center-region maximum sampled RGB value for black-page testing.
     bool m_remoteMouseCaptureActive = false;
+    // =====wjy====
+    Qt::CursorShape m_remoteCursorShape = Qt::ArrowCursor; // wjy: 缓存最近一次远端桌面光标，退出相对鼠标模式后无需等待下一条状态即可恢复。
+    // ===end====
     QTimer* m_framePresentTimer = nullptr; // wjy: Presents the newest pending frame at a fixed UI pace instead of posting one UI task per decoded frame.
     QTimer* m_sessionTimer = nullptr;
     bool m_waitingShortcutRelease = false;

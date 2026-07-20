@@ -340,10 +340,16 @@ WebrtcSession::~WebrtcSession()
     // =====wjy====
     append_viewer_log("session dtor begin"); // wjy: if crash happens during close, this marks the start of teardown.
     // ===end====
-    if (control_channel_) {
-        control_channel_->UnregisterObserver();
-        control_channel_ = nullptr;
+    // =====wjy====
+    {
+        std::lock_guard lock(control_channel_mutex_);
+        if (control_channel_) {
+            control_channel_->UnregisterObserver(); // wjy: 先阻止迟到 DataChannel 回调，再释放观察者和共享通道引用。
+            control_channel_ = nullptr;
+        }
+        control_observer_.reset();
     }
+    // ===end====
     // =====wjy====
     if (remote_video_track_ && remote_video_sink_) { // wjy: WebRTC keeps a raw sink pointer on the track, so unregister before freeing it.
         remote_video_track_->RemoveSink(remote_video_sink_.get()); // wjy: prevent video worker callbacks from hitting a released CallbackVideoSink.
@@ -412,11 +418,13 @@ void WebrtcSession::set_connection_state_callback(ConnectionStateCallback callba
 
 bool WebrtcSession::send_control_message(const std::string& message)
 {
-    auto channel = control_channel_;
-    if (!channel || channel->state() != webrtc::DataChannelInterface::kOpen) {
+    // =====wjy====
+    std::lock_guard lock(control_channel_mutex_); // wjy: 与初始化、OnDataChannel 和析构串行，禁止跨线程读写同一个 scoped_refptr。
+    if (!control_channel_ || control_channel_->state() != webrtc::DataChannelInterface::kOpen) {
         return false;
     }
-    return channel->Send(webrtc::DataBuffer(message));
+    return control_channel_->Send(webrtc::DataBuffer(message)); // wjy: 同一锁也保持多个 Host 辅助线程发送顺序，可靠有序通道不会被并发调用打乱。
+    // ===end====
 }
 
 // =====wjy====
@@ -602,9 +610,14 @@ bool WebrtcSession::configure_host_media(std::string* error)
         if (error) *error = std::string("CreateDataChannel failed: ") + std::string(data_result.error().message());
         return false;
     }
-    control_channel_ = data_result.MoveValue();
-    control_observer_ = std::make_unique<ControlDataObserver>(this);
-    control_channel_->RegisterObserver(control_observer_.get());
+    // =====wjy====
+    {
+        std::lock_guard lock(control_channel_mutex_);
+        control_channel_ = data_result.MoveValue(); // wjy: Host 初始化发布通道时与 25ms 光标发送线程串行，未完成前发送稳定返回 false。
+        control_observer_ = std::make_unique<ControlDataObserver>(this);
+        control_channel_->RegisterObserver(control_observer_.get());
+    }
+    // ===end====
 
     // =====wjy====
     if (!config_.host_video_source) {
@@ -738,12 +751,15 @@ void WebrtcSession::OnRemoveStream(webrtc::scoped_refptr<webrtc::MediaStreamInte
 void WebrtcSession::OnDataChannel(webrtc::scoped_refptr<webrtc::DataChannelInterface> data_channel)
 {
     if (!data_channel || data_channel->label() != "control") return;
+    // =====wjy====
+    std::lock_guard lock(control_channel_mutex_); // wjy: Viewer 的 WebRTC 回调与 UI 输入发送、质量请求和析构可能并发，必须原子替换通道与观察者。
     if (control_channel_) {
         control_channel_->UnregisterObserver();
     }
     control_channel_ = data_channel;
     control_observer_ = std::make_unique<ControlDataObserver>(this);
     control_channel_->RegisterObserver(control_observer_.get());
+    // ===end====
 }
 void WebrtcSession::OnRenegotiationNeeded() {}
 void WebrtcSession::OnIceConnectionChange(webrtc::PeerConnectionInterface::IceConnectionState state)

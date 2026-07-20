@@ -170,6 +170,30 @@ void AppSettings::setPeriodicDeviceDiscoveryIntervalSeconds(int seconds)
 // ===end====
 
 // =====wjy====
+bool AppSettings::desktopWallpaperRotationEnabled()
+{
+    return settings().value(QStringLiteral("desktopWallpaperRotationEnabled"), false).toBool(); // wjy: 没有历史配置的新安装保持关闭，避免程序首次启动就修改用户桌面。
+}
+
+void AppSettings::setDesktopWallpaperRotationEnabled(bool enabled)
+{
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("desktopWallpaperRotationEnabled"), enabled);
+}
+
+int AppSettings::desktopWallpaperRotationIntervalMinutes()
+{
+    return qBound(1, settings().value(QStringLiteral("desktopWallpaperRotationIntervalMinutes"), 1).toInt(), 1440); // wjy: 异常注册表值夹紧到 1 分钟至 24 小时，保证 QTimer 毫秒值安全有效。
+}
+
+void AppSettings::setDesktopWallpaperRotationIntervalMinutes(int minutes)
+{
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("desktopWallpaperRotationIntervalMinutes"), qBound(1, minutes, 1440));
+}
+// ===end====
+
+// =====wjy====
 int AppSettings::remoteHostMaxSessions()
 {
     return qBound(1, settings().value(QStringLiteral("remoteHostMaxSessions"), 3).toInt(), 3); // wjy: 注册表没有该项时直接返回 3，新设备复制程序后无需额外配置即可使用三路会话。

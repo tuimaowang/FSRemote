@@ -2,6 +2,7 @@
 
 #include "system/AppSettings.h"
 #include "system/DeviceCommandService.h"
+#include "system/DesktopWallpaperService.h"
 #include "system/DeviceInfoService.h"
 #include "system/DeviceListSyncModel.h"
 #include "system/DeviceListSyncService.h"
@@ -51,6 +52,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPointer>
+#include <QPolygonF>
 #include <QPixmap>
 #include <QPushButton>
 #include <QToolTip>
@@ -1693,8 +1695,8 @@ QRect localInfoCopyButtonRect(int index)
 QRect settingsLocalInfoHeaderRect()
 {
     // =====wjy====
-    const int top = (platform::UpdateService::canPublishCurrentBuild() ? 664 : 588)
-        + (kDetailScriptPanelTop - 120); // wjy: 周期检查卡片固定占一行；非构建运行包仅跳过发布卡片并上移 76 像素。
+    const int top = (platform::UpdateService::canPublishCurrentBuild() ? 740 : 664)
+        + (kDetailScriptPanelTop - 120); // wjy: 壁纸测试卡片固定占一行；非构建运行包仍只跳过发布卡片并上移 76 像素。
     return QRect(contentLeft(), top, contentWidth(), 44);
     // ===end====
 }
@@ -2548,7 +2550,19 @@ QRect settingsPeriodicDeviceDiscoverySwitchRect()
 // =====wjy====
 QRect settingsPublishUpdateButtonRect()
 {
-    return QRect(contentLeft() + contentWidth() - 118, 600 + (kDetailScriptPanelTop - 120), 100, 28); // wjy: 周期检查卡片插入后，发布按钮随发布卡片整体下移一行。
+    return QRect(contentLeft() + contentWidth() - 118, 676 + (kDetailScriptPanelTop - 120), 100, 28); // wjy: 新增壁纸测试卡片后，发布按钮随发布卡片整体再下移一行。
+}
+// ===end====
+
+// =====wjy====
+QRect settingsWallpaperRotationSwitchRect()
+{
+    return QRect(contentLeft() + contentWidth() - 90, 607 + (kDetailScriptPanelTop - 120), 82, 32); // wjy: 壁纸开关与其它常规设置开关右对齐，整张卡片点击命中保持一致。
+}
+
+QRect settingsWallpaperRotationIntervalInputRect()
+{
+    return QRect(contentLeft() + contentWidth() - 224, 607 + (kDetailScriptPanelTop - 120), 78, 32); // wjy: 分钟输入框位于开关左侧，并为“分钟”单位文字预留固定宽度。
 }
 // ===end====
 
@@ -2646,10 +2660,14 @@ void drawSettingsOptionIcon(QPainter& painter, const QRect& rect, int iconKind)
         painter.drawRect(QRectF(c.x() - 8, c.y() - 6, 16, 12));
         painter.drawLine(QPointF(c.x() - 4, c.y() - 1), QPointF(c.x() + 4, c.y() - 1));
         painter.drawLine(QPointF(c.x(), c.y() - 5), QPointF(c.x(), c.y() + 5));
-    } else {
+    } else if (iconKind == 5) {
         painter.drawRoundedRect(QRectF(c.x() - 8, c.y() - 7, 16, 14), 2, 2);
         painter.drawLine(QPointF(c.x() - 5, c.y() - 1), QPointF(c.x() + 5, c.y() - 1));
         painter.drawLine(QPointF(c.x() - 5, c.y() + 4), QPointF(c.x() + 5, c.y() + 4));
+    } else {
+        painter.drawRoundedRect(QRectF(c.x() - 9, c.y() - 7, 18, 14), 2, 2); // wjy: 壁纸测试项使用横向图片框图标，与本机信息文档图标区分。
+        painter.drawEllipse(QRectF(c.x() + 3, c.y() - 4, 3, 3)); // wjy: 右上圆点表示图片中的太阳。
+        painter.drawPolyline(QPolygonF{QPointF(c.x() - 7, c.y() + 5), QPointF(c.x() - 2, c.y()), QPointF(c.x() + 2, c.y() + 4), QPointF(c.x() + 5, c.y() + 1), QPointF(c.x() + 8, c.y() + 5)}); // wjy: 山形折线强化“图片/壁纸”语义。
     }
     painter.restore();
 }
@@ -2677,6 +2695,8 @@ void drawSettingsPage(
     bool remoteWakeupEnabled,
     bool preventSleepEnabled,
     bool periodicDeviceDiscoveryEnabled,
+    bool wallpaperRotationEnabled,
+    const QString& wallpaperRotationStatusText,
     bool localInfoExpanded,
     bool addDeviceExpanded,
     bool keyboardSelected,
@@ -2813,7 +2833,8 @@ void drawSettingsPage(
     const QRect batchCard(contentLeft(), 420 + settingsYShift, contentWidth(), 88);
     // =====wjy====
     const QRect periodicDiscoveryCard(contentLeft(), 512 + settingsYShift, contentWidth(), 71); // wjy: 周期检查新增设备紧跟在批量新增设备下面。
-    const QRect updateCard(contentLeft(), 588 + settingsYShift, contentWidth(), 56); // wjy: 更新卡片为周期检查让出一行。
+    const QRect wallpaperTestCard(contentLeft(), 588 + settingsYShift, contentWidth(), 71); // wjy: 自动壁纸轮换独占一张设置卡片，清楚标明共享来源且不混入设备扫描功能。
+    const QRect updateCard(contentLeft(), 664 + settingsYShift, contentWidth(), 56); // wjy: 更新卡片为壁纸测试再让出一行，后续本机信息按统一布局继续下移。
     // ===end====
     const bool canPublishUpdates = platform::UpdateService::canPublishCurrentBuild(); // wjy: 绘制、命中测试和服务层统一使用构建目录身份。
     painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
@@ -2823,6 +2844,7 @@ void drawSettingsPage(
     painter.drawRoundedRect(QRectF(refreshCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
     painter.drawRoundedRect(QRectF(batchCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
     painter.drawRoundedRect(QRectF(periodicDiscoveryCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4); // wjy: 新设置项始终显示，开关关闭时仅隐藏秒数输入框。
+    painter.drawRoundedRect(QRectF(wallpaperTestCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4); // wjy: 手绘卡片始终随常规页内容滚动，真实分钟输入框只覆盖右侧编辑区。
     if (canPublishUpdates) {
         painter.drawRoundedRect(QRectF(updateCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4); // wjy: 只有构建版本显示完整发布卡片，普通运行包不绘制任何占位背景。
     }
@@ -2839,6 +2861,7 @@ void drawSettingsPage(
     drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, refreshCard.y() + 22, 28, 28), 3);
     drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, batchCard.y() + 30, 28, 28), 4);
     drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, periodicDiscoveryCard.y() + 22, 28, 28), 3); // wjy: 周期检查复用刷新类图标，与功能语义一致。
+    drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, wallpaperTestCard.y() + 22, 28, 28), 6); // wjy: 横向图片图标帮助用户快速识别自动桌面壁纸入口。
     drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, settingsLocalInfoHeaderRect().y() + 8, 28, 28), 5);
     drawUiIcon(
         painter,
@@ -2853,6 +2876,17 @@ void drawSettingsPage(
     painter.drawText(QRectF(contentLeft() + 60, refreshCard.y() + 16, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("实时状态同步")); // wjy: 旧“列表自动刷新”改为只读实时广播说明，不再暗示周期 TCP 轮询。
     painter.drawText(QRectF(contentLeft() + 60, batchCard.y() + 24, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("批量新增设备"));
     painter.drawText(QRectF(contentLeft() + 60, periodicDiscoveryCard.y() + 16, 220, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("周期检查新增设备"));
+    painter.drawText(QRectF(contentLeft() + 60, wallpaperTestCard.y() + 16, 160, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("自动切换桌面壁纸")); // wjy: 标题明确表示开关控制的是持续自动轮换，并为右侧运行状态留出空间。
+    if (!wallpaperRotationStatusText.isEmpty()) {
+        QFont wallpaperStatusFont(textFont);
+        wallpaperStatusFont.setPixelSize(11);
+        painter.setFont(wallpaperStatusFont);
+        painter.setPen(QColor(QStringLiteral("#687384")));
+        painter.drawText(
+            QRectF(contentLeft() + 230, wallpaperTestCard.y() + 16, qMax(0, settingsWallpaperRotationIntervalInputRect().left() - contentLeft() - 240), 20),
+            Qt::AlignVCenter | Qt::AlignLeft,
+            wallpaperRotationStatusText); // wjy: 自动轮换结果直接留在卡片中，周期失败不会每分钟弹窗打断用户。
+    }
     // =====wjy====
     if (canPublishUpdates) {
         painter.drawText(QRectF(contentLeft() + 18, updateCard.y() + 8, 160, 18), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("软件更新发布")); // wjy: 构建版本说明此区域只负责向共享目录发布新包。
@@ -2877,6 +2911,10 @@ void drawSettingsPage(
     painter.drawText(QRectF(contentLeft() + 60, refreshCard.y() + 37, qMax(260, contentWidth() - 260), 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("状态变化立即同步，心跳仅用于识别异常退出和离线")); // wjy: 明确业务变化是事件驱动，1/5 秒心跳不是全设备轮询。
     painter.drawText(QRectF(contentLeft() + 60, batchCard.y() + 45, 220, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("可输入多个网段，用空格、逗号或换行分隔"));
     painter.drawText(QRectF(contentLeft() + 60, periodicDiscoveryCard.y() + 37, qMax(260, contentWidth() - 340), 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("按批量新增网段自动发现并加入新设备"));
+    painter.drawText(
+        QRectF(contentLeft() + 60, wallpaperTestCard.y() + 37, qMax(120, settingsWallpaperRotationIntervalInputRect().left() - contentLeft() - 76), 20),
+        Qt::AlignVCenter | Qt::AlignLeft,
+        platform::DesktopWallpaperService::sharedDirectoryPath()); // wjy: 在分钟输入框旁直接展示固定 UNC 来源，用户开启前就能核对图片放置位置。
 
     const auto drawSwitchWithLabel = [&painter, &textFont](const QRect& rect, bool checked) {
         painter.setFont(textFont);
@@ -2888,6 +2926,7 @@ void drawSettingsPage(
     drawSwitchWithLabel(settingsRemoteWakeupSwitchRect(), remoteWakeupEnabled);
     drawSwitchWithLabel(settingsPreventSleepSwitchRect(), preventSleepEnabled);
     drawSwitchWithLabel(settingsPeriodicDeviceDiscoverySwitchRect(), periodicDeviceDiscoveryEnabled); // wjy: 开关绘制与列表自动刷新完全一致。
+    drawSwitchWithLabel(settingsWallpaperRotationSwitchRect(), wallpaperRotationEnabled); // wjy: 壁纸轮换复用统一“开/关 + 蓝色滑块”视觉。
     painter.setFont(textFont);
     painter.setPen(QColor(QStringLiteral("#16A34A")));
     painter.drawText(QRectF(settingsAutoRefreshSwitchRect()), Qt::AlignCenter, QString::fromUtf8("已启用")); // wjy: 实时总线为固定基础能力，设置页只读展示，不提供重新开启旧轮询的入口。
@@ -2907,6 +2946,14 @@ void drawSettingsPage(
         painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
         painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
         painter.drawRoundedRect(QRectF(settingsPeriodicDeviceDiscoveryIntervalInputRect()), 4, 4); // wjy: 开启后显示 60 秒输入框，关闭时卡片保持简洁。
+    }
+    if (wallpaperRotationEnabled) {
+        painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
+        painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
+        painter.drawRoundedRect(QRectF(settingsWallpaperRotationIntervalInputRect()), 4, 4); // wjy: 只在轮换开启时显示分钟输入背景，关闭状态保持卡片简洁。
+        painter.setFont(subFont);
+        painter.setPen(QColor(QStringLiteral("#687384")));
+        painter.drawText(QRectF(settingsWallpaperRotationIntervalInputRect().right() + 5, settingsWallpaperRotationIntervalInputRect().y(), 35, 32), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("分钟"));
     }
 
     painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
@@ -3036,6 +3083,8 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     // =====wjy====
     m_periodicDeviceDiscoveryEnabled = platform::AppSettings::periodicDeviceDiscoveryEnabled();
     m_periodicDeviceDiscoveryIntervalSeconds = platform::AppSettings::periodicDeviceDiscoveryIntervalSeconds(); // wjy: 恢复周期新增开关和秒数，新安装默认关闭且为 60 秒。
+    m_wallpaperRotationEnabled = platform::AppSettings::desktopWallpaperRotationEnabled();
+    m_wallpaperRotationIntervalMinutes = platform::AppSettings::desktopWallpaperRotationIntervalMinutes(); // wjy: 恢复自动壁纸开关和分钟数，新安装默认关闭且为 1 分钟。
     // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before PowerManager restore")); // wjy: 应用防睡眠前打点，便于区分设置读取和系统 API 调用。
     platform::PowerManager::setPreventSleepEnabled(m_preventSleepEnabled); // wjy: 根据保存的设置恢复防睡眠，保证重启程序后行为一致。
@@ -3206,6 +3255,14 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     });
     // ===end====
 
+    // =====wjy====
+    m_wallpaperRotationTimer = new QTimer(this);
+    m_wallpaperRotationTimer->setTimerType(Qt::CoarseTimer); // wjy: 分钟级壁纸任务无需高精度唤醒，降低常驻定时器开销。
+    connect(m_wallpaperRotationTimer, &QTimer::timeout, this, [this] {
+        startDesktopWallpaperRotation(false); // wjy: 定时触发静默轮换；失败保留开关并等待下一周期重试。
+    });
+    // ===end====
+
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before wake visual timer")); // wjy: 记录远程开机视觉定时器创建前的位置。
     m_wakeVisualTimer = new QTimer(this);
     m_wakeVisualTimer->setTimerType(Qt::PreciseTimer);
@@ -3262,6 +3319,7 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     }); // wjy: Batch script output repaint into a short timer, keeping the UI responsive while still feeling live.
 
     applyPeriodicDeviceDiscoverySetting(false); // wjy: 启动时只恢复周期，不立即扫描，第一次检查发生在设置的 60 秒之后。
+    applyDesktopWallpaperRotationSetting(false); // wjy: 启动时恢复已保存的轮换周期，默认关闭时不会启动定时器或修改桌面。
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before delayed local device info setup"));
     QTimer::singleShot(500, this, [this] { // wjy: 窗口创建后再读取本机 IP/MAC，隔离 DeviceInfoService::local 是否导致 Release 启动阶段堆损坏。
         writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] delayed before DeviceInfoService::local")); // wjy: 延迟读取本机信息前打点。
@@ -3474,6 +3532,9 @@ void DeviceGrid::prepareForApplicationExit()
     platform::PortableOpenSshManager::instance().stopClientProcesses(); // wjy: 用户从托盘或主窗口选择退出时，立即关闭本程序打开的 cmd/ssh 交互终端。
     if (m_periodicDeviceDiscoveryTimer) {
         m_periodicDeviceDiscoveryTimer->stop(); // wjy: 退出准备开始后禁止定时器再启动新的网段扫描任务。
+    }
+    if (m_wallpaperRotationTimer) {
+        m_wallpaperRotationTimer->stop(); // wjy: 退出阶段停止壁纸定时器，避免再向后台线程登记共享目录任务。
     }
     // ===end====
     if (m_scriptCancelRequested) {
@@ -4766,6 +4827,32 @@ void DeviceGrid::setupSettingsControls()
     });
 
     // =====wjy====
+    m_wallpaperRotationIntervalEdit = new QLineEdit(this);
+    m_wallpaperRotationIntervalEdit->setGeometry(settingsWallpaperRotationIntervalInputRect());
+    m_wallpaperRotationIntervalEdit->setValidator(new QIntValidator(1, 1440, m_wallpaperRotationIntervalEdit)); // wjy: 轮换范围限制为 1 分钟至 24 小时，避免零周期忙循环或毫秒溢出。
+    m_wallpaperRotationIntervalEdit->setText(QString::number(m_wallpaperRotationIntervalMinutes));
+    m_wallpaperRotationIntervalEdit->setAlignment(Qt::AlignCenter);
+    m_wallpaperRotationIntervalEdit->setPlaceholderText(QStringLiteral("1"));
+    m_wallpaperRotationIntervalEdit->setStyleSheet(QStringLiteral(
+        "QLineEdit{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;padding:0 8px;"
+        "font-family:'Microsoft YaHei UI';font-size:14px;color:#040B18;}"
+        "QLineEdit:focus{border:1px solid #3A7BFC;}"
+        "QLineEdit:disabled{background:#F5F7FA;border:1px solid #DDE3EA;color:#687384;}"));
+    const auto saveWallpaperRotationInterval = [this] {
+        if (!m_wallpaperRotationIntervalEdit) {
+            return;
+        }
+        const int minutes = qBound(1, m_wallpaperRotationIntervalEdit->text().trimmed().toInt(), 1440);
+        m_wallpaperRotationIntervalMinutes = minutes;
+        m_wallpaperRotationIntervalEdit->setText(QString::number(minutes)); // wjy: 空值或输入中间态失焦时回退为 1，界面与最终持久化值保持一致。
+        platform::AppSettings::setDesktopWallpaperRotationIntervalMinutes(minutes);
+        applyDesktopWallpaperRotationSetting(false); // wjy: 修改分钟数后从当前时刻重新计时，不额外立即切换一次。
+    };
+    connect(m_wallpaperRotationIntervalEdit, &QLineEdit::editingFinished, this, saveWallpaperRotationInterval);
+    connect(m_wallpaperRotationIntervalEdit, &QLineEdit::returnPressed, this, saveWallpaperRotationInterval);
+    // ===end====
+
+    // =====wjy====
     const QString shortcutEditStyle = QStringLiteral(
         "QLineEdit{background:#F8FAFC;border:1px solid #CBD5E1;border-radius:4px;padding:0 8px;"
         "font-family:'Microsoft YaHei UI';font-size:13px;font-weight:600;color:#334155;}"
@@ -4893,6 +4980,96 @@ void DeviceGrid::setupSettingsControls()
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] setupSettingsControls end")); // wjy: 设置控件初始化完整结束。
     // ===end====
 }
+
+// =====wjy====
+void DeviceGrid::applyDesktopWallpaperRotationSetting(bool rotateImmediately)
+{
+    if (!m_wallpaperRotationTimer) {
+        return;
+    }
+
+    if (!m_wallpaperRotationEnabled) {
+        m_wallpaperRotationTimer->stop(); // wjy: 关闭开关立即停止后续周期，不再访问共享目录。
+        m_wallpaperRotationStatusText.clear();
+        if (m_wallpaperRotationIntervalEdit) {
+            m_wallpaperRotationIntervalEdit->setToolTip(QString());
+        }
+        updateSettingsControls();
+        update();
+        return;
+    }
+
+    const int intervalMs = qBound(1, m_wallpaperRotationIntervalMinutes, 1440) * 60 * 1000;
+    m_wallpaperRotationTimer->start(intervalMs); // wjy: 开启或修改分钟数后都从当前时刻重新计算下一轮。
+    if (rotateImmediately) {
+        startDesktopWallpaperRotation(true); // wjy: 用户刚开启时立即验证并切换一张，不必先等待完整周期。
+    }
+    updateSettingsControls();
+    update();
+}
+
+void DeviceGrid::startDesktopWallpaperRotation(bool userInitiated)
+{
+    if (!m_wallpaperRotationEnabled || m_wallpaperRotationInProgress || m_shuttingDown) {
+        return; // wjy: 开关关闭、上一轮仍在运行或退出阶段都不能登记新的壁纸任务。
+    }
+
+    m_wallpaperRotationInProgress = true;
+    m_wallpaperRotationStatusText = QString::fromUtf8("正在切换…");
+    update();
+    const QString previousSourcePath = m_lastWallpaperSourcePath;
+    QPointer<DeviceGrid> self(this);
+    runBackgroundTask([self, previousSourcePath, userInitiated] {
+        const platform::DeviceInfo targetDeviceInfo = platform::DeviceInfoService::local(); // wjy: 在壁纸工作线程读取当前目标机器信息，避免网络适配器枚举阻塞设置界面，也不会误用控制端设备名。
+        QString targetDeviceName = targetDeviceInfo.name.trimmed();
+        if (targetDeviceName.isEmpty()) {
+            targetDeviceName = targetDeviceInfo.ip.trimmed(); // wjy: 极少数取不到 Windows 计算机名的环境使用本机 IP，与设备自动发现的兜底语义保持一致。
+        }
+        if (targetDeviceName.isEmpty()) {
+            targetDeviceName = QString::fromUtf8("未知设备"); // wjy: 名称和 IP 都不可用时仍生成明确标识，绝不退回固定“99”。
+        }
+        const platform::DesktopWallpaperApplyResult result = platform::DesktopWallpaperService::applyNextSharedImage(previousSourcePath, targetDeviceName); // wjy: 共享原图只读取一次，目标名只合成到本机唯一 current.bmp，不复制上百张源图片。
+        if (!self) {
+            return;
+        }
+
+        QMetaObject::invokeMethod(self, [self, result, userInitiated] {
+            if (!self) {
+                return;
+            }
+            DeviceGrid* grid = self.data();
+            grid->m_wallpaperRotationInProgress = false;
+            if (result.success) {
+                grid->m_lastWallpaperSourcePath = result.sourcePath; // wjy: 仅成功应用后推进游标；失败时下一周期继续尝试同一张，避免无声跳过。
+                if (grid->m_wallpaperRotationEnabled) {
+                    grid->m_wallpaperRotationStatusText = QString::fromUtf8("已切换：%1").arg(QFileInfo(result.sourcePath).fileName());
+                    if (grid->m_wallpaperRotationIntervalEdit) {
+                        grid->m_wallpaperRotationIntervalEdit->setToolTip(grid->m_wallpaperRotationStatusText);
+                    }
+                } else {
+                    grid->m_wallpaperRotationStatusText.clear(); // wjy: 用户在后台任务结束前关闭开关时不再显示运行状态，且定时器已经停止。
+                }
+            } else if (grid->m_wallpaperRotationEnabled) {
+                grid->m_wallpaperRotationStatusText = QString::fromUtf8("切换失败，稍后重试");
+                if (grid->m_wallpaperRotationIntervalEdit) {
+                    grid->m_wallpaperRotationIntervalEdit->setToolTip(result.errorMessage); // wjy: 卡片保留简短状态，悬停分钟框可查看完整共享目录或缓存错误。
+                }
+                if (userInitiated) {
+                    QMessageBox::warning(
+                        grid,
+                        QString(),
+                        QString::fromUtf8("桌面壁纸自动切换已开启，但首次切换失败：%1\n程序会在下一个周期继续重试。")
+                            .arg(result.errorMessage)); // wjy: 首次开启失败明确告知用户，但定时失败不每分钟弹窗打断工作。
+                }
+            } else {
+                grid->m_wallpaperRotationStatusText.clear();
+            }
+            grid->updateSettingsControls();
+            grid->update();
+        }, Qt::QueuedConnection);
+    });
+}
+// ===end====
 
 void DeviceGrid::updateAddDeviceControls()
 {
@@ -5029,6 +5206,22 @@ void DeviceGrid::updateSettingsControls()
             m_batchAddButton->raise();
         }
     }
+
+    // =====wjy====
+    if (m_wallpaperRotationIntervalEdit) {
+        const QRect wallpaperIntervalRect = settingsScrolledRect(settingsWallpaperRotationIntervalInputRect(), m_settingsScrollOffset); // wjy: 真实分钟输入框跟随手绘常规页内容使用同一滚动偏移。
+        const bool wallpaperIntervalVisible = m_settingsSelected
+            && m_settingsTab == SettingsTab::General
+            && m_wallpaperRotationEnabled
+            && viewport.contains(wallpaperIntervalRect); // wjy: 仅在开关开启且输入框完整位于常规页视口时显示，避免遮住其它页面。
+        m_wallpaperRotationIntervalEdit->setGeometry(wallpaperIntervalRect);
+        m_wallpaperRotationIntervalEdit->setVisible(wallpaperIntervalVisible);
+        m_wallpaperRotationIntervalEdit->setEnabled(wallpaperIntervalVisible);
+        if (wallpaperIntervalVisible) {
+            m_wallpaperRotationIntervalEdit->raise();
+        }
+    }
+    // ===end====
 
     for (int i = 0; i < m_shortcutKeyEdits.size(); ++i) {
         QLineEdit* edit = m_shortcutKeyEdits.at(i);
@@ -8260,6 +8453,8 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             m_remoteWakeupEnabled,
             m_preventSleepEnabled,
             m_periodicDeviceDiscoveryEnabled,
+            m_wallpaperRotationEnabled,
+            m_wallpaperRotationStatusText,
             m_settingsLocalInfoExpanded,
             m_settingsAddDeviceExpanded,
             m_settingsTab == SettingsTab::Keyboard,
@@ -8614,6 +8809,12 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         && !m_periodicDeviceDiscoveryIntervalEdit->geometry().contains(event->pos())) {
         m_periodicDeviceDiscoveryIntervalEdit->clearFocus();
         setFocus(Qt::MouseFocusReason); // wjy: 点击周期检查输入框外部时立即保存秒数并重启定时器。
+    }
+    if (m_wallpaperRotationIntervalEdit
+        && m_wallpaperRotationIntervalEdit->hasFocus()
+        && !m_wallpaperRotationIntervalEdit->geometry().contains(event->pos())) {
+        m_wallpaperRotationIntervalEdit->clearFocus();
+        setFocus(Qt::MouseFocusReason); // wjy: 点击分钟输入框外部时立即保存新周期并从当前时刻重新计时。
     }
     if (m_batchSubnetEdit
         && m_batchSubnetEdit->hasFocus()
@@ -9955,6 +10156,13 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 platform::AppSettings::setPeriodicDeviceDiscoveryEnabled(m_periodicDeviceDiscoveryEnabled);
                 applyPeriodicDeviceDiscoverySetting(m_periodicDeviceDiscoveryEnabled); // wjy: 开启时立即扫描一次，之后按 60 秒周期；关闭时立即停表。
                 update();
+                event->accept();
+                return;
+            }
+            if (settingsScrolledRect(settingsWallpaperRotationSwitchRect(), m_settingsScrollOffset).contains(event->pos())) {
+                m_wallpaperRotationEnabled = !m_wallpaperRotationEnabled;
+                platform::AppSettings::setDesktopWallpaperRotationEnabled(m_wallpaperRotationEnabled);
+                applyDesktopWallpaperRotationSetting(m_wallpaperRotationEnabled); // wjy: 开启后立即后台切换首张并启动分钟周期；关闭后立即停表。
                 event->accept();
                 return;
             }
