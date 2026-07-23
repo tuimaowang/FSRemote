@@ -2414,9 +2414,9 @@ private:
         report_status(status_callback_, user_, FSREMOTE_STATUS_INITIALIZING_WEBRTC, "Initializing WebRTC");
         uu::NativeWebrtcRuntime runtime;
         std::atomic_bool frameReported = false;
-        runtime.set_decoded_texture_callback([this, &frameReported](int width, int height, void* shared_handle, uint64_t frame_id, double encoded_mbps) {
+        runtime.set_decoded_texture_callback([this, &frameReported](int width, int height, void* shared_handle, uint64_t frame_id, double encoded_mbps) -> int {
             if (!texture_callback_ || !running_ || !shared_handle) {
-                return false;
+                return FSREMOTE_TEXTURE_FRAME_FALLBACK; // wjy: 无纹理接收方时保留原有BGRA软件回退。
             }
             bool expected = false;
             if (frameReported.compare_exchange_strong(expected, true)) {
@@ -2431,7 +2431,7 @@ private:
             }
             trySendPendingQualityRequest(); // wjy: data-channel通常在首帧前后打开，未发送请求在每帧以单槽状态低成本重试。
             checkPendingQualityTimeout();
-            return texture_callback_(user_, width, height, shared_handle, frame_id, encoded_mbps) != 0;
+            return texture_callback_(user_, width, height, shared_handle, frame_id, encoded_mbps); // wjy: 原样传递接受/回退/受控丢帧，不能把结果2压缩成bool。
         });
         // =====wjy====
         runtime.set_decoded_bgra_callback([this, &frameReported](int width, int height, const uint8_t* bgra, size_t size, double encoded_mbps) {

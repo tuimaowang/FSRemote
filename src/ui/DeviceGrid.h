@@ -1,11 +1,16 @@
 #pragma once
 
 #include "system/DeviceInfoService.h"
+#include "system/LocalSystemInfoService.h"
 #include "system/DeviceRealtimeStateService.h"
 #include "system/DeviceStatusService.h"
+#include "system/DeviceStatusRefreshResult.h"
 #include "stream/RemoteQualityPolicy.h"
 #include "ui/RemoteQualityCoordinator.h"
 #include "ui/RemoteInputBroadcastCoordinator.h"
+#include "ui/RemoteWindowCoordinator.h"
+#include "ui/ScriptPanelController.h"
+#include "ui/ScriptUiStateStore.h"
 
 #include <atomic>
 #include <functional>
@@ -36,15 +41,18 @@ class QMouseEvent;
 class QPaintEvent;
 class QPushButton;
 class QResizeEvent;
+class QShowEvent;
 class QSpinBox;
 class QTextEdit;
 class QTimer;
 class QTreeWidget;
 class QTreeWidgetItem;
+class QVariantAnimation;
 class QWheelEvent;
 
 namespace ui {
 
+class DeviceSearchPanel;
 class RemoteDesktopWindow;
 class RemoteViewerLifecycleManager; // wjy: DeviceGrid统一拥有远控初始化准入和可等待生命周期工作池。
 
@@ -54,7 +62,7 @@ enum class BottomAction {
     More,
 };
 
-class DeviceGrid final : public QFrame {
+class DeviceGrid final : public QFrame, private ScriptPanelController {
     Q_OBJECT
 
 public:
@@ -72,6 +80,7 @@ protected:
     void keyPressEvent(QKeyEvent* event) override;
     bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override;
     void resizeEvent(QResizeEvent* event) override;
+    void showEvent(QShowEvent* event) override; // wjy: 从托盘或最小化恢复时确保顶部自动隐藏窗口完整滑出。
     void leaveEvent(QEvent* event) override;
 
 private:
@@ -82,13 +91,36 @@ private:
     };
 
     enum class DeviceDetailTab {
-        Config,
-        ScriptLog,
+        Local, // wjy: 本机页位于脚本左侧，展示控制端系统信息和实时 CPU 占用。
+        ScriptLog, // wjy: 枚举顺序与界面从左到右一致，后续新增页签时更容易核对绘制和命中区域。
+        Config, // wjy: 配置页固定排在脚本右侧，保持状态定义、绘制顺序和点击顺序一致。
+        Search, // wjy: 查找与脚本、配置共用设备详情页签区域，不再使用独立弹窗。
     };
 
+    // =====wjy====
+    void setupDeviceSearchPanel(); // wjy: 创建一次嵌入式查找面板，后续页签切换只更新快照、几何和显隐。
+    void updateDeviceSearchPanel(); // wjy: 将面板限制在配置页同一内容区域，并在离开查找页时立即隐藏。
+    void showDeviceSearchPanel(); // wjy: 点击查找页签或 Ctrl+F 时刷新只读快照、切换页面并聚焦输入框。
+    void selectDeviceFromSearch(const QString& deviceId); // wjy: 双击结果后按稳定设备 ID 重新解析、展开分组并定位详情。
+    void showLocalSystemInfoTab(); // wjy: 点击本机页签时读取静态信息、建立 CPU/GPU 基线并启动三类资源周期刷新。
+    void refreshLocalSystemInfoTab(); // wjy: 重新读取本机静态信息并重置 CPU/GPU/内存显示状态，避免跨页面复用旧样本。
+    void animateLocalUsageTo(QVariantAnimation* animation, qreal& displayPercent, int targetPercent); // wjy: 三类资源共用同一缓动入口，让圆环和数字从当前显示值平滑过渡。
+    void updateLocalSystemMonitorState(); // wjy: 只在本机页选中时保持 CPU、GPU、内存定时采样，其它页面立即停止。
+    // ===end====
     void startDeviceSwitchAnimation(int newIndex, const QString& newName);
     void applySyncedDeviceSnapshot(const QJsonObject& snapshot); // wjy: 在 UI 线程按稳定 ID 应用共享快照，并保留本机分组展开状态和当前选择。
     void syncResponsiveLayoutState() const;
+    // =====wjy====
+    void setDetailPanelCollapsed(bool collapsed); // wjy: 启动详情栏收起或展开的窗口宽度缓动，不再直接闪变尺寸。
+    void finishDetailPanelCollapseTransition(); // wjy: 动画结束后统一固定最终宽度约束、控件显隐和本机采样状态。
+    // ===end====
+    // =====wjy====
+    void ensureTopEdgeAutoHideControllers(); // wjy: 首次顶部停靠时延迟创建位置动画、全局鼠标监视和收起延迟定时器。
+    void updateTopEdgeAutoHideAfterWindowDrag(const QPoint& releaseGlobalPosition); // wjy: 拖窗松开后按鼠标所在屏幕判断是否吸附顶部。
+    void setTopEdgeAutoHidden(bool hidden); // wjy: 在当前屏幕顶部与仅露出触发条的位置之间平滑移动主窗口。
+    void monitorTopEdgeAutoHide(); // wjy: 窗口缩入屏幕后仍检查全局鼠标，进入顶部触发条即可滑下。
+    void cancelTopEdgeAutoHide(); // wjy: 用户重新拖窗、缩放或退出时停止所有自动位置修改。
+    // ===end====
     void beginWindowResize(const QPoint& position, const QPoint& globalPosition);
     void updateWindowResize(const QPoint& globalPosition);
     void finishWindowResize();
@@ -96,6 +128,10 @@ private:
     void updateDesktopHover(const QPoint& position);
     void updateBottomActionHover(const QPoint& position);
     void clearBottomActionHover();
+    // =====wjy====
+    void animateDeviceListScrollTo(int targetOffset); // wjy: 设备轨道空白点击后用短促缓动移动滑块，直接拖动仍保持实时跟手。
+    void animateSettingsScrollTo(int targetOffset); // wjy: 常规设置轨道点击使用同样的快速缓动，并同步移动真实输入控件。
+    // ===end====
     void setupAddDeviceControls();
     void updateAddDeviceControls();
     void setupLocalInfoControls();
@@ -143,6 +179,7 @@ private:
     void startCurrentDeviceWakeVisual();
     void toggleRemoteWakeup();
     void refreshDeviceStatuses();
+    void applyDeviceStatusRefreshResult(platform::DeviceStatusRefreshResult refreshResult); // wjy: 在 UI 线程统一归并状态刷新结果，隔离后台采集与控件更新职责。
     void probePoweringOnDevices();
     // =====wjy====
     void updateRealtimeConfiguredDevices(); // wjy: 把当前 devices.json 中的 IP 白名单同步给 UDP 接收器，广播不能创建未配置设备。
@@ -155,6 +192,10 @@ private:
     int devicePoweringOnRemainingSecondsForIndex(int index) const;
     void setupSettingsControls();
     void updateSettingsControls();
+    // =====wjy====
+    void refreshRollbackVersions(bool forceRefresh = false); // wjy: 后台枚举共享历史版本；普通进入设置可复用短时缓存，发布或失败恢复时允许强制刷新。
+    // ===end====
+    void applySettingsControlGeometry(QWidget* control, const QRect& geometry, bool visible, bool enabled, bool raiseWhenVisible); // wjy: 统一设置页真实控件的几何、显隐、可用状态和层级，避免每个字段重复维护同一套生命周期逻辑。
     void applyDesktopWallpaperRotationSetting(bool rotateImmediately); // wjy: 根据持久化开关启停分钟定时器，用户开启时可立即触发首轮。
     void startDesktopWallpaperRotation(bool userInitiated); // wjy: 后台选择并应用下一张共享图片，防止网络访问阻塞设置界面或产生重叠任务。
     void saveRemoteQualitySettingsFromControls(); // wjy: 收集远控画质页字段、统一归一化持久化并立即通知跟随全局的窗口。
@@ -201,45 +242,16 @@ private:
     void applyRemoteScriptRuntimeState(const QString& deviceIp, const QString& loginUser, const platform::RemoteScriptRuntimeInfo& runtime); // wjy: Reconcile target-authoritative script state into the per-device cache after startup or refresh.
     QVector<int> deviceIndexesForGroup(int groupIndex) const;
     QVector<int> contextDeviceIndexesForRightClick(int clickedDeviceIndex) const;
+    QVector<int> normalizedBatchDeviceIndexes(const QVector<int>& deviceIndexes) const; // wjy: 批量动作统一过滤过期/重复下标，再按稳定 ID 恢复当前展示位置。
     void batchWakeDevices(const QVector<int>& deviceIndexes);
     void batchShutdownDevices(const QVector<int>& deviceIndexes);
     void batchRestartDevices(const QVector<int>& deviceIndexes);
     // =====wjy====
+    void batchExecuteDeviceScriptFolder(const QVector<int>& deviceIndexes, const QString& scriptFolderPath, const QString& noExecutableMessage); // wjy: 多选设备和分组脚本共用统一批量入口，一次校验脚本后再逐台启动。
     void batchUpdateDevices(const QVector<int>& deviceIndexes); // wjy: 多选设备或分组菜单统一复用单设备更新请求逻辑。
     // ===end====
     void batchOpenDeviceTerminals(const QVector<int>& deviceIndexes);
     bool ensureRemoteControlAuthorization(int deviceIndex, bool showMessages); // wjy: 远控窗口创建前确保当前控制端公钥已登记到目标设备。
-
-    struct ScriptUiState {
-        bool outputVisible = false;
-        bool outputRunning = false;
-        bool outputFailed = false;
-        // =====wjy====
-        bool localLaunchInProgress = false; // wjy: 本控制端仍持有启动 SSH 任务时为 true，避免活动清单刚写入前被一次空闲刷新提前清掉图标。
-        bool remoteStatusConfirmed = false; // wjy: 标识 outputRunning 是否已经被目标状态服务确认，供后续远端空闲响应清理陈旧图标。
-        QString remoteRunId; // wjy: 保存远端唯一运行 ID，停止或正常结束时只清理同一次任务的活动清单。
-        qint64 remoteControllerPid = 0; // wjy: 缓存目标 PowerShell PID，重启恢复时用于诊断和精确显示状态来源。
-        qint64 remoteStartedAtEpochMs = 0; // wjy: 缓存目标开始时间，和状态服务返回的同一次运行保持关联。
-        // ===end====
-        int outputScrollOffset = 0;
-        bool outputAutoScroll = true;
-        bool outputDirty = false;
-        QString outputTitle;
-        QString outputText;
-        QString outputFilePath;
-        QString lastScriptFolderPath;
-        std::shared_ptr<std::atomic_bool> cancelRequested;
-        bool editorVisible = false;
-        bool editorLoading = false;
-        bool editorSaving = false;
-        QString editorTitle;
-        QString editorRemotePath;
-        QString editorDeviceIp;
-        QString editorLoginUser;
-        QString editorWorkName;
-        QString editorText;
-        bool editorModified = false;
-    };
 
     // =====wjy====
     platform::DeviceRealtimeStateService* m_realtimeStateService = nullptr; // wjy: 由 main 持有且晚于 MainWindow 销毁，DeviceGrid 只连接和调用，不负责释放。
@@ -253,30 +265,14 @@ private:
     QHash<QString, platform::RealtimeScriptState> m_deviceRealtimeScriptStates; // wjy: Unknown/Idle/Running 独立于可恢复脚本 UI 元数据，离线只隐藏 Logo 不破坏恢复信息。
     // ===end====
     QString m_currentDeviceName;
-    bool m_scriptOutputVisible = false; // wjy: Show the in-page script terminal after a device script is selected.
-    bool m_scriptOutputRunning = false; // wjy: True while the remote script command is still executing.
-    bool m_scriptOutputFailed = false; // wjy: Paint failure status in the script terminal without blocking the UI with a modal dialog.
-    int m_scriptOutputScrollOffset = 0; // wjy: Terminal scroll offset measured in lines from the newest output; zero means pinned to bottom.
-    bool m_scriptOutputAutoScroll = true; // wjy: Keep following new output until the user scrolls upward.
-    bool m_scriptOutputDirty = false; // wjy: True when the local temp output file has new content waiting to be loaded into the panel.
-    QString m_scriptOutputTitle;
-    QString m_scriptOutputText;
-    QString m_scriptOutputFilePath;
-    QString m_lastScriptFolderPath;
-    std::shared_ptr<std::atomic_bool> m_scriptCancelRequested;
-    bool m_scriptEditorVisible = false;
-    bool m_scriptEditorLoading = false;
-    bool m_scriptEditorSaving = false;
-    QString m_scriptEditorTitle;
-    QString m_scriptEditorRemotePath;
-    QString m_scriptEditorDeviceIp;
-    QString m_scriptEditorLoginUser;
-    QString m_scriptEditorWorkName;
-    QHash<QString, ScriptUiState> m_scriptUiStates; // wjy: Keep script output/editor state isolated per device IP so switching devices does not mix panels.
+    ScriptUiStateStore m_scriptUiStateStore; // wjy: 每设备脚本状态由独立仓储唯一持有，DeviceGrid 只投影当前设备页面。
     QLineEdit* m_periodicDeviceDiscoveryIntervalEdit = nullptr; // wjy: 周期检查新增设备的秒数输入框，默认 60 秒。
     QLineEdit* m_batchSubnetEdit = nullptr; // wjy: 批量新增网段输入框，支持以空格分隔多个 IPv4 通配网段。
     QPushButton* m_batchAddButton = nullptr; // wjy: 批量新增按钮，扫描期间禁用避免重复启动。
     QLineEdit* m_wallpaperRotationIntervalEdit = nullptr; // wjy: 自动壁纸轮换分钟输入框，仅在开关开启且卡片可见时显示。
+    // =====wjy====
+    QComboBox* m_rollbackVersionCombo = nullptr; // wjy: 常规页只展示低于当前安装版本且关键载荷完整的共享历史版本。
+    // ===end====
     QVector<QLineEdit*> m_shortcutKeyEdits; // wjy: Keyboard settings shortcut editors, one per remote-window action.
     // =====wjy====
     stream::RemoteQualityConfiguration m_remoteQualityConfiguration; // wjy: 主窗口缓存当前持久化全局画质，所有跟随全局窗口读取同一份值。
@@ -300,6 +296,18 @@ private:
     QLineEdit* m_deviceRemarkEdit = nullptr;
     QLineEdit* m_deviceGroupNameEdit = nullptr; // wjy: Group rename editor.
     QLineEdit* m_deviceListNameEdit = nullptr; // wjy: Device rename editor shown directly on the left list row.
+    DeviceSearchPanel* m_deviceSearchPanel = nullptr; // wjy: 主界面右侧查找页的唯一控件实例，生命周期由 DeviceGrid 父子关系管理。
+    platform::LocalSystemInfo m_localSystemInfo; // wjy: 本机详情页展示的静态系统和网络快照，不写回设备目录。
+    platform::CpuUsageSampler m_localCpuUsageSampler; // wjy: 保存相邻 GetSystemTimes 样本，只在本机页可见期间推进基线。
+    platform::GpuUsageSampler m_localGpuUsageSampler; // wjy: 持有 Windows GPU Engine 性能计数器查询，只在本机页可见期间采样。
+    platform::MemoryUsageSampler m_localMemoryUsageSampler; // wjy: 每秒只读当前物理内存负载，不保存跨页面基线。
+    QTimer* m_localSystemInfoTimer = nullptr; // wjy: 本机页 CPU、GPU、内存占用共用一秒刷新定时器，离开页面后停止。
+    QVariantAnimation* m_localCpuUsageAnimation = nullptr; // wjy: CPU 圆环在相邻样本间平滑扫动。
+    QVariantAnimation* m_localGpuUsageAnimation = nullptr; // wjy: GPU 圆环独立缓动，不与 CPU 新样本互相抢占动画状态。
+    QVariantAnimation* m_localMemoryUsageAnimation = nullptr; // wjy: 内存圆环独立缓动，并与 CPU/GPU 使用相同速度曲线。
+    qreal m_localCpuUsagePercent = -1.0; // wjy: CPU 动画中的小数显示值；负数表示正在建立采样基线。
+    qreal m_localGpuUsagePercent = -1.0; // wjy: GPU 动画显示值；性能计数器不可用时保持负数并显示占位。
+    qreal m_localMemoryUsagePercent = -1.0; // wjy: 内存动画显示值；有效结果始终限制在 0-100。
     QTextEdit* m_scriptFileEdit = nullptr;
     QTextEdit* m_scriptOutputEdit = nullptr; // wjy: 脚本日志正文使用只读文本控件，支持鼠标选择、Ctrl+C和右键复制。
     QPushButton* m_scriptFileSaveButton = nullptr;
@@ -307,6 +315,14 @@ private:
     QPushButton* m_saveDeviceButton = nullptr;
     QPushButton* m_cancelDeviceButton = nullptr;
     QVector<QPushButton*> m_localInfoCopyButtons;
+    // =====wjy====
+    QVariantAnimation* m_topEdgeAutoHideAnimation = nullptr; // wjy: 只改变顶层窗口 y 坐标，保持横向位置和窗口尺寸不变。
+    QTimer* m_topEdgeAutoHideMonitorTimer = nullptr; // wjy: 低频读取全局鼠标位置，使仅剩 4px 的隐藏窗口仍能响应顶部悬停。
+    QTimer* m_topEdgeAutoHideDelayTimer = nullptr; // wjy: 鼠标离开后延迟收起，避免经过标题栏边缘时窗口立即消失。
+    QRect m_topEdgeDockScreenGeometry; // wjy: 保存停靠屏幕的工作区，支持副屏负坐标和不同顶部位置。
+    bool m_topEdgeDocked = false; // wjy: true 表示本次拖窗已明确停靠到某块屏幕顶部。
+    bool m_topEdgeAutoHidden = false; // wjy: 记录位置动画的目标状态，用于滑动中途正确处理鼠标重新进入。
+    // ===end====
     bool m_draggingWindow = false;
     bool m_resizingWindow = false;
     int m_resizeEdges = 0;
@@ -332,9 +348,14 @@ private:
     bool m_settingsSelected = false;
     SettingsTab m_settingsTab = SettingsTab::General;
     // =====wjy====
-    DeviceDetailTab m_deviceDetailTab = DeviceDetailTab::ScriptLog; // wjy: 设备详情页默认显示脚本界面。
+    DeviceDetailTab m_deviceDetailTab = DeviceDetailTab::Local; // wjy: 主控窗口首次显示设备详情时默认进入本机页，脚本页仍可通过右侧页签手动切换。
     // ===end====
-    bool m_leftSidebarCollapsed = false;
+    // =====wjy====
+    bool m_detailPanelCollapsed = false; // wjy: true 只隐藏右侧详情栏，左侧设备栏在两种状态下都保持完整可用。
+    int m_expandedWindowWidth = 920; // wjy: 收起前记录用户当前窗口宽度，重新展开时保持当前位置并恢复该宽度。
+    QVariantAnimation* m_detailPanelWidthAnimation = nullptr; // wjy: 逐帧修改主窗口宽度，让详情栏从右侧平滑收起或展开。
+    bool m_detailPanelAnimationTargetCollapsed = false; // wjy: 动画期间保存最终折叠状态，收起时允许详情内容保持到滑动结束再隐藏。
+    // ===end====
     bool m_settingsLocalInfoExpanded = false;
     bool m_settingsAddDeviceExpanded = false;
     bool m_autoRunEnabled = true;
@@ -356,13 +377,23 @@ private:
     bool m_updateAvailable = false; // wjy: 后台检测到更高版本时显示标题栏更新按钮，用户点击前绝不开始安装。
     bool m_updatePreparing = false; // wjy: 防止用户连续点击重复创建多个更新任务和更新器进程。
     QString m_availableUpdateVersion; // wjy: 保存检测到的远端版本，供标题栏更新状态使用。
+    bool m_rollbackPreparing = false; // wjy: 回撤载荷暂存期间禁用下拉框和按钮，防止同一目标重复启动多个事务任务。
+    bool m_rollbackVersionsRefreshInProgress = false; // wjy: 共享目录扫描在后台运行时阻止设置点击重复创建遍历任务。
+    bool m_rollbackVersionsRefreshPending = false; // wjy: 扫描期间收到强制刷新请求时，在当前结果返回后补做一次最新扫描。
+    QElapsedTimer m_rollbackVersionsRefreshClock; // wjy: 普通重复进入设置在 30 秒内复用下拉框结果，减少网络目录元数据请求。
     // ===end====
     int m_deviceListScrollOffset = 0; // wjy: Scroll offset for the hand-painted device list.
     // =====wjy====
     bool m_draggingDeviceListScrollbar = false; // wjy: 按住左侧设备列表滑块时独占鼠标移动，避免同时触发设备或分组拖拽。
     int m_deviceListScrollbarGrabOffsetY = 0; // wjy: 保存鼠标相对滑块顶部的位置，开始拖动时滑块不会突然跳到鼠标中心。
+    QVariantAnimation* m_deviceListScrollbarAnimation = nullptr; // wjy: 轨道空白点击时负责设备滑块的短距离快速缓动，不参与直接拖拽。
     // ===end====
     int m_settingsScrollOffset = 0; // wjy: Scroll offset for the Settings > General content area.
+    // =====wjy====
+    bool m_draggingSettingsScrollbar = false; // wjy: 常规设置滚动条按下后独占鼠标移动，避免同时触发卡片、按钮或真实输入框。
+    int m_settingsScrollbarGrabOffsetY = 0; // wjy: 记录鼠标相对设置滑块顶部的距离，拖拽滑块时保持抓取点不跳动。
+    QVariantAnimation* m_settingsScrollbarAnimation = nullptr; // wjy: 设置轨道点击动画逐帧刷新手绘卡片和真实子控件位置。
+    // ===end====
     int m_renamingDeviceGroupIndex = -1; // wjy: Current renaming group index, -1 means none.
     int m_renamingDeviceIndex = -1; // wjy: Current inline-renaming device index, -1 means none.
     // wjy: Primary device shown on the right detail page.
@@ -416,13 +447,9 @@ private:
     BottomAction m_hoveredBottomAction = BottomAction::None;
     QSet<QString> m_poweringOnDeviceIps;
     QHash<QString, qint64> m_poweringOnStartedAtMs;
-    QHash<QString, QPointer<RemoteDesktopWindow>> m_remoteDesktopWindows; // wjy: 标题栏启动的远程桌面窗口按设备 IP 去重，再次启动只激活原窗口。
     QHash<QString, QString> m_pendingRemoteRenameNames; // wjy: 记录远端改名等待重启生效的设备，避免自动刷新立刻用旧电脑名覆盖手动新名字。
     platform::DeviceInfo m_localDeviceInfo;
-    QVector<QPointer<RemoteDesktopWindow>> m_tiledRemoteWindows; // wjy: 记录设备平铺创建的窗口，下次平铺前先关闭旧窗口再重新排列。
-    QVector<QPointer<RemoteDesktopWindow>> m_remoteWindowActivationOrder;
-    QHash<RemoteDesktopWindow*, QRect> m_remoteTileRestoreGeometries;
-    bool m_remoteWindowsTiled = false;
+    std::unique_ptr<RemoteWindowCoordinator> m_remoteWindowCoordinator; // wjy: 远控窗口集合、激活顺序、平铺恢复几何和 close-all 的唯一所有者。
     int m_lastShortcutActionIndex = -1;
     qint64 m_lastShortcutActionAtMs = 0;
 };

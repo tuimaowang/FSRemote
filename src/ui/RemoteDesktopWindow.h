@@ -50,7 +50,7 @@ public:
         QWidget* parent = nullptr); // wjy: 每个窗口共享同一生命周期管理器，不再自行创建无法等待的后台线程。
     ~RemoteDesktopWindow() override;
     void enqueueRemoteFrame(QImage image, quint64 viewerGeneration); // wjy: BGRA回调携带viewer代际，重连后迟到旧帧会在写入pending前被拒绝。
-    bool enqueueRemoteTextureFrame(int width, int height, void* sharedHandle, quint64 frameId, double encodedMbps, quint64 viewerGeneration); // wjy: 纹理帧同时校验代际和单槽调度，旧连接不能覆盖新连接画面。
+    int enqueueRemoteTextureFrame(int width, int height, void* sharedHandle, quint64 frameId, double encodedMbps, quint64 viewerGeneration); // wjy: 返回接受、回退或受控丢帧，解码器据此安全切换keyed mutex所有权。
     void setRemoteFrame(const QImage& image);
     void setConnectionStatus(int code, const QString& message);
     void setEncodedBitrateMbps(double mbps);
@@ -200,10 +200,12 @@ private:
     void showSnapPreviews(const QHash<RemoteDesktopWindow*, QRect>& geometries); // wjy: 拖拽越界重排时同时显示整组窗口的最终虚影。
     void clearSnapPreviews(); // wjy: 拖离、释放、双击或关闭时统一清理整组吸附预览。
     void flushPendingRemoteFrame();
-    void drainPendingRemoteTextureFrame(); // wjy: Qt线程一次只取最新共享纹理，执行期间到达的旧帧会被后续新帧覆盖。
+    void drainPendingRemoteTextureFrame(); // wjy: Qt线程一次消费一个已接受纹理；单槽忙时新帧由解码器受控丢弃并立即归还。
+    void discardPendingTextureFrame(); // wjy: 取消单槽帧时完成keyed mutex消费者交接，避免解码纹理槽永久占用。
     void invalidateViewerCallbacks(); // wjy: 关闭或重连前统一递增代际并清空待呈现帧，让全部旧异步结果立即失效。
     void saveWindowGeometry();
     void updateFrameStats(const QImage& image); // wjy: Update the bottom-right stream stats overlay from each received remote frame.
+    void updatePresentedFrameStats(qint64 bgraBytes); // wjy: BGRA和共享纹理成功呈现统一计入真实接收FPS，零拷贝纹理不增加RAW带宽。
     void updateFrameColorStats(const QImage& image); // wjy: Update right-bottom RGB diagnostics for pure-black webpage tests.
     void sampleFrameColorRegion(const QImage& image, const QRect& region, int* minValue, int* avgValue, int* maxValue) const; // wjy: Sample RGB values cheaply without scanning every pixel.
     QString m_deviceName;
@@ -273,7 +275,7 @@ private:
     QRect m_resizeStartGeometry;
     QElapsedTimer m_sessionClock;
     QElapsedTimer m_frameStatsClock; // wjy: Measures one-second windows for the remote desktop stats overlay.
-    int m_frameStatsCount = 0; // wjy: Counts frames received by the Qt UI handoff during the current stats window.
+    int m_frameStatsCount = 0; // wjy: 统计当前窗口真正成功进入显示路径的BGRA或共享纹理帧数。
     qint64 m_frameStatsBytes = 0; // wjy: Accumulates decoded BGRA bytes for raw-throughput diagnostics.
     double m_receiveFps = 0.0; // wjy: Last calculated UI-side received FPS shown in the overlay.
     double m_rawBgraMbps = 0.0; // wjy: Last calculated decoded BGRA throughput, separate from compressed network bitrate.

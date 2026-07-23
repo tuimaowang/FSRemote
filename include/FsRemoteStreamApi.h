@@ -32,6 +32,14 @@ typedef int(FSREMOTE_STREAM_CALL* FsRemoteTextureFrameCallback)(
     uint64_t frame_id,
     double encoded_mbps);
 
+// =====wjy====
+enum FsRemoteTextureFrameResult {
+    FSREMOTE_TEXTURE_FRAME_FALLBACK = 0, // wjy: 当前纹理无法进入安全GPU路径，解码器继续生成BGRA软件帧保证画面不中断。
+    FSREMOTE_TEXTURE_FRAME_ACCEPTED = 1, // wjy: 控制端已经接管共享纹理，生产端将纹理所有权交给D3D11 Presenter。
+    FSREMOTE_TEXTURE_FRAME_DROPPED = 2, // wjy: Qt单槽正在占用，主动丢弃当前帧且不做昂贵BGRA回读，生产端立即回收纹理槽。
+};
+// ===end====
+
 typedef void* FsRemoteStreamHandle;
 
 // =====wjy====

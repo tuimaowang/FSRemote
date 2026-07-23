@@ -141,6 +141,7 @@ public:
         bitrate_kbps_ = std::max(10u, codec_settings->startBitrate ? codec_settings->startBitrate : 120000u);
         fps_ = std::max(1u, codec_settings->maxFramerate ? codec_settings->maxFramerate : 60u);
         target_size_ = {codec_settings->width, codec_settings->height};
+        force_keyframe_next_ = true; // wjy: 新编码器会话首帧必须输出IDR和参数集，禁止从无参考帧的P帧开始。
         return ensure_device() ? WEBRTC_VIDEO_CODEC_OK : WEBRTC_VIDEO_CODEC_ERROR;
     }
 
@@ -158,6 +159,7 @@ public:
         texture_.Reset();
         argb_.clear();
         callback_ = nullptr;
+        force_keyframe_next_ = true; // wjy: 下次重新初始化编码器时重新建立完整关键帧边界。
         return WEBRTC_VIDEO_CODEC_OK;
     }
 
@@ -221,7 +223,7 @@ private:
 
         context_->UpdateSubresource(texture_.Get(), 0, nullptr, argb_.data(), width * 4, 0);
 
-        bool force_keyframe = frame_id_ == 0;
+        bool force_keyframe = frame_id_ == 0 || force_keyframe_next_; // wjy: 尺寸变化重建NVENC后不等待WebRTC迟到的关键帧请求。
         if (frame_types) {
             force_keyframe = force_keyframe || std::any_of(frame_types->begin(), frame_types->end(), [](webrtc::VideoFrameType type) {
                 return type == webrtc::VideoFrameType::kVideoFrameKey;
@@ -234,6 +236,9 @@ private:
         if (!encoder_.encode(texture_.Get(), frame_id_++, force_keyframe, &encoded, &keyframe, &error)) {
             std::cerr << "NVENC encode failed: " << error << "\n";
             return WEBRTC_VIDEO_CODEC_ERROR;
+        }
+        if (keyframe) {
+            force_keyframe_next_ = false; // wjy: 只有NVENC确认实际输出关键帧后才结束尺寸切换交接。
         }
         if (frame_id_ == 1 || frame_id_ % 120 == 0) {
             std::cout << "uu-nvenc-hevc encoded frames=" << frame_id_
@@ -324,6 +329,7 @@ private:
         encoder_.shutdown();
         encoder_bitrate_kbps_ = 0; // wjy: Force NVENC reinitialization after texture size changes.
         encoder_fps_ = 0;
+        force_keyframe_next_ = true; // wjy: 任意输入尺寸变化都要求新会话第一帧强制IDR，避免短暂模糊或参考链失效。
         return true;
     }
 
@@ -341,6 +347,7 @@ private:
     uint64_t last_bitrate_reconfigure_ms_ = 0;
     uint32_t fps_ = 60;
     uint32_t frame_id_ = 0;
+    bool force_keyframe_next_ = true; // wjy: 记录新会话或尺寸切换后的关键帧交接状态，成功IDR前持续请求。
     int tex_w_ = 0;
     int tex_h_ = 0;
 };
@@ -448,6 +455,30 @@ private:
             append_viewer_log("decoder ffmpeg decode failed error=" + error); // wjy: compressed frame decode returned an error.
             return WEBRTC_VIDEO_CODEC_ERROR;
         }
+        // =====wjy====
+        struct SharedTextureReleaseGuard {
+            lsp::H264Decoder* decoder = nullptr;
+            lsp::DecodedFrame* frame = nullptr;
+            bool released = false;
+
+            ~SharedTextureReleaseGuard()
+            {
+                if (!released && decoder && frame) {
+                    decoder->release_shared_texture(frame, false); // wjy: 任意异常或提前返回都把生产端持有的纹理归还key 0。
+                }
+            }
+
+            void release(bool consumerAccepted)
+            {
+                if (!released && decoder && frame) {
+                    decoder->release_shared_texture(frame, consumerAccepted); // wjy: GPU接管交给key 1，其余路径立即回到生产者key。
+                    released = true;
+                }
+            }
+        } sharedTextureGuard;
+        sharedTextureGuard.decoder = &decoder_; // wjy: 显式绑定当前解码器，避免依赖局部守卫是否满足聚合初始化规则。
+        sharedTextureGuard.frame = &decoded;
+        // ===end====
         // append_viewer_log("decoder ffmpeg decode ok size=" + std::to_string(decoded.size.width)
         //     + "x" + std::to_string(decoded.size.height)
         //     + " bgra=" + std::to_string(decoded.bgra.size())); // wjy: per-frame decode-success log disabled.
@@ -458,9 +489,9 @@ private:
 
         auto buffer = webrtc::I420Buffer::Create(static_cast<int>(decoded.size.width),
                                                  static_cast<int>(decoded.size.height));
-        bool texture_presented = false;
+        int texture_result = DecodedTextureFallback; // wjy: 使用编解码公共库内部三态，避免底层目标反向依赖上层FsRemoteStreamApi头文件。
         if (texture_callback_ && decoded.shared_handle) {
-            texture_presented = texture_callback_(
+            texture_result = texture_callback_(
                 static_cast<int>(decoded.size.width),
                 static_cast<int>(decoded.size.height),
                 decoded.shared_handle,
@@ -468,7 +499,8 @@ private:
                 encoded_mbps_);
         }
 
-        if (texture_presented) {
+        if (texture_result != DecodedTextureFallback) {
+            sharedTextureGuard.release(texture_result == DecodedTextureAccepted); // wjy: 丢弃帧直接回到生产者key，不锁死共享纹理槽。
             const int width = static_cast<int>(decoded.size.width);
             const int height = static_cast<int>(decoded.size.height);
             for (int y = 0; y < height; ++y) {
@@ -487,6 +519,7 @@ private:
                 append_viewer_log("decoder copy_srv_to_bgra failed"); // wjy: texture readback failed before Qt callback.
                 return WEBRTC_VIDEO_CODEC_ERROR;
             }
+            sharedTextureGuard.release(false); // wjy: GPU到CPU回读完成后归还纹理，Qt复制与I420转换不再占用共享槽。
             // append_viewer_log("decoder bgra ready size=" + std::to_string(bgra.size())); // wjy: per-frame BGRA-ready log disabled.
             {
                 DecodedBgraCallback hook = bgra_callback_; // wjy: prefer this decoder's viewer callback, so tiled windows do not overwrite each other.

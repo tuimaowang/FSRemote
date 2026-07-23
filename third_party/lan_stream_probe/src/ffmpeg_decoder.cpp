@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -12,6 +13,11 @@ extern "C" {
 
 namespace lsp {
 namespace {
+
+// =====wjy====
+constexpr UINT64 kSharedTextureProducerKey = 0; // wjy: 生产端只有取得key 0后才能覆盖共享纹理。
+constexpr UINT64 kSharedTextureConsumerKey = 1; // wjy: 完整帧提交后使用key 1交给控制端读取。
+// ===end====
 
 AVPixelFormat get_hw_format(AVCodecContext*, const AVPixelFormat* formats)
 {
@@ -219,9 +225,15 @@ bool H264Decoder::convert_d3d11_frame(DecodedFrame* decoded, std::string* error)
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_desc = {};
     output_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
     output_desc.Texture2D.MipSlice = 0;
-    const int write_index = output_index_ ^ 1;
+    // =====wjy====
+    const int write_index = acquire_output_texture(error); // wjy: keyed mutex保证不会覆盖Qt仍在显示或排队的纹理。
+    if (write_index < 0) {
+        return false; // wjy: 三槽均不可写属于异常同步状态，拒绝制造未同步黑帧。
+    }
+    // ===end====
     hr = video_device_->CreateVideoProcessorOutputView(output_textures_[write_index].Get(), processor_enum_.Get(), &output_desc, &output_view);
     if (FAILED(hr)) {
+        output_keyed_mutexes_[write_index]->ReleaseSync(kSharedTextureProducerKey); // wjy: 创建输出视图失败时立即归还生产者key。
         if (error) *error = "CreateVideoProcessorOutputView failed: 0x" + std::to_string(static_cast<unsigned long>(hr));
         return false;
     }
@@ -248,6 +260,7 @@ bool H264Decoder::convert_d3d11_frame(DecodedFrame* decoded, std::string* error)
     stream.pInputSurface = input_view.Get();
     hr = video_context_->VideoProcessorBlt(processor_.Get(), output_view.Get(), 0, 1, &stream);
     if (FAILED(hr)) {
+        output_keyed_mutexes_[write_index]->ReleaseSync(kSharedTextureProducerKey); // wjy: Blt失败没有可交付帧，保持槽位仍归生产端。
         if (error) *error = "VideoProcessorBlt failed: 0x" + std::to_string(static_cast<unsigned long>(hr));
         return false;
     }
@@ -258,8 +271,94 @@ bool H264Decoder::convert_d3d11_frame(DecodedFrame* decoded, std::string* error)
     output_index_ = write_index;
     decoded->srv = output_srvs_[output_index_];
     decoded->shared_handle = output_shared_handles_[output_index_];
+    decoded->shared_texture_index = output_index_; // wjy: 上层根据纹理回调结果决定交给消费者key还是直接归还生产者key。
+    decoded->shared_texture_locked = true; // wjy: 回调返回前生产端持续持有该槽，消费者只能在正式交接后读取。
     return true;
 }
+
+// =====wjy====
+void H264Decoder::release_shared_texture(DecodedFrame* frame, bool consumerAccepted)
+{
+    if (!frame || !frame->shared_texture_locked
+        || frame->shared_texture_index < 0
+        || frame->shared_texture_index >= kOutputTextureCount) {
+        return;
+    }
+
+    const int textureIndex = frame->shared_texture_index;
+    if (output_keyed_mutexes_[textureIndex]) {
+        context_->Flush(); // wjy: 将本设备对共享纹理的命令提交后再切换同步key。
+        output_keyed_mutexes_[textureIndex]->ReleaseSync(
+            consumerAccepted ? kSharedTextureConsumerKey : kSharedTextureProducerKey); // wjy: 接受帧交给Presenter；丢帧或BGRA回退则立即复用。
+    }
+    frame->shared_texture_locked = false;
+    frame->shared_texture_index = -1;
+}
+
+int H264Decoder::acquire_output_texture(std::string* error)
+{
+    collect_retired_output_textures(); // wjy: 每帧回收已经被控制端释放的旧分辨率纹理组。
+    for (int offset = 1; offset <= kOutputTextureCount; ++offset) {
+        const int candidate = (output_index_ + offset + kOutputTextureCount) % kOutputTextureCount;
+        if (!output_keyed_mutexes_[candidate]) {
+            continue;
+        }
+        const HRESULT hr = output_keyed_mutexes_[candidate]->AcquireSync(kSharedTextureProducerKey, 0);
+        if (hr == S_OK || hr == WAIT_ABANDONED) {
+            return candidate; // wjy: 非阻塞选择空闲槽，解码线程不等待Qt释放某一张固定纹理。
+        }
+        if (hr != WAIT_TIMEOUT && FAILED(hr) && error) {
+            *error = "AcquireSync(BGRA output) failed: 0x" + std::to_string(static_cast<unsigned long>(hr));
+        }
+    }
+    if (error && error->empty()) {
+        *error = "no writable keyed shared texture";
+    }
+    return -1;
+}
+
+void H264Decoder::retire_output_textures()
+{
+    bool hasTextures = false;
+    RetiredOutputTextures retired;
+    for (int i = 0; i < kOutputTextureCount; ++i) {
+        hasTextures = hasTextures || output_textures_[i].Get() != nullptr;
+        retired.textures[i] = std::move(output_textures_[i]); // wjy: 延长旧资源生命周期，Qt队列中的共享句柄不会在分辨率切换时悬空。
+        retired.keyed_mutexes[i] = std::move(output_keyed_mutexes_[i]);
+        retired.shared_handles[i] = output_shared_handles_[i];
+        output_srvs_[i].Reset();
+        output_shared_handles_[i] = nullptr;
+    }
+    if (hasTextures) {
+        retired_output_textures_.push_back(std::move(retired));
+    }
+    output_index_ = -1;
+}
+
+void H264Decoder::collect_retired_output_textures()
+{
+    for (auto iterator = retired_output_textures_.begin(); iterator != retired_output_textures_.end();) {
+        bool allReleased = true;
+        for (const auto& keyedMutex : iterator->keyed_mutexes) {
+            if (!keyedMutex) {
+                continue;
+            }
+            const HRESULT hr = keyedMutex->AcquireSync(kSharedTextureProducerKey, 0);
+            if (hr == S_OK || hr == WAIT_ABANDONED) {
+                keyedMutex->ReleaseSync(kSharedTextureProducerKey); // wjy: 探测后保持生产者key不变，确认该槽没有待消费帧。
+            } else {
+                allReleased = false;
+                break;
+            }
+        }
+        if (allReleased) {
+            iterator = retired_output_textures_.erase(iterator); // wjy: 全部槽归还后才销毁旧纹理和共享句柄。
+        } else {
+            ++iterator;
+        }
+    }
+}
+// ===end====
 
 bool H264Decoder::ensure_video_processor(int width, int height, std::string* error)
 {
@@ -269,12 +368,8 @@ bool H264Decoder::ensure_video_processor(int width, int height, std::string* err
 
     processor_.Reset();
     processor_enum_.Reset();
-    output_srvs_[0].Reset();
-    output_srvs_[1].Reset();
-    output_textures_[0].Reset();
-    output_textures_[1].Reset();
-    output_shared_handles_[0] = nullptr;
-    output_shared_handles_[1] = nullptr;
+    collect_retired_output_textures(); // wjy: 创建新尺寸前清理已经完成消费的历史纹理组。
+    retire_output_textures(); // wjy: 尚在Qt单槽或Presenter中的旧句柄继续有效，避免尺寸切换闪黑。
 
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC content = {};
     content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
@@ -303,8 +398,8 @@ bool H264Decoder::ensure_video_processor(int width, int height, std::string* err
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-    for (int i = 0; i < 2; ++i) {
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX; // wjy: keyed mutex同时提供跨设备共享和明确的GPU读写所有权。
+    for (int i = 0; i < kOutputTextureCount; ++i) {
         hr = device_->CreateTexture2D(&desc, nullptr, &output_textures_[i]);
         if (FAILED(hr)) {
             if (error) *error = "CreateTexture2D(BGRA output) failed: 0x" + std::to_string(static_cast<unsigned long>(hr));
@@ -318,6 +413,11 @@ bool H264Decoder::ensure_video_processor(int width, int height, std::string* err
         hr = device_->CreateShaderResourceView(output_textures_[i].Get(), &srv_desc, &output_srvs_[i]);
         if (FAILED(hr)) {
             if (error) *error = "CreateShaderResourceView(BGRA output) failed: 0x" + std::to_string(static_cast<unsigned long>(hr));
+            return false;
+        }
+        hr = output_textures_[i].As(&output_keyed_mutexes_[i]);
+        if (FAILED(hr) || !output_keyed_mutexes_[i]) {
+            if (error) *error = "QueryInterface(IDXGIKeyedMutex) failed for BGRA output texture";
             return false;
         }
         Microsoft::WRL::ComPtr<IDXGIResource> shared_resource;
@@ -335,7 +435,7 @@ bool H264Decoder::ensure_video_processor(int width, int height, std::string* err
         output_shared_handles_[i] = shared_handle;
     }
 
-    output_index_ = 0;
+    output_index_ = -1; // wjy: 第一帧从0号槽开始，后续环形选择已经归还的纹理。
     processor_width_ = width;
     processor_height_ = height;
     return true;
@@ -345,13 +445,14 @@ void H264Decoder::shutdown()
 {
     processor_.Reset();
     processor_enum_.Reset();
-    output_srvs_[0].Reset();
-    output_srvs_[1].Reset();
-    output_textures_[0].Reset();
-    output_textures_[1].Reset();
-    output_shared_handles_[0] = nullptr;
-    output_shared_handles_[1] = nullptr;
-    output_index_ = 0;
+    for (int i = 0; i < kOutputTextureCount; ++i) {
+        output_srvs_[i].Reset();
+        output_keyed_mutexes_[i].Reset();
+        output_textures_[i].Reset();
+        output_shared_handles_[i] = nullptr;
+    }
+    retired_output_textures_.clear(); // wjy: Viewer停止后统一释放活动和退役共享纹理。
+    output_index_ = -1;
     video_context_.Reset();
     video_device_.Reset();
 

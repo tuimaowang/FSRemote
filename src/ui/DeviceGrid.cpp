@@ -4,6 +4,11 @@
 #include "system/DeviceCommandService.h"
 #include "system/DesktopWallpaperService.h"
 #include "system/DeviceInfoService.h"
+#include "system/DeviceCatalog.h"
+#include "system/DeviceCatalogRepository.h"
+#include "system/DeviceActionTargetResolver.h"
+#include "system/DeviceActionPolicy.h"
+#include "system/DeviceStatusRefreshResult.h"
 #include "system/DeviceListSyncModel.h"
 #include "system/DeviceListSyncService.h"
 #include "system/DeviceStatusService.h"
@@ -13,7 +18,10 @@
 #include "system/UpdateService.h"
 #include "system/WolDetector.h"
 #include "system/WjyDiagnosticLog.h"
+#include "ui/DeviceSearchPanel.h"
 #include "ui/RemoteDesktopWindow.h"
+#include "ui/ScriptPanelVisibility.h"
+#include "ui/SettingsLayoutSnapshot.h"
 #include "ui/RemoteViewerLifecycleManager.h"
 
 #include <QAction>
@@ -25,10 +33,12 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QCoreApplication>
+#include <QCursor>
 #include <QDateTime>
 #include <QDebug>
 #include <QDialog>
 #include <QDir>
+#include <QEasingCurve>
 #include <QFile>
 #include <QFileInfo>
 #include <QFocusEvent>
@@ -63,6 +73,8 @@
 #include <QScreen>
 #include <QScrollBar>
 #include <QSet>
+#include <QShortcut>
+#include <QShowEvent>
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QStringList>
@@ -71,6 +83,7 @@
 #include <QTextEdit>
 #include <QTextDocument>
 #include <QTextStream>
+#include <QVariantAnimation>
 #include <QTextCursor>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
@@ -120,7 +133,15 @@ constexpr int kSidebarContentTop = kTitleBarHeight + 10;
 constexpr int kDefaultShellWidth = 920;
 constexpr int kDefaultShellHeight = 680;
 constexpr int kSidebarWidth = 240;
-constexpr int kCollapsedContentLeft = 52;
+// =====wjy====
+constexpr int kMinimumExpandedShellWidth = 720; // wjy: 详情栏展开时继续使用原主窗口最低宽度，保证右侧页面仍有可用空间。
+constexpr int kMinimumShellHeight = 520; // wjy: 收起详情只改变宽度，窗口最低高度继续沿用原值。
+constexpr int kDetailToggleStripWidth = 42; // wjy: 设备栏右侧独立窄条只承载 << / >>，不侵入设备行和滚动条。
+constexpr int kCollapsedShellWidth = kSidebarWidth + kDetailToggleStripWidth; // wjy: 紧凑窗口由完整 240px 设备栏和 42px 按钮窄条组成。
+constexpr int kTopEdgeDockSnapDistance = 14; // wjy: 拖窗松开时顶部在工作区边缘上下少量范围内即可吸附，不要求精确对齐单个像素。
+constexpr int kTopEdgeHiddenStripHeight = 4; // wjy: 收起后保留 4px 触发条，既不占用明显桌面空间又能提供鼠标入口。
+constexpr int kTopEdgeRevealTriggerDepth = 6; // wjy: 全局鼠标命中比可见条略深 2px，降低高 DPI 下难以触发的问题。
+// ===end====
 constexpr int kExpandedContentLeft = 270;
 constexpr int kShellResizeGrip = 7;
 constexpr int kResizeNone = 0;
@@ -130,12 +151,15 @@ constexpr int kResizeTop = 0x4;
 constexpr int kResizeBottom = 0x8;
 
 QSize g_shellSize(kDefaultShellWidth, kDefaultShellHeight);
-bool g_leftSidebarCollapsedForLayout = false;
 
-void setResponsiveLayoutState(const QSize& size, bool sidebarCollapsed)
+void setResponsiveLayoutState(const QSize& size, bool detailPanelCollapsed)
 {
-    g_shellSize = QSize(qMax(kDefaultShellWidth, size.width()), qMax(kDefaultShellHeight, size.height()));
-    g_leftSidebarCollapsedForLayout = sidebarCollapsed;
+    // =====wjy====
+    const int minimumWidth = detailPanelCollapsed
+        ? kCollapsedShellWidth
+        : kMinimumExpandedShellWidth; // wjy: 紧凑态按设备栏宽度布局，展开态不再错误地把 720-919px 窗口当成 920px 绘制。
+    g_shellSize = QSize(qMax(minimumWidth, size.width()), qMax(kMinimumShellHeight, size.height()));
+    // ===end====
 }
 
 int shellWidth()
@@ -150,7 +174,7 @@ int shellHeight()
 
 int contentLeft()
 {
-    return g_leftSidebarCollapsedForLayout ? kCollapsedContentLeft : kExpandedContentLeft;
+    return kExpandedContentLeft; // wjy: 设备栏始终保留，右侧详情展开时固定从设备栏右侧开始。
 }
 
 int contentRightMargin()
@@ -165,8 +189,7 @@ int contentWidth()
 
 QRect contentClipRect()
 {
-    const int left = g_leftSidebarCollapsedForLayout ? 0 : kSidebarWidth;
-    return QRect(left, kTitleBarHeight, shellWidth() - left, shellHeight() - kTitleBarHeight);
+    return QRect(kSidebarWidth, kTitleBarHeight, shellWidth() - kSidebarWidth, shellHeight() - kTitleBarHeight); // wjy: 详情内容永远不能覆盖左侧设备栏。
 }
 
 // =====wjy====
@@ -183,13 +206,15 @@ QRect deviceDetailContentClipRect()
 }
 // ===end====
 
-int windowResizeEdgesAt(const QPoint& position, const QSize& size)
+int windowResizeEdgesAt(const QPoint& position, const QSize& size, bool allowHorizontalResize)
 {
     int edges = kResizeNone;
-    if (position.x() <= kShellResizeGrip) {
-        edges |= kResizeLeft;
-    } else if (position.x() >= size.width() - kShellResizeGrip) {
-        edges |= kResizeRight;
+    if (allowHorizontalResize) {
+        if (position.x() <= kShellResizeGrip) {
+            edges |= kResizeLeft;
+        } else if (position.x() >= size.width() - kShellResizeGrip) {
+            edges |= kResizeRight;
+        }
     }
     if (position.y() <= kShellResizeGrip) {
         edges |= kResizeTop;
@@ -420,6 +445,26 @@ void drawUiIcon(QPainter& painter, const QRect& target, const QString& name)
 {
     painter.drawPixmap(target, uupix(QStringLiteral("titlebar/") + name));
 }
+
+// =====wjy====
+void drawRotatedUiIcon(
+    QPainter& painter,
+    const QRect& target,
+    const QString& name,
+    qreal rotationDegrees,
+    const QPointF& normalizedPivot = QPointF(0.5, 0.5))
+{
+    const QPointF rotationCenter(
+        target.x() + target.width() * normalizedPivot.x(),
+        target.y() + target.height() * normalizedPivot.y()); // wjy: 使用浮点坐标映射 SVG 真实圆心，避免 QRect::center 对偶数尺寸向左上取整 1px。
+    painter.save();
+    painter.translate(rotationCenter);
+    painter.rotate(rotationDegrees);
+    painter.translate(-rotationCenter); // wjy: 平移到图标圆心后旋转再还原坐标，图标只原地自转而不会绕错误支点画小圆。
+    drawUiIcon(painter, target, name);
+    painter.restore();
+}
+// ===end====
 
 void drawResourceIcon(QPainter& painter, const QRect& target, const QString& name)
 {
@@ -747,7 +792,7 @@ private:
 
 QRect minimizeRect()
 {
-    return QRect(shellWidth() - 84, 0, 48, kTitleBarHeight); //最小化图标
+    return QRect(shellWidth() - 84, 0, 36, kTitleBarHeight); // wjy: 最小化热区到关闭按钮左边结束，紧凑标题栏中两个窗口按钮不再重叠。
 }
 
 QRect refreshRect()
@@ -760,26 +805,28 @@ QRect closeRect()
     return QRect(shellWidth() - 48, 0, 48, kTitleBarHeight); //关闭按钮图标
 }
 
-QRect sidebarCollapseButtonRect(bool collapsed)
+QRect detailPanelToggleButtonRect(bool collapsed)
 {
-    const int y = qMax(kTitleBarHeight + 64, shellHeight() - 32);
-    return collapsed ? QRect(5, y, 32, 28) : QRect(245, y, 32, 28);//>> :<<
+    Q_UNUSED(collapsed)
+    const int y = qMax(kTitleBarHeight + 64, shellHeight() - 40); // wjy: 底部保留 12px 间距，按钮不会抢到无边框窗口的底边缩放热区。
+    return QRect(kSidebarWidth + 5, y, 32, 28); // wjy: 两种状态都使用设备栏右侧专用窄条，按钮不再覆盖设备或分组。
 }
 
-int deviceDetailHeaderX(bool sidebarCollapsed)
+int deviceDetailHeaderX(bool detailPanelCollapsed)
 {
-    return sidebarCollapsed ? kCollapsedContentLeft : kExpandedContentLeft;
+    Q_UNUSED(detailPanelCollapsed)
+    return kExpandedContentLeft; // wjy: 详情栏只在展开状态绘制，不再存在隐藏设备栏后的左移布局。
 }
 
-int deviceDetailHeaderRight(bool sidebarCollapsed)
+int deviceDetailHeaderRight(bool detailPanelCollapsed)
 {
-    Q_UNUSED(sidebarCollapsed)
+    Q_UNUSED(detailPanelCollapsed)
     return contentLeft() + contentWidth();
 }
 
-void drawSidebarCollapseButton(QPainter& painter, bool collapsed)
+void drawDetailPanelToggleButton(QPainter& painter, bool collapsed)
 {
-    const QRect buttonRect = sidebarCollapseButtonRect(collapsed);
+    const QRect buttonRect = detailPanelToggleButtonRect(collapsed);
     painter.save();
     painter.setPen(QPen(QColor(QStringLiteral("#D8DEE5")), 1));
     painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
@@ -822,16 +869,7 @@ QRect deviceGroupHeaderRect()//左侧设备列表开始位置
     return QRect(0, kSidebarContentTop, 236, 34);
 }
 
-struct DeviceEntry {
-    QString name;
-    QString ip;
-    QString mac;
-    QString broadcastIp;
-    QString remark;
-    QString group; // wjy: 设备所属分组，空字符串表示设备仍在“我的设备”根部，只有拖入具体分组后才写分组名。
-    QString id; // wjy: 跨设备同步使用的稳定 UUID；旧 JSON 会按 MAC/IP 确定性迁移，重命名和换组都不会改变它。
-    QString groupId; // wjy: 设备真正归属分组的稳定 UUID，group 名仅保留给旧逻辑显示与兼容。
-};
+using DeviceEntry = platform::DeviceRecord; // wjy: 设备实体类型统一由 DeviceCatalog 提供，DeviceGrid 暂时保留旧别名以分阶段迁移调用方。
 
 // =====wjy====
 struct DeviceListRow {
@@ -1188,19 +1226,14 @@ bool isSameSubnet(const QString& targetIp, const QString& candidateIp, const QSt
     return (target & mask) == (candidate & mask);
 }
 
-QVector<DeviceEntry> g_devices;
-QVector<QString> g_deviceGroupNames; // wjy: 保存右键新建的分组名称，会写入 devices.json 的 groups 字段。
-QVector<bool> g_deviceGroupExpandedStates; // wjy: 保存每个分组是否展开，会和分组名称一起持久化。
 // =====wjy====
-QVector<QString> g_deviceGroupIds; // wjy: 与分组名称按下标一一对应；重命名只改名称，稳定 ID 不变。
-qint64 g_deviceSnapshotRevision = 0; // wjy: 当前 UI 已采用的共享 revision，本地修改提交前保持基线 revision。
-QString g_deviceSnapshotUpdatedAt;
-QString g_deviceSnapshotUpdatedBy;
-QJsonObject g_deviceSnapshotTombstones;
-bool g_deviceSyncStarted = false;
-bool g_deviceSyncApplyingRemote = false; // wjy: 应用远端快照时仍需写本地文件，但不能把这次写入再次当成本地修改提交。
+platform::DeviceCatalog g_deviceCatalog; // wjy: 设备、分组和快照元数据的唯一内存所有者，先通过兼容引用迁移旧 UI 调用，避免并行状态副本。
+platform::DeviceCatalogRepository g_deviceCatalogRepository(g_deviceCatalog, {}); // wjy: 先创建纯内存仓储，真正路径在首次读写前注入，避免静态初始化阶段依赖 QApplication 环境。
+const auto& g_devices = g_deviceCatalog.devices(); // wjy: 绘制和命中测试只能读取目录顺序，下标仅作为本次展示位置，不能直接修改权威设备数据。
+const auto& g_deviceGroupNames = g_deviceCatalog.groupNames(); // wjy: 分组名称通过目录只读视图提供，写操作必须携带稳定 groupId 调用目录方法。
+const auto& g_deviceGroupExpandedStates = g_deviceCatalog.groupExpandedStates(); // wjy: 展开状态只读消费，切换操作统一交给目录校验分组身份。
+const auto& g_deviceGroupIds = g_deviceCatalog.groupIds(); // wjy: 稳定 groupId 与展示顺序仍保持同位，但匿名命名空间不再拥有可写容器。
 // ===end====
-
 int deviceIndexForIp(const QString& ip)
 {
     const QString trimmedIp = ip.trimmed();
@@ -1226,207 +1259,20 @@ QString deviceStorePath()
 }
 
 // =====wjy====
-QJsonObject currentDeviceSnapshot(bool includeLocalUiState)
-{
-    while (g_deviceGroupIds.size() < g_deviceGroupNames.size()) {
-        g_deviceGroupIds.append(QString());
-    }
-    while (g_deviceGroupExpandedStates.size() < g_deviceGroupNames.size()) {
-        g_deviceGroupExpandedStates.append(true);
-    }
-
-    QJsonArray rawGroupArray;
-    for (int i = 0; i < g_deviceGroupNames.size(); ++i) {
-        QJsonObject group;
-        group.insert(QStringLiteral("id"), g_deviceGroupIds.value(i));
-        group.insert(QStringLiteral("name"), g_deviceGroupNames.at(i).trimmed());
-        rawGroupArray.append(group);
-    }
-
-    QJsonArray rawDeviceArray;
-    for (const DeviceEntry& device : std::as_const(g_devices)) {
-        QString effectiveGroupId;
-        const QString normalizedGroupName = device.group.trimmed();
-        for (int groupIndex = 0; groupIndex < g_deviceGroupNames.size(); ++groupIndex) {
-            if (g_deviceGroupNames.at(groupIndex).trimmed() == normalizedGroupName) {
-                effectiveGroupId = g_deviceGroupIds.value(groupIndex);
-                break;
-            }
-        }
-        QJsonObject object;
-        object.insert(QStringLiteral("id"), device.id);
-        object.insert(QStringLiteral("name"), device.name);
-        object.insert(QStringLiteral("ip"), device.ip);
-        object.insert(QStringLiteral("mac"), device.mac);
-        object.insert(QStringLiteral("broadcast_ip"), device.broadcastIp);
-        object.insert(QStringLiteral("remark"), device.remark);
-        object.insert(QStringLiteral("group"), device.group);
-        object.insert(QStringLiteral("groupId"), effectiveGroupId); // wjy: 拖入其它分组时现有 UI 先改 group 名，这里按名称重新解析目标 ID，不能继续沿用旧组 ID。
-        rawDeviceArray.append(object);
-    }
-
-    QJsonObject rawRoot;
-    rawRoot.insert(QStringLiteral("schemaVersion"), 2);
-    rawRoot.insert(QStringLiteral("revision"), g_deviceSnapshotRevision);
-    rawRoot.insert(QStringLiteral("updatedAt"), g_deviceSnapshotUpdatedAt);
-    rawRoot.insert(QStringLiteral("updatedBy"), g_deviceSnapshotUpdatedBy);
-    rawRoot.insert(QStringLiteral("devices"), rawDeviceArray);
-    rawRoot.insert(QStringLiteral("groups"), rawGroupArray);
-    rawRoot.insert(QStringLiteral("tombstones"), g_deviceSnapshotTombstones);
-    QJsonObject normalized = platform::normalizeDeviceListSnapshot(rawRoot);
-
-    const QJsonArray normalizedGroups = normalized.value(QStringLiteral("groups")).toArray();
-    g_deviceGroupIds.clear();
-    for (const QJsonValue& value : normalizedGroups) {
-        g_deviceGroupIds.append(value.toObject().value(QStringLiteral("id")).toString());
-    }
-    const QJsonArray normalizedDevices = normalized.value(QStringLiteral("devices")).toArray();
-    for (int i = 0; i < normalizedDevices.size() && i < g_devices.size(); ++i) {
-        const QJsonObject object = normalizedDevices.at(i).toObject();
-        g_devices[i].id = object.value(QStringLiteral("id")).toString();
-        g_devices[i].groupId = object.value(QStringLiteral("groupId")).toString();
-        g_devices[i].group = object.value(QStringLiteral("group")).toString();
-    }
-
-    if (includeLocalUiState) {
-        QJsonArray localGroups = normalizedGroups;
-        for (int i = 0; i < localGroups.size(); ++i) {
-            QJsonObject group = localGroups.at(i).toObject();
-            group.insert(QStringLiteral("expanded"), g_deviceGroupExpandedStates.value(i, true));
-            localGroups.replace(i, group); // wjy: expanded 只写本机 devices.json，提交共享前规范化函数会自动剥离它。
-        }
-        normalized.insert(QStringLiteral("groups"), localGroups);
-    }
-    return normalized;
-}
-
-bool applyDeviceSnapshotToGlobals(const QJsonObject& sourceRoot, bool preserveCurrentExpandedState)
-{
-    QHash<QString, bool> expandedById;
-    QHash<QString, bool> expandedByName;
-    if (preserveCurrentExpandedState) {
-        for (int i = 0; i < g_deviceGroupNames.size(); ++i) {
-            expandedById.insert(g_deviceGroupIds.value(i), g_deviceGroupExpandedStates.value(i, true));
-            expandedByName.insert(g_deviceGroupNames.value(i).toCaseFolded(), g_deviceGroupExpandedStates.value(i, true));
-        }
-    }
-    for (const QJsonValue& value : sourceRoot.value(QStringLiteral("groups")).toArray()) {
-        const QJsonObject group = value.toObject();
-        if (!group.contains(QStringLiteral("expanded"))) {
-            continue; // wjy: 共享快照不包含 expanded，不能用默认 true 覆盖本机已有折叠状态。
-        }
-        const bool expanded = group.value(QStringLiteral("expanded")).toBool(true);
-        const QString id = QUuid(group.value(QStringLiteral("id")).toString()).toString(QUuid::WithoutBraces).toLower();
-        const QString nameKey = group.value(QStringLiteral("name")).toString().trimmed().toCaseFolded();
-        if (!preserveCurrentExpandedState || !expandedById.contains(id)) {
-            expandedById.insert(id, expanded);
-        }
-        if (!preserveCurrentExpandedState || !expandedByName.contains(nameKey)) {
-            expandedByName.insert(nameKey, expanded); // wjy: 启动加载采用文件状态；远端同步时已有本机状态优先。
-        }
-    }
-
-    const QJsonObject normalized = platform::normalizeDeviceListSnapshot(sourceRoot);
-    QVector<QString> groupIds;
-    QVector<QString> groupNames;
-    QVector<bool> expandedStates;
-    for (const QJsonValue& value : normalized.value(QStringLiteral("groups")).toArray()) {
-        const QJsonObject group = value.toObject();
-        const QString id = group.value(QStringLiteral("id")).toString();
-        const QString name = group.value(QStringLiteral("name")).toString();
-        groupIds.append(id);
-        groupNames.append(name);
-        expandedStates.append(expandedById.value(id, expandedByName.value(name.toCaseFolded(), true))); // wjy: 同步重命名后优先按稳定 groupId 恢复本机展开状态。
-    }
-
-    QVector<DeviceEntry> devices;
-    for (const QJsonValue& value : normalized.value(QStringLiteral("devices")).toArray()) {
-        const QJsonObject object = value.toObject();
-        const QString ip = object.value(QStringLiteral("ip")).toString().trimmed();
-        quint32 ipValue = 0;
-        if (!parseIpv4Address(ip, &ipValue)) {
-            continue;
-        }
-        QString name = object.value(QStringLiteral("name")).toString().trimmed();
-        if (name.isEmpty()) {
-            name = ip;
-        }
-        DeviceEntry device;
-        device.name = name;
-        device.ip = ip;
-        device.mac = object.value(QStringLiteral("mac")).toString().trimmed();
-        device.broadcastIp = object.value(QStringLiteral("broadcast_ip")).toString().trimmed();
-        device.remark = object.value(QStringLiteral("remark")).toString();
-        device.group = object.value(QStringLiteral("group")).toString().trimmed();
-        device.id = object.value(QStringLiteral("id")).toString();
-        device.groupId = object.value(QStringLiteral("groupId")).toString();
-        devices.append(device);
-    }
-
-    g_devices = devices;
-    g_deviceGroupIds = groupIds;
-    g_deviceGroupNames = groupNames;
-    g_deviceGroupExpandedStates = expandedStates;
-    g_deviceSnapshotRevision = platform::deviceListSnapshotRevision(normalized);
-    g_deviceSnapshotUpdatedAt = normalized.value(QStringLiteral("updatedAt")).toString();
-    g_deviceSnapshotUpdatedBy = normalized.value(QStringLiteral("updatedBy")).toString();
-    g_deviceSnapshotTombstones = normalized.value(QStringLiteral("tombstones")).toObject();
-    return true;
-}
-
 void saveDevices()
 {
-    const QJsonObject localRoot = currentDeviceSnapshot(true);
-
-    QFileInfo info(deviceStorePath());
-    QDir().mkpath(info.absolutePath());
-
-    QSaveFile file(info.filePath());
-    if (!file.open(QIODevice::WriteOnly)) {
-        return;
-    }
-    const QByteArray bytes = QJsonDocument(localRoot).toJson(QJsonDocument::Indented);
-    if (file.write(bytes) != bytes.size() || !file.commit()) {
-        return;
-    }
-    if (g_deviceSyncStarted && !g_deviceSyncApplyingRemote) {
-        platform::DeviceListSyncService::instance().submitLocalSnapshot(localRoot); // wjy: 本地 UI 已成功落盘后再生成 pending 并异步提交，网络失败不影响当前操作。
-    }
+    // =====wjy====
+    g_deviceCatalogRepository.setStorePath(deviceStorePath());
+    g_deviceCatalogRepository.saveLocal(); // wjy: 原子保存和“仅本地修改才提交同步”的判断统一由仓储处理，UI 不再维护同步生命周期标志。
+    // ===end====
 }
 
 void loadDevices()
 {
-    g_devices.clear();
-    g_deviceGroupNames.clear(); // wjy: 重新加载文件前清空内存分组，避免重复追加。
-    g_deviceGroupExpandedStates.clear(); // wjy: 重新加载文件前同步清空展开状态。
-    g_deviceGroupIds.clear();
-
-    QFile file(deviceStorePath());
-    if (!file.exists()) {
-        g_devices.append({QStringLiteral("72"), QStringLiteral("192.168.3.27"), {}, {}, {}, {}}); // wjy: 默认示例设备不属于任何分组，group 保持空字符串。
-        saveDevices();
-        return;
-    }
-
-    if (!file.open(QIODevice::ReadOnly)) {
-        return;
-    }
-
-    QJsonParseError parseError;
-    const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &parseError);
-    if (!document.isArray() && !document.isObject()) {
-        return;
-    }
-
-    QJsonObject rootObject;
-    if (document.isArray()) {
-        rootObject.insert(QStringLiteral("devices"), document.array()); // wjy: 兼容最早期顶层数组格式，并在本次启动后迁移为 schemaVersion=2。
-    } else {
-        rootObject = document.object();
-    }
-    applyDeviceSnapshotToGlobals(rootObject, false);
-    saveDevices(); // wjy: 启动时立即原子重写规范化格式，补齐稳定 ID 和 groupId，后续所有设备才能可靠做实体级合并。
-// ===end====
+    // =====wjy====
+    g_deviceCatalogRepository.setStorePath(deviceStorePath());
+    g_deviceCatalogRepository.loadLocal(); // wjy: 文件读取、旧数组格式迁移和规范化重写由仓储一次完成，UI 只消费目录结果。
+    // ===end====
 }
 
 QStringList deviceNames();
@@ -1695,8 +1541,8 @@ QRect localInfoCopyButtonRect(int index)
 QRect settingsLocalInfoHeaderRect()
 {
     // =====wjy====
-    const int top = (platform::UpdateService::canPublishCurrentBuild() ? 740 : 664)
-        + (kDetailScriptPanelTop - 120); // wjy: 壁纸测试卡片固定占一行；非构建运行包仍只跳过发布卡片并上移 76 像素。
+    const int top = (platform::UpdateService::canPublishCurrentBuild() ? 816 : 740)
+        + (kDetailScriptPanelTop - 120); // wjy: 回撤版本卡片始终占一行；构建版本再保留发布卡片，普通运行包只跳过发布区域。
     return QRect(contentLeft(), top, contentWidth(), 44);
     // ===end====
 }
@@ -1710,13 +1556,6 @@ QRect settingsLocalInfoCardRect(bool expanded)
 QRect settingsScrollViewportRect()
 {
     return QRect(contentLeft(), kDetailScriptPanelTop, contentWidth(), qMax(220, deviceDetailBottomBoundaryTop() - kDetailScriptPanelTop - kDetailScriptPanelBottomGap)); // wjy: 设置页内容视口和设备详情页主体区域使用同一顶部与底部安全边界。
-}
-
-QRect settingsScrolledRect(const QRect& rect, int scrollOffset)
-{
-    QRect result = rect;
-    result.translate(0, -scrollOffset);
-    return result;
 }
 
 QRect settingsVerticalScrollbarTrackRect()
@@ -1738,6 +1577,25 @@ QRect settingsVerticalScrollbarThumbRect(int scrollOffset, int maxScrollOffset)
     const int thumbY = track.y() + (travel * qBound(0, scrollOffset, maxScrollOffset)) / maxScrollOffset;
     return QRect(track.x(), thumbY, track.width(), thumbHeight);
 }
+
+// =====wjy====
+int settingsScrollOffsetForThumbTop(int thumbTop, int maxScrollOffset)
+{
+    if (maxScrollOffset <= 0) {
+        return 0; // wjy: 内容未溢出时不允许滚动，避免轨道点击导致无效除法。
+    }
+
+    const QRect track = settingsVerticalScrollbarTrackRect();
+    const QRect thumb = settingsVerticalScrollbarThumbRect(0, maxScrollOffset);
+    const int thumbTravel = qMax(0, track.height() - thumb.height());
+    if (thumbTravel <= 0) {
+        return 0; // wjy: 滑块已经占满轨道时没有可映射的移动距离。
+    }
+
+    const int relativeTop = qBound(0, thumbTop - track.y(), thumbTravel); // wjy: 轨道上下空白点击和拖拽越界都统一夹到首尾位置。
+    return static_cast<int>((static_cast<qint64>(relativeTop) * maxScrollOffset + thumbTravel / 2) / thumbTravel); // wjy: 使用四舍五入让最后一个像素准确对应最大设置页滚动偏移。
+}
+// ===end====
 
 QRect settingsAddDeviceHeaderRect(bool localInfoExpanded)
 {
@@ -1802,6 +1660,16 @@ int maxSettingsScrollOffset(bool localInfoExpanded, bool addDeviceExpanded)
 {
     return qMax(0, settingsContentBottom(localInfoExpanded, addDeviceExpanded) - settingsScrollViewportRect().bottom());
 }
+
+// =====wjy====
+ui::SettingsLayoutSnapshot settingsLayoutSnapshot(bool localInfoExpanded, bool addDeviceExpanded, int requestedScrollOffset)
+{
+    return ui::SettingsLayoutSnapshot(
+        settingsScrollViewportRect(),
+        maxSettingsScrollOffset(localInfoExpanded, addDeviceExpanded),
+        requestedScrollOffset); // wjy: DeviceGrid 只提供内容相关输入，滚动换算和命中规则交给独立辅助类。
+}
+// ===end====
 
 QString localInfoLabelText(int index)
 {
@@ -2124,23 +1992,44 @@ QRect scriptFileEditorRect()
     return QRect(contentLeft(), kDetailScriptPanelTop, contentWidth(), qMax(220, deviceDetailBottomBoundaryTop() - kDetailScriptPanelTop - kDetailScriptPanelBottomGap)); // wjy: 配置文件编辑面板同样停在底部安全下沿上方，切换标签页不会覆盖折叠按钮。
 }
 
+QRect deviceSearchPanelRect()
+{
+    return scriptFileEditorRect(); // wjy: 查找页与配置页复用完全相同的详情内容边界，窗口缩放和侧栏折叠时同步变化。
+}
+
 QRect detailScriptLogTabRect()
 {
     // =====wjy====
-    // wjy: 脚本标签在左（默认页），与设置页标签同宽同间距。
-    return QRect(contentLeft(), kDetailScriptTabTop, 56, 36);
+    // wjy: 脚本标签排在本机右侧，与配置页保持同宽同间距。
+    return QRect(contentLeft() + 72, kDetailScriptTabTop, 56, 36);
     // ===end====
+}
+
+QRect detailLocalTabRect()
+{
+    return QRect(contentLeft(), kDetailScriptTabTop, 56, 36); // wjy: 本机标签位于设备详情页最左侧，先于脚本和配置显示。
 }
 
 QRect detailConfigTabRect()
 {
     // =====wjy====
-    // wjy: 配置标签在右。
-    return QRect(contentLeft() + 72, kDetailScriptTabTop, 56, 36);
+    // wjy: 配置标签排在脚本右侧。
+    return QRect(contentLeft() + 144, kDetailScriptTabTop, 56, 36);
     // ===end====
 }
 
-void drawDeviceDetailTabs(QPainter& painter, bool configSelected, const QFont& textFont)
+QRect detailSearchTabRect()
+{
+    return QRect(contentLeft() + 216, kDetailScriptTabTop, 56, 36); // wjy: 查找页签暂时隐藏，但保留在配置右侧的最终位置供后续恢复。
+}
+
+void drawDeviceDetailTabs(
+    QPainter& painter,
+    bool localSelected,
+    bool scriptSelected,
+    bool configSelected,
+    bool searchSelected,
+    const QFont& textFont)
 {
     const QRect tabBar(contentLeft(), kDetailScriptTabTop, contentWidth(), 38); // wjy: 标签栏分割线与标签文字使用同一顶部位置，整体靠上显示。
     painter.save();
@@ -2152,7 +2041,7 @@ void drawDeviceDetailTabs(QPainter& painter, bool configSelected, const QFont& t
     tabFont.setPixelSize(14);
     tabFont.setBold(true);
     // =====wjy====
-    // wjy: 顺序为“脚本 / 配置”，默认选中脚本；蓝线规则与设置页一致。
+    // wjy: 顺序为“本机 / 脚本 / 配置 / 查找”，四个页签共用同一蓝线选中规则。
     const auto paintTab = [&](const QRect& rect, const QString& text, bool selected) {
         painter.setFont(tabFont);
         painter.setPen(selected ? QColor(QStringLiteral("#040B18")) : QColor(QStringLiteral("#687384")));
@@ -2162,11 +2051,248 @@ void drawDeviceDetailTabs(QPainter& painter, bool configSelected, const QFont& t
             painter.drawLine(QPointF(rect.x() + 4, rect.bottom() + 2), QPointF(rect.x() + 32, rect.bottom() + 2));
         }
     };
-    paintTab(detailScriptLogTabRect(), QString::fromUtf8("脚本"), !configSelected);
+    paintTab(detailLocalTabRect(), QString::fromUtf8("本机"), localSelected);
+    paintTab(detailScriptLogTabRect(), QString::fromUtf8("脚本"), scriptSelected);
     paintTab(detailConfigTabRect(), QString::fromUtf8("配置"), configSelected);
+#if 0
+    // wjy: 查找页签暂不显示；保留绘制语句供后续直接恢复。
+    paintTab(detailSearchTabRect(), QString::fromUtf8("查找"), searchSelected);
+#else
+    Q_UNUSED(searchSelected)
+#endif
     // ===end====
     painter.restore();
 }
+
+// =====wjy====
+QString localSystemInfoDisplayValue(const QString& value)
+{
+    const QString trimmed = value.trimmed();
+    return trimmed.isEmpty() ? QStringLiteral("--") : trimmed; // wjy: 系统 API 返回空值时统一显示占位，不让某个字段影响其它信息绘制。
+}
+
+QString localSystemMemoryText(quint64 bytes)
+{
+    if (bytes == 0) {
+        return QStringLiteral("--"); // wjy: 内存查询失败时保留明确占位，避免把未知值误显示成 0 GB。
+    }
+    return QStringLiteral("%1 GB").arg(bytes / (1024.0 * 1024.0 * 1024.0), 0, 'f', 1);
+}
+
+QString localSystemDiskUsageText(const platform::LocalSystemInfo& info)
+{
+    if (info.systemDiskTotalBytes == 0) {
+        return QStringLiteral("--"); // wjy: 根分区查询失败时只显示占位，不影响 CPU 动画和其它系统信息。
+    }
+    const quint64 usedBytes = qMin(info.systemDiskUsedBytes, info.systemDiskTotalBytes); // wjy: 显示层再次限制已用容量，防止系统容量变化期间出现超过总量的文本。
+    const int usagePercent = qBound(0, qRound(usedBytes * 100.0 / info.systemDiskTotalBytes), 100); // wjy: 百分比限制在 0-100，与 CPU 区域的数值规则保持一致。
+    const QString rootText = info.systemDiskRoot.trimmed().isEmpty()
+        ? QString()
+        : info.systemDiskRoot.trimmed() + QStringLiteral("  "); // wjy: 有盘符时在容量前标明目标磁盘，未知挂载点时仍能显示容量。
+    return QString::fromUtf8("%1已用 %2 / %3 GB · %4%")
+        .arg(rootText)
+        .arg(usedBytes / (1024.0 * 1024.0 * 1024.0), 0, 'f', 1)
+        .arg(info.systemDiskTotalBytes / (1024.0 * 1024.0 * 1024.0), 0, 'f', 1)
+        .arg(usagePercent); // wjy: 同一行同时给出已用、总量和百分比，用户无需在多个字段间换算。
+}
+
+QColor localUsageColor(qreal usagePercent)
+{
+    if (usagePercent < 0) {
+        return QColor(QStringLiteral("#AAB3C0")); // wjy: 尚未取得有效资源样本时使用中性灰色，区分采样状态和真实负载。
+    }
+    if (usagePercent >= 85) {
+        return QColor(QStringLiteral("#E35D6A")); // wjy: 高于 85% 时使用红色提醒控制端资源压力。
+    }
+    if (usagePercent >= 60) {
+        return QColor(QStringLiteral("#E5A93D")); // wjy: 60%-84% 代表持续偏高，使用橙色提示但不制造错误告警。
+    }
+    return QColor(QStringLiteral("#3A7BFC")); // wjy: 正常负载使用主界面蓝色，和页签选中线保持一致。
+}
+
+void drawLocalSystemInfoPage(
+    QPainter& painter,
+    const platform::LocalSystemInfo& info,
+    qreal cpuUsagePercent,
+    qreal gpuUsagePercent,
+    qreal memoryUsagePercent,
+    const QFont& textFont)
+{
+    const QRect panel = scriptFileEditorRect(); // wjy: 本机页复用脚本/配置内容区域，缩放和底部安全边界保持完全一致。
+    const QRect usageCard(panel.x(), panel.y(), panel.width(), 118); // wjy: 顶部资源卡统一容纳 CPU、GPU、内存三列和底部系统盘占用。
+    const int infoTop = usageCard.bottom() + 12;
+    const QRect infoCard(panel.x(), infoTop, panel.width(), qMax(220, panel.bottom() - infoTop));
+
+    const auto drawCard = [&painter](const QRect& card) {
+        painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
+        painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
+        painter.drawRoundedRect(QRectF(card).adjusted(0.5, 0.5, -0.5, -0.5), 5, 5); // wjy: 信息卡使用配置页同样的白底和细边框，避免本机页脱离现有视觉系统。
+    };
+
+    drawCard(usageCard);
+    drawCard(infoCard);
+
+    QFont titleFont(textFont);
+    titleFont.setPixelSize(15);
+    titleFont.setBold(true);
+    const QRect metricsArea = usageCard.adjusted(16, 10, -16, -34); // wjy: 上部区域均分给三类资源，底部 24 像素继续留给系统盘占用。
+    const int metricGap = 12;
+    const int metricWidth = qMax(1, (metricsArea.width() - metricGap * 2) / 3);
+    const QRect cpuMetric(metricsArea.x(), metricsArea.y(), metricWidth, metricsArea.height());
+    const QRect gpuMetric(cpuMetric.right() + 1 + metricGap, metricsArea.y(), metricWidth, metricsArea.height());
+    const int memoryMetricX = gpuMetric.right() + 1 + metricGap;
+    const QRect memoryMetric(memoryMetricX, metricsArea.y(), qMax(1, metricsArea.right() - memoryMetricX + 1), metricsArea.height()); // wjy: 最后一列吸收整数除法余数，三个区域始终填满可用宽度。
+
+    painter.save();
+    painter.setPen(QPen(QColor(QStringLiteral("#EEF2F7")), 1));
+    const int firstSeparatorX = cpuMetric.right() + metricGap / 2;
+    const int secondSeparatorX = gpuMetric.right() + metricGap / 2;
+    painter.drawLine(firstSeparatorX, metricsArea.y() + 6, firstSeparatorX, metricsArea.bottom() - 6);
+    painter.drawLine(secondSeparatorX, metricsArea.y() + 6, secondSeparatorX, metricsArea.bottom() - 6); // wjy: 使用浅分隔线表达三列关系，不把用户截图中的红色标注框画进正式界面。
+    painter.restore();
+
+    const auto drawUsageMetric = [&](const QRect& metricRect,
+                                     const QString& label,
+                                     const QString& detail,
+                                     qreal usagePercent) {
+        const int ringSize = qBound(44, metricRect.height() - 8, 54);
+        const QRect ringRect(
+            metricRect.right() - ringSize - 2,
+            metricRect.y() + (metricRect.height() - ringSize) / 2,
+            ringSize,
+            ringSize); // wjy: 每列圆环右对齐，左侧保留标签和摘要，布局对应用户给出的三块示意。
+        const QRect textRect(
+            metricRect.x() + 2,
+            metricRect.y() + 7,
+            qMax(34, ringRect.x() - metricRect.x() - 8),
+            metricRect.height() - 14);
+
+        QFont labelFont(textFont);
+        labelFont.setPixelSize(11);
+        painter.setFont(labelFont);
+        painter.setPen(QColor(QStringLiteral("#687384")));
+        painter.drawText(textRect.adjusted(0, 0, 0, -28), Qt::AlignLeft | Qt::AlignVCenter, label);
+
+        QFont detailFont(textFont);
+        detailFont.setPixelSize(15);
+        detailFont.setBold(true);
+        painter.setFont(detailFont);
+        painter.setPen(QColor(QStringLiteral("#111827")));
+        painter.drawText(
+            textRect.adjusted(0, 20, 0, 0),
+            Qt::AlignLeft | Qt::AlignVCenter,
+            QFontMetrics(detailFont).elidedText(detail, Qt::ElideRight, textRect.width())); // wjy: 每列摘要在窄窗口下独立省略，不会挤进圆环。
+
+        painter.save();
+        painter.setRenderHint(QPainter::Antialiasing);
+        const QRectF ringStrokeRect = QRectF(ringRect).adjusted(3.0, 3.0, -3.0, -3.0);
+        painter.setPen(QPen(QColor(QStringLiteral("#EEF2F7")), 5.0, Qt::SolidLine, Qt::RoundCap));
+        painter.setBrush(Qt::NoBrush);
+        painter.drawEllipse(ringStrokeRect); // wjy: 三枚圆环先绘制相同浅色底轨，未占用部分保持统一。
+        if (usagePercent >= 0) {
+            painter.setPen(QPen(localUsageColor(usagePercent), 5.0, Qt::SolidLine, Qt::RoundCap));
+            const int spanAngle = -qRound(
+                360.0 * 16.0 * qBound<qreal>(0.0, usagePercent, 100.0) / 100.0); // wjy: 每个资源动画值独立换算为从 12 点顺时针扫过的圆弧角度。
+            if (spanAngle != 0) {
+                painter.drawArc(ringStrokeRect, 90 * 16, spanAngle);
+            }
+        }
+        painter.restore();
+
+        QFont percentFont(textFont);
+        percentFont.setPixelSize(usagePercent < 0 ? 9 : 13);
+        percentFont.setBold(true);
+        painter.setFont(percentFont);
+        painter.setPen(localUsageColor(usagePercent));
+        const QString percentText = usagePercent < 0
+            ? QString::fromUtf8("采样")
+            : QStringLiteral("%1%").arg(qRound(usagePercent)); // wjy: 中心数字和圆弧使用同一小数显示值，三类资源都具有同步增减效果。
+        painter.drawText(ringRect, Qt::AlignCenter, percentText);
+    };
+
+    const QString cpuDetail = info.logicalProcessorCount > 0
+        ? QString::fromUtf8("%1线程").arg(info.logicalProcessorCount)
+        : QStringLiteral("--");
+    const QString gpuDetail = gpuUsagePercent < 0
+        ? QString::fromUtf8("采样中")
+        : QString::fromUtf8("实时占用");
+    drawUsageMetric(cpuMetric, QStringLiteral("CPU"), cpuDetail, cpuUsagePercent);
+    drawUsageMetric(gpuMetric, QStringLiteral("GPU"), gpuDetail, gpuUsagePercent);
+    drawUsageMetric(memoryMetric, QString::fromUtf8("内存"), localSystemMemoryText(info.totalPhysicalMemoryBytes), memoryUsagePercent); // wjy: 顶部按 CPU、GPU、内存固定顺序绘制，三列位置不会随采样结果变化。
+
+    const QRect diskUsageRow = usageCard.adjusted(18, 88, -18, -8); // wjy: 三类资源下方继续显示系统盘信息，不增加卡片高度或挤压详情字段。
+    painter.setFont(textFont);
+    painter.setPen(QColor(QStringLiteral("#687384")));
+    painter.drawText(diskUsageRow, Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("系统盘占用")); // wjy: 删除无实际数据含义的“整机实时负载”，改为明确的磁盘指标名称。
+
+    QFont diskValueFont(textFont);
+    diskValueFont.setPixelSize(12);
+    diskValueFont.setBold(true);
+    painter.setFont(diskValueFont);
+    painter.setPen(QColor(QStringLiteral("#111827")));
+    const QRect diskValueRect = diskUsageRow.adjusted(92, 0, 0, 0); // wjy: 左侧为固定标签预留空间，右侧容量文字在窄窗口下仍保持右对齐。
+    const QString diskValue = QFontMetrics(diskValueFont).elidedText(
+        localSystemDiskUsageText(info), Qt::ElideRight, diskValueRect.width()); // wjy: 盘符或容量文本过长时只做视觉省略，不改变真实系统盘数据。
+    painter.drawText(diskValueRect, Qt::AlignVCenter | Qt::AlignRight, diskValue);
+
+    const QStringList labels{
+        QString::fromUtf8("电脑名称"),
+        QString::fromUtf8("操作系统"),
+        QString::fromUtf8("CPU 型号"),
+        QString::fromUtf8("CPU 架构"),
+        QString::fromUtf8("逻辑处理器"),
+        QString::fromUtf8("物理内存"),
+        QStringLiteral("IPv4"),
+        QStringLiteral("MAC"),
+        QString::fromUtf8("子网掩码"),
+        QString::fromUtf8("默认网关"),
+    };
+    const QStringList values{
+        localSystemInfoDisplayValue(info.network.name),
+        localSystemInfoDisplayValue(info.operatingSystem),
+        localSystemInfoDisplayValue(info.cpuModel),
+        localSystemInfoDisplayValue(info.cpuArchitecture),
+        info.logicalProcessorCount > 0 ? QString::number(info.logicalProcessorCount) : QStringLiteral("--"),
+        localSystemMemoryText(info.totalPhysicalMemoryBytes),
+        localSystemInfoDisplayValue(info.network.ip),
+        localSystemInfoDisplayValue(info.network.mac),
+        localSystemInfoDisplayValue(info.network.subnetMask),
+        localSystemInfoDisplayValue(info.network.gateway),
+    };
+
+    painter.setFont(titleFont);
+    painter.setPen(QColor(QStringLiteral("#040B18")));
+    painter.drawText(infoCard.adjusted(18, 12, -18, -infoCard.height() + 42), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("本机系统信息"));
+
+    const int columnGap = 18;
+    const int fieldGap = 6;
+    const int fieldWidth = qMax(120, (infoCard.width() - 36 - columnGap) / 2);
+    const int fieldHeight = 38; // wjy: 五行信息在最小窗口高度下仍完整落入详情安全边界，不被底部折叠区域裁掉。
+    QFont labelFont(textFont);
+    labelFont.setPixelSize(11);
+    QFont valueFont(textFont);
+    valueFont.setPixelSize(13);
+    for (int index = 0; index < labels.size(); ++index) {
+        const int column = index % 2;
+        const int row = index / 2;
+        const QRect field(
+            infoCard.x() + 18 + column * (fieldWidth + columnGap),
+            infoCard.y() + 44 + row * (fieldHeight + fieldGap),
+            fieldWidth,
+            fieldHeight);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(QStringLiteral("#F8FAFC")));
+        painter.drawRoundedRect(QRectF(field), 4, 4);
+        painter.setFont(labelFont);
+        painter.setPen(QColor(QStringLiteral("#687384")));
+        painter.drawText(field.adjusted(10, 3, -10, -20), Qt::AlignVCenter | Qt::AlignLeft, labels.at(index));
+        painter.setFont(valueFont);
+        painter.setPen(QColor(QStringLiteral("#111827")));
+        const QString value = QFontMetrics(valueFont).elidedText(values.at(index), Qt::ElideRight, field.width() - 20);
+        painter.drawText(field.adjusted(10, 17, -10, -3), Qt::AlignVCenter | Qt::AlignLeft, value);
+    }
+}
+// ===end====
 
 QRect scriptFileEditorSaveButtonRect()
 {
@@ -2550,7 +2676,21 @@ QRect settingsPeriodicDeviceDiscoverySwitchRect()
 // =====wjy====
 QRect settingsPublishUpdateButtonRect()
 {
-    return QRect(contentLeft() + contentWidth() - 118, 676 + (kDetailScriptPanelTop - 120), 100, 28); // wjy: 新增壁纸测试卡片后，发布按钮随发布卡片整体再下移一行。
+    return QRect(contentLeft() + contentWidth() - 118, 752 + (kDetailScriptPanelTop - 120), 100, 28); // wjy: 发布卡片位于版本回撤下方，按钮继续保持卡片内右侧对齐。
+}
+// ===end====
+
+// =====wjy====
+QRect settingsRollbackVersionComboRect()
+{
+    const int buttonX = contentLeft() + contentWidth() - 118;
+    const int comboWidth = qBound(132, contentWidth() / 4, 180);
+    return QRect(buttonX - comboWidth - 12, 683 + (kDetailScriptPanelTop - 120), comboWidth, 32); // wjy: 下拉框和回撤按钮位于同一行，窗口变窄时优先压缩下拉框但保留可读宽度。
+}
+
+QRect settingsRollbackButtonRect()
+{
+    return QRect(contentLeft() + contentWidth() - 118, 683 + (kDetailScriptPanelTop - 120), 100, 32); // wjy: 回撤按钮固定贴近卡片右边，与发布按钮保持同一右边界。
 }
 // ===end====
 
@@ -2697,6 +2837,8 @@ void drawSettingsPage(
     bool periodicDeviceDiscoveryEnabled,
     bool wallpaperRotationEnabled,
     const QString& wallpaperRotationStatusText,
+    bool rollbackVersionAvailable,
+    bool rollbackPreparing,
     bool localInfoExpanded,
     bool addDeviceExpanded,
     bool keyboardSelected,
@@ -2704,6 +2846,7 @@ void drawSettingsPage(
     const platform::DeviceInfo& localInfo,
     int settingsScrollOffset)
 {
+    const SettingsLayoutSnapshot layout = settingsLayoutSnapshot(localInfoExpanded, addDeviceExpanded, settingsScrollOffset); // wjy: 这一帧绘制固定使用同一份布局快照，避免视口、滚动上限和真实控件各自重新计算。
     QFont tabFont(textFont);
     tabFont.setPixelSize(14);
     tabFont.setBold(true);
@@ -2719,7 +2862,7 @@ void drawSettingsPage(
 
     // =====wjy====
     if (remoteControlSelected) {
-        const QRect qualityCard = settingsScrollViewportRect();
+        const QRect qualityCard = layout.viewport();
         painter.save();
         painter.setRenderHint(QPainter::Antialiasing);
         painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
@@ -2741,14 +2884,14 @@ void drawSettingsPage(
         painter.setPen(QColor(QStringLiteral("#687384")));
         painter.drawText(QRectF(qualityCard.x() + 28, qualityCard.y() + 38, qualityCard.width() - 56, 18),
             Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("可见窗口先降分辨率再降FPS；最小化立即降FPS；所有连接始终保持不断流。")); // wjy: 在全局设置页明确展示用户确认过的FPS优先和不断流规则。
+            QString::fromUtf8("可见清晰度按模式固定，性能压力只降低FPS；最小化使用后台档；所有连接始终保持不断流。")); // wjy: 设置页明确展示固定清晰度与FPS适配规则，避免用户误以为画面会自动降分辨率。
 
         const char* labels[] = {
             "全局模式",
             "目标FPS",
             "可见最低FPS",
             "严重压力最低FPS",
-            "可见最低分辨率",
+            "可见清晰度策略",
             "最小化FPS",
             "最小化分辨率",
             "降级持续时间",
@@ -2773,7 +2916,7 @@ void drawSettingsPage(
     // ===end====
 
     if (keyboardSelected) {
-        const QRect keyboardCard = settingsScrollViewportRect(); // wjy: 键盘页主面板和设备详情页主体面板使用同一位置与高度。
+        const QRect keyboardCard = layout.viewport(); // wjy: 键盘页主面板和设备详情页主体面板使用同一位置与高度。
         painter.save();
         painter.setRenderHint(QPainter::Antialiasing);
         painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
@@ -2823,8 +2966,8 @@ void drawSettingsPage(
     }
 
     painter.save();
-    painter.setClipRect(settingsScrollViewportRect());
-    painter.translate(0, -settingsScrollOffset);
+    painter.setClipRect(layout.viewport());
+    painter.translate(0, -layout.scrollOffset()); // wjy: 手绘常规页与布局快照保持同一滚动位置。
 
     const int settingsYShift = kDetailScriptPanelTop - 120; // wjy: 以旧常规页第一张卡片 y=120 为基准，整体移动到设备详情页主体顶部。
     const QRect startupCard(contentLeft(), 120 + settingsYShift, contentWidth(), 144);
@@ -2834,7 +2977,8 @@ void drawSettingsPage(
     // =====wjy====
     const QRect periodicDiscoveryCard(contentLeft(), 512 + settingsYShift, contentWidth(), 71); // wjy: 周期检查新增设备紧跟在批量新增设备下面。
     const QRect wallpaperTestCard(contentLeft(), 588 + settingsYShift, contentWidth(), 71); // wjy: 自动壁纸轮换独占一张设置卡片，清楚标明共享来源且不混入设备扫描功能。
-    const QRect updateCard(contentLeft(), 664 + settingsYShift, contentWidth(), 56); // wjy: 更新卡片为壁纸测试再让出一行，后续本机信息按统一布局继续下移。
+    const QRect rollbackCard(contentLeft(), 664 + settingsYShift, contentWidth(), 71); // wjy: 所有运行版本都显示回撤卡片，历史版本为空时仅禁用操作而不改变页面结构。
+    const QRect updateCard(contentLeft(), 740 + settingsYShift, contentWidth(), 56); // wjy: 开发构建的发布卡片排在回撤卡片下方，普通运行包仍完全隐藏发布功能。
     // ===end====
     const bool canPublishUpdates = platform::UpdateService::canPublishCurrentBuild(); // wjy: 绘制、命中测试和服务层统一使用构建目录身份。
     painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
@@ -2845,6 +2989,7 @@ void drawSettingsPage(
     painter.drawRoundedRect(QRectF(batchCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
     painter.drawRoundedRect(QRectF(periodicDiscoveryCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4); // wjy: 新设置项始终显示，开关关闭时仅隐藏秒数输入框。
     painter.drawRoundedRect(QRectF(wallpaperTestCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4); // wjy: 手绘卡片始终随常规页内容滚动，真实分钟输入框只覆盖右侧编辑区。
+    painter.drawRoundedRect(QRectF(rollbackCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4); // wjy: 回撤版本沿用常规设置白底细边卡片，不引入新的视觉体系。
     if (canPublishUpdates) {
         painter.drawRoundedRect(QRectF(updateCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4); // wjy: 只有构建版本显示完整发布卡片，普通运行包不绘制任何占位背景。
     }
@@ -2862,6 +3007,7 @@ void drawSettingsPage(
     drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, batchCard.y() + 30, 28, 28), 4);
     drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, periodicDiscoveryCard.y() + 22, 28, 28), 3); // wjy: 周期检查复用刷新类图标，与功能语义一致。
     drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, wallpaperTestCard.y() + 22, 28, 28), 6); // wjy: 横向图片图标帮助用户快速识别自动桌面壁纸入口。
+    drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, rollbackCard.y() + 22, 28, 28), 3); // wjy: 回撤同样属于版本切换动作，复用刷新类图标提示程序会重新启动。
     drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, settingsLocalInfoHeaderRect().y() + 8, 28, 28), 5);
     drawUiIcon(
         painter,
@@ -2877,6 +3023,10 @@ void drawSettingsPage(
     painter.drawText(QRectF(contentLeft() + 60, batchCard.y() + 24, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("批量新增设备"));
     painter.drawText(QRectF(contentLeft() + 60, periodicDiscoveryCard.y() + 16, 220, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("周期检查新增设备"));
     painter.drawText(QRectF(contentLeft() + 60, wallpaperTestCard.y() + 16, 160, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("自动切换桌面壁纸")); // wjy: 标题明确表示开关控制的是持续自动轮换，并为右侧运行状态留出空间。
+    painter.drawText(
+        QRectF(contentLeft() + 60, rollbackCard.y() + 16, qMax(80, settingsRollbackVersionComboRect().left() - contentLeft() - 76), 20),
+        Qt::AlignVCenter | Qt::AlignLeft,
+        QString::fromUtf8("回撤版本")); // wjy: 窄窗口下标题宽度止于下拉框左侧，不会被真实控件覆盖或透出残字。
     if (!wallpaperRotationStatusText.isEmpty()) {
         QFont wallpaperStatusFont(textFont);
         wallpaperStatusFont.setPixelSize(11);
@@ -2915,6 +3065,10 @@ void drawSettingsPage(
         QRectF(contentLeft() + 60, wallpaperTestCard.y() + 37, qMax(120, settingsWallpaperRotationIntervalInputRect().left() - contentLeft() - 76), 20),
         Qt::AlignVCenter | Qt::AlignLeft,
         platform::DesktopWallpaperService::sharedDirectoryPath()); // wjy: 在分钟输入框旁直接展示固定 UNC 来源，用户开启前就能核对图片放置位置。
+    painter.drawText(
+        QRectF(contentLeft() + 60, rollbackCard.y() + 37, qMax(100, settingsRollbackVersionComboRect().left() - contentLeft() - 76), 20),
+        Qt::AlignVCenter | Qt::AlignLeft,
+        QString::fromUtf8("选择历史版本，回撤完成后自动重启")); // wjy: 在操作前直接说明重启结果，确认弹窗再提示配置兼容风险。
 
     const auto drawSwitchWithLabel = [&painter, &textFont](const QRect& rect, bool checked) {
         painter.setFont(textFont);
@@ -2941,6 +3095,19 @@ void drawSettingsPage(
         painter.setPen(QColor(QStringLiteral("#FFFFFF")));
         painter.drawText(settingsPublishUpdateButtonRect(), Qt::AlignCenter, QString::fromUtf8("发布更新")); // wjy: 普通设备不会绘制按钮文字，也不会留下可误认的空按钮。
     }
+    // ===end====
+    // =====wjy====
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(rollbackVersionAvailable && !rollbackPreparing
+        ? QColor(QStringLiteral("#3A7BFC"))
+        : QColor(QStringLiteral("#C9D0DA"))); // wjy: 没有合法历史版本或正在准备任务时使用禁用色，绘制状态与实际点击条件完全一致。
+    painter.drawRoundedRect(QRectF(settingsRollbackButtonRect()), 4, 4);
+    QFont rollbackButtonFont(textFont);
+    rollbackButtonFont.setPixelSize(12);
+    painter.setFont(rollbackButtonFont);
+    painter.setPen(QColor(QStringLiteral("#FFFFFF")));
+    painter.drawText(settingsRollbackButtonRect(), Qt::AlignCenter,
+        rollbackPreparing ? QString::fromUtf8("准备中") : QString::fromUtf8("回撤")); // wjy: 暂存大文件期间即时显示准备状态并阻止重复创建更新器任务。
     // ===end====
     if (periodicDeviceDiscoveryEnabled) {
         painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
@@ -3033,14 +3200,14 @@ void drawSettingsPage(
 
     painter.restore();
 
-    const int maxScrollOffset = maxSettingsScrollOffset(localInfoExpanded, addDeviceExpanded);
+    const int maxScrollOffset = layout.maxScrollOffset();
     if (maxScrollOffset > 0) {
         const QRect track = settingsVerticalScrollbarTrackRect();
         painter.setPen(Qt::NoPen);
         painter.setBrush(QColor(QStringLiteral("#E5EAF1")));
         painter.drawRoundedRect(QRectF(track), 2.5, 2.5);
         painter.setBrush(QColor(QStringLiteral("#AAB3C0")));
-        painter.drawRoundedRect(QRectF(settingsVerticalScrollbarThumbRect(settingsScrollOffset, maxScrollOffset)), 2.5, 2.5);
+        painter.drawRoundedRect(QRectF(settingsVerticalScrollbarThumbRect(layout.scrollOffset(), maxScrollOffset)), 2.5, 2.5);
     }
 }
 
@@ -3050,6 +3217,7 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     : QFrame(parent)
     , m_realtimeStateService(realtimeStateService)
     , m_remoteViewerLifecycleManager(std::make_unique<RemoteViewerLifecycleManager>(4, 4)) // wjy: 同时最多4路初始化、4个可等待生命周期线程；最终在线窗口数量不设上限。
+    , m_remoteWindowCoordinator(std::make_unique<RemoteWindowCoordinator>()) // wjy: 远控窗口协调器先于所有窗口创建，统一承接普通/平铺集合和生命周期索引。
 {
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] DeviceGrid ctor begin")); // wjy: 进入 DeviceGrid 构造函数，定位 MainWindow 创建内部崩溃。
     setObjectName(QStringLiteral("DeviceGrid")); // wjy: 恢复正常 QObject 名称，便于样式、调试和对象树识别。
@@ -3061,12 +3229,24 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     setMouseTracking(true);
     setFocusPolicy(Qt::ClickFocus); // wjy: 允许手绘区域被点击后接管焦点，数字输入框点击外部时才能真正失焦并保存。
     // =====wjy====
+#if 0
+    // wjy: 查找功能暂缓启用；保留完整 Ctrl+F 注册代码，后续删除本门禁即可恢复快捷键入口。
+    auto* deviceSearchShortcut = new QShortcut(QKeySequence::Find, this); // wjy: 使用 Qt 标准查找键序列注册 Ctrl+F，避免手工判断平台按键差异。
+    deviceSearchShortcut->setContext(Qt::WidgetWithChildrenShortcut); // wjy: 主控窗口及其输入框有焦点时均可搜索，远控窗口获得焦点时不会误触发。
+    connect(deviceSearchShortcut, &QShortcut::activated,
+        this, &DeviceGrid::showDeviceSearchPanel); // wjy: Ctrl+F 直接切到主界面查找页，不再创建模态弹窗。
+#endif
+    // ===end====
+    // =====wjy====
     connect(&platform::UpdateService::instance(), &platform::UpdateService::updateAvailabilityChanged,
         this, [this](bool available, const QString& remoteVersion) {
             m_updateAvailable = available; // wjy: 后台检查仅改变标题栏入口可见性，不在信号处理中启动安装或弹出窗口。
             m_availableUpdateVersion = available ? remoteVersion : QString(); // wjy: 无更新时同步清除旧版本状态，避免共享目录异常后残留按钮。
             m_updatePreparing = false; // wjy: 新一轮检查完成后允许用户重新发起一次更新准备。
             update(titlebarUpdateRect().adjusted(-2, -2, 2, 2)); // wjy: 只重绘标题栏更新区域，及时显示或隐藏按钮。
+            if (m_settingsSelected && m_settingsTab == SettingsTab::General) {
+                refreshRollbackVersions(true); // wjy: 更新状态变化可能来自共享目录刚发布的新版本，绕过短时缓存后台读取最新回撤列表。
+            }
         });
     // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after basic widget setup")); // wjy: 记录基础 QWidget 属性设置完成。
@@ -3131,6 +3311,7 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after setupSettingsControls")); // wjy: 记录设置页控件创建完成。
     setupScriptFileEditor();
     setupScriptFolderTree();
+    // setupDeviceSearchPanel(); // wjy: 查找 UI 暂缓启用；保留创建入口，后续取消本行注释即可恢复面板实例。
     updateSettingsControls();
     updateLocalInfoControls();
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after update controls")); // wjy: 记录控件显隐和内容刷新完成。
@@ -3176,6 +3357,67 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
         update();
     });
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after detail animation timer")); // wjy: 记录详情动画定时器创建完成。
+
+    // =====wjy====
+    const auto setupLocalUsageAnimation = [this](QVariantAnimation*& animation, qreal* displayPercent) {
+        animation = new QVariantAnimation(this); // wjy: 每类资源独立持有动画，三枚圆环可以同时从各自当前值过渡。
+        animation->setDuration(320); // wjy: 320ms 能清楚看见环形扫动方向，同时在下一次一秒采样前完成。
+        animation->setEasingCurve(QEasingCurve::OutCubic); // wjy: 前段快速响应、末端柔和减速，数值升降不会闪跳。
+        connect(animation, &QVariantAnimation::valueChanged, this, [this, displayPercent](const QVariant& value) {
+            *displayPercent = qBound<qreal>(0.0, value.toReal(), 100.0); // wjy: 保留小数精度计算圆弧角度，中心数字再按帧取整。
+            update(scriptFileEditorRect()); // wjy: 任意资源动画帧只刷新本机详情区域，三枚圆环互不影响其它页面。
+        });
+    };
+    setupLocalUsageAnimation(m_localCpuUsageAnimation, &m_localCpuUsagePercent);
+    setupLocalUsageAnimation(m_localGpuUsageAnimation, &m_localGpuUsagePercent);
+    setupLocalUsageAnimation(m_localMemoryUsageAnimation, &m_localMemoryUsagePercent);
+
+    m_localSystemInfoTimer = new QTimer(this);
+    m_localSystemInfoTimer->setInterval(1000); // wjy: CPU、GPU、内存统一每秒采样，三枚圆环保持相同刷新节奏。
+    m_localSystemInfoTimer->setTimerType(Qt::CoarseTimer);
+    connect(m_localSystemInfoTimer, &QTimer::timeout, this, [this] {
+        const bool localPageVisible = !m_settingsSelected
+            && !m_remoteAssistSelected
+            && !m_localInfoSelected
+            && m_deviceDetailTab == DeviceDetailTab::Local;
+        if (!localPageVisible) {
+            m_localSystemInfoTimer->stop(); // wjy: 页面状态变化但尚未来得及刷新控件时，定时回调再次兜底停止隐藏采样。
+            m_localCpuUsageAnimation->stop();
+            m_localGpuUsageAnimation->stop();
+            m_localMemoryUsageAnimation->stop(); // wjy: 页面已经隐藏时同时停止三类显示动画，不再投递无意义重绘。
+            m_localCpuUsageSampler.reset(); // wjy: 隐藏页面不保留累计时间基线，下次进入必须重新取得两个相邻样本。
+            m_localGpuUsageSampler.reset(); // wjy: GPU 查询句柄跟随页面可见性释放，隐藏期间不持续采集性能计数器。
+            m_localCpuUsagePercent = -1.0;
+            m_localGpuUsagePercent = -1.0;
+            m_localMemoryUsagePercent = -1.0; // wjy: 清除三类显示值，下次进入先重新建立各自采样状态。
+            return;
+        }
+        const int sampledCpuPercent = m_localCpuUsageSampler.samplePercent(); // wjy: 一次定时回调连续读取三类只读资源快照。
+        const int sampledGpuPercent = m_localGpuUsageSampler.samplePercent();
+        const int sampledMemoryPercent = m_localMemoryUsageSampler.samplePercent();
+        if (sampledCpuPercent >= 0) {
+            animateLocalUsageTo(m_localCpuUsageAnimation, m_localCpuUsagePercent, sampledCpuPercent);
+        }
+        if (sampledGpuPercent >= 0) {
+            animateLocalUsageTo(m_localGpuUsageAnimation, m_localGpuUsagePercent, sampledGpuPercent);
+        }
+        if (sampledMemoryPercent >= 0) {
+            animateLocalUsageTo(m_localMemoryUsageAnimation, m_localMemoryUsagePercent, sampledMemoryPercent); // wjy: 三类有效样本分别从当前画面平滑过渡，不会互相重置。
+        }
+    });
+    QTimer::singleShot(0, this, [this] {
+        const bool localPageVisible = !m_settingsSelected // wjy: 只有启动后实际落在设备详情区时才加载，空设备进入设置页不会触发系统查询。
+            && !m_remoteAssistSelected
+            && !m_localInfoSelected
+            && m_deviceDetailTab == DeviceDetailTab::Local;
+        if (!localPageVisible) {
+            return;
+        }
+        refreshLocalSystemInfoTab(); // wjy: 构造结束并进入事件循环后再读取静态信息及三类资源首样本，避免在窗口构造中同步查询。
+        updateLocalSystemMonitorState(); // wjy: 默认本机页可见时启动一秒采样；后续切页仍由统一状态函数立即停止。
+        update(scriptFileEditorRect()); // wjy: 延迟数据就绪后只刷新本机详情内容区域，让首次显示立即呈现真实系统信息。
+    });
+    // ===end====
 
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before desktop hover timer")); // wjy: 记录桌面悬停动画定时器创建前的位置。
     m_desktopHoverTimer = new QTimer(this);
@@ -3333,10 +3575,17 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     // =====wjy====
     connect(&platform::DeviceListSyncService::instance(), &platform::DeviceListSyncService::snapshotAvailable,
         this, &DeviceGrid::applySyncedDeviceSnapshot); // wjy: 后台只处理共享文件，所有 UI 和全局设备数组修改统一回到主线程。
-    g_deviceSyncStarted = true;
-    platform::DeviceListSyncService::instance().start(
+    g_deviceCatalogRepository.startSynchronization(
         QFileInfo(deviceStorePath()).absolutePath(),
-        currentDeviceSnapshot(false)); // wjy: UI 完成初始化后才启动同步，避免构造中途收到远端快照访问尚未创建的控件。
+        [](const QString& dataDirectory, const QJsonObject& localSnapshot) {
+            platform::DeviceListSyncService::instance().start(dataDirectory, localSnapshot); // wjy: 具体同步服务通过窄回调注入，仓储仍保持可独立测试。
+        },
+        [] {
+            platform::DeviceListSyncService::instance().stop(); // wjy: 仓储拥有生命周期决定权，回调只负责执行现有服务的停止动作。
+        },
+        [](const QJsonObject& localSnapshot) {
+            platform::DeviceListSyncService::instance().submitLocalSnapshot(localSnapshot); // wjy: 本地原子保存成功后由仓储触发 pending 提交。
+        }); // wjy: UI 完成初始化后由仓储启动同步，目录快照和提交抑制状态不再泄漏到 DeviceGrid。
     // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] DeviceGrid ctor end")); // wjy: DeviceGrid 构造函数正常结束。
 }
@@ -3375,7 +3624,8 @@ void DeviceGrid::applySyncedDeviceSnapshot(const QJsonObject& snapshot)
         return;
     }
 
-    const QJsonObject currentSnapshot = currentDeviceSnapshot(false);
+    g_deviceCatalog.normalizeState();
+    const QJsonObject currentSnapshot = g_deviceCatalogRepository.snapshot(false); // wjy: 比较前统一使用目录规范化快照，避免旧兼容字段造成假变化。
     const bool payloadChanged = !platform::deviceListSnapshotsEquivalent(currentSnapshot, snapshot);
     QString selectedDeviceId;
     if (m_selectedDeviceIndex >= 0 && m_selectedDeviceIndex < g_devices.size()) {
@@ -3389,10 +3639,7 @@ void DeviceGrid::applySyncedDeviceSnapshot(const QJsonObject& snapshot)
     }
     saveCurrentScriptUiState(); // wjy: 快照可能删除或移动当前设备，替换数组前先保存它自己的脚本 UI 状态。
 
-    g_deviceSyncApplyingRemote = true;
-    applyDeviceSnapshotToGlobals(snapshot, true);
-    saveDevices(); // wjy: 远端快照也原子保存到本机 devices.json，但 applying 标志阻止形成循环 pending。
-    g_deviceSyncApplyingRemote = false;
+    g_deviceCatalogRepository.applySynchronizedSnapshot(snapshot); // wjy: 仓储一次完成目录应用和本机落盘，并在内部阻止远端快照形成递归 pending。
     updateRealtimeConfiguredDevices(); // wjy: 同步快照可能新增、删除或修改 IP，立即重建广播来源白名单。
 
     m_selectedDeviceIndexes.clear();
@@ -3518,6 +3765,24 @@ void DeviceGrid::prepareForApplicationExit()
     writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] DeviceGrid prepareForApplicationExit begin"));
     m_shuttingDown = true; // wjy: 更新退出准备一开始就阻止新增后台任务，避免退出过程中又启动状态探测或 SSH 操作。
     // =====wjy====
+    cancelTopEdgeAutoHide(); // wjy: 退出时停止全局鼠标监视、收起延迟和窗口位置动画，不再修改正在销毁的顶层窗口。
+    if (m_localSystemInfoTimer) {
+        m_localSystemInfoTimer->stop(); // wjy: 退出准备阶段终止 CPU、GPU、内存统一采样，不再投递资源环重绘。
+        m_localCpuUsageSampler.reset();
+        m_localGpuUsageSampler.reset(); // wjy: 同步清除 CPU 时间基线并关闭 GPU PDH 查询句柄。
+        m_localCpuUsagePercent = -1.0;
+        m_localGpuUsagePercent = -1.0;
+        m_localMemoryUsagePercent = -1.0; // wjy: 三类显示值全部恢复未采样哨兵，重复进入退出准备时状态一致。
+    }
+    if (m_localCpuUsageAnimation) {
+        m_localCpuUsageAnimation->stop();
+    }
+    if (m_localGpuUsageAnimation) {
+        m_localGpuUsageAnimation->stop();
+    }
+    if (m_localMemoryUsageAnimation) {
+        m_localMemoryUsageAnimation->stop(); // wjy: 退出时同步终止三枚资源圆环动画，避免采样已停但动画仍请求重绘。
+    }
     if (m_remoteQualityTimer) {
         m_remoteQualityTimer->stop(); // wjy: 退出期间停止质量采样，不再向已经提交stop的窗口发送任何新协议请求。
     }
@@ -3525,10 +3790,7 @@ void DeviceGrid::prepareForApplicationExit()
     if (m_remoteViewerLifecycleManager) {
         m_remoteViewerLifecycleManager->beginApplicationShutdown(); // wjy: 退出第一步关闭Viewer启动准入，排队中的第5台以后设备不会在清理途中又开始连接。
     }
-    if (g_deviceSyncStarted) {
-        g_deviceSyncStarted = false;
-        platform::DeviceListSyncService::instance().stop(); // wjy: 停止轮询并等待短时共享任务汇合，退出后不再向已销毁 UI 投递快照。
-    }
+    g_deviceCatalogRepository.stopSynchronization(); // wjy: 同步生命周期归仓储管理，退出时统一停止轮询并等待共享任务汇合。
     platform::PortableOpenSshManager::instance().stopClientProcesses(); // wjy: 用户从托盘或主窗口选择退出时，立即关闭本程序打开的 cmd/ssh 交互终端。
     if (m_periodicDeviceDiscoveryTimer) {
         m_periodicDeviceDiscoveryTimer->stop(); // wjy: 退出准备开始后禁止定时器再启动新的网段扫描任务。
@@ -3540,32 +3802,12 @@ void DeviceGrid::prepareForApplicationExit()
     if (m_scriptCancelRequested) {
         m_scriptCancelRequested->store(true); // wjy: 当前可见的无限期脚本 SSH 会话收到取消信号后会杀掉本地 ssh.exe 并结束后台线程。
     }
-    for (auto it = m_scriptUiStates.begin(); it != m_scriptUiStates.end(); ++it) {
-        if (it->cancelRequested) {
-            it->cancelRequested->store(true); // wjy: 逐设备取消所有仍在执行的脚本，确保析构 join 不会无限等待远端命令结束。
-        }
-    }
+    m_scriptUiStateStore.requestCancelAll(); // wjy: 脚本仓储统一取消所有设备任务，DeviceGrid 不再遍历内部容器。
     unregisterGlobalShortcuts();
 
     // =====wjy====
-    QVector<QPointer<RemoteDesktopWindow>> windows;
-    QSet<RemoteDesktopWindow*> seenWindows;
-    const auto appendShutdownWindow = [&windows, &seenWindows](const QPointer<RemoteDesktopWindow>& window) {
-        if (!window || seenWindows.contains(window.data())) {
-            return;
-        }
-        seenWindows.insert(window.data()); // wjy: 普通、平铺和激活顺序可能引用同一窗口，退出时每个窗口只能提交一次stop并删除一次。
-        windows.append(window);
-    };
-    for (auto it = m_remoteDesktopWindows.cbegin(); it != m_remoteDesktopWindows.cend(); ++it) {
-        appendShutdownWindow(it.value());
-    }
-    for (const QPointer<RemoteDesktopWindow>& window : std::as_const(m_tiledRemoteWindows)) {
-        appendShutdownWindow(window);
-    }
-    for (const QPointer<RemoteDesktopWindow>& window : std::as_const(m_remoteWindowActivationOrder)) {
-        appendShutdownWindow(window); // wjy: 包含已经进入异步关闭状态的窗口，不能像普通业务查询那样过滤isClosingConnection。
-    }
+    const QVector<QPointer<RemoteDesktopWindow>> windows =
+        m_remoteWindowCoordinator->shutdownWindows(); // wjy: 协调器统一去重普通、平铺和激活顺序引用，退出时每个窗口只处理一次。
     // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] remote windows count=%1").arg(windows.size()));
     for (const QPointer<RemoteDesktopWindow>& window : windows) {
@@ -3595,11 +3837,7 @@ void DeviceGrid::prepareForApplicationExit()
     }
     // ===end====
 
-    m_remoteDesktopWindows.clear();
-    m_tiledRemoteWindows.clear();
-    m_remoteWindowActivationOrder.clear();
-    m_remoteTileRestoreGeometries.clear();
-    m_remoteWindowsTiled = false;
+    m_remoteWindowCoordinator->clear(); // wjy: 所有窗口删除后清空协调器索引，避免退出阶段残留对象地址。
     writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] DeviceGrid prepareForApplicationExit end"));
 }
 
@@ -3727,16 +3965,339 @@ void DeviceGrid::releaseRemoteShortcutKeyState(int shortcutIndex)
 
 void DeviceGrid::syncResponsiveLayoutState() const
 {
-    setResponsiveLayoutState(size(), m_leftSidebarCollapsed);
+    // =====wjy====
+    const bool detailWidthAnimating = m_detailPanelWidthAnimation
+        && m_detailPanelWidthAnimation->state() == QAbstractAnimation::Running; // wjy: 动画帧使用窗口真实宽度，标题栏按钮会随右边界移动而不是在 720px 处停住。
+    setResponsiveLayoutState(size(), m_detailPanelCollapsed || detailWidthAnimating);
+    // ===end====
 }
+
+// =====wjy====
+void DeviceGrid::setDetailPanelCollapsed(bool collapsed)
+{
+    if (m_detailPanelWidthAnimation
+        && m_detailPanelWidthAnimation->state() == QAbstractAnimation::Running) {
+        return; // wjy: 220ms 滑动期间忽略重复点击，防止两个相反目标同时修改顶层窗口几何。
+    }
+    if (m_detailPanelCollapsed == collapsed) {
+        return;
+    }
+
+    QWidget* shell = window();
+    if (collapsed && shell) {
+        m_expandedWindowWidth = qMax(kMinimumExpandedShellWidth, shell->width()); // wjy: 只保存展开宽度，紧凑窗口移动后再次展开不会跳回旧位置。
+    }
+    m_detailPanelAnimationTargetCollapsed = collapsed; // wjy: 收起过程暂不改变可见状态，让详情内容跟随右边界被逐步裁掉。
+
+    if (collapsed) {
+        if (m_settingsScrollbarAnimation) {
+            m_settingsScrollbarAnimation->stop(); // wjy: 隐藏设置页时终止滚动缓动，避免不可见内容继续改变位置。
+        }
+        m_draggingSettingsScrollbar = false;
+    }
+
+    if (!shell || !shell->isVisible()) {
+        finishDetailPanelCollapseTransition(); // wjy: 窗口尚未显示或已隐藏到托盘时无需播放不可见动画，直接应用最终状态。
+        return;
+    }
+
+    if (!m_detailPanelWidthAnimation) {
+        m_detailPanelWidthAnimation = new QVariantAnimation(this);
+        m_detailPanelWidthAnimation->setDuration(220); // wjy: 220ms 足够看清折叠方向，同时不会让主窗口操作显得拖沓。
+        m_detailPanelWidthAnimation->setEasingCurve(QEasingCurve::OutCubic); // wjy: 前段快速移动、末端柔和减速，边界停止时没有生硬撞击感。
+        connect(m_detailPanelWidthAnimation, &QVariantAnimation::valueChanged, this, [this](const QVariant& value) {
+            QWidget* animatedShell = window();
+            if (!animatedShell) {
+                return;
+            }
+            QRect animatedGeometry = animatedShell->geometry();
+            animatedGeometry.setWidth(value.toInt()); // wjy: 固定左上角和高度，只推动右侧边界，实现详情栏横向滑入滑出。
+            animatedShell->setGeometry(animatedGeometry);
+        });
+        connect(m_detailPanelWidthAnimation, &QVariantAnimation::finished,
+            this, &DeviceGrid::finishDetailPanelCollapseTransition); // wjy: 最后一帧再隐藏详情或恢复展开约束，消除内容先闪没再缩窗的问题。
+    }
+
+    setMinimumSize(kCollapsedShellWidth, kMinimumShellHeight); // wjy: 动画期间临时允许中央控件经过 720px 以下宽度，否则 Qt 最小尺寸会阻止收起。
+    shell->setMinimumSize(kCollapsedShellWidth, kMinimumShellHeight);
+    shell->setMaximumWidth(QWIDGETSIZE_MAX); // wjy: 收起和展开动画都必须暂时解除固定宽度，逐帧 setGeometry 才能生效。
+
+    if (!collapsed) {
+        m_detailPanelCollapsed = false; // wjy: 展开第一帧就恢复详情绘制，后续随着窗口变宽从右侧逐步露出内容。
+        syncResponsiveLayoutState();
+        updateAddDeviceControls();
+        updateLocalInfoControls();
+        updateSettingsControls();
+        updateScriptFileEditorControls();
+        update();
+    }
+
+    const int startWidth = shell->width();
+    const int targetWidth = collapsed
+        ? kCollapsedShellWidth
+        : qMax(kMinimumExpandedShellWidth, m_expandedWindowWidth); // wjy: 展开恢复收起前宽度，收起固定到设备栏与按钮窄条之和。
+    if (startWidth == targetWidth) {
+        finishDetailPanelCollapseTransition();
+        return;
+    }
+
+    m_detailPanelWidthAnimation->setStartValue(startWidth);
+    m_detailPanelWidthAnimation->setEndValue(targetWidth);
+    m_detailPanelWidthAnimation->start(); // wjy: QVariantAnimation 每帧驱动主窗口宽度，替代原来一次 setGeometry 的闪现。
+}
+
+void DeviceGrid::finishDetailPanelCollapseTransition()
+{
+    const bool collapsed = m_detailPanelAnimationTargetCollapsed;
+    QWidget* shell = window();
+    m_detailPanelCollapsed = collapsed; // wjy: 收起在最后一帧才隐藏详情；展开状态已在起始帧设置，这里再次确认最终值。
+
+    if (collapsed) {
+        setMinimumSize(kCollapsedShellWidth, kMinimumShellHeight);
+        if (shell) {
+            shell->setMinimumSize(kCollapsedShellWidth, kMinimumShellHeight);
+            shell->setMaximumWidth(kCollapsedShellWidth); // wjy: 动画完成后紧凑窗口重新锁定横向宽度，只保留高度调整能力。
+            QRect compactGeometry = shell->geometry();
+            compactGeometry.setWidth(kCollapsedShellWidth);
+            shell->setGeometry(compactGeometry);
+        }
+    } else {
+        if (shell) {
+            shell->setMaximumWidth(QWIDGETSIZE_MAX); // wjy: 展开结束后恢复用户横向缩放窗口的能力。
+        }
+        setMinimumSize(kMinimumExpandedShellWidth, kMinimumShellHeight);
+        if (shell) {
+            shell->setMinimumSize(kMinimumExpandedShellWidth, kMinimumShellHeight);
+            QRect expandedGeometry = shell->geometry();
+            expandedGeometry.setWidth(qMax(kMinimumExpandedShellWidth, m_expandedWindowWidth));
+            shell->setGeometry(expandedGeometry); // wjy: 用精确目标宽度收尾，避免浮点插值取整留下 1px 边缘误差。
+        }
+    }
+
+    syncResponsiveLayoutState();
+    setDesktopHoverActive(false);
+    clearBottomActionHover();
+    updateAddDeviceControls();
+    updateLocalInfoControls();
+    updateSettingsControls();
+    updateScriptFileEditorControls(); // wjy: 动画结束后统一隐藏或恢复真实控件，并同步本机资源采样生命周期。
+    if (!collapsed
+        && !m_settingsSelected
+        && !m_remoteAssistSelected
+        && !m_localInfoSelected
+        && m_deviceDetailTab == DeviceDetailTab::Local) {
+        refreshLocalSystemInfoTab(); // wjy: 详情完全展开后再重建 CPU/GPU 基线和内存快照，避免动画期间重复刷新。
+    }
+    update();
+}
+// ===end====
+
+// =====wjy====
+void DeviceGrid::ensureTopEdgeAutoHideControllers()
+{
+    if (!m_topEdgeAutoHideAnimation) {
+        m_topEdgeAutoHideAnimation = new QVariantAnimation(this);
+        m_topEdgeAutoHideAnimation->setDuration(180); // wjy: 顶部收起和滑下保持短促，能看清方向但不会拖慢窗口操作。
+        m_topEdgeAutoHideAnimation->setEasingCurve(QEasingCurve::OutCubic);
+        connect(m_topEdgeAutoHideAnimation, &QVariantAnimation::valueChanged, this, [this](const QVariant& value) {
+            QWidget* shell = window();
+            if (!m_topEdgeDocked || !shell) {
+                return;
+            }
+            shell->move(shell->x(), value.toInt()); // wjy: 每帧只改变 y 坐标，窗口宽高、横向停靠位置和详情栏状态都保持不变。
+        });
+        connect(m_topEdgeAutoHideAnimation, &QVariantAnimation::finished, this, [this] {
+            QWidget* shell = window();
+            if (!m_topEdgeDocked || !shell || !m_topEdgeDockScreenGeometry.isValid()) {
+                return;
+            }
+            const int finalY = m_topEdgeAutoHidden
+                ? m_topEdgeDockScreenGeometry.top() - shell->height() + kTopEdgeHiddenStripHeight
+                : m_topEdgeDockScreenGeometry.top();
+            shell->move(shell->x(), finalY); // wjy: 动画结束精确落到工作区顶部或 4px 触发条位置，消除插值取整残留。
+        });
+    }
+
+    if (!m_topEdgeAutoHideMonitorTimer) {
+        m_topEdgeAutoHideMonitorTimer = new QTimer(this);
+        m_topEdgeAutoHideMonitorTimer->setTimerType(Qt::CoarseTimer);
+        m_topEdgeAutoHideMonitorTimer->setInterval(50); // wjy: 20Hz 足够及时响应屏幕顶部悬停，同时避免高频全局鼠标查询。
+        connect(m_topEdgeAutoHideMonitorTimer, &QTimer::timeout,
+            this, &DeviceGrid::monitorTopEdgeAutoHide);
+    }
+
+    if (!m_topEdgeAutoHideDelayTimer) {
+        m_topEdgeAutoHideDelayTimer = new QTimer(this);
+        m_topEdgeAutoHideDelayTimer->setSingleShot(true);
+        m_topEdgeAutoHideDelayTimer->setInterval(650); // wjy: 鼠标离开约三分之二秒后才收起，操作标题栏和窗口边缘时不会误触发。
+        connect(m_topEdgeAutoHideDelayTimer, &QTimer::timeout, this, [this] {
+            QWidget* shell = window();
+            if (!m_topEdgeDocked || m_topEdgeAutoHidden || m_draggingWindow || m_resizingWindow
+                || !shell || !shell->isVisible() || shell->isMinimized()
+                || QApplication::activePopupWidget() || QApplication::activeModalWidget()) {
+                return;
+            }
+            if (shell->frameGeometry().adjusted(-2, -2, 2, 2).contains(QCursor::pos())) {
+                return; // wjy: 延迟期间鼠标重新进入窗口则保持展开，下一次真正离开后由监视器重新计时。
+            }
+            setTopEdgeAutoHidden(true);
+        });
+    }
+}
+
+void DeviceGrid::updateTopEdgeAutoHideAfterWindowDrag(const QPoint& releaseGlobalPosition)
+{
+    QWidget* shell = window();
+    if (!shell || shell->isMaximized()) {
+        cancelTopEdgeAutoHide();
+        return;
+    }
+
+    QScreen* targetScreen = QGuiApplication::screenAt(releaseGlobalPosition);
+    if (!targetScreen) {
+        targetScreen = shell->screen();
+    }
+    if (!targetScreen) {
+        targetScreen = QGuiApplication::primaryScreen();
+    }
+    if (!targetScreen) {
+        cancelTopEdgeAutoHide();
+        return;
+    }
+
+    const QRect dockGeometry = targetScreen->availableGeometry(); // wjy: 使用目标屏幕工作区顶部，任务栏放在顶部时不会把触发条藏到任务栏后面。
+    const int topOffset = shell->frameGeometry().top() - dockGeometry.top();
+    const bool touchesTopEdge = topOffset <= kTopEdgeDockSnapDistance
+        && topOffset >= -kTitleBarHeight; // wjy: 鼠标到屏幕顶端时标题栏可能被拖出最多一行高度，仍视为用户明确停靠。
+    if (!touchesTopEdge) {
+        cancelTopEdgeAutoHide();
+        return;
+    }
+
+    ensureTopEdgeAutoHideControllers();
+    if (m_topEdgeAutoHideAnimation) {
+        m_topEdgeAutoHideAnimation->stop();
+    }
+    if (m_topEdgeAutoHideDelayTimer) {
+        m_topEdgeAutoHideDelayTimer->stop();
+    }
+    m_topEdgeDockScreenGeometry = dockGeometry;
+    m_topEdgeDocked = true;
+    m_topEdgeAutoHidden = false;
+    QRect snappedGeometry = shell->geometry();
+    snappedGeometry.moveTop(dockGeometry.top());
+    shell->setGeometry(snappedGeometry); // wjy: 松开后先精确吸附顶部；鼠标离开窗口后再开始延迟收起。
+    if (m_topEdgeAutoHideMonitorTimer && !m_topEdgeAutoHideMonitorTimer->isActive()) {
+        m_topEdgeAutoHideMonitorTimer->start();
+    }
+}
+
+void DeviceGrid::setTopEdgeAutoHidden(bool hidden)
+{
+    QWidget* shell = window();
+    if (!m_topEdgeDocked || !shell || !m_topEdgeDockScreenGeometry.isValid()) {
+        return;
+    }
+    ensureTopEdgeAutoHideControllers();
+
+    if (m_topEdgeAutoHideDelayTimer) {
+        m_topEdgeAutoHideDelayTimer->stop();
+    }
+    const int targetY = hidden
+        ? m_topEdgeDockScreenGeometry.top() - shell->height() + kTopEdgeHiddenStripHeight
+        : m_topEdgeDockScreenGeometry.top(); // wjy: 隐藏态只露出 4px，展开态完整贴合当前停靠屏幕的工作区顶部。
+    if (m_topEdgeAutoHideAnimation
+        && m_topEdgeAutoHideAnimation->state() == QAbstractAnimation::Running) {
+        if (m_topEdgeAutoHidden == hidden) {
+            return;
+        }
+        m_topEdgeAutoHideAnimation->stop(); // wjy: 鼠标在滑动中反向进入或离开时，从当前 y 坐标平滑反向而不是瞬移。
+    }
+
+    m_topEdgeAutoHidden = hidden;
+    if (!hidden) {
+        shell->show();
+        shell->raise();
+        shell->activateWindow(); // wjy: 被其它窗口覆盖时，鼠标到达顶部触发区仍能把主窗口完整带到前面。
+    }
+    if (shell->y() == targetY || !shell->isVisible() || shell->isMinimized()) {
+        shell->move(shell->x(), targetY);
+        return;
+    }
+
+    m_topEdgeAutoHideAnimation->setStartValue(shell->y());
+    m_topEdgeAutoHideAnimation->setEndValue(targetY);
+    m_topEdgeAutoHideAnimation->start();
+}
+
+void DeviceGrid::monitorTopEdgeAutoHide()
+{
+    QWidget* shell = window();
+    if (!m_topEdgeDocked || m_shuttingDown || !shell || !m_topEdgeDockScreenGeometry.isValid()) {
+        if (m_topEdgeAutoHideMonitorTimer) {
+            m_topEdgeAutoHideMonitorTimer->stop();
+        }
+        return;
+    }
+    if (!shell->isVisible() || shell->isMinimized()) {
+        if (m_topEdgeAutoHideDelayTimer) {
+            m_topEdgeAutoHideDelayTimer->stop();
+        }
+        return; // wjy: 隐藏到托盘或最小化期间保留停靠状态，但不继续移动不可见窗口。
+    }
+
+    const QPoint cursorPosition = QCursor::pos();
+    const QRect revealTrigger(
+        shell->x(),
+        m_topEdgeDockScreenGeometry.top(),
+        shell->width(),
+        kTopEdgeRevealTriggerDepth); // wjy: 触发区只覆盖本窗口原有横向范围，不会让整块屏幕顶部都唤出主窗口。
+    if (m_topEdgeAutoHidden) {
+        if (revealTrigger.contains(cursorPosition)) {
+            setTopEdgeAutoHidden(false); // wjy: 全局鼠标进入顶部触发区时，即使窗口主体已经在屏幕外也能滑下。
+        }
+        return;
+    }
+
+    const bool interactionActive = m_draggingWindow
+        || m_resizingWindow
+        || QApplication::activePopupWidget()
+        || QApplication::activeModalWidget(); // wjy: 下拉框、菜单、确认框和手动拖放期间始终保持窗口展开。
+    const bool cursorInsideWindow = shell->frameGeometry().adjusted(-2, -2, 2, 2).contains(cursorPosition);
+    if (interactionActive || cursorInsideWindow) {
+        if (m_topEdgeAutoHideDelayTimer) {
+            m_topEdgeAutoHideDelayTimer->stop();
+        }
+    } else if (m_topEdgeAutoHideDelayTimer && !m_topEdgeAutoHideDelayTimer->isActive()) {
+        m_topEdgeAutoHideDelayTimer->start(); // wjy: 真正离开主窗口后才开始 650ms 倒计时，倒计时回调会再次复核鼠标位置。
+    }
+}
+
+void DeviceGrid::cancelTopEdgeAutoHide()
+{
+    if (m_topEdgeAutoHideAnimation) {
+        m_topEdgeAutoHideAnimation->stop();
+    }
+    if (m_topEdgeAutoHideMonitorTimer) {
+        m_topEdgeAutoHideMonitorTimer->stop();
+    }
+    if (m_topEdgeAutoHideDelayTimer) {
+        m_topEdgeAutoHideDelayTimer->stop();
+    }
+    m_topEdgeDocked = false;
+    m_topEdgeAutoHidden = false;
+    m_topEdgeDockScreenGeometry = QRect(); // wjy: 清除旧屏幕工作区，下一次拖到其它显示器顶部会重新计算。
+}
+// ===end====
 
 void DeviceGrid::beginWindowResize(const QPoint& position, const QPoint& globalPosition)
 {
     syncResponsiveLayoutState();
-    m_resizeEdges = windowResizeEdgesAt(position, size());
+    m_resizeEdges = windowResizeEdgesAt(position, size(), !m_detailPanelCollapsed); // wjy: 紧凑态屏蔽左右边缘，只保留上下高度调整。
     if (m_resizeEdges == kResizeNone || !window()) {
         return;
     }
+    cancelTopEdgeAutoHide(); // wjy: 用户开始手动改变窗口几何时立即解除顶部停靠，后续不会被自动 y 动画拉回。
     m_resizingWindow = true;
     m_resizeStartGlobal = globalPosition;
     m_resizeStartGeometry = window()->frameGeometry();
@@ -3816,6 +4377,7 @@ QString DeviceGrid::currentScriptUiDeviceIp() const
 // ===end====
 }
 
+// =====wjy====
 void DeviceGrid::saveCurrentScriptUiState()
 {
 // =====wjy====
@@ -3824,31 +4386,9 @@ void DeviceGrid::saveCurrentScriptUiState()
         return;
     }
 
-    ScriptUiState state = m_scriptUiStates.value(deviceIp); // wjy: 保留远端 runId/PID/确认状态，切换设备时只用当前可见控件覆盖 UI 字段。
-    state.outputVisible = m_scriptOutputVisible;
-    state.outputRunning = m_scriptOutputRunning;
-    state.outputFailed = m_scriptOutputFailed;
-    state.outputScrollOffset = m_scriptOutputScrollOffset;
-    state.outputAutoScroll = m_scriptOutputAutoScroll;
-    state.outputDirty = m_scriptOutputDirty;
-    state.outputTitle = m_scriptOutputTitle;
-    state.outputText = m_scriptOutputText;
-    state.outputFilePath = m_scriptOutputFilePath;
-    state.lastScriptFolderPath = m_lastScriptFolderPath;
-    state.cancelRequested = m_scriptCancelRequested;
-    state.editorVisible = m_scriptEditorVisible;
-    state.editorLoading = m_scriptEditorLoading;
-    state.editorSaving = m_scriptEditorSaving;
-    state.editorTitle = m_scriptEditorTitle;
-    state.editorRemotePath = m_scriptEditorRemotePath;
-    state.editorDeviceIp = m_scriptEditorDeviceIp;
-    state.editorLoginUser = m_scriptEditorLoginUser;
-    state.editorWorkName = m_scriptEditorWorkName;
-    if (m_scriptFileEdit) {
-        state.editorText = m_scriptFileEdit->toPlainText(); // wjy: 切走设备前保留未保存的编辑器文本，切回来时继续显示。
-        state.editorModified = m_scriptFileEdit->document()->isModified();
-    }
-    m_scriptUiStates.insert(deviceIp, state);
+    ScriptUiState state = m_scriptUiStateStore.state(deviceIp); // wjy: 保留远端 runId/PID/确认状态，当前控件只覆盖 UI 展示字段。
+    saveVisibleState(state, m_scriptFileEdit); // wjy: 直接更新目标设备状态，避免先构造临时快照再逐字段复制。
+    m_scriptUiStateStore.setState(deviceIp, std::move(state));
 // ===end====
 }
 
@@ -3856,18 +4396,8 @@ void DeviceGrid::loadScriptUiStateForDevice(const QString& deviceIp)
 {
 // =====wjy====
     const QString key = deviceIp.trimmed();
-    const ScriptUiState state = m_scriptUiStates.value(key);
-    m_scriptOutputVisible = state.outputVisible;
-    m_scriptOutputRunning = state.outputRunning;
-    m_scriptOutputFailed = state.outputFailed;
-    m_scriptOutputScrollOffset = state.outputScrollOffset;
-    m_scriptOutputAutoScroll = state.outputAutoScroll;
-    m_scriptOutputDirty = state.outputDirty;
-    m_scriptOutputTitle = state.outputTitle;
-    m_scriptOutputText = state.outputText;
-    m_scriptOutputFilePath = state.outputFilePath;
-    m_lastScriptFolderPath = state.lastScriptFolderPath;
-    m_scriptCancelRequested = state.cancelRequested;
+    const ScriptUiState state = m_scriptUiStateStore.state(key);
+    applyState(state, key, m_scriptFileEdit); // wjy: 脚本面板字段统一由控制器恢复，避免切换入口各自复制一套赋值逻辑。
     if (m_scriptOutputVisible && !m_scriptOutputFilePath.trimmed().isEmpty()) {
         m_scriptOutputText = stripTerminalControlSequences(readScriptOutputFileTail(m_scriptOutputFilePath)); // wjy: 切回正在运行或已执行设备时，从临时输出文件补读最新内容。
         m_scriptOutputDirty = false;
@@ -3876,18 +4406,6 @@ void DeviceGrid::loadScriptUiStateForDevice(const QString& deviceIp)
         }
     }
 
-    m_scriptEditorVisible = state.editorVisible;
-    m_scriptEditorLoading = state.editorLoading;
-    m_scriptEditorSaving = state.editorSaving;
-    m_scriptEditorTitle = state.editorTitle;
-    m_scriptEditorRemotePath = state.editorRemotePath;
-    m_scriptEditorDeviceIp = state.editorDeviceIp.trimmed().isEmpty() ? key : state.editorDeviceIp;
-    m_scriptEditorLoginUser = state.editorLoginUser;
-    m_scriptEditorWorkName = state.editorWorkName;
-    if (m_scriptFileEdit) {
-        m_scriptFileEdit->setPlainText(state.editorText);
-        m_scriptFileEdit->document()->setModified(state.editorModified);
-    }
     updateScriptFileEditorControls();
     update(scriptFileEditorRect().adjusted(-2, -2, 2, 2).united(scriptTerminalPanelRect().toAlignedRect().adjusted(-2, -2, 2, 2)));
 // ===end====
@@ -3904,7 +4422,7 @@ void DeviceGrid::applyRemoteScriptRuntimeState(
         return; // wjy: 旧目标端或无法确认的响应不覆盖本地状态，避免把“未知”错误显示成“未运行”。
     }
 
-    ScriptUiState state = m_scriptUiStates.value(targetIp);
+    ScriptUiState state = m_scriptUiStateStore.state(targetIp);
     if (runtime.running) {
         const bool recoveredRun = !state.outputRunning
             || (!runtime.runId.isEmpty() && state.remoteRunId != runtime.runId); // wjy: 新进程首次发现运行或 runId 变化时重建本设备的日志提示。
@@ -3950,7 +4468,7 @@ void DeviceGrid::applyRemoteScriptRuntimeState(
         }
     }
 
-    m_scriptUiStates.insert(targetIp, state);
+    m_scriptUiStateStore.setState(targetIp, std::move(state));
     update(deviceListViewportRect(m_deviceGroupExpanded)); // wjy: 每次远端确认后立即刷新左侧列表，让重启恢复的运行图标无需等待用户切换设备。
     if (currentScriptUiDeviceIp() == targetIp) {
         loadScriptUiStateForDevice(targetIp); // wjy: 当前详情设备同时恢复停止所需的 loginUser/workName 和脚本终端提示。
@@ -4162,11 +4680,17 @@ void DeviceGrid::updateScriptFileEditorControls()
 {
 // =====wjy====
     syncResponsiveLayoutState();
-    const bool scriptTreeVisible =
-        !m_settingsSelected
-        && !m_remoteAssistSelected
-        && !m_localInfoSelected
-        && m_deviceDetailTab == DeviceDetailTab::ScriptLog;
+    const ScriptPanelViewContext panelContext{
+        m_settingsSelected,
+        m_remoteAssistSelected,
+        m_localInfoSelected,
+        m_deviceDetailTab == DeviceDetailTab::ScriptLog,
+        m_deviceDetailTab == DeviceDetailTab::Config,
+        m_scriptOutputVisible,
+        m_scriptEditorVisible};
+    const ScriptPanelVisibility panelVisibility = computeScriptPanelVisibility(panelContext); // wjy: 脚本树、输出和编辑器共用同一份页面可见性判定，避免三个控件各自维护互相漂移的条件。
+    const bool detailControlsVisible = !m_detailPanelCollapsed; // wjy: 紧凑窗口保留页面逻辑状态，但所有右侧真实控件必须隐藏并禁用。
+    const bool scriptTreeVisible = detailControlsVisible && panelVisibility.treeVisible;
     if (m_scriptFolderTree) {
         m_scriptFolderTree->setGeometry(scriptFolderTreeRect());
         m_scriptFolderTree->setVisible(scriptTreeVisible);
@@ -4177,7 +4701,7 @@ void DeviceGrid::updateScriptFileEditorControls()
         }
     }
 
-    const bool scriptOutputVisible = scriptTreeVisible && m_scriptOutputVisible;
+    const bool scriptOutputVisible = detailControlsVisible && panelVisibility.outputVisible;
     if (m_scriptOutputEdit) {
         m_scriptOutputEdit->setGeometry(scriptTerminalOutputRect().toAlignedRect());
         m_scriptOutputEdit->setVisible(scriptOutputVisible);
@@ -4211,12 +4735,7 @@ void DeviceGrid::updateScriptFileEditorControls()
         }
     }
 
-    const bool visible =
-        m_scriptEditorVisible
-        && !m_settingsSelected
-        && !m_remoteAssistSelected
-        && !m_localInfoSelected
-        && m_deviceDetailTab == DeviceDetailTab::Config;
+    const bool visible = detailControlsVisible && panelVisibility.editorVisible;
     if (m_scriptFileEdit) {
         m_scriptFileEdit->setGeometry(scriptFileEditorTextRect());
         m_scriptFileEdit->setVisible(visible);
@@ -4234,6 +4753,8 @@ void DeviceGrid::updateScriptFileEditorControls()
             m_scriptFileSaveButton->raise();
         }
     }
+    updateDeviceSearchPanel(); // wjy: 搜索面板与脚本树、日志和配置编辑器共用同一页签可见性刷新时机，切页后不会互相覆盖。
+    updateLocalSystemMonitorState(); // wjy: 真实控件显隐刷新完成后同步三类资源定时器，任一页面切换都不会留下后台采样。
 // ===end====
 }
 
@@ -4245,7 +4766,7 @@ void DeviceGrid::loadScriptFileEditor(const QString& deviceIp, const QString& lo
     }
     const QString targetIp = deviceIp.trimmed();
     const bool targetIsCurrent = currentScriptUiDeviceIp() == targetIp;
-    ScriptUiState loadingState = m_scriptUiStates.value(targetIp);
+    ScriptUiState loadingState = m_scriptUiStateStore.state(targetIp);
     loadingState.editorVisible = true;
     loadingState.editorLoading = true;
     loadingState.editorSaving = false;
@@ -4254,9 +4775,10 @@ void DeviceGrid::loadScriptFileEditor(const QString& deviceIp, const QString& lo
     loadingState.editorDeviceIp = targetIp;
     loadingState.editorLoginUser = loginUser;
     loadingState.editorWorkName = scriptWorkName;
+    loadingState.editorRequestId = QUuid::createUuid().toString(QUuid::WithoutBraces); // wjy: 记录本次读取请求，设备切换或再次读取后旧回调自动失效。
     loadingState.editorText = QString::fromUtf8("正在读取目标设备本地 json/txt 文件...");
     loadingState.editorModified = false;
-    m_scriptUiStates.insert(targetIp, loadingState); // wjy: 开始读取时先更新目标设备状态，切走设备也不会污染当前编辑器。
+    m_scriptUiStateStore.setState(targetIp, loadingState); // wjy: 开始读取时先更新目标设备状态，切走设备也不会污染当前编辑器。
     if (targetIsCurrent) {
         m_scriptEditorVisible = loadingState.editorVisible;
         m_scriptEditorLoading = loadingState.editorLoading;
@@ -4265,11 +4787,7 @@ void DeviceGrid::loadScriptFileEditor(const QString& deviceIp, const QString& lo
         m_scriptEditorRemotePath = loadingState.editorRemotePath;
         m_scriptEditorDeviceIp = loadingState.editorDeviceIp;
         m_scriptEditorLoginUser = loadingState.editorLoginUser;
-        m_scriptEditorWorkName = loadingState.editorWorkName;
-        if (m_scriptFileEdit) {
-            m_scriptFileEdit->setPlainText(loadingState.editorText);
-            m_scriptFileEdit->document()->setModified(false);
-        }
+        applyState(loadingState, targetIp, m_scriptFileEdit); // wjy: 当前设备的编辑器显示统一由控制器恢复。
         updateScriptFileEditorControls();
     }
 
@@ -4305,8 +4823,9 @@ Write-Output 'FSREMOTE_EDIT_END'
             .arg(powerShellEncodedCommand(remotePowerShellScript)),
     };
 
+    const QString requestId = loadingState.editorRequestId;
     QPointer<DeviceGrid> self(this);
-    runBackgroundTask([self, deviceIp, loginUser, scriptWorkName, commands] {
+    runBackgroundTask([self, deviceIp, loginUser, scriptWorkName, requestId, commands] {
         QString outputText;
         QString errorMessage;
         const bool ok = platform::PortableOpenSshManager::instance().runRemoteCommands(
@@ -4319,14 +4838,17 @@ Write-Output 'FSREMOTE_EDIT_END'
         if (!self) {
             return;
         }
-        QMetaObject::invokeMethod(self, [self, ok, deviceIp, loginUser, scriptWorkName, outputText, errorMessage] {
+        QMetaObject::invokeMethod(self, [self, ok, deviceIp, loginUser, scriptWorkName, requestId, outputText, errorMessage] {
             if (!self) {
                 return;
             }
             DeviceGrid* grid = self.data();
             const QString targetIp = deviceIp.trimmed();
             const bool targetIsCurrent = grid->currentScriptUiDeviceIp() == targetIp;
-            ScriptUiState state = grid->m_scriptUiStates.value(targetIp);
+            ScriptUiState state = grid->m_scriptUiStateStore.state(targetIp);
+            if (state.editorRequestId != requestId) {
+                return; // wjy: 旧读取回调不能覆盖同一设备后续发起的新读取或保存请求。
+            }
             const QString activeWorkName = targetIsCurrent ? grid->m_scriptEditorWorkName : state.editorWorkName;
             if (activeWorkName != scriptWorkName) {
                 return;
@@ -4380,7 +4902,7 @@ Write-Output 'FSREMOTE_EDIT_END'
             state.editorWorkName = scriptWorkName;
             state.editorText = nextText;
             state.editorModified = false;
-            grid->m_scriptUiStates.insert(targetIp, state); // wjy: 文件读取结果先归档到目标设备自己的状态，切回来时能恢复对应编辑器。
+            grid->m_scriptUiStateStore.setState(targetIp, state); // wjy: 文件读取结果先归档到目标设备自己的状态，切回来时能恢复对应编辑器。
 
             if (targetIsCurrent) {
                 grid->m_scriptEditorVisible = state.editorVisible;
@@ -4390,11 +4912,7 @@ Write-Output 'FSREMOTE_EDIT_END'
                 grid->m_scriptEditorRemotePath = state.editorRemotePath;
                 grid->m_scriptEditorDeviceIp = state.editorDeviceIp;
                 grid->m_scriptEditorLoginUser = state.editorLoginUser;
-                grid->m_scriptEditorWorkName = state.editorWorkName;
-                if (grid->m_scriptFileEdit) {
-                    grid->m_scriptFileEdit->setPlainText(state.editorText);
-                    grid->m_scriptFileEdit->document()->setModified(false); // wjy: 只刷新当前设备自己的编辑器，避免别的设备后台读取覆盖当前文本。
-                }
+                grid->applyState(state, targetIp, grid->m_scriptFileEdit); // wjy: 只刷新当前设备自己的编辑器，避免别的设备后台读取覆盖当前文本。
                 grid->updateScriptFileEditorControls();
                 grid->update(scriptFileEditorRect().adjusted(-2, -2, 2, 2));
             }
@@ -4420,6 +4938,11 @@ void DeviceGrid::saveScriptFileEditor()
     const QString contentBase64 = base64Utf8(m_scriptFileEdit->toPlainText());
     const QString deviceIp = m_scriptEditorDeviceIp;
     const QString loginUser = m_scriptEditorLoginUser;
+    const QString requestId = QUuid::createUuid().toString(QUuid::WithoutBraces); // wjy: 保存操作也有独立请求 ID，防止迟到结果改写后续编辑内容。
+    ScriptUiState requestState = m_scriptUiStateStore.state(deviceIp);
+    requestState.editorRequestId = requestId;
+    requestState.editorSaving = true;
+    m_scriptUiStateStore.setState(deviceIp, std::move(requestState));
     const QString remotePowerShellScript = QStringLiteral(R"($ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $path = '%1'
@@ -4435,7 +4958,7 @@ Write-Output 'FSREMOTE_EDIT_SAVE_OK'
     };
 
     QPointer<DeviceGrid> self(this);
-    runBackgroundTask([self, deviceIp, loginUser, remotePath, commands] {
+    runBackgroundTask([self, deviceIp, loginUser, remotePath, requestId, commands] {
         QString outputText;
         QString errorMessage;
         const bool ok = platform::PortableOpenSshManager::instance().runRemoteCommands(
@@ -4448,14 +4971,17 @@ Write-Output 'FSREMOTE_EDIT_SAVE_OK'
         if (!self) {
             return;
         }
-        QMetaObject::invokeMethod(self, [self, ok, deviceIp, remotePath, outputText, errorMessage] {
+        QMetaObject::invokeMethod(self, [self, ok, deviceIp, remotePath, requestId, outputText, errorMessage] {
             if (!self) {
                 return;
             }
             DeviceGrid* grid = self.data();
             const QString targetIp = deviceIp.trimmed();
             const bool targetIsCurrent = grid->currentScriptUiDeviceIp() == targetIp;
-            ScriptUiState state = grid->m_scriptUiStates.value(targetIp);
+            ScriptUiState state = grid->m_scriptUiStateStore.state(targetIp);
+            if (state.editorRequestId != requestId) {
+                return; // wjy: 旧保存回调不能撤销后续读取/保存对同一设备状态的更新。
+            }
             const QString activeRemotePath = targetIsCurrent ? grid->m_scriptEditorRemotePath : state.editorRemotePath;
             if (activeRemotePath != remotePath) {
                 return;
@@ -4464,7 +4990,7 @@ Write-Output 'FSREMOTE_EDIT_SAVE_OK'
             if (ok) {
                 state.editorModified = false; // wjy: 保存成功只清掉目标设备自己的编辑器脏标记，不影响其它设备正在编辑的文本。
             }
-            grid->m_scriptUiStates.insert(targetIp, state);
+            grid->m_scriptUiStateStore.setState(targetIp, state);
             if (targetIsCurrent) {
                 grid->m_scriptEditorSaving = false;
                 if (ok && grid->m_scriptFileEdit) {
@@ -4485,7 +5011,7 @@ Write-Output 'FSREMOTE_EDIT_SAVE_OK'
                     QString::fromUtf8("\n编辑器保存失败：%1\n").arg(errorMessage.trimmed().isEmpty() ? outputText.trimmed() : errorMessage.trimmed()),
                     QIODevice::Append);
                 state.outputDirty = true;
-                grid->m_scriptUiStates.insert(targetIp, state);
+                grid->m_scriptUiStateStore.setState(targetIp, state);
                 if (targetIsCurrent) {
                     grid->m_scriptOutputDirty = true;
                 }
@@ -4516,7 +5042,7 @@ bool DeviceGrid::stopDeviceScriptForDeviceIndex(int deviceIndex, bool showMessag
     }
 
     const QString deviceIp = g_devices.at(deviceIndex).ip.trimmed();
-    ScriptUiState state = m_scriptUiStates.value(deviceIp);
+    ScriptUiState state = m_scriptUiStateStore.state(deviceIp);
     if (!state.outputRunning) {
         return false;
     }
@@ -4533,7 +5059,7 @@ bool DeviceGrid::stopDeviceScriptForDeviceIndex(int deviceIndex, bool showMessag
         state.outputRunning = false;
         state.outputFailed = false;
         state.localLaunchInProgress = false; // wjy: 无法定位远端 work 时结束本地启动态，避免后续空闲刷新一直被启动竞态保护挡住。
-        m_scriptUiStates.insert(deviceIp, state);
+        m_scriptUiStateStore.setState(deviceIp, std::move(state));
         update(deviceListViewportRect(m_deviceGroupExpanded)); // wjy: 停止状态写回后立即重绘左侧设备列表，让运行图标同步消失。
         if (currentScriptUiDeviceIp() == deviceIp) {
             loadScriptUiStateForDevice(deviceIp);
@@ -4546,7 +5072,7 @@ bool DeviceGrid::stopDeviceScriptForDeviceIndex(int deviceIndex, bool showMessag
     state.localLaunchInProgress = false; // wjy: 用户已明确请求停止，先关闭本地启动竞态保护并隐藏运行图标。
     writeScriptOutputFile(outputFilePath, QString::fromUtf8("\n状态: 正在停止目标进程...\n"), QIODevice::Append);
     state.outputText = stripTerminalControlSequences(readScriptOutputFileTail(outputFilePath));
-    m_scriptUiStates.insert(deviceIp, state); // wjy: 先把目标设备状态写成停止中，当前 UI 或切回该设备时都能看到停止状态。
+    m_scriptUiStateStore.setState(deviceIp, state); // wjy: 先把目标设备状态写成停止中，当前 UI 或切回该设备时都能看到停止状态。
     update(deviceListViewportRect(m_deviceGroupExpanded)); // wjy: 发起停止时运行状态已经结束，侧栏徽标无需等待远端 taskkill 返回。
     if (currentScriptUiDeviceIp() == deviceIp) {
         loadScriptUiStateForDevice(deviceIp);
@@ -4631,7 +5157,7 @@ exit 0
             }
             DeviceGrid* grid = self.data();
             const QString targetIp = deviceIp.trimmed();
-            ScriptUiState state = grid->m_scriptUiStates.value(targetIp);
+            ScriptUiState state = grid->m_scriptUiStateStore.state(targetIp);
             if (state.outputFilePath != outputFilePath) {
                 return;
             }
@@ -4646,7 +5172,7 @@ exit 0
                 state.remoteStartedAtEpochMs = 0; // wjy: 远端停止命令完成后清除恢复元数据，下一次状态刷新会再次核对目标是否确实空闲。
             }
             state.outputDirty = true;
-            grid->m_scriptUiStates.insert(targetIp, state);
+            grid->m_scriptUiStateStore.setState(targetIp, std::move(state));
             if (grid->currentScriptUiDeviceIp() == targetIp) {
                 grid->m_scriptOutputDirty = true;
                 if (!grid->m_scriptOutputFlushTimer->isActive()) {
@@ -4853,6 +5379,22 @@ void DeviceGrid::setupSettingsControls()
     // ===end====
 
     // =====wjy====
+    m_rollbackVersionCombo = new QComboBox(this);
+    m_rollbackVersionCombo->setGeometry(settingsRollbackVersionComboRect());
+    m_rollbackVersionCombo->addItem(QString::fromUtf8("打开常规设置后读取"), QString()); // wjy: 构造阶段不访问网络共享，避免主窗口启动被离线目录阻塞。
+    m_rollbackVersionCombo->setMaxVisibleItems(10);
+    m_rollbackVersionCombo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    m_rollbackVersionCombo->setMinimumContentsLength(12);
+    m_rollbackVersionCombo->setStyleSheet(QStringLiteral(
+        "QComboBox{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;padding:0 9px;"
+        "font-family:'Microsoft YaHei UI';font-size:13px;color:#040B18;}"
+        "QComboBox:focus{border:1px solid #3A7BFC;}"
+        "QComboBox:disabled{background:#F5F7FA;color:#94A3B8;}"
+        "QComboBox QAbstractItemView{background:#FFFFFF;border:1px solid #DDE3EA;selection-background-color:#EAF1FF;selection-color:#040B18;}")); // wjy: 下拉框沿用设置页白底蓝色焦点样式，真实控件负责键盘选择和弹出列表。
+    m_rollbackVersionCombo->setVisible(false); // wjy: 首次显隐统一交给 updateSettingsControls，构造时不会覆盖其它页面。
+    // ===end====
+
+    // =====wjy====
     const QString shortcutEditStyle = QStringLiteral(
         "QLineEdit{background:#F8FAFC;border:1px solid #CBD5E1;border-radius:4px;padding:0 8px;"
         "font-family:'Microsoft YaHei UI';font-size:13px;font-weight:600;color:#334155;}"
@@ -4916,8 +5458,9 @@ void DeviceGrid::setupSettingsControls()
         combo->addItem(QStringLiteral("360p"), static_cast<int>(stream::RemoteResolutionTier::P360)); // wjy: 固定档位和协调器/协议共用同一枚举顺序。
     };
     m_remoteMinimumResolutionCombo = new QComboBox(this);
-    populateResolutionCombo(m_remoteMinimumResolutionCombo);
-    m_remoteMinimumResolutionCombo->setCurrentIndex(qMax(0, m_remoteMinimumResolutionCombo->findData(static_cast<int>(m_remoteQualityConfiguration.minimumVisibleResolution))));
+    m_remoteMinimumResolutionCombo->addItem(QString::fromUtf8("按模式固定"), static_cast<int>(stream::RemoteResolutionTier::P720)); // wjy: 保留旧控件位置和配置字段兼容，但不再提供会触发动态尺寸变化的可见下限选项。
+    m_remoteMinimumResolutionCombo->setCurrentIndex(0);
+    m_remoteMinimumResolutionCombo->setToolTip(QString::fromUtf8("高质量/自动：原始；均衡：1080p；流畅：720p")); // wjy: 直接说明四种可见模式的固定清晰度映射。
     m_remoteMinimizedResolutionCombo = new QComboBox(this);
     populateResolutionCombo(m_remoteMinimizedResolutionCombo);
     m_remoteMinimizedResolutionCombo->setCurrentIndex(qMax(0, m_remoteMinimizedResolutionCombo->findData(static_cast<int>(m_remoteQualityConfiguration.minimizedResolution))));
@@ -4963,7 +5506,6 @@ void DeviceGrid::setupSettingsControls()
     connect(m_remoteTargetFpsSpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
     connect(m_remoteMinimumVisibleFpsSpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
     connect(m_remoteSevereMinimumFpsSpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
-    connect(m_remoteMinimumResolutionCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, persistRemoteQuality);
     connect(m_remoteMinimizedFpsSpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
     connect(m_remoteMinimizedResolutionCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, persistRemoteQuality);
     connect(m_remoteDegradationDelaySpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
@@ -5079,27 +5621,32 @@ void DeviceGrid::updateAddDeviceControls()
         return; // wjy: 没有新增设备控件时直接跳过显隐/可用状态刷新，避免空指针崩溃干扰堆损坏定位。
     }
 
-    m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded));
-    const QRect viewport = settingsScrollViewportRect();
-    const QRect ipRect = settingsScrolledRect(settingsAddDeviceIpEditRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset);
-    const QRect nameRect = settingsScrolledRect(settingsAddDeviceNameEditRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset);
-    const QRect macRect = settingsScrolledRect(settingsAddDeviceMacEditRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset);
-    const QRect remarkRect = settingsScrolledRect(settingsAddDeviceRemarkEditRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset);
-    const QRect saveRect = settingsScrolledRect(settingsAddDeviceSaveButtonRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset);
-    const QRect cancelRect = settingsScrolledRect(settingsAddDeviceCancelButtonRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset);
-    const bool addPageVisible = m_settingsSelected && m_settingsTab == SettingsTab::General && m_settingsAddDeviceExpanded && !m_localInfoSelected;
+    const SettingsLayoutSnapshot layout = settingsLayoutSnapshot(
+        m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded, m_settingsScrollOffset); // wjy: 新增设备控件直接消费统一布局快照，避免和手绘卡片使用不同滚动边界。
+    m_settingsScrollOffset = layout.scrollOffset();
+    const QRect ipRect = layout.scrolled(settingsAddDeviceIpEditRect(m_settingsLocalInfoExpanded));
+    const QRect nameRect = layout.scrolled(settingsAddDeviceNameEditRect(m_settingsLocalInfoExpanded));
+    const QRect macRect = layout.scrolled(settingsAddDeviceMacEditRect(m_settingsLocalInfoExpanded));
+    const QRect remarkRect = layout.scrolled(settingsAddDeviceRemarkEditRect(m_settingsLocalInfoExpanded));
+    const QRect saveRect = layout.scrolled(settingsAddDeviceSaveButtonRect(m_settingsLocalInfoExpanded));
+    const QRect cancelRect = layout.scrolled(settingsAddDeviceCancelButtonRect(m_settingsLocalInfoExpanded));
+    const bool addPageVisible = !m_detailPanelCollapsed
+        && m_settingsSelected
+        && m_settingsTab == SettingsTab::General
+        && m_settingsAddDeviceExpanded
+        && !m_localInfoSelected; // wjy: 收起详情栏时新增设备输入框整体隐藏，展开后沿用原展开状态恢复。
     m_deviceIpEdit->setGeometry(ipRect);
     m_deviceNameEdit->setGeometry(nameRect);
     m_deviceMacEdit->setGeometry(macRect);
     m_deviceRemarkEdit->setGeometry(remarkRect);
     m_saveDeviceButton->setGeometry(saveRect);
     m_cancelDeviceButton->setGeometry(cancelRect);
-    m_deviceIpEdit->setVisible(addPageVisible && viewport.contains(ipRect));
-    m_deviceNameEdit->setVisible(addPageVisible && viewport.contains(nameRect));
-    m_deviceMacEdit->setVisible(addPageVisible && viewport.contains(macRect));
-    m_deviceRemarkEdit->setVisible(addPageVisible && viewport.contains(remarkRect));
-    m_saveDeviceButton->setVisible(addPageVisible && viewport.contains(saveRect));
-    m_cancelDeviceButton->setVisible(addPageVisible && viewport.contains(cancelRect));
+    m_deviceIpEdit->setVisible(addPageVisible && layout.fullyVisible(settingsAddDeviceIpEditRect(m_settingsLocalInfoExpanded)));
+    m_deviceNameEdit->setVisible(addPageVisible && layout.fullyVisible(settingsAddDeviceNameEditRect(m_settingsLocalInfoExpanded)));
+    m_deviceMacEdit->setVisible(addPageVisible && layout.fullyVisible(settingsAddDeviceMacEditRect(m_settingsLocalInfoExpanded)));
+    m_deviceRemarkEdit->setVisible(addPageVisible && layout.fullyVisible(settingsAddDeviceRemarkEditRect(m_settingsLocalInfoExpanded)));
+    m_saveDeviceButton->setVisible(addPageVisible && layout.fullyVisible(settingsAddDeviceSaveButtonRect(m_settingsLocalInfoExpanded)));
+    m_cancelDeviceButton->setVisible(addPageVisible && layout.fullyVisible(settingsAddDeviceCancelButtonRect(m_settingsLocalInfoExpanded)));
 
     m_saveDeviceButton->setEnabled(!m_deviceIpEdit->text().trimmed().isEmpty());
     if (addPageVisible) {
@@ -5147,15 +5694,19 @@ void DeviceGrid::setupLocalInfoControls()
 void DeviceGrid::updateLocalInfoControls()
 {
     syncResponsiveLayoutState();
-    m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded));
-    const QRect viewport = settingsScrollViewportRect();
-    const bool visible = m_settingsSelected && m_settingsTab == SettingsTab::General && m_settingsLocalInfoExpanded;
+    const SettingsLayoutSnapshot layout = settingsLayoutSnapshot(
+        m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded, m_settingsScrollOffset); // wjy: 本机信息复制按钮和设置页其它控件共享同一视口快照。
+    m_settingsScrollOffset = layout.scrollOffset();
+    const bool visible = !m_detailPanelCollapsed
+        && m_settingsSelected
+        && m_settingsTab == SettingsTab::General
+        && m_settingsLocalInfoExpanded; // wjy: 本机信息复制按钮只在详情栏真实可见时参与布局和点击。
     for (int i = 0; i < m_localInfoCopyButtons.size(); ++i) {
         QPushButton* button = m_localInfoCopyButtons.at(i);
         if (button) {
-            const QRect buttonRect = settingsScrolledRect(localInfoCopyButtonRect(i), m_settingsScrollOffset);
+            const QRect buttonRect = layout.scrolled(localInfoCopyButtonRect(i));
             button->setGeometry(buttonRect);
-            button->setVisible(visible && viewport.contains(buttonRect));
+            button->setVisible(visible && layout.fullyVisible(localInfoCopyButtonRect(i)));
             if (button->isVisible()) {
                 button->raise();
             }
@@ -5168,58 +5719,153 @@ void DeviceGrid::refreshLocalDeviceInfo()
     m_localDeviceInfo = platform::DeviceInfoService::local();
 }
 
+// =====wjy====
+void DeviceGrid::refreshRollbackVersions(bool forceRefresh)
+{
+    if (!m_rollbackVersionCombo || m_rollbackPreparing) {
+        return; // wjy: 回撤任务开始后保持用户确认的目标不变，等待主程序有序退出，不再重新访问共享目录。
+    }
+
+    if (m_rollbackVersionsRefreshInProgress) {
+        m_rollbackVersionsRefreshPending = m_rollbackVersionsRefreshPending || forceRefresh; // wjy: 普通重复点击直接复用正在进行的扫描；强制刷新则记录一次补扫需求。
+        return;
+    }
+    constexpr qint64 rollbackVersionCacheMs = 30 * 1000;
+    if (!forceRefresh
+        && m_rollbackVersionsRefreshClock.isValid()
+        && m_rollbackVersionsRefreshClock.elapsed() < rollbackVersionCacheMs) {
+        return; // wjy: 30 秒内再次点击设置只显示现有结果，不重复访问共享目录中的每个版本文件。
+    }
+
+    const QString previousVersion = m_rollbackVersionCombo->currentData().toString();
+    m_rollbackVersionsRefreshInProgress = true;
+    m_rollbackVersionsRefreshPending = false;
+    {
+        const QSignalBlocker blocker(m_rollbackVersionCombo);
+        m_rollbackVersionCombo->clear();
+        m_rollbackVersionCombo->addItem(QString::fromUtf8("正在读取版本…"), QString()); // wjy: 点击设置后立即显示页面和加载状态，耗时共享目录遍历不再阻塞 UI 线程。
+    }
+    m_rollbackVersionCombo->setToolTip(QString::fromUtf8("正在后台读取共享历史版本"));
+    updateSettingsControls();
+    update();
+
+    QPointer<DeviceGrid> self(this);
+    runBackgroundTask([self, previousVersion] {
+        QString error;
+        const QStringList versions = platform::UpdateService::availableRollbackVersions(&error); // wjy: 网络目录枚举和每个版本的关键文件元数据检查全部在工作线程完成。
+        if (!self) {
+            return;
+        }
+        QMetaObject::invokeMethod(self, [self, previousVersion, versions, error] {
+            if (!self) {
+                return;
+            }
+
+            DeviceGrid* grid = self.data();
+            grid->m_rollbackVersionsRefreshInProgress = false;
+            grid->m_rollbackVersionsRefreshClock.restart(); // wjy: 成功、空列表或网络错误都短时缓存，避免用户连续点击时反复等待同一共享目录。
+            if (grid->m_rollbackVersionCombo && !grid->m_rollbackPreparing) {
+                const QSignalBlocker blocker(grid->m_rollbackVersionCombo);
+                grid->m_rollbackVersionCombo->clear();
+                for (const QString& version : versions) {
+                    grid->m_rollbackVersionCombo->addItem(QStringLiteral("v%1").arg(version), version); // wjy: 后台结果回到 UI 线程后再安全修改下拉框，显示文本带 v、提交数据保持三段版本号。
+                }
+
+                if (versions.isEmpty()) {
+                    const QString placeholder = error.isEmpty()
+                        ? QString::fromUtf8("暂无可回撤版本")
+                        : QString::fromUtf8("共享历史版本不可用");
+                    grid->m_rollbackVersionCombo->addItem(placeholder, QString()); // wjy: 网络不可用和没有历史版本都使用空数据项，回撤按钮保持禁用。
+                    grid->m_rollbackVersionCombo->setToolTip(error);
+                } else {
+                    const int previousIndex = grid->m_rollbackVersionCombo->findData(previousVersion);
+                    grid->m_rollbackVersionCombo->setCurrentIndex(previousIndex >= 0 ? previousIndex : 0); // wjy: 异步刷新完成后优先恢复用户原选择，否则选择最接近当前版本的第一项。
+                    grid->m_rollbackVersionCombo->setToolTip(QString::fromUtf8("选择要恢复的历史版本"));
+                }
+            }
+
+            const bool refreshAgain = grid->m_rollbackVersionsRefreshPending;
+            grid->m_rollbackVersionsRefreshPending = false;
+            grid->updateSettingsControls();
+            grid->update();
+            if (refreshAgain && !grid->m_rollbackPreparing) {
+                grid->refreshRollbackVersions(true); // wjy: 发布等操作若发生在扫描期间，当前回调结束后再补扫一次，避免旧结果覆盖新版本状态。
+            }
+        }, Qt::QueuedConnection);
+    });
+}
+// ===end====
+
+// =====wjy====
+void DeviceGrid::applySettingsControlGeometry(QWidget* control, const QRect& geometry, bool visible, bool enabled, bool raiseWhenVisible)
+{
+    if (!control) {
+        return; // wjy: 控件尚未创建时跳过布局更新，兼容构造阶段的分批初始化顺序。
+    }
+
+    const bool effectiveVisible = visible && !m_detailPanelCollapsed; // wjy: 所有设置页真实控件共用详情栏门禁，避免紧凑窗口外仍有隐藏热区。
+    control->setGeometry(geometry); // wjy: 所有真实控件沿用手绘布局计算出的矩形，滚动和缩放只在一个入口生效。
+    control->setVisible(effectiveVisible);
+    control->setEnabled(effectiveVisible && enabled); // wjy: 详情栏收起时同时禁用键盘焦点和鼠标输入，展开后恢复业务可用状态。
+    if (raiseWhenVisible && effectiveVisible) {
+        control->raise(); // wjy: 真实控件显示时覆盖手绘背景，保证鼠标命中和键盘输入仍落到控件上。
+    }
+}
+// ===end====
+
 void DeviceGrid::updateSettingsControls()
 {
     syncResponsiveLayoutState();
 // =====wjy====
-    m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded));
-    const QRect viewport = settingsScrollViewportRect();
+    const SettingsLayoutSnapshot layout = settingsLayoutSnapshot(
+        m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded, m_settingsScrollOffset); // wjy: 所有真实设置控件在同一快照下计算滚动后几何和视口可见性。
+    m_settingsScrollOffset = layout.scrollOffset();
     if (m_periodicDeviceDiscoveryIntervalEdit) {
-        const QRect discoveryIntervalRect = settingsScrolledRect(settingsPeriodicDeviceDiscoveryIntervalInputRect(), m_settingsScrollOffset);
+        const QRect discoveryIntervalRect = layout.scrolled(settingsPeriodicDeviceDiscoveryIntervalInputRect());
         const bool discoveryIntervalVisible = m_settingsSelected
             && m_settingsTab == SettingsTab::General
             && m_periodicDeviceDiscoveryEnabled
-            && viewport.contains(discoveryIntervalRect);
-        m_periodicDeviceDiscoveryIntervalEdit->setGeometry(discoveryIntervalRect);
-        m_periodicDeviceDiscoveryIntervalEdit->setVisible(discoveryIntervalVisible);
-        m_periodicDeviceDiscoveryIntervalEdit->setEnabled(m_periodicDeviceDiscoveryEnabled);
-        if (discoveryIntervalVisible) {
-            m_periodicDeviceDiscoveryIntervalEdit->raise(); // wjy: 滚动到周期检查卡片时才显示真实输入框，避免悬浮在其它设置项上。
-        }
+            && layout.fullyVisible(settingsPeriodicDeviceDiscoveryIntervalInputRect());
+        applySettingsControlGeometry(m_periodicDeviceDiscoveryIntervalEdit, discoveryIntervalRect,
+            discoveryIntervalVisible, m_periodicDeviceDiscoveryEnabled, true);
     }
 
     if (m_batchSubnetEdit && m_batchAddButton) {
-        const QRect batchEditRect = settingsScrolledRect(settingsBatchSubnetInputRect(), m_settingsScrollOffset);
-        const QRect batchButtonRect = settingsScrolledRect(settingsBatchAddButtonRect(), m_settingsScrollOffset);
+        const QRect batchEditRect = layout.scrolled(settingsBatchSubnetInputRect());
+        const QRect batchButtonRect = layout.scrolled(settingsBatchAddButtonRect());
         const bool batchVisible = m_settingsSelected && m_settingsTab == SettingsTab::General; // wjy: 批量新增属于设置常规页功能，切到键盘页时隐藏真实控件。
-        m_batchSubnetEdit->setGeometry(batchEditRect);
-        m_batchAddButton->setGeometry(batchButtonRect);
-        m_batchSubnetEdit->setVisible(batchVisible && viewport.contains(batchEditRect));
-        m_batchAddButton->setVisible(batchVisible && viewport.contains(batchButtonRect));
-        m_batchSubnetEdit->setEnabled(batchVisible && !m_batchAddInProgress);
-        m_batchAddButton->setEnabled(batchVisible && !m_batchAddInProgress);
+        const bool batchEditVisible = batchVisible && layout.fullyVisible(settingsBatchSubnetInputRect());
+        const bool batchButtonVisible = batchVisible && layout.fullyVisible(settingsBatchAddButtonRect());
+        applySettingsControlGeometry(m_batchSubnetEdit, batchEditRect,
+            batchEditVisible, batchVisible && !m_batchAddInProgress, true);
+        applySettingsControlGeometry(m_batchAddButton, batchButtonRect,
+            batchButtonVisible, batchVisible && !m_batchAddInProgress, true);
         m_batchAddButton->setText(m_batchAddInProgress ? QStringLiteral("扫描中") : QStringLiteral("批量新增"));
-        if (m_batchSubnetEdit->isVisible()) {
-            m_batchSubnetEdit->raise();
-        }
-        if (m_batchAddButton->isVisible()) {
-            m_batchAddButton->raise();
-        }
     }
 
     // =====wjy====
     if (m_wallpaperRotationIntervalEdit) {
-        const QRect wallpaperIntervalRect = settingsScrolledRect(settingsWallpaperRotationIntervalInputRect(), m_settingsScrollOffset); // wjy: 真实分钟输入框跟随手绘常规页内容使用同一滚动偏移。
+        const QRect wallpaperIntervalRect = layout.scrolled(settingsWallpaperRotationIntervalInputRect()); // wjy: 真实分钟输入框跟随手绘常规页内容使用同一滚动偏移。
         const bool wallpaperIntervalVisible = m_settingsSelected
             && m_settingsTab == SettingsTab::General
             && m_wallpaperRotationEnabled
-            && viewport.contains(wallpaperIntervalRect); // wjy: 仅在开关开启且输入框完整位于常规页视口时显示，避免遮住其它页面。
-        m_wallpaperRotationIntervalEdit->setGeometry(wallpaperIntervalRect);
-        m_wallpaperRotationIntervalEdit->setVisible(wallpaperIntervalVisible);
-        m_wallpaperRotationIntervalEdit->setEnabled(wallpaperIntervalVisible);
-        if (wallpaperIntervalVisible) {
-            m_wallpaperRotationIntervalEdit->raise();
-        }
+            && layout.fullyVisible(settingsWallpaperRotationIntervalInputRect()); // wjy: 仅在开关开启且输入框完整位于常规页视口时显示，避免遮住其它页面。
+        applySettingsControlGeometry(m_wallpaperRotationIntervalEdit, wallpaperIntervalRect,
+            wallpaperIntervalVisible, wallpaperIntervalVisible, true);
+    }
+    // ===end====
+
+    // =====wjy====
+    if (m_rollbackVersionCombo) {
+        const QRect rollbackComboRect = layout.scrolled(settingsRollbackVersionComboRect());
+        const bool rollbackVisible = m_settingsSelected
+            && m_settingsTab == SettingsTab::General
+            && layout.fullyVisible(settingsRollbackVersionComboRect());
+        const bool rollbackEnabled = rollbackVisible
+            && !m_rollbackPreparing
+            && !m_rollbackVersionCombo->currentData().toString().isEmpty(); // wjy: 占位项没有目标数据，不能通过键盘或鼠标误发起回撤。
+        applySettingsControlGeometry(m_rollbackVersionCombo, rollbackComboRect,
+            rollbackVisible, rollbackEnabled, true);
     }
     // ===end====
 
@@ -5230,14 +5876,9 @@ void DeviceGrid::updateSettingsControls()
         }
         const QRect shortcutRect = settingsShortcutKeyEditRect(i);
         const bool shortcutVisible = m_settingsSelected && m_settingsTab == SettingsTab::Keyboard; // wjy: 快捷键输入框只属于设置的键盘页，常规页和设备详情页必须隐藏。
-        edit->setGeometry(shortcutRect);
-        edit->setVisible(shortcutVisible);
-        edit->setEnabled(shortcutVisible);
+        applySettingsControlGeometry(edit, shortcutRect, shortcutVisible, shortcutVisible, true);
         if (auto* shortcutEdit = static_cast<ShortcutKeyEdit*>(edit); shortcutEdit && !shortcutEdit->hasFocus()) {
             shortcutEdit->setCommittedText(remoteShortcutDisplayText(i)); // wjy: 控件未录入时跟随当前保存设置刷新显示。
-        }
-        if (shortcutVisible) {
-            edit->raise(); // wjy: 输入框是真实子控件，需要盖在手绘按键背景上才能接收点击和按键。
         }
     }
 
@@ -5262,12 +5903,8 @@ void DeviceGrid::updateSettingsControls()
             continue;
         }
         const QRect controlRect = settingsRemoteQualityControlRect(index);
-        control->setGeometry(controlRect);
-        control->setVisible(qualityVisible);
-        control->setEnabled(qualityVisible);
-        if (qualityVisible) {
-            control->raise(); // wjy: 远控画质真实控件盖在手绘标签卡片之上，切页后其它设置控件全部隐藏。
-        }
+        const bool controlEnabled = qualityVisible && control != m_remoteMinimumResolutionCombo; // wjy: 可见清晰度策略只读展示，其他资源参数继续允许在线修改。
+        applySettingsControlGeometry(control, controlRect, qualityVisible, controlEnabled, true);
     }
     // ===end====
 
@@ -5290,7 +5927,7 @@ void DeviceGrid::saveRemoteQualitySettingsFromControls()
     configuration.targetFps = m_remoteTargetFpsSpin->value();
     configuration.minimumVisibleFps = m_remoteMinimumVisibleFpsSpin->value();
     configuration.severePressureMinimumFps = m_remoteSevereMinimumFpsSpin->value();
-    configuration.minimumVisibleResolution = static_cast<stream::RemoteResolutionTier>(m_remoteMinimumResolutionCombo->currentData().toInt());
+    configuration.minimumVisibleResolution = stream::RemoteResolutionTier::P720; // wjy: 旧字段固定保留兼容值，协调器不再读取它执行可见分辨率降级。
     configuration.minimizedFps = m_remoteMinimizedFpsSpin->value();
     configuration.minimizedResolution = static_cast<stream::RemoteResolutionTier>(m_remoteMinimizedResolutionCombo->currentData().toInt());
     configuration.degradationHoldMs = m_remoteDegradationDelaySpin->value() * 1000;
@@ -5566,7 +6203,7 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
                 const int existingIndex = deviceIndexForIp(ip);
                 if (existingIndex >= 0) {
                     bool deviceUpdated = false;
-                    DeviceEntry& existingDevice = g_devices[existingIndex];
+                    DeviceEntry existingDevice = g_devices.at(existingIndex); // wjy: 先复制稳定实体，修改完成后再通过目录按 ID 提交，禁止直接写展示数组。
                     if (existingDevice.mac.trimmed().isEmpty() && !result.mac.trimmed().isEmpty()) {
                         existingDevice.mac = result.mac.trimmed(); // wjy: 批量扫描命中旧设备时补齐 MAC，让后续远程开机不再因为旧记录为空而被拦截。
                         deviceUpdated = true;
@@ -5577,18 +6214,26 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
                     }
                     grid->m_deviceStatuses.insert(ip, platform::DevicePresenceState::Online);
                     addedIps.insert(ip);
-                    if (deviceUpdated) {
+                    if (deviceUpdated && g_deviceCatalog.updateDevice(existingDevice.id, std::move(existingDevice))) {
                         ++updatedCount;
                     }
                     continue;
                 }
 
                 const QString name = result.name.trimmed().isEmpty() ? ip : result.name.trimmed();
-                g_devices.append({name, ip, result.mac.trimmed(), result.broadcastIp.trimmed(), QStringLiteral("批量增加"), {}});
+                DeviceEntry newDevice;
+                newDevice.name = name;
+                newDevice.ip = ip;
+                newDevice.mac = result.mac.trimmed();
+                newDevice.broadcastIp = result.broadcastIp.trimmed();
+                newDevice.remark = QStringLiteral("批量增加");
+                if (!g_deviceCatalog.addDevice(std::move(newDevice))) {
+                    continue; // wjy: 目录统一拒绝重复 IP 或非法地址，扫描回调不再直接向权威容器追加记录。
+                }
                 grid->m_deviceStatuses.insert(ip, platform::DevicePresenceState::Online);
                 addedIps.insert(ip);
                 if (firstAddedIndex < 0) {
-                    firstAddedIndex = g_devices.size() - 1;
+                    firstAddedIndex = g_deviceCatalog.deviceIndexForIp(ip); // wjy: 新实体加入后重新解析展示位置，下标只用于本次选择和动画。
                 }
                 ++addedCount;
             }
@@ -5650,11 +6295,7 @@ QString DeviceGrid::nextDefaultDeviceGroupName() const
 
 int DeviceGrid::createDefaultDeviceGroup()
 {
-    const int groupIndex = g_deviceGroupNames.size(); // wjy: 新分组追加到当前分组列表末尾，返回真实分组下标供后续归组和定位。
-    g_deviceGroupNames.append(nextDefaultDeviceGroupName()); // wjy: 创建时先写入唯一默认名称，行内编辑可直接全选覆盖。
-    g_deviceGroupIds.append(QUuid::createUuid().toString(QUuid::WithoutBraces).toLower()); // wjy: 新分组立即拥有稳定 UUID，后续重命名不会改变设备关联实体。
-    g_deviceGroupExpandedStates.append(true); // wjy: 新分组默认展开，设备归入后立即可见。
-    return groupIndex;
+    return g_deviceCatalog.addGroup(nextDefaultDeviceGroupName(), {}, true); // wjy: 目录一次创建名称、稳定 UUID 和展开状态，三个字段不再由 UI 分别追加。
 }
 
 bool DeviceGrid::assignDevicesToGroup(const QVector<int>& deviceIndexes, int groupIndex)
@@ -5663,33 +6304,26 @@ bool DeviceGrid::assignDevicesToGroup(const QVector<int>& deviceIndexes, int gro
         return false; // wjy: 菜单关闭前若目标分组失效，禁止把设备写入错误下标。
     }
 
-    while (g_deviceGroupIds.size() < g_deviceGroupNames.size()) {
-        g_deviceGroupIds.append(QUuid::createUuid().toString(QUuid::WithoutBraces).toLower()); // wjy: 兼容旧内存数据缺失稳定 ID 的情况，归组前补齐一一对应关系。
-    }
-    while (g_deviceGroupExpandedStates.size() < g_deviceGroupNames.size()) {
-        g_deviceGroupExpandedStates.append(true); // wjy: 防御性补齐展开数组，避免按分组下标访问越界。
-    }
-
     const QString groupName = g_deviceGroupNames.at(groupIndex).trimmed(); // wjy: group 名继续写入兼容字段，旧界面排序和显示逻辑保持不变。
     const QString groupId = g_deviceGroupIds.at(groupIndex); // wjy: groupId 是真正的稳定归属，重命名后仍指向同一分组。
     bool changed = !g_deviceGroupExpandedStates.at(groupIndex); // wjy: 选择已有折叠组也属于状态变化，需要持久化展开状态。
-    g_deviceGroupExpandedStates[groupIndex] = true; // wjy: 无论设备是否已在组内，选中目标组后都保证展开。
+    g_deviceCatalog.setGroupExpanded(groupId, true); // wjy: 通过稳定分组 ID 展开目标组，排序变化后不会写错其它分组。
 
     QSet<int> assignedIndexes; // wjy: 菜单目标可能重复，确保每台有效设备最多处理一次。
+    QVector<QString> deviceIds;
     for (int deviceIndex : deviceIndexes) {
         if (deviceIndex < 0 || deviceIndex >= g_devices.size() || assignedIndexes.contains(deviceIndex)) {
             continue; // wjy: 忽略菜单打开后已失效的下标和重复下标，不影响其它设备。
         }
         assignedIndexes.insert(deviceIndex);
 
-        DeviceEntry& device = g_devices[deviceIndex];
+        const DeviceEntry& device = g_devices.at(deviceIndex);
         if (device.group.trimmed() == groupName && device.groupId == groupId) {
             continue; // wjy: 设备已经属于目标稳定分组时保持数据不变，只在后续执行展开和定位。
         }
-        device.group = groupName; // wjy: 更新兼容分组名，让现有绘制和拖拽逻辑立即把设备排到目标组下。
-        device.groupId = groupId; // wjy: 同步写入稳定 ID，跨端同步和重命名不依赖名称匹配。
-        changed = true;
+        deviceIds.append(device.id); // wjy: 从当前展示下标提取稳定设备 ID，真正归组不再依赖数组位置。
     }
+    changed = g_deviceCatalog.assignDevicesToGroup(deviceIds, groupId) || changed; // wjy: 目录批量写入 groupId，并同步维护旧界面仍读取的 group 名。
 
     if (changed) {
         saveDevices(); // wjy: 所有目标处理完后只保存一次，避免多选设备逐台写文件和触发同步。
@@ -5708,10 +6342,7 @@ void DeviceGrid::revealDeviceGroup(int groupIndex, bool beginRename)
     }
     finishDeviceRename(true); // wjy: 分组定位会改变设备行位置，先结束设备名编辑以免输入框悬浮在错误行。
     m_deviceGroupExpanded = true; // wjy: 若整个设备列表被收起，操作后自动打开以展示目标分组。
-    while (g_deviceGroupExpandedStates.size() < g_deviceGroupNames.size()) {
-        g_deviceGroupExpandedStates.append(true);
-    }
-    g_deviceGroupExpandedStates[groupIndex] = true; // wjy: 目标组始终展开，归入的多选设备立即出现在组标题下。
+    g_deviceCatalog.setGroupExpanded(g_deviceGroupIds.at(groupIndex), true); // wjy: 目标组始终展开，稳定 ID 保证视觉重排后仍命中原分组。
 
     const int rowIndex = visualRowIndexForGroupIndex(groupIndex); // wjy: 设备归组会重排可见行，因此必须在归组完成后重新解析目标视觉行。
     if (rowIndex < 0) {
@@ -5779,15 +6410,10 @@ void DeviceGrid::finishDeviceGroupRename(bool saveText)
         }
 
         if (!newName.isEmpty() && !duplicated) {
-            // 同步修改原来属于该分组的设备
-            for (DeviceEntry& device : g_devices) {
-                if (device.group.trimmed() == oldName) {
-                    device.group = newName;
-                }
+            const QString groupId = g_deviceGroupIds.value(groupIndex);
+            if (g_deviceCatalog.renameGroup(groupId, newName)) {
+                saveDevices(); // wjy: 目录按稳定 groupId 重命名，并统一更新组内设备的兼容 group 名后只保存一次。
             }
-
-            g_deviceGroupNames[groupIndex] = newName;
-            saveDevices();
         } else {
             // 空名字或者名字重复时恢复原名称
             m_deviceGroupNameEdit->setText(oldName);
@@ -5873,7 +6499,15 @@ void DeviceGrid::saveNewDevice()
     }
 
     const bool addingFirstDevice = g_devices.isEmpty(); // wjy: First device has no previous detail page, so switching animation would draw the same device twice.
-    g_devices.append({name, ip, mac, {}, m_deviceRemarkEdit->text().trimmed(), {}}); // wjy: 新增设备默认无分组，只有后续拖入具体分组时才写 group。
+    DeviceEntry newDevice;
+    newDevice.name = name;
+    newDevice.ip = ip;
+    newDevice.mac = mac;
+    newDevice.remark = m_deviceRemarkEdit->text().trimmed();
+    if (!g_deviceCatalog.addDevice(std::move(newDevice))) {
+        updateAddDeviceControls();
+        return; // wjy: 目录统一校验 IPv4 和重复 IP，手动新增失败时不修改任何展示状态。
+    }
     saveDevices();
     updateRealtimeConfiguredDevices(); // wjy: 手动新增后把新 IP 加入广播白名单，下一份心跳即可实时显示状态。
     m_deviceStatuses.remove(ip);
@@ -5892,8 +6526,7 @@ void DeviceGrid::saveNewDevice()
     m_deviceGroupExpanded = true;
     setDesktopHoverActive(false);
     clearBottomActionHover();
-    const int newDeviceIndex =
-        g_devices.size() - 1;
+    const int newDeviceIndex = g_deviceCatalog.deviceIndexForIp(ip); // wjy: 新设备的视觉下标由目录当前顺序重新解析，后续异步排序不会复用旧位置。
 
     m_selectedDeviceIndexes.clear();
     m_selectedDeviceIndexes.insert(
@@ -6009,29 +6642,12 @@ void DeviceGrid::refreshDeviceStatuses()
 // =====wjy====
         writeDeviceGridStartupLog(QStringLiteral("[wjy-status] background thread start ipCount=%1").arg(ips.size())); // wjy: 后台总线程启动日志写入文件，确认是否进入线程阶段。
 // ===end====
-        QHash<QString, platform::DevicePresenceState> statuses;
-        statuses.reserve(ips.size());
-        // =====wjy====
-        QHash<QString, bool> remoteUpdateAvailability;
-        QHash<QString, int> remoteSessionCounts;
-        QHash<QString, QString> remoteControllerNames;
-        remoteUpdateAvailability.reserve(ips.size());
-        remoteSessionCounts.reserve(ips.size());
-        remoteControllerNames.reserve(ips.size());
-        // ===end====
+        platform::DeviceStatusRefreshResult refreshResult; // wjy: 后台线程只产出一个不可变语义上的结果包，UI 线程再决定如何归并到实时服务或旧缓存。
+        refreshResult.reserve(ips.size());
         for (const QString& ip : ips) {
-            statuses.insert(ip, platform::DevicePresenceState::Offline); // wjy: 每轮刷新先默认离线，只有状态服务明确返回 online/busy 时才覆盖，避免沿用旧在线状态。
-            remoteUpdateAvailability.insert(ip, false); // wjy: 离线、旧协议或查询失败默认不显示更新按钮，避免给不可操作设备提供入口。
-            remoteSessionCounts.insert(ip, 0); // wjy: 默认无远控会话，只有状态服务返回人数后才显示数字徽标。
-            remoteControllerNames.insert(ip, {});
+            refreshResult.devices.insert(ip, platform::DeviceStatusInfo{}); // wjy: 每轮刷新先默认离线、无会话，只有本次查询明确返回才覆盖旧值。
+            refreshResult.updateAvailability.insert(ip, false); // wjy: 离线、旧协议或查询失败默认不显示更新按钮。
         }
-        QHash<QString, QString> remoteDeviceNames; // wjy: 自动刷新时顺便记录远端真实设备名，用来同步 devices.json 的 name 字段。
-        QHash<QString, QString> remoteDeviceMacs; // wjy: 状态服务返回 MAC 时用于补齐旧设备记录，避免远程开机仍读到空 MAC。
-        QHash<QString, QString> remoteDeviceBroadcastIps; // wjy: 同步记录广播地址，后续远程开机代理可直接使用正确网段。
-        // =====wjy====
-        QHash<QString, platform::RemoteScriptRuntimeInfo> remoteScriptRuntimes; // wjy: 保存每台新版目标端返回的脚本运行信息，UI 线程据此恢复重启前的运行图标。
-        QHash<QString, QString> remoteTerminalUsers; // wjy: 运行状态和登录用户一起回传 UI，恢复任务后停止命令仍能建立 SSH。
-        // ===end====
         std::mutex resultMutex;
         std::atomic_int nextIndex = 0;
         const int workerCount = std::max(1, std::min<int>(8, ips.size()));
@@ -6058,7 +6674,7 @@ void DeviceGrid::refreshDeviceStatuses()
                         .arg(index)
                         .arg(ip)); // wjy: 单个 IP 探测前记录，崩溃时可定位是否卡在某台设备。
 // ===end====
-                    const platform::DeviceStatusInfo info = platform::DeviceStatusService::query(ip);
+                    platform::DeviceStatusInfo info = platform::DeviceStatusService::query(ip); // wjy: 先收集目标端完整状态，再在结果包边界规范化会话名称和人数。
                     bool updateAvailable = false;
                     if (info.state == platform::DevicePresenceState::Online
                         || info.state == platform::DevicePresenceState::Busy) {
@@ -6075,27 +6691,10 @@ void DeviceGrid::refreshDeviceStatuses()
                         .arg(static_cast<int>(info.state))); // wjy: 单个 IP 探测后记录状态枚举值，判断 query 是否顺利返回。
 // ===end====
                     std::lock_guard lock(resultMutex);
-                    statuses.insert(ip, info.state);
-                    // =====wjy====
-                    remoteUpdateAvailability.insert(ip, updateAvailable);
-                    remoteSessionCounts.insert(ip, qBound(0, info.remoteSessionCount, 10)); // wjy: 同步缓存远控人数，驱动设备行 1-10 数字徽标。
-                    remoteControllerNames.insert(ip, info.remoteControllerNames.trimmed());
-                    // ===end====
-                    if (!info.deviceName.trimmed().isEmpty()) {
-                        remoteDeviceNames.insert(ip, info.deviceName.trimmed()); // wjy: 只有新版远端返回了真实设备名时才参与本地 JSON 同步。
-                    }
-                    if (!info.mac.trimmed().isEmpty()) {
-                        remoteDeviceMacs.insert(ip, info.mac.trimmed()); // wjy: 在线刷新拿到 MAC 后回填本地设备记录，修复旧批量新增留下的空值。
-                    }
-                    if (!info.broadcastIp.trimmed().isEmpty()) {
-                        remoteDeviceBroadcastIps.insert(ip, info.broadcastIp.trimmed()); // wjy: 广播地址和 MAC 一起回填，保持远程开机参数完整。
-                    }
-                    // =====wjy====
-                    if (info.scriptRuntime.supported) {
-                        remoteScriptRuntimes.insert(ip, info.scriptRuntime); // wjy: 只有响应明确携带新版字段时才参与脚本状态同步，旧目标端不会被当成空闲。
-                        remoteTerminalUsers.insert(ip, info.terminalUser.trimmed()); // wjy: 缓存目标登录用户，控制端重启后无需依赖已丢失的 ScriptUiState。
-                    }
-                    // ===end====
+                    info.remoteSessionCount = qBound(0, info.remoteSessionCount, 10); // wjy: 在结果包边界统一限制会话人数，避免 UI 层重复防御。
+                    info.remoteControllerNames = info.remoteControllerNames.trimmed();
+                    refreshResult.devices.insert(ip, info); // wjy: 一个 DeviceStatusInfo 保留同一台设备的状态、名称、网络、脚本和远控会话字段。
+                    refreshResult.updateAvailability.insert(ip, updateAvailable); // wjy: 更新可用性和状态结果使用同一个 IP 键，避免平行表遗漏。
                 }
 // =====wjy====
                 writeDeviceGridStartupLog(QStringLiteral("[wjy-status] worker end worker=%1").arg(worker)); // wjy: worker 结束日志，判断线程是否正常跑完。
@@ -6109,7 +6708,7 @@ void DeviceGrid::refreshDeviceStatuses()
             }
         }
 // =====wjy====
-        writeDeviceGridStartupLog(QStringLiteral("[wjy-status] all workers joined statusCount=%1").arg(statuses.size())); // wjy: 所有 worker 汇合后记录结果数量。
+        writeDeviceGridStartupLog(QStringLiteral("[wjy-status] all workers joined statusCount=%1").arg(refreshResult.devices.size())); // wjy: 所有 worker 汇合后记录结果数量。
 // ===end====
 
         if (!self) {
@@ -6121,7 +6720,7 @@ void DeviceGrid::refreshDeviceStatuses()
 
 // =====wjy====
         writeDeviceGridStartupLog(QStringLiteral("[wjy-status] invoke ui post begin")); // wjy: 准备把后台探测结果投递回 UI 线程；如果有 begin 没有 end，说明崩在投递附近。
-        const bool invokeQueued = QMetaObject::invokeMethod(self, [self, statuses = std::move(statuses), remoteUpdateAvailability = std::move(remoteUpdateAvailability), remoteSessionCounts = std::move(remoteSessionCounts), remoteControllerNames = std::move(remoteControllerNames), remoteDeviceNames = std::move(remoteDeviceNames), remoteDeviceMacs = std::move(remoteDeviceMacs), remoteDeviceBroadcastIps = std::move(remoteDeviceBroadcastIps), remoteScriptRuntimes = std::move(remoteScriptRuntimes), remoteTerminalUsers = std::move(remoteTerminalUsers)]() mutable { // wjy: 把更新可用性、脚本运行、远控人数/设备名和在线结果同批投递到 UI 线程。
+        const bool invokeQueued = QMetaObject::invokeMethod(self, [self, refreshResult = std::move(refreshResult)]() mutable { // wjy: 把同一设备的状态、网络、脚本和远控字段作为一个结果包投递到 UI 线程。
 // =====wjy====
             writeDeviceGridStartupLog(QStringLiteral("[wjy-status] invoke ui begin")); // wjy: 回到 UI 线程前半段日志，判断崩溃是否发生在 UI 更新阶段。
 // ===end====
@@ -6132,103 +6731,7 @@ void DeviceGrid::refreshDeviceStatuses()
                 return;
             }
             DeviceGrid* grid = self.data();
-            // =====wjy====
-            grid->m_deviceUpdateAvailability.clear();
-            const bool realtimeAvailable = grid->m_realtimeStateService
-                && grid->m_realtimeStateService->isRunning();
-            if (realtimeAvailable) {
-                for (auto it = statuses.cbegin(); it != statuses.cend(); ++it) {
-                    platform::DeviceStatusInfo calibration;
-                    calibration.state = it.value();
-                    calibration.deviceName = remoteDeviceNames.value(it.key());
-                    calibration.mac = remoteDeviceMacs.value(it.key());
-                    calibration.broadcastIp = remoteDeviceBroadcastIps.value(it.key());
-                    calibration.terminalUser = remoteTerminalUsers.value(it.key());
-                    calibration.remoteSessionCount = remoteSessionCounts.value(it.key(), 0);
-                    calibration.remoteControllerNames = remoteControllerNames.value(it.key());
-                    calibration.scriptRuntime = remoteScriptRuntimes.value(it.key());
-                    grid->m_realtimeStateService->applyManualCalibration(it.key(), calibration); // wjy: 标题栏手动刷新结果进入同一归并器；已有新鲜广播时不会被一次 TCP 超时覆盖。
-                }
-            } else {
-                grid->m_deviceStatuses = std::move(statuses);
-                grid->m_deviceRemoteSessionCounts = std::move(remoteSessionCounts);
-                grid->m_deviceRemoteControllerNames = std::move(remoteControllerNames); // wjy: 仅在实时服务启动失败时保留一次手动 TCP 结果的直接显示兜底。
-            }
-            for (auto it = remoteUpdateAvailability.cbegin(); it != remoteUpdateAvailability.cend(); ++it) {
-                grid->setRemoteUpdateAvailability(it.key(), it.value()); // wjy: 通过统一入口过滤更新任务启动后的迟到结果，再刷新普通和平铺窗口按钮。
-            }
-            // wjy: 状态自动刷新只更新设备列表状态，不再依据单次 Offline 结果关闭远控窗口。
-            // wjy: 设备状态探测服务的超时或瞬时失败不等于 WebRTC 会话已经断开，避免多窗口刷新时被批量误关。
-            // wjy: 远控窗口继续由用户操作、窗口自身连接流程、重新平铺或应用退出管理生命周期。
-            // ===end====
-            bool deviceRecordChanged = false;
-            for (DeviceEntry& device : g_devices) {
-                const QString ip = device.ip.trimmed();
-                const QString remoteMac = remoteDeviceMacs.value(ip).trimmed();
-                const QString remoteBroadcastIp = remoteDeviceBroadcastIps.value(ip).trimmed();
-                if (!ip.isEmpty()
-                    && device.mac.trimmed().isEmpty()
-                    && !remoteMac.isEmpty()) {
-                    qWarning().noquote() << QStringLiteral("[wjy-status] sync device mac ip=%1 mac=%2")
-                        .arg(ip)
-                        .arg(remoteMac); // wjy: 自动刷新发现旧设备没有 MAC 时补齐，避免远程开机入口继续弹未填写 MAC。
-                    device.mac = remoteMac;
-                    deviceRecordChanged = true;
-                }
-                if (!ip.isEmpty()
-                    && device.broadcastIp.trimmed().isEmpty()
-                    && !remoteBroadcastIp.isEmpty()) {
-                    device.broadcastIp = remoteBroadcastIp; // wjy: 旧记录没有广播地址时顺手补齐，和批量新增保存结构保持一致。
-                    deviceRecordChanged = true;
-                }
-                const QString remoteName = remoteDeviceNames.value(ip).trimmed();
-                const QString pendingRemoteRename = grid->m_pendingRemoteRenameNames.value(ip).trimmed(); // wjy: 远端改名成功后 Windows 可能要重启才上报新电脑名，先记住等待生效的新名字。
-                if (!pendingRemoteRename.isEmpty()) {
-                    if (remoteName == pendingRemoteRename) {
-                        grid->m_pendingRemoteRenameNames.remove(ip); // wjy: 远端已经上报新名字，说明重启或系统刷新后改名生效，可以恢复正常自动同步。
-                    } else {
-                        continue; // wjy: 远端仍上报旧名字时不要覆盖本地手动新名字，避免 53_TEST 改 53 后被刷新立刻改回去。
-                    }
-                }
-                if (!ip.isEmpty()
-                    && !remoteName.isEmpty()
-                    && device.name.trimmed() != remoteName) {
-                    qWarning().noquote() << QStringLiteral("[wjy-status] sync device name ip=%1 old=%2 new=%3")
-                        .arg(ip)
-                        .arg(device.name.trimmed())
-                        .arg(remoteName); // wjy: 自动刷新发现 JSON 设备名和远端真实设备名不一致，按远端设备名修正本地记录。
-                    device.name = remoteName;
-                    deviceRecordChanged = true;
-                }
-            }
-            if (deviceRecordChanged) {
-                saveDevices(); // wjy: 设备名或 MAC/广播地址同步后立即保存 devices.json，保证下次启动仍使用修正后的记录。
-                if (grid->m_selectedDeviceIndex >= 0 && grid->m_selectedDeviceIndex < g_devices.size()) {
-                    grid->m_currentDeviceName = deviceDisplayName(g_devices.at(grid->m_selectedDeviceIndex));
-                    grid->m_previousDeviceName = grid->m_currentDeviceName;
-                }
-            }
-            // =====wjy====
-            if (!realtimeAvailable) {
-                for (auto it = remoteScriptRuntimes.cbegin(); it != remoteScriptRuntimes.cend(); ++it) {
-                    grid->applyRemoteScriptRuntimeState(
-                        it.key(),
-                        remoteTerminalUsers.value(it.key()),
-                        it.value()); // wjy: 实时服务不可用时，用户手动校准仍可直接恢复一次脚本状态。
-                }
-            }
-            // ===end====
-            for (auto it = grid->m_poweringOnDeviceIps.begin(); it != grid->m_poweringOnDeviceIps.end();) {
-                const platform::DevicePresenceState state = grid->m_deviceStatuses.value(*it, platform::DevicePresenceState::Offline);
-                if (state != platform::DevicePresenceState::Offline) {
-                    grid->m_poweringOnStartedAtMs.remove(*it);
-                    it = grid->m_poweringOnDeviceIps.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-            grid->m_statusRefreshInProgress = false;
-            grid->update();
+            grid->applyDeviceStatusRefreshResult(std::move(refreshResult)); // wjy: UI 回调只负责生命周期校验和转交，状态归并集中到单一方法维护。
 // =====wjy====
             writeDeviceGridStartupLog(QStringLiteral("[wjy-status] invoke ui end")); // wjy: UI 状态写入和重绘请求完成日志。
 // ===end====
@@ -6238,6 +6741,100 @@ void DeviceGrid::refreshDeviceStatuses()
 // ===end====
     });
 }
+
+// =====wjy====
+void DeviceGrid::applyDeviceStatusRefreshResult(platform::DeviceStatusRefreshResult refreshResult)
+{
+    m_deviceUpdateAvailability.clear(); // wjy: 新一轮刷新先清空更新按钮缓存，随后按结果包重新写入。
+    const bool realtimeAvailable = m_realtimeStateService
+        && m_realtimeStateService->isRunning(); // wjy: 实时广播服务运行时交给归并器决定新旧状态优先级。
+    if (realtimeAvailable) {
+        for (auto it = refreshResult.devices.cbegin(); it != refreshResult.devices.cend(); ++it) {
+            m_realtimeStateService->applyManualCalibration(it.key(), it.value()); // wjy: 手动刷新结果进入实时归并器，避免一次超时覆盖已收到的新鲜广播。
+        }
+    } else {
+        m_deviceStatuses.clear();
+        m_deviceRemoteSessionCounts.clear();
+        m_deviceRemoteControllerNames.clear();
+        for (auto it = refreshResult.devices.cbegin(); it != refreshResult.devices.cend(); ++it) {
+            m_deviceStatuses.insert(it.key(), it.value().state); // wjy: 无实时服务时保留原有离线缓存兜底。
+            m_deviceRemoteSessionCounts.insert(it.key(), it.value().remoteSessionCount); // wjy: 同一结果包同步更新远控会话数。
+            m_deviceRemoteControllerNames.insert(it.key(), it.value().remoteControllerNames); // wjy: 同一结果包同步更新控制端名称。
+        }
+    }
+    for (auto it = refreshResult.updateAvailability.cbegin(); it != refreshResult.updateAvailability.cend(); ++it) {
+        setRemoteUpdateAvailability(it.key(), it.value()); // wjy: 更新可用性通过统一入口写入，避免迟到结果重新显示已受理任务。
+    }
+    // wjy: 状态刷新只更新设备状态，不根据一次 Offline 探测关闭远控窗口；窗口生命周期由专门流程管理。
+    bool deviceRecordChanged = false;
+    for (const DeviceEntry& device : g_devices) {
+        DeviceEntry updatedDevice = device; // wjy: 先在副本中归并远端字段，最后按稳定 ID 一次提交目录。
+        bool currentDeviceChanged = false;
+        const QString ip = device.ip.trimmed();
+        const platform::DeviceStatusInfo refreshedInfo = refreshResult.devices.value(ip);
+        const QString remoteMac = refreshedInfo.mac.trimmed();
+        const QString remoteBroadcastIp = refreshedInfo.broadcastIp.trimmed();
+        if (!ip.isEmpty() && device.mac.trimmed().isEmpty() && !remoteMac.isEmpty()) {
+            qWarning().noquote() << QStringLiteral("[wjy-status] sync device mac ip=%1 mac=%2")
+                .arg(ip)
+                .arg(remoteMac); // wjy: 保留原有诊断日志，便于定位自动补齐 MAC 的来源。
+            updatedDevice.mac = remoteMac; // wjy: 仅补齐本地缺失的 MAC，避免覆盖用户已有值。
+            currentDeviceChanged = true;
+        }
+        if (!ip.isEmpty() && device.broadcastIp.trimmed().isEmpty() && !remoteBroadcastIp.isEmpty()) {
+            updatedDevice.broadcastIp = remoteBroadcastIp; // wjy: 仅补齐本地缺失的广播地址。
+            currentDeviceChanged = true;
+        }
+        const QString remoteName = refreshedInfo.deviceName.trimmed();
+        const QString pendingRemoteRename = m_pendingRemoteRenameNames.value(ip).trimmed(); // wjy: 改名等待重启生效期间保护本地新名称。
+        bool allowRemoteNameSync = true;
+        if (!pendingRemoteRename.isEmpty()) {
+            if (remoteName == pendingRemoteRename) {
+                m_pendingRemoteRenameNames.remove(ip); // wjy: 远端已上报新名称，解除保护。
+            } else {
+                allowRemoteNameSync = false; // wjy: 远端仍返回旧名称时不覆盖本地待生效名称。
+            }
+        }
+        if (allowRemoteNameSync && !ip.isEmpty() && !remoteName.isEmpty() && device.name.trimmed() != remoteName) {
+            qWarning().noquote() << QStringLiteral("[wjy-status] sync device name ip=%1 old=%2 new=%3")
+                .arg(ip)
+                .arg(device.name.trimmed())
+                .arg(remoteName); // wjy: 保留原有诊断日志，便于定位远端名称同步。
+            updatedDevice.name = remoteName; // wjy: 远端真实设备名变化时同步本地目录。
+            currentDeviceChanged = true;
+        }
+        if (currentDeviceChanged && g_deviceCatalog.updateDevice(device.id, std::move(updatedDevice))) {
+            deviceRecordChanged = true; // wjy: 使用稳定 deviceId 提交，避免刷新期间数组重排造成错写。
+        }
+    }
+    if (deviceRecordChanged) {
+        saveDevices(); // wjy: 设备元数据修正后立即持久化，保证下次启动继续使用最新信息。
+        if (m_selectedDeviceIndex >= 0 && m_selectedDeviceIndex < g_devices.size()) {
+            m_currentDeviceName = deviceDisplayName(g_devices.at(m_selectedDeviceIndex));
+            m_previousDeviceName = m_currentDeviceName;
+        }
+    }
+    if (!realtimeAvailable) {
+        for (auto it = refreshResult.devices.cbegin(); it != refreshResult.devices.cend(); ++it) {
+            if (!it.value().scriptRuntime.supported) {
+                continue;
+            }
+            applyRemoteScriptRuntimeState(it.key(), it.value().terminalUser.trimmed(), it.value().scriptRuntime); // wjy: 无实时服务时仍用手动刷新恢复目标脚本运行态。
+        }
+    }
+    for (auto it = m_poweringOnDeviceIps.begin(); it != m_poweringOnDeviceIps.end();) {
+        const platform::DevicePresenceState state = m_deviceStatuses.value(*it, platform::DevicePresenceState::Offline); // wjy: 开机探测成功后结束视觉提示。
+        if (state != platform::DevicePresenceState::Offline) {
+            m_poweringOnStartedAtMs.remove(*it);
+            it = m_poweringOnDeviceIps.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    m_statusRefreshInProgress = false; // wjy: UI 应用完成后才允许下一轮刷新进入。
+    update(); // wjy: 一次性请求设备列表和详情区域重绘。
+}
+// ===end====
 
 void DeviceGrid::probePoweringOnDevices()
 {
@@ -6358,15 +6955,19 @@ void DeviceGrid::showDeviceContextMenuForIndexes(
         return; // wjy: 设备已删除或下标失效时不显示可能控制错误目标的菜单。
     }
 
-    QVector<int> validTargetIndexes; // wjy: 菜单可能来自多选设备，也可能来自单个远控窗口，先统一过滤为有效下标。
-    for (int targetIndex : targetDeviceIndexes) {
-        if (targetIndex >= 0 && targetIndex < g_devices.size() && !validTargetIndexes.contains(targetIndex)) {
-            validTargetIndexes.append(targetIndex);
+    QVector<QString> requestedTargetIds;
+    for (const int targetIndex : targetDeviceIndexes) {
+        if (targetIndex >= 0 && targetIndex < g_devices.size()) {
+            requestedTargetIds.append(g_devices.at(targetIndex).id); // wjy: UI 下标只在菜单入口转换一次，后续目标集合以稳定设备 ID 传递。
         }
     }
-    if (validTargetIndexes.isEmpty()) {
-        validTargetIndexes.append(deviceIndex); // wjy: 远控标题栏或异常空选择至少保留当前窗口绑定的这一台设备。
-    }
+    const QVector<QString> targetDeviceIds = platform::DeviceActionTargetResolver::normalizeDeviceIds(
+        g_deviceCatalog,
+        requestedTargetIds,
+        g_devices.at(deviceIndex).id); // wjy: 过滤重复、过期目标并在多选失效时回退触发菜单的设备。
+    const QVector<int> validTargetIndexes = platform::DeviceActionTargetResolver::indexesForDeviceIds(
+        g_deviceCatalog,
+        targetDeviceIds); // wjy: 兼容旧批量入口仍使用瞬时下标，但下标由稳定 ID 在当前目录顺序重新解析。
     const bool batchDeviceMenu = validTargetIndexes.size() > 1; // wjy: 只有设备列表多选才显示“批量”文案，单个远控窗口始终控制一台设备。
 
     QMenu menu(this); // wjy: 两种入口复用同一 QMenu，后续顺序、图标或动作调整只需要维护这一处。
@@ -6409,8 +7010,18 @@ void DeviceGrid::showDeviceContextMenuForIndexes(
             revealDeviceGroup(selectedGroupIndex, false); // wjy: 已在该组时不重复写归属，但仍展开并滚动到目标组标题。
         }
     // ===end====
+    // =====wjy====
     } else if (selectedAction && selectedAction->data().isValid()) {
-        executeDeviceScriptFolder(deviceIndex, selectedAction->data().toString(), true); // wjy: 脚本始终发送给触发菜单的真实设备，不读取 m_selectedDeviceIndex。
+        const QString scriptFolderPath = selectedAction->data().toString(); // wjy: 先保存脚本菜单绑定的目录，单设备和多设备必须执行同一个脚本入口。
+        if (batchDeviceMenu) {
+            batchExecuteDeviceScriptFolder(
+                validTargetIndexes,
+                scriptFolderPath,
+                QString::fromUtf8("选中的设备中没有可执行设备。")); // wjy: 多选时传入完整有效目标集合，不能再只使用触发右键菜单的 deviceIndex。
+        } else {
+            executeDeviceScriptFolder(deviceIndex, scriptFolderPath, true); // wjy: 单设备及远控标题栏菜单保留原来的详细失败提示。
+        }
+    // ===end====
     } else if (selectedAction == wakeAction) {
         batchWakeDevices(validTargetIndexes);
     } else if (selectedAction == shutdownAction) {
@@ -6467,18 +7078,10 @@ QVector<int> DeviceGrid::deviceIndexesForGroup(int groupIndex) const
     if (groupIndex < 0 || groupIndex >= g_deviceGroupNames.size()) {
         return result;
     }
-
-    const QString groupName = g_deviceGroupNames.at(groupIndex).trimmed();
-    if (groupName.isEmpty()) {
-        return result;
-    }
-
-    for (int i = 0; i < g_devices.size(); ++i) {
-        if (g_devices.at(i).group.trimmed() == groupName) {
-            result.append(i);
-        }
-    }
-    return result;
+    const QString groupId = g_deviceGroupIds.at(groupIndex);
+    return platform::DeviceActionTargetResolver::indexesForDeviceIds(
+        g_deviceCatalog,
+        platform::DeviceActionTargetResolver::deviceIdsForGroup(g_deviceCatalog, groupId)); // wjy: 分组批量操作先按稳定 groupId 收集，再恢复当前展示下标，避免名称和旧位置漂移。
 // ===end====
 }
 
@@ -6505,10 +7108,27 @@ QVector<int> DeviceGrid::contextDeviceIndexesForRightClick(int clickedDeviceInde
 // ===end====
 }
 
+QVector<int> DeviceGrid::normalizedBatchDeviceIndexes(const QVector<int>& deviceIndexes) const
+{
+    QVector<QString> requestedIds;
+    requestedIds.reserve(deviceIndexes.size());
+    for (const int deviceIndex : deviceIndexes) {
+        if (deviceIndex >= 0 && deviceIndex < g_devices.size()) {
+            requestedIds.append(g_devices.at(deviceIndex).id); // wjy: 仅在 UI 入口读取一次下标，异步动作后续依赖稳定设备 ID。
+        }
+    }
+    const QVector<QString> normalizedIds = platform::DeviceActionTargetResolver::normalizeDeviceIds(
+        g_deviceCatalog,
+        requestedIds); // wjy: 统一去重并过滤菜单打开后已经失效的目标。
+    return platform::DeviceActionTargetResolver::indexesForDeviceIds(
+        g_deviceCatalog,
+        normalizedIds); // wjy: 兼容现有单设备函数接口，但每次执行前都按当前目录顺序重新解析下标。
+}
+
 void DeviceGrid::batchWakeDevices(const QVector<int>& deviceIndexes)
 {
 // =====wjy====
-    for (int deviceIndex : deviceIndexes) {
+    for (const int deviceIndex : normalizedBatchDeviceIndexes(deviceIndexes)) {
         wakeDeviceForIndex(deviceIndex, false);
     }
 // ===end====
@@ -6517,7 +7137,7 @@ void DeviceGrid::batchWakeDevices(const QVector<int>& deviceIndexes)
 void DeviceGrid::batchShutdownDevices(const QVector<int>& deviceIndexes)
 {
 // =====wjy====
-    for (int deviceIndex : deviceIndexes) {
+    for (const int deviceIndex : normalizedBatchDeviceIndexes(deviceIndexes)) {
         shutdownDeviceForIndex(deviceIndex, false);
     }
 // ===end====
@@ -6526,7 +7146,7 @@ void DeviceGrid::batchShutdownDevices(const QVector<int>& deviceIndexes)
 void DeviceGrid::batchRestartDevices(const QVector<int>& deviceIndexes)
 {
 // =====wjy====
-    for (int deviceIndex : deviceIndexes) {
+    for (const int deviceIndex : normalizedBatchDeviceIndexes(deviceIndexes)) {
         restartDeviceForIndex(deviceIndex, false);
     }
 // ===end====
@@ -6535,7 +7155,7 @@ void DeviceGrid::batchRestartDevices(const QVector<int>& deviceIndexes)
 // =====wjy====
 void DeviceGrid::batchUpdateDevices(const QVector<int>& deviceIndexes)
 {
-    for (int deviceIndex : deviceIndexes) {
+    for (const int deviceIndex : normalizedBatchDeviceIndexes(deviceIndexes)) {
         updateDeviceForIndex(deviceIndex, false); // wjy: 离线设备由单设备 helper 自动跳过，在线设备各自根据共享版本决定是否更新。
     }
 }
@@ -6544,7 +7164,7 @@ void DeviceGrid::batchUpdateDevices(const QVector<int>& deviceIndexes)
 void DeviceGrid::batchOpenDeviceTerminals(const QVector<int>& deviceIndexes)
 {
 // =====wjy====
-    for (int deviceIndex : deviceIndexes) {
+    for (const int deviceIndex : normalizedBatchDeviceIndexes(deviceIndexes)) {
         openTerminalForDeviceIndex(deviceIndex, false);
     }
 // ===end====
@@ -6557,7 +7177,9 @@ bool DeviceGrid::openTerminalForDeviceIndex(int deviceIndex, bool showMessages)
     }
 
     const DeviceEntry& device = g_devices.at(deviceIndex);
-    if (devicePresenceForIndex(deviceIndex) == platform::DevicePresenceState::Offline) {
+    if (!platform::isDeviceActionAllowed(
+            platform::DeviceActionKind::Terminal,
+            devicePresenceForIndex(deviceIndex))) { // wjy: 终端只拒绝明确离线，Unknown 仍允许后续 SSH/授权流程给出准确错误。
         return false;
     }
 
@@ -6681,7 +7303,7 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
 
     const DeviceEntry device = g_devices.at(deviceIndex);
     const QString targetIp = device.ip.trimmed();
-    const ScriptUiState existingState = m_scriptUiStates.value(targetIp);
+    const ScriptUiState existingState = m_scriptUiStateStore.state(targetIp);
     if (existingState.outputRunning && existingState.localLaunchInProgress) {
         if (showMessages) {
             QMessageBox messageBox(
@@ -6800,7 +7422,7 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
     state.editorText = QString::fromUtf8("正在等待脚本文件复制到目标设备本地 work 目录...");
     state.editorModified = false;
     writeScriptOutputFile(state.outputFilePath, state.outputText, QIODevice::Truncate);
-    m_scriptUiStates.insert(targetIp, state); // wjy: 指定设备执行脚本时先写入对应 IP 状态，分组批量执行不会抢当前设备 UI。
+    m_scriptUiStateStore.setState(targetIp, state); // wjy: 指定设备执行脚本时先写入对应 IP 状态，分组批量执行不会抢当前设备 UI。
     update(deviceListViewportRect(m_deviceGroupExpanded)); // wjy: 脚本启动后立刻刷新设备列表，单台和分组批量执行都能马上显示运行图标。
     if (targetIsCurrent) {
         m_deviceDetailTab = DeviceDetailTab::ScriptLog;
@@ -6831,7 +7453,7 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
         update();
     }
     QTimer::singleShot(900, this, [this, deviceIp = device.ip, loginUser, scriptWorkName] {
-        const ScriptUiState state = m_scriptUiStates.value(deviceIp.trimmed());
+        const ScriptUiState state = m_scriptUiStateStore.state(deviceIp);
         if (state.editorWorkName == scriptWorkName) {
             loadScriptFileEditor(deviceIp, loginUser, scriptWorkName); // wjy: 复制开始后短暂延迟读取，让编辑框尽快显示 work 子目录里的 json/txt。
         }
@@ -6943,7 +7565,7 @@ exit $scriptExit
         escapedPowerShellSingleQuoted(scriptWorkName),
         escapedPowerShellSingleQuoted(runId)); // wjy: 目标包装器原子写入全局活动清单，正常结束时按 runId 条件删除，旧任务不会误删新任务状态。
     QPointer<DeviceGrid> self(this);
-    runBackgroundTask([self, deviceIp = device.ip, loginUser, remotePowerShellScript, targetName, scriptName, scriptWorkName, outputFilePath = state.outputFilePath, cancelRequested = state.cancelRequested] {
+    runBackgroundTask([self, deviceIp = device.ip, loginUser, runId, remotePowerShellScript, targetName, scriptName, scriptWorkName, outputFilePath = state.outputFilePath, cancelRequested = state.cancelRequested] {
         QString outputText;
         QString runError;
         const bool ok = platform::PortableOpenSshManager::instance().runRemotePowerShellScript(
@@ -6953,23 +7575,24 @@ exit $scriptExit
             &outputText,
             &runError,
             0,
-            [self, deviceIp, outputFilePath](const QString& chunk) {
+            [self, deviceIp, runId, outputFilePath](const QString& chunk) {
                 if (!self || chunk.isEmpty()) {
                     return;
                 }
                 writeScriptOutputFile(outputFilePath, stripTerminalControlSequences(chunk), QIODevice::Append);
-                QMetaObject::invokeMethod(self, [self, deviceIp, outputFilePath] {
+                QMetaObject::invokeMethod(self, [self, deviceIp, runId, outputFilePath] {
                     if (!self) {
                         return;
                     }
                     DeviceGrid* grid = self.data();
                     const QString targetIp = deviceIp.trimmed();
-                    ScriptUiState state = grid->m_scriptUiStates.value(targetIp);
-                    if (state.outputFilePath != outputFilePath) {
+                    ScriptUiState state = grid->m_scriptUiStateStore.state(targetIp);
+                    if (state.outputFilePath != outputFilePath
+                        || (!state.remoteRunId.isEmpty() && state.remoteRunId != runId)) {
                         return;
                     }
                     state.outputDirty = true;
-                    grid->m_scriptUiStates.insert(targetIp, state); // wjy: 输出分片先标记到目标设备状态，切到其它设备时不触发当前终端刷新。
+                    grid->m_scriptUiStateStore.setState(targetIp, state); // wjy: 输出分片先标记到目标设备状态，切到其它设备时不触发当前终端刷新。
                     const bool targetIsCurrent = grid->currentScriptUiDeviceIp() == targetIp;
                     if (targetIsCurrent) {
                         grid->m_scriptOutputDirty = true;
@@ -6987,15 +7610,16 @@ exit $scriptExit
             return;
         }
 
-        QMetaObject::invokeMethod(self, [self, ok, deviceIp, loginUser, targetName, scriptName, scriptWorkName, outputText, runError, outputFilePath, cancelRequested] {
+        QMetaObject::invokeMethod(self, [self, ok, deviceIp, loginUser, runId, targetName, scriptName, scriptWorkName, outputText, runError, outputFilePath, cancelRequested] {
             if (!self) {
                 return;
             }
 
             DeviceGrid* grid = self.data();
             const QString targetIp = deviceIp.trimmed();
-            ScriptUiState state = grid->m_scriptUiStates.value(targetIp);
-            if (state.outputFilePath != outputFilePath) {
+            ScriptUiState state = grid->m_scriptUiStateStore.state(targetIp);
+            if (state.outputFilePath != outputFilePath
+                || (!state.remoteRunId.isEmpty() && state.remoteRunId != runId)) {
                 return;
             }
             const QString resultText = runError.trimmed().isEmpty() ? outputText.trimmed() : runError.trimmed();
@@ -7022,7 +7646,7 @@ exit $scriptExit
             state.outputDirty = false;
             state.outputTitle = QString::fromUtf8("%1 - %2").arg(targetName, scriptName);
             state.outputText = stripTerminalControlSequences(readScriptOutputFileTail(outputFilePath));
-            grid->m_scriptUiStates.insert(targetIp, state); // wjy: 结束状态写回目标设备，后台跑完后切回该设备能看到已完成/失败/停止。
+            grid->m_scriptUiStateStore.setState(targetIp, state); // wjy: 结束状态写回目标设备，后台跑完后切回该设备能看到已完成/失败/停止。
             grid->update(deviceListViewportRect(grid->m_deviceGroupExpanded)); // wjy: 无论目标设备是否是当前详情页，都立即移除它在左侧列表里的运行图标。
 
             const bool targetIsCurrent = grid->currentScriptUiDeviceIp() == targetIp;
@@ -7050,14 +7674,13 @@ exit $scriptExit
 // ===end====
 }
 
-void DeviceGrid::executeDeviceGroupScriptFolder(int groupIndex, const QString& scriptFolderPath)
-{
 // =====wjy====
-    if (groupIndex < 0 || groupIndex >= g_deviceGroupNames.size()) {
-        return;
-    }
-
-    const QFileInfo entryScript = scriptEntryFile(scriptFolderPath);
+void DeviceGrid::batchExecuteDeviceScriptFolder(
+    const QVector<int>& deviceIndexes,
+    const QString& scriptFolderPath,
+    const QString& noExecutableMessage)
+{
+    const QFileInfo entryScript = scriptEntryFile(scriptFolderPath); // wjy: 批量执行前只解析一次脚本入口，避免每台设备重复弹出“无可用脚本”。
     if (!entryScript.exists() || scriptRunCommandForFile(entryScript).trimmed().isEmpty()) {
         QMessageBox messageBox(
             QMessageBox::Information,
@@ -7067,21 +7690,13 @@ void DeviceGrid::executeDeviceGroupScriptFolder(int groupIndex, const QString& s
             this);
         messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
         messageBox.exec();
-        return; // wjy: 分组批量执行前先校验一次脚本入口，避免组内每台设备重复弹窗。
+        return; // wjy: 脚本目录无有效入口时整批停止，不创建任何远程任务。
     }
 
-    const QString groupName = g_deviceGroupNames.at(groupIndex).trimmed();
-    QVector<int> groupDeviceIndexes;
-    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
-        if (g_devices.at(deviceIndex).group.trimmed() == groupName) {
-            groupDeviceIndexes.append(deviceIndex); // wjy: 以真实分组名收集设备下标，保证菜单行号变化不影响批量目标。
-        }
-    }
-
-    int startedCount = 0;
-    for (int deviceIndex : groupDeviceIndexes) {
-        if (executeDeviceScriptFolder(deviceIndex, scriptFolderPath, false)) {
-            ++startedCount; // wjy: 每台设备各自创建 SSH 任务和 UI 状态，互不共享输出文件或停止标志。
+    int startedCount = 0; // wjy: 记录已成功创建本地异步执行任务的设备数量，用于判断整批是否均被跳过。
+    for (const int targetDeviceIndex : normalizedBatchDeviceIndexes(deviceIndexes)) {
+        if (executeDeviceScriptFolder(targetDeviceIndex, scriptFolderPath, false)) {
+            ++startedCount; // wjy: 每个有效目标都调用一次单设备执行函数，各设备继续使用独立的脚本状态和输出文件。
         }
     }
 
@@ -7089,14 +7704,27 @@ void DeviceGrid::executeDeviceGroupScriptFolder(int groupIndex, const QString& s
         QMessageBox messageBox(
             QMessageBox::Warning,
             QString(),
-            QString::fromUtf8("分组内没有可执行设备。"),
+            noExecutableMessage,
             QMessageBox::NoButton,
             this);
         messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
-        messageBox.exec();
+        messageBox.exec(); // wjy: 所有目标都离线、正在运行脚本或连接失败时，只显示一次批量结果提示。
     } else {
-        update(); // wjy: 如果当前详情设备属于该分组，批量启动后立即刷新它的脚本面板。
+        update(); // wjy: 至少一台设备启动后立即刷新设备列表和当前脚本详情页的运行状态。
     }
+}
+// ===end====
+
+void DeviceGrid::executeDeviceGroupScriptFolder(int groupIndex, const QString& scriptFolderPath)
+{
+// =====wjy====
+    if (groupIndex < 0 || groupIndex >= g_deviceGroupNames.size()) {
+        return;
+    }
+    batchExecuteDeviceScriptFolder(
+        deviceIndexesForGroup(groupIndex),
+        scriptFolderPath,
+        QString::fromUtf8("分组内没有可执行设备。")); // wjy: 分组入口也按稳定分组 ID 取得设备，并复用与多选设备完全相同的批量执行逻辑。
 // ===end====
 }
 
@@ -7156,7 +7784,7 @@ void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex)
     if (deviceIp.isEmpty()) {
         return;
     }
-    QPointer<RemoteDesktopWindow> existingWindow = m_remoteDesktopWindows.value(deviceIp);
+    QPointer<RemoteDesktopWindow> existingWindow = m_remoteWindowCoordinator->normalWindow(deviceIp); // wjy: 普通远控入口通过协调器按 IP 去重，避免 DeviceGrid 直接维护窗口哈希。
     if (existingWindow && !existingWindow->isClosingConnection()) {
         if (existingWindow->isMinimized()) {
             existingWindow->showNormal();
@@ -7168,8 +7796,6 @@ void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex)
         rememberRemoteWindowActivation(existingWindow.data());
         return;
     }
-    m_remoteDesktopWindows.remove(deviceIp);
-
     if (!ensureRemoteControlAuthorization(deviceIndex, true)) {
         return; // wjy: 新设备首次远控先自动生成并登记公钥，失败时不创建必然被拒绝的远控窗口。
     }
@@ -7179,19 +7805,11 @@ void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex)
         deviceIp,
         m_remoteViewerLifecycleManager.get(),
         &m_remoteInputBroadcastCoordinator); // wjy: 普通远控窗口同时接入共享生命周期管理器和唯一键鼠同步协调器。
-    m_remoteDesktopWindows.insert(deviceIp, remoteWindow);
+    m_remoteWindowCoordinator->registerNormalWindow(deviceIp, remoteWindow); // wjy: 新普通窗口登记到协调器，后续重复打开只激活它。
     publishRemoteControllerTarget(remoteWindow, deviceDisplayName(g_devices.at(deviceIndex)), deviceIp); // wjy: 窗口建立即发布本机正在控制的目标租约，目标人数仍只看目标主机自己的会话表。
     connect(remoteWindow, &QObject::destroyed, this, [this, deviceIp, remoteWindow] {
         removeRemoteControllerTarget(remoteWindow); // wjy: 异常关闭或正常关闭都由 QObject 生命周期删除同一租约。
-        m_remoteDesktopWindows.remove(deviceIp);
-        for (auto it = m_remoteWindowActivationOrder.begin(); it != m_remoteWindowActivationOrder.end();) {
-            if (!*it) {
-                it = m_remoteWindowActivationOrder.erase(it);
-            } else {
-                ++it;
-            }
-        }
-        m_remoteTileRestoreGeometries.remove(remoteWindow);
+        m_remoteWindowCoordinator->removeWindow(deviceIp, remoteWindow); // wjy: 销毁回调统一清理普通映射、激活顺序和平铺恢复几何。
     });
     connect(remoteWindow, &RemoteDesktopWindow::activated, this, &DeviceGrid::rememberRemoteWindowActivation);
     // =====wjy====
@@ -7259,12 +7877,7 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
         return; // wjy: 空分组名没有稳定匹配依据，不打开任何窗口。
     }
 
-    for (const QPointer<RemoteDesktopWindow>& tiledWindow : m_tiledRemoteWindows) {
-        if (tiledWindow && !tiledWindow->isClosingConnection()) {
-            tiledWindow->close(); // wjy: 再次点击设备平铺时先关闭上一批平铺窗口，避免重复创建叠加的新窗口。
-        }
-    }
-    m_tiledRemoteWindows.clear(); // wjy: 旧窗口已进入关闭流程，后续只记录本次重新平铺创建的新窗口。
+    m_remoteWindowCoordinator->closeTiledWindows(); // wjy: 再次点击设备平铺时由协调器关闭上一批窗口，避免 DeviceGrid 维护重复集合。
 
     QVector<int> groupDeviceIndexes; // wjy: 保存这个分组里的真实设备下标，后面创建窗口时要用真实设备名和 IP。
     for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
@@ -7317,25 +7930,11 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
             m_remoteViewerLifecycleManager.get(),
             &m_remoteInputBroadcastCoordinator); // wjy: 平铺窗口与普通窗口处于同一同步成员集合，任一标题栏按钮都能原子切换主控。
         remoteWindow->setRememberGeometryEnabled(false);
-        m_tiledRemoteWindows.append(remoteWindow); // wjy: 记录本次平铺创建的窗口，下一次设备平铺前统一关闭并重排。
+        m_remoteWindowCoordinator->registerTiledWindow(remoteWindow); // wjy: 记录本次平铺创建的窗口，下一次设备平铺前统一关闭并重排。
         publishRemoteControllerTarget(remoteWindow, deviceDisplayName(g_devices.at(deviceIndex)), g_devices.at(deviceIndex).ip); // wjy: 每个平铺窗口拥有独立诊断租约，不会与普通窗口覆盖。
         connect(remoteWindow, &QObject::destroyed, this, [this, remoteWindow] {
             removeRemoteControllerTarget(remoteWindow);
-            for (auto it = m_tiledRemoteWindows.begin(); it != m_tiledRemoteWindows.end();) {
-                if (!*it || it->data() == remoteWindow) {
-                    it = m_tiledRemoteWindows.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-            for (auto it = m_remoteWindowActivationOrder.begin(); it != m_remoteWindowActivationOrder.end();) {
-                if (!*it || it->data() == remoteWindow) {
-                    it = m_remoteWindowActivationOrder.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-            m_remoteTileRestoreGeometries.remove(remoteWindow);
+            m_remoteWindowCoordinator->removeWindow(remoteWindow); // wjy: 平铺窗口销毁时统一清理平铺集合、激活顺序和恢复几何。
         });
         connect(remoteWindow, &RemoteDesktopWindow::activated, this, &DeviceGrid::rememberRemoteWindowActivation);
         // =====wjy====
@@ -7364,26 +7963,7 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
 
 QVector<QPointer<RemoteDesktopWindow>> DeviceGrid::openedRemoteWindows() const
 {
-    QVector<QPointer<RemoteDesktopWindow>> windows;
-    QSet<RemoteDesktopWindow*> seen;
-    const auto appendWindow = [&windows, &seen](const QPointer<RemoteDesktopWindow>& window) {
-        if (!window || window->isClosingConnection() || seen.contains(window.data())) {
-            return;
-        }
-        seen.insert(window.data());
-        windows.append(window);
-    };
-
-    for (auto it = m_remoteDesktopWindows.cbegin(); it != m_remoteDesktopWindows.cend(); ++it) {
-        appendWindow(it.value());
-    }
-    for (const QPointer<RemoteDesktopWindow>& window : m_tiledRemoteWindows) {
-        appendWindow(window);
-    }
-    for (const QPointer<RemoteDesktopWindow>& window : m_remoteWindowActivationOrder) {
-        appendWindow(window);
-    }
-    return windows;
+    return m_remoteWindowCoordinator->openedWindows(); // wjy: 普通/平铺/激活窗口的去重和 closing 过滤由协调器统一完成。
 }
 
 void DeviceGrid::setRemoteUpdateAvailability(const QString& hostIp, bool available)
@@ -7460,29 +8040,12 @@ void DeviceGrid::refreshOpenedRemoteUpdateAvailability()
 
 void DeviceGrid::rememberRemoteWindowActivation(RemoteDesktopWindow* window)
 {
-    if (!window) {
-        return;
-    }
-    for (auto it = m_remoteWindowActivationOrder.begin(); it != m_remoteWindowActivationOrder.end();) {
-        if (!*it || it->data() == window) {
-            it = m_remoteWindowActivationOrder.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    m_remoteWindowActivationOrder.append(QPointer<RemoteDesktopWindow>(window));
+    m_remoteWindowCoordinator->rememberActivation(window); // wjy: 激活顺序由协调器维护，快捷键不再依赖 DeviceGrid 容器。
 }
 
 RemoteDesktopWindow* DeviceGrid::topmostRemoteWindow() const
 {
-    for (int i = m_remoteWindowActivationOrder.size() - 1; i >= 0; --i) {
-        RemoteDesktopWindow* window = m_remoteWindowActivationOrder.at(i).data();
-        if (window && !window->isClosingConnection()) {
-            return window;
-        }
-    }
-    const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
-    return windows.isEmpty() ? nullptr : windows.last().data();
+    return m_remoteWindowCoordinator->topmostWindow(); // wjy: 协调器优先返回最近激活且仍可用的窗口。
 }
 
 void DeviceGrid::toggleTopmostRemoteWindowFullscreen()
@@ -7511,21 +8074,21 @@ void DeviceGrid::toggleRemoteWindowTiling()
         return;
     }
 
-    if (m_remoteWindowsTiled) {
+    if (m_remoteWindowCoordinator->windowsTiled()) {
         for (const QPointer<RemoteDesktopWindow>& window : windows) {
             if (!window) {
                 continue;
             }
             window->showNormal();
-            const QRect restoreGeometry = m_remoteTileRestoreGeometries.value(window.data());
+            const QRect restoreGeometry = m_remoteWindowCoordinator->restoreGeometry(window.data());
             if (restoreGeometry.isValid()) {
                 window->setGeometry(restoreGeometry);
             }
             window->setRememberGeometryEnabled(true);
             window->show();
         }
-        m_remoteTileRestoreGeometries.clear();
-        m_remoteWindowsTiled = false;
+        m_remoteWindowCoordinator->clearRestoreGeometries();
+        m_remoteWindowCoordinator->setWindowsTiled(false);
         return;
     }
 
@@ -7540,13 +8103,13 @@ void DeviceGrid::toggleRemoteWindowTiling()
     const int tileWidth = qMax(1, availableRect.width() / columnCount); // wjy: 快捷键平铺同样取消 320px 宽度下限，窗口数量多时仍严格落在屏幕内。
     const int tileHeight = qMax(1, availableRect.height() / rowCount); // wjy: 取消 240px 高度下限，12 个窗口可按 4x3 网格完整铺开且互不重叠。
 
-    m_remoteTileRestoreGeometries.clear();
+    m_remoteWindowCoordinator->clearRestoreGeometries();
     for (int i = 0; i < windows.size(); ++i) {
         RemoteDesktopWindow* remoteWindow = windows.at(i).data();
         if (!remoteWindow) {
             continue;
         }
-        m_remoteTileRestoreGeometries.insert(remoteWindow, remoteWindow->geometry());
+        m_remoteWindowCoordinator->setRestoreGeometry(remoteWindow, remoteWindow->geometry());
         remoteWindow->setRememberGeometryEnabled(false);
         remoteWindow->showNormal();
         const int row = i / columnCount;
@@ -7568,7 +8131,7 @@ void DeviceGrid::toggleRemoteWindowTiling()
         remoteWindow->activateWindow();
         remoteWindow->setFocus(Qt::ActiveWindowFocusReason);
     }
-    m_remoteWindowsTiled = true;
+    m_remoteWindowCoordinator->setWindowsTiled(true);
 }
 
 void DeviceGrid::closeTopmostRemoteWindow()
@@ -7582,15 +8145,7 @@ void DeviceGrid::closeTopmostRemoteWindow()
 
 void DeviceGrid::closeAllRemoteWindows()
 {
-    const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
-    for (const QPointer<RemoteDesktopWindow>& window : windows) {
-        if (window && !window->isClosingConnection()) {
-            window->close();
-        }
-    }
-    m_remoteWindowActivationOrder.clear();
-    m_remoteTileRestoreGeometries.clear();
-    m_remoteWindowsTiled = false;
+    m_remoteWindowCoordinator->closeAllWindows(); // wjy: close-all 的窗口遍历、去重和状态清理由协调器集中负责。
 }
 
 void DeviceGrid::shutdownCurrentDevice()
@@ -7604,7 +8159,9 @@ bool DeviceGrid::shutdownDeviceForIndex(int deviceIndex, bool showMessages)
         return false;
     }
 
-    if (devicePresenceForIndex(deviceIndex) == platform::DevicePresenceState::Offline) {
+    if (!platform::isDeviceActionAllowed(
+            platform::DeviceActionKind::Shutdown,
+            devicePresenceForIndex(deviceIndex))) { // wjy: 关机只提前拦截明确离线，未知状态仍交给命令服务确认。
         return false;
     }
 
@@ -7642,7 +8199,9 @@ bool DeviceGrid::restartDeviceForIndex(int deviceIndex, bool showMessages)
         return false;
     }
 
-    if (devicePresenceForIndex(deviceIndex) == platform::DevicePresenceState::Offline) {
+    if (!platform::isDeviceActionAllowed(
+            platform::DeviceActionKind::Restart,
+            devicePresenceForIndex(deviceIndex))) { // wjy: 重启复用统一动作策略，避免批量和单设备入口出现不同离线判断。
         return false;
     }
 
@@ -7749,9 +8308,12 @@ void DeviceGrid::applyDeviceRename(int deviceIndex, const QString& newName)
     }
 
     const QString targetIp = g_devices.at(deviceIndex).ip.trimmed();
+    const QString targetDeviceId = g_devices.at(deviceIndex).id; // wjy: 异步重命名回调携带稳定设备 ID，设备排序后仍能回滚原目标。
     const bool shouldRenameRemote = !targetIp.isEmpty()
         && devicePresenceForIndex(deviceIndex) != platform::DevicePresenceState::Offline; // wjy: 离线设备只改本地显示名，在线设备才尝试同步远端电脑名。
-    g_devices[deviceIndex].name = normalizedNewName;
+    if (!g_deviceCatalog.renameDevice(targetDeviceId, normalizedNewName)) {
+        return; // wjy: 目录拒绝无效稳定 ID 时不保存半成品名称，避免 UI 下标和权威数据分叉。
+    }
     saveDevices();
     if (deviceIndex == m_selectedDeviceIndex) {
         m_currentDeviceName = normalizedNewName;
@@ -7762,7 +8324,7 @@ void DeviceGrid::applyDeviceRename(int deviceIndex, const QString& newName)
     if (shouldRenameRemote) {
         m_pendingRemoteRenameNames.insert(targetIp, normalizedNewName); // wjy: Windows 改电脑名通常要重启才从状态服务返回新名，先阻止自动刷新用旧名覆盖。
         QPointer<DeviceGrid> self(this);
-        runBackgroundTask([self, targetIp, oldName, normalizedNewName] {
+        runBackgroundTask([self, targetDeviceId, targetIp, oldName, normalizedNewName] {
             QString errorMessage;
             const bool renamed = platform::DeviceCommandService::renameDevice(targetIp, normalizedNewName, &errorMessage);
             qWarning().noquote() << QStringLiteral("[rename-device] remote ip=%1 renamed=%2 error=%3")
@@ -7775,7 +8337,7 @@ void DeviceGrid::applyDeviceRename(int deviceIndex, const QString& newName)
             if (renamed) {
                 return; // wjy: 远端已接受改名请求，等待目标系统重启后状态服务上报新电脑名。
             }
-            QMetaObject::invokeMethod(self, [self, targetIp, oldName, normalizedNewName, errorMessage] {
+            QMetaObject::invokeMethod(self, [self, targetDeviceId, targetIp, oldName, normalizedNewName, errorMessage] {
                 if (!self) {
                     return;
                 }
@@ -7785,14 +8347,7 @@ void DeviceGrid::applyDeviceRename(int deviceIndex, const QString& newName)
                     grid->m_pendingRemoteRenameNames.remove(targetIp); // wjy: 命令明确失败后取消待生效保护，让后续刷新恢复正常同步。
                 }
 
-                bool reverted = false;
-                for (DeviceEntry& device : g_devices) {
-                    if (device.ip.trimmed() == targetIp && device.name.trimmed() == normalizedNewName) {
-                        device.name = oldName; // wjy: 远端没有接受改名时回滚本地名，避免界面显示一个不会在目标机生效的名字。
-                        reverted = true;
-                        break;
-                    }
-                }
+                const bool reverted = g_deviceCatalog.renameDevice(targetDeviceId, oldName); // wjy: 远端失败时按原稳定 ID 回滚，不能按 IP 或旧数组下标误改其它设备。
                 if (reverted) {
                     saveDevices();
                     if (grid->m_selectedDeviceIndex >= 0 && grid->m_selectedDeviceIndex < g_devices.size()) {
@@ -7840,8 +8395,9 @@ void DeviceGrid::deleteDeviceForIndex(int deviceIndex)
 
     const int previousSelectedIndex = m_selectedDeviceIndex; // wjy: 删除目标可能来自远控标题栏，先保存主界面当前选择以便删除后校正下标。
     const QString removedIp = g_devices.at(deviceIndex).ip.trimmed();
+    const QString removedDeviceId = g_devices.at(deviceIndex).id; // wjy: 删除操作先记录稳定设备 ID，后续目录移除不依赖数组位置。
     saveCurrentScriptUiState(); // wjy: 删除当前设备前先收拢编辑框未保存文本和终端状态，随后按 IP 清理缓存。
-    g_devices.removeAt(deviceIndex); // wjy: 只从本机设备集合移除，不向目标设备发送任何关机、卸载或删除文件命令。
+    g_deviceCatalog.removeDevice(removedDeviceId); // wjy: 只从目录设备集合移除，不向目标设备发送任何关机、卸载或删除文件命令。
     saveDevices();
     updateRealtimeConfiguredDevices(); // wjy: 删除后立即拒绝该 IP 的后续广播并清理服务端序号/TTL 状态。
     m_deviceStatuses.remove(removedIp);
@@ -7851,7 +8407,7 @@ void DeviceGrid::deleteDeviceForIndex(int deviceIndex)
     m_deviceRealtimeScriptStates.remove(removedIp); // wjy: 删除设备时同步清掉实时脚本三态，未来复用该 IP 不继承旧 Logo。
     m_poweringOnDeviceIps.remove(removedIp);
     m_poweringOnStartedAtMs.remove(removedIp);
-    m_scriptUiStates.remove(removedIp); // wjy: 被删除设备的脚本 UI 不再保留，避免后续同 IP 之外的设备误用旧状态。
+    m_scriptUiStateStore.removeState(removedIp); // wjy: 被删除设备的脚本 UI 不再保留，避免后续同 IP 之外的设备误用旧状态。
     if (g_devices.isEmpty()) {
             m_selectedDeviceIndex = 0;
             m_previousDeviceIndex = 0;
@@ -7919,7 +8475,10 @@ void DeviceGrid::startCurrentDeviceWakeVisual()
     }
 
     const QString ip = g_devices.at(m_selectedDeviceIndex).ip.trimmed();
-    if (ip.isEmpty() || devicePresenceForIndex(m_selectedDeviceIndex) != platform::DevicePresenceState::Offline) {
+    if (ip.isEmpty()
+        || !platform::isDeviceActionAllowed(
+            platform::DeviceActionKind::Wake,
+            devicePresenceForIndex(m_selectedDeviceIndex))) { // wjy: 开机动画与真正的 Wake 动作复用同一资格策略，避免视觉入口和命令入口分叉。
         return;
     }
 
@@ -7938,7 +8497,9 @@ bool DeviceGrid::wakeDeviceForIndex(int deviceIndex, bool showMessages)
     }
 
     const DeviceEntry& device = g_devices.at(deviceIndex);
-    if (devicePresenceForIndex(deviceIndex) != platform::DevicePresenceState::Offline) {
+    if (!platform::isDeviceActionAllowed(
+            platform::DeviceActionKind::Wake,
+            devicePresenceForIndex(deviceIndex))) { // wjy: 开机只允许明确离线设备，在线或占用目标不重复发送唤醒包。
         return false;
     }
 
@@ -8151,24 +8712,20 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
 
     painter.fillRect(rect(), QColor(QStringLiteral("#F8FAFC")));
     painter.fillRect(QRectF(0, 0, width(), kTitleBarHeight), QColor(QStringLiteral("#EEF3F7"))); //标题栏
-    if (!m_leftSidebarCollapsed) {
-        painter.fillRect(QRectF(0, kTitleBarHeight, kSidebarWidth, height() - kTitleBarHeight), QColor(QStringLiteral("#EEF3F7")));
-    }
+    painter.fillRect(QRectF(0, kTitleBarHeight, kSidebarWidth, height() - kTitleBarHeight), QColor(QStringLiteral("#EEF3F7"))); // wjy: 详情栏收起时设备栏仍完整保留，不再随 << 消失。
 
     painter.setPen(QPen(QColor(QStringLiteral("#BFC7D1")), 1));
     painter.setBrush(Qt::NoBrush);
     painter.drawRoundedRect(QRectF(0.5, 0.5, width() - 1, height() - 1), 6, 6);
     painter.setPen(QPen(QColor(QStringLiteral("#D8DEE5")), 1));
-    if (!m_leftSidebarCollapsed) { //分割线
-        painter.drawLine(kSidebarWidth, kTitleBarHeight, kSidebarWidth, height());
-    }
+    painter.drawLine(kSidebarWidth, kTitleBarHeight, kSidebarWidth, height()); // wjy: 分割线固定区分 240px 设备栏与详情/按钮窄条。
 
 // =====wjy====
     const QRect titleWordmarkRect = titleBarCenteredRect(18, 116); // wjy: 左上角标题名使用统一标题栏视觉高度，不再从 y=15 开始下沉。
     const QRect settingsIconRect = titleBarCenteredRect(titlebarSettingsRect().x() + 14, 20, 20); // wjy: 设置按钮只保留图标，放在刷新按钮左侧并垂直居中。
     const QRect refreshIconRect = titleBarCenteredRect(refreshRect().x() + 10, 28, 22); // wjy: 刷新图标保留原有资源高度 22，并由标题栏高度统一居中。
-    const QRect minimizeIconRect = titleBarCenteredRect(minimizeRect().x() + 12, 24, 24); // wjy: 最小化图标保留原有 24 像素资源尺寸，并与同一标题栏中线对齐。
-    const QRect closeIconRect = titleBarCenteredRect(closeRect().x() + 25, 10, 10); // wjy: 关闭图标保留原有 10 像素资源尺寸，统一由标题栏中线计算垂直位置。
+    const QRect minimizeIconRect = titleBarCenteredRect(minimizeRect().x() + 6, 24, 24); // wjy: 24px 最小化图标在 36px 独立热区内水平居中。
+    const QRect closeIconRect = titleBarCenteredRect(closeRect().x() + 19, 10, 10); // wjy: 10px 关闭图标在 48px 关闭热区内水平居中，紧凑标题栏左右留白一致。
     const qreal separatorTop = (kTitleBarHeight - kTitleBarVisualHeight) / 2.0; // wjy: 竖杠顶部也跟随统一视觉高度，避免越过标题栏下边界。
     const qreal separatorBottom = separatorTop + kTitleBarVisualHeight; // wjy: 竖杠底部由顶部加统一高度得到，和左上标题名保持同一高度。
 
@@ -8187,13 +8744,13 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
         painter.drawText(QRectF(versionRect), Qt::AlignVCenter | Qt::AlignLeft, versionText);
     }
     // ===end====
-    if (m_settingsSelected) {
+    if (!m_detailPanelCollapsed && m_settingsSelected) {
         painter.setPen(Qt::NoPen);
         painter.setBrush(QColor(QStringLiteral("#DDE6EF")));
         painter.drawRoundedRect(QRectF(titlebarSettingsRect()).adjusted(8, 4, -8, -4), 4, 4);
     }
     // =====wjy====
-    if (m_updateAvailable) {
+    if (!m_detailPanelCollapsed && m_updateAvailable) {
         painter.setPen(Qt::NoPen);
         painter.setBrush(QColor(QStringLiteral("#3A7BFC")));
         painter.drawRoundedRect(QRectF(titlebarUpdateRect()), 4, 4); // wjy: 仅检测到远端版本更高时，在设置按钮左侧绘制主动更新入口。
@@ -8206,38 +8763,39 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             m_updatePreparing ? QString::fromUtf8("准备中") : QString::fromUtf8("更新")); // wjy: 用户点击后显示准备状态，并阻止重复创建更新任务。
     }
     // ===end====
-    QFont identityFont(QStringLiteral("Microsoft YaHei UI"));
-    identityFont.setPixelSize(12);
-    painter.setFont(identityFont);
-    painter.setPen(QColor(QStringLiteral("#4B5563")));
-    const int identityRight = (m_updateAvailable ? titlebarUpdateRect().x() : titlebarSettingsRect().x()) - 10; // wjy: 更新按钮出现时，本机名称和 IP 自动向左让位，避免文字重叠。
-    // =====wjy====
-    // wjy: 顺序“本机名 本机IP 设置”；名称与 IP 间距 10px，与远控窗口标题栏 name/IP 间距一致。
-    const QFontMetrics identityMetrics(identityFont);
-    const QString localNameText = m_localDeviceInfo.name.trimmed();
-    const QString localIpText = m_localDeviceInfo.ip.trimmed();
-    const int localIpWidth = qMin(114, identityMetrics.horizontalAdvance(localIpText));
-    const int localNameWidth = qMin(118, identityMetrics.horizontalAdvance(localNameText));
-    const int identityY = (kTitleBarHeight - kTitleBarVisualHeight) / 2;
-    const QRect localIpRect(identityRight - localIpWidth, identityY, localIpWidth, kTitleBarVisualHeight);
-    const QRect localNameRect(localIpRect.x() - 10 - localNameWidth, identityY, localNameWidth, kTitleBarVisualHeight);
-    painter.drawText(QRectF(localNameRect), Qt::AlignVCenter | Qt::AlignRight, identityMetrics.elidedText(localNameText, Qt::ElideRight, localNameWidth));
-    painter.drawText(QRectF(localIpRect), Qt::AlignVCenter | Qt::AlignRight, identityMetrics.elidedText(localIpText, Qt::ElideLeft, localIpWidth));
-    // ===end====
-    // =====wjy====
-    painter.save();
-    painter.translate(settingsIconRect.center());
-    painter.rotate(m_settingsGearRotation); // wjy: 点击设置时齿轮旋转半圈，与刷新按钮旋转同一套动画节奏。
-    painter.translate(-settingsIconRect.center());
-    drawUiIcon(painter, settingsIconRect, QStringLiteral("settings.svg"));
-    painter.restore();
-    // ===end====
-    painter.save();
-    painter.translate(refreshIconRect.center());
-    painter.rotate(m_refreshRotation);
-    painter.translate(-refreshIconRect.center());
-    drawUiIcon(painter, refreshIconRect, QStringLiteral("refresh.svg")); // wjy: 刷新旋转动画仍围绕居中后的图标中心点旋转。
-    painter.restore();
+    if (!m_detailPanelCollapsed) {
+        QFont identityFont(QStringLiteral("Microsoft YaHei UI"));
+        identityFont.setPixelSize(12);
+        painter.setFont(identityFont);
+        painter.setPen(QColor(QStringLiteral("#4B5563")));
+        const int identityRight = (m_updateAvailable ? titlebarUpdateRect().x() : titlebarSettingsRect().x()) - 10; // wjy: 更新按钮出现时，本机名称和 IP 自动向左让位，避免文字重叠。
+        // =====wjy====
+        // wjy: 完整标题栏保持“本机名 本机IP 设置”；紧凑态整体跳过，避免文字与窗口控制按钮重叠。
+        const QFontMetrics identityMetrics(identityFont);
+        const QString localNameText = m_localDeviceInfo.name.trimmed();
+        const QString localIpText = m_localDeviceInfo.ip.trimmed();
+        const int localIpWidth = qMin(114, identityMetrics.horizontalAdvance(localIpText));
+        const int localNameWidth = qMin(118, identityMetrics.horizontalAdvance(localNameText));
+        const int identityY = (kTitleBarHeight - kTitleBarVisualHeight) / 2;
+        const QRect localIpRect(identityRight - localIpWidth, identityY, localIpWidth, kTitleBarVisualHeight);
+        const QRect localNameRect(localIpRect.x() - 10 - localNameWidth, identityY, localNameWidth, kTitleBarVisualHeight);
+        painter.drawText(QRectF(localNameRect), Qt::AlignVCenter | Qt::AlignRight, identityMetrics.elidedText(localNameText, Qt::ElideRight, localNameWidth));
+        painter.drawText(QRectF(localIpRect), Qt::AlignVCenter | Qt::AlignRight, identityMetrics.elidedText(localIpText, Qt::ElideLeft, localIpWidth));
+        // ===end====
+        // =====wjy====
+        drawRotatedUiIcon(
+            painter,
+            settingsIconRect,
+            QStringLiteral("settings.svg"),
+            m_settingsGearRotation); // wjy: 齿轮 SVG 圆心正好位于 20×20 画布的 (10,10)，使用默认 0.5/0.5 浮点支点原地旋转。
+        drawRotatedUiIcon(
+            painter,
+            refreshIconRect,
+            QStringLiteral("refresh.svg"),
+            m_refreshRotation,
+            QPointF(14.5 / 28.0, 10.5 / 22.0)); // wjy: 刷新圆弧真实圆心为 SVG 的 (14.5,10.5)，不能按 28×22 画布中心或 QRect 整数中心旋转。
+        // ===end====
+    }
     painter.setPen(QPen(QColor(QStringLiteral("#D8DEE5")), 1));
     painter.drawLine(QPointF(minimizeRect().x() - 0.5, separatorTop), QPointF(minimizeRect().x() - 0.5, separatorBottom)); // wjy: 竖杠高度统一为标题栏视觉高度，和标题名对齐。
     drawUiIcon(painter, minimizeIconRect, QStringLiteral("minimize.svg")); // wjy: 最小化位置由统一居中矩形控制。
@@ -8249,11 +8807,10 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
 
 // =====wjy====
     const QSet<int> badges = deviceBadgeIndexes(); // wjy: 远程控制角标仍然按真实设备下标判断，避免分组行影响设备下标。
-    if (!m_leftSidebarCollapsed) {
-        m_deviceListScrollOffset = qBound(0, m_deviceListScrollOffset, maxDeviceListScrollOffset()); // wjy: 每次绘制前校正滚动偏移，避免删除设备或折叠分组后停在无效滚动位置。
-        const QVector<DeviceListRow> deviceRows = visibleDeviceRows(); // wjy: 左侧列表改为按“真实可见行”绘制，设备和分组的顺序由分组数据统一决定。
-        const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: “我的设备”内部滚动视口，设备和分组只能画在这个范围内。
-        if (m_deviceGroupExpanded) {
+    m_deviceListScrollOffset = qBound(0, m_deviceListScrollOffset, maxDeviceListScrollOffset()); // wjy: 详情栏收起后仍校正设备滚动偏移，设备栏交互不受影响。
+    const QVector<DeviceListRow> deviceRows = visibleDeviceRows(); // wjy: 设备栏在展开和紧凑状态下使用同一份可见行快照。
+    const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: “我的设备”内部滚动视口始终限制在 240px 设备栏内。
+    if (m_deviceGroupExpanded) {
         painter.save();
         painter.setClipRect(deviceListClip); // wjy: 内容超出视口时直接裁掉，避免设备行压到下面的设备管理区域。
         painter.setPen(Qt::NoPen);
@@ -8437,14 +8994,13 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
     }
 // ===end====
 
-    }
-
-    painter.save();
-    //右侧内容裁剪区域
-    const bool deviceDetailPage = !m_settingsSelected && !m_remoteAssistSelected && !m_localInfoSelected; // wjy: 设备详情页使用底部安全边界，避免内容压住折叠按钮。
-    const bool settingsPage = m_settingsSelected && !m_remoteAssistSelected && !m_localInfoSelected; // wjy: 设置页也参照设备详情页，使用同一条底部绘制边界。
-    painter.setClipRect((deviceDetailPage || settingsPage) ? deviceDetailContentClipRect() : contentClipRect()); // wjy: 详情和设置页都裁到安全边界上方，但不再额外绘制底部条框。
-    if (m_settingsSelected) {
+    if (!m_detailPanelCollapsed) {
+        painter.save();
+        //右侧内容裁剪区域
+        const bool deviceDetailPage = !m_settingsSelected && !m_remoteAssistSelected && !m_localInfoSelected; // wjy: 设备详情页使用底部安全边界，避免内容压住折叠按钮。
+        const bool settingsPage = m_settingsSelected && !m_remoteAssistSelected && !m_localInfoSelected; // wjy: 设置页也参照设备详情页，使用同一条底部绘制边界。
+        painter.setClipRect((deviceDetailPage || settingsPage) ? deviceDetailContentClipRect() : contentClipRect()); // wjy: 详情栏展开时才创建右侧裁剪区域，紧凑态完全跳过详情绘制。
+        if (m_settingsSelected) {
         m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded));
         drawSettingsPage(
             painter,
@@ -8455,13 +9011,25 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             m_periodicDeviceDiscoveryEnabled,
             m_wallpaperRotationEnabled,
             m_wallpaperRotationStatusText,
+            m_rollbackVersionCombo && !m_rollbackVersionCombo->currentData().toString().isEmpty(), // wjy: 手绘按钮可用状态直接取真实下拉框目标数据，视觉与点击条件保持一致。
+            m_rollbackPreparing,
             m_settingsLocalInfoExpanded,
             m_settingsAddDeviceExpanded,
             m_settingsTab == SettingsTab::Keyboard,
             m_settingsTab == SettingsTab::RemoteControl,
             m_localDeviceInfo,
             m_settingsScrollOffset);
-    } else if (m_detailAnimationTimer->isActive()) {
+        } else if (!m_remoteAssistSelected
+        && !m_localInfoSelected
+        && m_deviceDetailTab == DeviceDetailTab::Local) {
+        drawLocalSystemInfoPage(
+            painter,
+            m_localSystemInfo,
+            m_localCpuUsagePercent,
+            m_localGpuUsagePercent,
+            m_localMemoryUsagePercent,
+            textFont); // wjy: 本机页完全替代远端设备卡片，避免控制端信息和当前选中设备信息混在同一页面。
+        } else if (m_detailAnimationTimer->isActive()) {
         const qreal eased = easeOutCubic(m_detailAnimationProgress);
         drawDeviceDetail(
             painter,
@@ -8475,7 +9043,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             BottomAction::None,
             -24.0 * eased,
             1.0 - eased,
-            m_leftSidebarCollapsed,
+            false,
             textFont);
         drawDeviceDetail(
             painter,
@@ -8489,9 +9057,9 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             BottomAction::None,
             32.0 * (1.0 - eased),
             eased,
-            m_leftSidebarCollapsed,
+            false,
             textFont);
-    } else {
+        } else {
         drawDeviceDetail(
             painter,
             m_currentDeviceName,
@@ -8504,17 +9072,23 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             m_hoveredBottomAction,
             0,
             1.0,
-            m_leftSidebarCollapsed,
+            false,
             textFont);
     }
 
-    if (!m_settingsSelected
+        if (!m_settingsSelected
         && !m_remoteAssistSelected
         && !m_localInfoSelected) {
-        drawDeviceDetailTabs(painter, m_deviceDetailTab == DeviceDetailTab::Config, textFont);
+        drawDeviceDetailTabs(
+            painter,
+            m_deviceDetailTab == DeviceDetailTab::Local,
+            m_deviceDetailTab == DeviceDetailTab::ScriptLog,
+            m_deviceDetailTab == DeviceDetailTab::Config,
+            m_deviceDetailTab == DeviceDetailTab::Search,
+            textFont); // wjy: 四个详情页签使用同一状态源绘制；查找页虽暂时隐藏，仍保留独立选中状态供后续恢复。
     }
 
-    if (!m_settingsSelected
+        if (!m_settingsSelected
         && !m_remoteAssistSelected
         && !m_localInfoSelected
         && m_deviceDetailTab == DeviceDetailTab::Config) {
@@ -8525,7 +9099,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             !m_scriptEditorRemotePath.trimmed().isEmpty()); // wjy: 左侧白色编辑面板只在设备详情页显示，避免盖住设置/新增设备页面。
     }
 
-    if (!m_settingsSelected
+        if (!m_settingsSelected
         && !m_remoteAssistSelected
         && !m_localInfoSelected
         && m_deviceDetailTab == DeviceDetailTab::ScriptLog) {
@@ -8538,8 +9112,9 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             m_scriptOutputScrollOffset,
             !m_lastScriptFolderPath.trimmed().isEmpty() && !m_scriptOutputRunning); // wjy: Script output lives in the right-side blank area after the device detail card is painted.
     }
-    painter.restore();
-    drawSidebarCollapseButton(painter, m_leftSidebarCollapsed);
+        painter.restore();
+    }
+    drawDetailPanelToggleButton(painter, m_detailPanelCollapsed); // wjy: << / >> 始终绘制在设备栏右侧专用窄条，不覆盖设备内容。
     updateScriptFileEditorControls(); // wjy: 绘制完成后同步真实 QTextEdit/QPushButton 的显隐和层级，保证页面切换时不会残留在其它页面。
 
 // =====wjy====
@@ -8611,6 +9186,242 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
     }
 // ===end====
 }
+
+// =====wjy====
+void DeviceGrid::refreshLocalSystemInfoTab()
+{
+    m_localSystemInfo = platform::LocalSystemInfoService::local(); // wjy: 仅在用户进入本机页时读取静态信息，启动和普通设备切换不增加系统查询。
+    if (m_localCpuUsageAnimation) {
+        m_localCpuUsageAnimation->stop();
+    }
+    if (m_localGpuUsageAnimation) {
+        m_localGpuUsageAnimation->stop();
+    }
+    if (m_localMemoryUsageAnimation) {
+        m_localMemoryUsageAnimation->stop(); // wjy: 重新进入本机页时停止三类旧过渡，所有圆环从新的页面快照重新开始。
+    }
+    m_localCpuUsageSampler.reset();
+    m_localGpuUsageSampler.reset();
+    m_localCpuUsagePercent = m_localCpuUsageSampler.samplePercent(); // wjy: CPU 首次采样只建立累计时间基线。
+    m_localGpuUsagePercent = m_localGpuUsageSampler.samplePercent(); // wjy: GPU 首次采集创建通配符查询并建立性能计数器基线。
+    m_localMemoryUsagePercent = -1.0;
+    const int memoryPercent = m_localMemoryUsageSampler.samplePercent();
+    if (memoryPercent >= 0) {
+        animateLocalUsageTo(m_localMemoryUsageAnimation, m_localMemoryUsagePercent, memoryPercent); // wjy: 内存无需双样本，进入页面后立即从零平滑显示当前负载。
+    }
+}
+
+void DeviceGrid::animateLocalUsageTo(QVariantAnimation* animation, qreal& displayPercent, int targetPercent)
+{
+    const qreal boundedTarget = qBound<qreal>(0.0, targetPercent, 100.0); // wjy: 三类动画目标统一限制在合法百分比范围，显示层不信任外部采样值。
+    const qreal startPercent = displayPercent < 0.0
+        ? 0.0
+        : qBound<qreal>(0.0, displayPercent, 100.0); // wjy: 第一个有效样本从零增长，后续从各自圆环当前角度自然衔接。
+    if (!animation) {
+        displayPercent = boundedTarget; // wjy: 单个动画对象异常缺失时仍显示对应真实样本，不拖累另外两类资源。
+        update(scriptFileEditorRect()); // wjy: 降级路径同样只刷新本机详情区域。
+        return;
+    }
+
+    animation->stop(); // wjy: 新样本到来时只接管对应资源的旧动画，不会停止另外两枚圆环。
+    if (qAbs(startPercent - boundedTarget) < 0.01) {
+        displayPercent = boundedTarget; // wjy: 数值未变化时直接保持目标，避免创建无位移动画和额外帧。
+        update(scriptFileEditorRect());
+        return;
+    }
+    animation->setStartValue(startPercent); // wjy: 起点使用当前屏幕数值，上一段动画未结束时更新也不会回跳。
+    animation->setEndValue(boundedTarget); // wjy: 终点使用对应资源最新真实样本。
+    animation->start(); // wjy: valueChanged 逐帧同时驱动该资源圆弧和中心数字。
+}
+
+void DeviceGrid::updateLocalSystemMonitorState()
+{
+    if (!m_localSystemInfoTimer) {
+        return;
+    }
+    const bool localPageVisible = !m_detailPanelCollapsed
+        && !m_settingsSelected
+        && !m_remoteAssistSelected
+        && !m_localInfoSelected
+        && m_deviceDetailTab == DeviceDetailTab::Local;
+    if (localPageVisible) {
+        if (!m_localSystemInfoTimer->isActive()) {
+            m_localSystemInfoTimer->start(); // wjy: 只有本机页真实可见时启动一秒采样，重复刷新不会创建多个定时器。
+        }
+        return;
+    }
+    const bool hadLocalMonitorState = m_localSystemInfoTimer->isActive()
+        || m_localCpuUsagePercent >= 0.0
+        || m_localGpuUsagePercent >= 0.0
+        || m_localMemoryUsagePercent >= 0.0; // wjy: 任意一类资源已采样都视为存在本机监控状态。
+    if (m_localSystemInfoTimer->isActive()) {
+        m_localSystemInfoTimer->stop();
+    }
+    if (m_localCpuUsageAnimation) {
+        m_localCpuUsageAnimation->stop();
+    }
+    if (m_localGpuUsageAnimation) {
+        m_localGpuUsageAnimation->stop();
+    }
+    if (m_localMemoryUsageAnimation) {
+        m_localMemoryUsageAnimation->stop(); // wjy: 离开本机页时三枚圆环立即停止过渡，隐藏页面不再继续刷新。
+    }
+    if (hadLocalMonitorState) {
+        m_localCpuUsageSampler.reset();
+        m_localGpuUsageSampler.reset(); // wjy: 离开页面立即丢弃 CPU 基线并关闭 GPU 查询，隐藏期间不继续消耗资源。
+        m_localCpuUsagePercent = -1.0;
+        m_localGpuUsagePercent = -1.0;
+        m_localMemoryUsagePercent = -1.0; // wjy: 重新进入时三枚圆环都不会短暂显示旧负载。
+    }
+}
+
+void DeviceGrid::showLocalSystemInfoTab()
+{
+    m_settingsSelected = false;
+    m_remoteAssistSelected = false;
+    m_localInfoSelected = false;
+    m_deviceDetailTab = DeviceDetailTab::Local; // wjy: 本机页属于设备详情导航，不使用旧的独立 localInfoSelected 页面状态。
+    if (m_detailAnimationTimer) {
+        m_detailAnimationTimer->stop();
+    }
+    refreshLocalSystemInfoTab();
+    setDesktopHoverActive(false);
+    clearBottomActionHover();
+    updateAddDeviceControls();
+    updateLocalInfoControls();
+    updateSettingsControls();
+    updateScriptFileEditorControls(); // wjy: 隐藏脚本/配置控件并同步启动本机三类资源定时器，防止页面控件重叠。
+    update();
+}
+
+void DeviceGrid::setupDeviceSearchPanel()
+{
+    if (m_deviceSearchPanel) {
+        return;
+    }
+
+    m_deviceSearchPanel = new DeviceSearchPanel(this); // wjy: 面板只创建一次并挂在 DeviceGrid 下，避免每次查找重新构造整套输入框和表格。
+    m_deviceSearchPanel->deviceActivated = [this](const QString& deviceId) {
+        selectDeviceFromSearch(deviceId); // wjy: 面板仅回传稳定 ID，主界面负责最新目录解析、展开分组和详情页切换。
+    };
+    m_deviceSearchPanel->hide();
+}
+
+void DeviceGrid::updateDeviceSearchPanel()
+{
+    if (!m_deviceSearchPanel) {
+        return;
+    }
+
+    syncResponsiveLayoutState();
+    const bool visible = !m_detailPanelCollapsed
+        && !m_settingsSelected
+        && !m_remoteAssistSelected
+        && !m_localInfoSelected
+        && m_deviceDetailTab == DeviceDetailTab::Search; // wjy: 查找页逻辑状态可保留，但详情栏收起时真实面板必须隐藏并禁用。
+    m_deviceSearchPanel->setGeometry(deviceSearchPanelRect()); // wjy: 每次重绘或缩放都使用配置页相同矩形，侧栏展开/收起后不会错位。
+    m_deviceSearchPanel->setVisible(visible);
+    m_deviceSearchPanel->setEnabled(visible);
+    if (visible) {
+        m_deviceSearchPanel->raise(); // wjy: 真实输入框和表格覆盖详情区手绘背景，但不遮挡上方页签栏。
+    }
+}
+
+void DeviceGrid::showDeviceSearchPanel()
+{
+    setupDeviceSearchPanel();
+
+    QVector<DeviceSearchItem> searchItems;
+    searchItems.reserve(g_devices.size()); // wjy: 每次进入查找页都复制当前展示字段，面板过滤不持有目录引用也不修改设备数据。
+    for (const DeviceEntry& device : g_devices) {
+        const int groupIndex = g_deviceCatalog.groupIndexForId(device.groupId);
+        const QString groupName = groupIndex >= 0 && groupIndex < g_deviceGroupNames.size()
+            ? g_deviceGroupNames.at(groupIndex).trimmed()
+            : device.group.trimmed(); // wjy: 优先通过稳定 groupId 取得最新组名，兼容尚未迁移完成的旧分组名称记录。
+        searchItems.append(DeviceSearchItem{
+            device.id,
+            deviceDisplayName(device),
+            groupName,
+            device.mac.trimmed(),
+            device.ip.trimmed(),
+        });
+    }
+
+    m_deviceSearchPanel->setDevices(std::move(searchItems)); // wjy: 使用最新设备快照刷新候选，同时保留用户此前输入的查找条件。
+    m_settingsSelected = false;
+    m_remoteAssistSelected = false;
+    m_localInfoSelected = false;
+    m_deviceDetailTab = DeviceDetailTab::Search; // wjy: 页签点击和 Ctrl+F 统一切换同一个嵌入式查找状态。
+    if (m_detailAnimationTimer) {
+        m_detailAnimationTimer->stop();
+    }
+    setDesktopHoverActive(false);
+    clearBottomActionHover();
+    updateAddDeviceControls();
+    updateLocalInfoControls();
+    updateSettingsControls();
+    updateScriptFileEditorControls(); // wjy: 隐藏脚本/配置真实控件并显示查找面板，避免两个 QWidget 页面重叠接收鼠标。
+    m_deviceSearchPanel->focusPrimaryInput();
+    update();
+}
+
+void DeviceGrid::selectDeviceFromSearch(const QString& deviceId)
+{
+    const int deviceIndex = g_deviceCatalog.deviceIndexForId(deviceId);
+    if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
+        return; // wjy: 查找期间设备若被同步删除，安全忽略过期结果，不使用面板快照中的旧数组位置。
+    }
+
+    finishDeviceGroupRename(true);
+    finishDeviceRename(true); // wjy: 展开分组会改变左侧行坐标，先提交现有行内编辑，避免输入框停在错误设备上。
+    if (m_deviceListScrollbarAnimation) {
+        m_deviceListScrollbarAnimation->stop(); // wjy: 取消旧的轨道点击动画，防止定位完成后又被上一段动画拉回原位置。
+    }
+
+    const DeviceEntry& device = g_devices.at(deviceIndex);
+    int groupIndex = g_deviceCatalog.groupIndexForId(device.groupId);
+    if (groupIndex < 0) {
+        groupIndex = g_deviceCatalog.groupIndexForName(device.group); // wjy: 旧设备缺少 groupId 时按兼容组名展开，保证迁移数据也能被搜索定位。
+    }
+    if (groupIndex >= 0 && groupIndex < g_deviceGroupIds.size()) {
+        g_deviceCatalog.setGroupExpanded(g_deviceGroupIds.at(groupIndex), true); // wjy: 仅改变本机列表展开状态，不保存或同步任何设备字段。
+    }
+
+    setDetailPanelCollapsed(false); // wjy: 搜索结果需要显示配置详情时展开右侧区域，设备栏本身从不再被隐藏。
+    m_deviceGroupExpanded = true; // wjy: 确保“我的设备”展开，让目标设备在左侧列表中可见。
+    syncResponsiveLayoutState();
+    m_settingsSelected = false;
+    m_remoteAssistSelected = false;
+    m_localInfoSelected = false; // wjy: 从设置、本机信息或协助页返回普通设备详情，右侧立即显示搜索目标。
+    m_deviceDetailTab = DeviceDetailTab::Config; // wjy: 双击候选后离开查找页，直接在配置页查看已定位设备。
+    m_selectedDeviceIndexes.clear();
+    m_selectedDeviceIndexes.insert(deviceIndex);
+    m_draggingDeviceIndexes.clear();
+    m_selectionAnchorDeviceIndex = deviceIndex; // wjy: 搜索定位收敛为单选，并把 Shift 范围选择锚点同步到目标设备。
+
+    const int rowIndex = visualRowIndexForDeviceIndex(deviceIndex);
+    if (rowIndex >= 0) {
+        const QRect viewport = deviceListViewportRect(true);
+        const QRect currentRowRect = scrolledVisibleDeviceRowRect(rowIndex, m_deviceListScrollOffset);
+        int targetOffset = m_deviceListScrollOffset;
+        if (currentRowRect.top() < viewport.top()) {
+            targetOffset = visibleDeviceRowRect(rowIndex).top() - viewport.top(); // wjy: 目标在视口上方时把行顶移到列表顶部。
+        } else if (currentRowRect.bottom() > viewport.bottom()) {
+            targetOffset = visibleDeviceRowRect(rowIndex).bottom() - viewport.bottom(); // wjy: 目标在视口下方时只滚动到完整露出该行。
+        }
+        m_deviceListScrollOffset = qBound(0, targetOffset, maxDeviceListScrollOffset());
+    }
+
+    setDesktopHoverActive(false);
+    clearBottomActionHover();
+    updateAddDeviceControls();
+    updateLocalInfoControls();
+    updateSettingsControls();
+    startDeviceSwitchAnimation(deviceIndex, deviceDisplayName(device)); // wjy: 复用现有设备切换入口，脚本面板和右侧详情状态随目标设备一起恢复。
+    updateScriptFileEditorControls(); // wjy: 目标设备状态恢复后再显示配置控件，避免短暂沿用上一台设备的编辑内容。
+    update();
+}
+// ===end====
 
 void DeviceGrid::startDeviceSwitchAnimation(int newIndex, const QString& newName)
 {
@@ -8753,6 +9564,57 @@ void DeviceGrid::clearBottomActionHover()
     update();
 }
 
+// =====wjy====
+void DeviceGrid::animateDeviceListScrollTo(int targetOffset)
+{
+    const int boundedTarget = qBound(0, targetOffset, maxDeviceListScrollOffset()); // wjy: 动画开始前先限制目标，列表数量或窗口高度变化时不会滑出有效范围。
+    if (!m_deviceListScrollbarAnimation) {
+        m_deviceListScrollbarAnimation = new QVariantAnimation(this);
+        m_deviceListScrollbarAnimation->setDuration(140); // wjy: 140 毫秒足够看见滑动方向，同时保持轨道点击的快速响应感。
+        m_deviceListScrollbarAnimation->setEasingCurve(QEasingCurve::OutCubic); // wjy: 前段快速、末端柔和减速，避免线性移动显得生硬。
+        connect(m_deviceListScrollbarAnimation, &QVariantAnimation::valueChanged, this, [this](const QVariant& value) {
+            m_deviceListScrollOffset = qBound(0, value.toInt(), maxDeviceListScrollOffset()); // wjy: 每帧重新夹紧，动画期间分组折叠或窗口缩放也不会产生越界偏移。
+            update(deviceListViewportRect(true));
+        });
+    }
+
+    m_deviceListScrollbarAnimation->stop(); // wjy: 连续点击轨道时从当前画面重新起步，不让多个动画同时争抢同一个偏移。
+    if (boundedTarget == m_deviceListScrollOffset) {
+        return;
+    }
+    m_deviceListScrollbarAnimation->setStartValue(m_deviceListScrollOffset);
+    m_deviceListScrollbarAnimation->setEndValue(boundedTarget);
+    m_deviceListScrollbarAnimation->start();
+}
+
+void DeviceGrid::animateSettingsScrollTo(int targetOffset)
+{
+    const int maxOffset = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+    const int boundedTarget = qBound(0, targetOffset, maxOffset); // wjy: 设置卡片展开状态决定当前滚动上限，动画目标必须使用本帧真实范围。
+    if (!m_settingsScrollbarAnimation) {
+        m_settingsScrollbarAnimation = new QVariantAnimation(this);
+        m_settingsScrollbarAnimation->setDuration(140); // wjy: 与设备区保持相同速度，两个滚动条的点击手感一致。
+        m_settingsScrollbarAnimation->setEasingCurve(QEasingCurve::OutCubic);
+        connect(m_settingsScrollbarAnimation, &QVariantAnimation::valueChanged, this, [this](const QVariant& value) {
+            const int currentMax = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+            m_settingsScrollOffset = qBound(0, value.toInt(), currentMax); // wjy: 动画每帧同步设置页偏移，避免折叠卡片后保留无效位置。
+            updateSettingsControls();
+            updateAddDeviceControls();
+            updateLocalInfoControls();
+            update(); // wjy: 手绘卡片、滚动条和真实输入控件共同滑动，不出现控件瞬移或落后一帧。
+        });
+    }
+
+    m_settingsScrollbarAnimation->stop();
+    if (boundedTarget == m_settingsScrollOffset) {
+        return;
+    }
+    m_settingsScrollbarAnimation->setStartValue(m_settingsScrollOffset);
+    m_settingsScrollbarAnimation->setEndValue(boundedTarget);
+    m_settingsScrollbarAnimation->start();
+}
+// ===end====
+
 //鼠标时间处理函数
 void DeviceGrid::mousePressEvent(QMouseEvent* event)
 {
@@ -8767,21 +9629,61 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
     }
 
     // =====wjy====
-    if (event->button() == Qt::LeftButton && !m_leftSidebarCollapsed && m_deviceGroupExpanded) {
+    if (event->button() == Qt::LeftButton && m_deviceGroupExpanded) {
         const int maxScrollOffset = maxDeviceListScrollOffset();
+        const QRect track = deviceListScrollbarTrackRect();
         const QRect thumb = deviceListScrollbarThumbRect(m_deviceListScrollOffset);
-        const QRect thumbHitRect = thumb.adjusted(-4, -2, 1, 2).intersected(deviceListViewportRect(true)); // wjy: 视觉仍是 5 像素宽，但向左扩展命中区让滑块更容易抓住且不覆盖设备行。
-        if (maxScrollOffset > 0 && thumbHitRect.contains(event->pos())) {
+        const QRect trackHitRect = track.adjusted(-4, -2, 1, 2).intersected(deviceListViewportRect(true)); // wjy: 轨道空白也纳入命中区，点击后让滑块中心跳到鼠标位置。
+        const bool thumbHit = thumb.isValid() && thumb.adjusted(-4, -2, 1, 2).intersected(deviceListViewportRect(true)).contains(event->pos());
+        if (maxScrollOffset > 0 && trackHitRect.contains(event->pos())) {
             finishDeviceGroupRename(true); // wjy: 滚动会改变行坐标，抓取前先提交并关闭正在显示的分组编辑框。
             finishDeviceRename(true);
             m_draggingDeviceListScrollbar = true; // wjy: 从此处起本次左键手势只控制滚动条。
-            m_deviceListScrollbarGrabOffsetY = qBound(0, event->pos().y() - thumb.top(), qMax(0, thumb.height() - 1)); // wjy: 点击扩大命中区上下边缘时也夹紧到真实滑块内部。
+            m_deviceListScrollbarGrabOffsetY = thumbHit
+                ? qBound(0, event->pos().y() - thumb.top(), qMax(0, thumb.height() - 1))
+                : thumb.height() / 2; // wjy: 点击滑块保留原抓取点，点击轨道空白则按滑块中心定位，避免跳到鼠标上方或下方。
             m_groupDragCandidateActive = false; // wjy: 清除任何残留行拖拽候选，滚动条手势不能移动分组。
             m_deviceDragCandidateActive = false;
             m_draggingGroup = false;
             m_draggingDevice = false;
+            if (thumbHit) {
+                if (m_deviceListScrollbarAnimation) m_deviceListScrollbarAnimation->stop(); // wjy: 用户直接抓住滑块时立即接管，停止尚未完成的轨道点击动画。
+            } else {
+                const int targetOffset = deviceListScrollOffsetForThumbTop(event->pos().y() - m_deviceListScrollbarGrabOffsetY);
+                animateDeviceListScrollTo(targetOffset); // wjy: 点击设备轨道空白时不再闪现，用短促缓动把滑块中心移动到鼠标位置。
+            }
             setCursor(Qt::ClosedHandCursor); // wjy: 闭合手型表示滑块已经被抓住。
-            update(deviceListViewportRect(true));
+            update(deviceListViewportRect(true)); // wjy: 按下时立即切换抓取颜色，实际偏移由动画或后续拖拽持续刷新。
+            event->accept();
+            return;
+        }
+    }
+    // ===end====
+
+    // =====wjy====
+    if (event->button() == Qt::LeftButton
+        && !m_detailPanelCollapsed
+        && m_settingsSelected
+        && m_settingsTab == SettingsTab::General) {
+        const int maxScrollOffset = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+        const QRect track = settingsVerticalScrollbarTrackRect();
+        const QRect thumb = settingsVerticalScrollbarThumbRect(m_settingsScrollOffset, maxScrollOffset);
+        const QRect trackHitRect = track.adjusted(-5, -2, 5, 2); // wjy: 设置滚动条视觉较窄，扩大横向和纵向命中区后更容易拖动且不改变绘制宽度。
+        const bool thumbHit = thumb.isValid() && thumb.adjusted(-5, -2, 5, 2).contains(event->pos());
+        if (maxScrollOffset > 0 && trackHitRect.contains(event->pos())) {
+            m_draggingSettingsScrollbar = true; // wjy: 设置页滚动条按下后独占当前左键手势，不会误触发卡片开关或按钮。
+            m_settingsScrollbarGrabOffsetY = thumbHit
+                ? qBound(0, event->pos().y() - thumb.top(), qMax(0, thumb.height() - 1))
+                : thumb.height() / 2; // wjy: 轨道空白点击按滑块中心跳转，直接点击滑块则保留原抓取点。
+            if (thumbHit) {
+                if (m_settingsScrollbarAnimation) m_settingsScrollbarAnimation->stop(); // wjy: 直接拖动优先于特效，滑块必须立即完全跟随鼠标。
+            } else {
+                const int targetOffset = settingsScrollOffsetForThumbTop(
+                    event->pos().y() - m_settingsScrollbarGrabOffsetY, maxScrollOffset);
+                animateSettingsScrollTo(targetOffset); // wjy: 常规页轨道空白点击使用与设备区相同的快速缓动特效。
+            }
+            update(); // wjy: 按下反馈立即绘制，偏移变化由动画逐帧同步真实控件。
+            setCursor(Qt::ClosedHandCursor); // wjy: 明确反馈设置页滚动条已经抓取。
             event->accept();
             return;
         }
@@ -8789,6 +9691,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
     // ===end====
 
     if (event->button() == Qt::LeftButton
+        && !m_detailPanelCollapsed
         && !m_settingsSelected
         && !m_remoteAssistSelected
         && !m_localInfoSelected
@@ -8834,7 +9737,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         finishDeviceRename(true);
     }
 
-    if (event->button() == Qt::RightButton && !m_leftSidebarCollapsed && m_deviceGroupExpanded) {
+    if (event->button() == Qt::RightButton && m_deviceGroupExpanded) {
         const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 设备行右键命中使用当前可见行，保证滚动后菜单出现在真实设备上。
         const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded);
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
@@ -8880,7 +9783,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         }
     }
 
-    if (event->button() == Qt::RightButton && !m_leftSidebarCollapsed && m_deviceGroupExpanded) { // wjy: 右键分组行时弹出分组菜单，先于空白区菜单判断，避免误触发“新建分组”。
+    if (event->button() == Qt::RightButton && m_deviceGroupExpanded) { // wjy: 详情栏收起时分组右键仍可用，设备栏交互不受影响。
         const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 分组右键命中也复用当前可见行，滚动后坐标和绘制保持一致。
         const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 只允许右键当前可见视口里的分组行。
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
@@ -8902,7 +9805,6 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
             }
 
             QMenu menu(this); // wjy: 创建分组右键菜单，用来放分组相关操作入口。
-            // QAction* tileDevicesAction = menu.addAction(QString::fromUtf8("设备平铺")); // wjy: 按需求隐藏分组右键“设备平铺”，菜单不显示也无法调用。
             QMenu* scriptMenu = menu.addMenu(QString::fromUtf8("启动脚本")); // wjy: 分组右键用“启动脚本”明确表示将对组内设备批量启动所选脚本，底层批量执行逻辑保持不变。
             populateScriptFolderMenu(scriptMenu, QString::fromUtf8(kRemoteScriptFolderPath));
             QAction* stopScriptsAction = menu.addAction(QString::fromUtf8("停止脚本")); // wjy: 分组右键用“停止脚本”与启动入口成对显示，点击后仍遍历组内设备停止全部脚本进程树。
@@ -8916,9 +9818,6 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
             QAction* deleteGroupAction = menu.addAction(QString::fromUtf8("删除分组")); // wjy: 删除分组菜单项先显示出来，后续再补真正删除分组和设备归属处理。
             const QAction* selectedAction = menu.exec(mapToGlobal(event->pos())); // wjy: 在分组行右键位置弹出菜单。
             const QVector<int> groupDeviceIndexes = deviceIndexesForGroup(row.groupIndex);
-            // if (selectedAction == tileDevicesAction) {
-            //     openDeviceGroupTiledWindows(row.groupIndex); // wjy: 分组右键“设备平铺”已按需求注释隐藏，不能从该菜单调用。
-            // } else
             if (selectedAction && selectedAction->data().isValid()) {
                 executeDeviceGroupScriptFolder(row.groupIndex, selectedAction->data().toString()); // wjy: 点击脚本叶子目录时，对该分组内所有设备启动同一个脚本。
             } else if (selectedAction == stopScriptsAction) {
@@ -8937,19 +9836,8 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
                 const int groupIndex = row.groupIndex; // wjy: 记录要删除的真实分组下标，不能用界面行号删除数据。
                 if (groupIndex >= 0 && groupIndex < g_deviceGroupNames.size()) {
                     const QString deletedGroupName = g_deviceGroupNames.at(groupIndex).trimmed(); // wjy: 保存被删除的分组名，用来释放这个分组里的设备。
-                    for (DeviceEntry& device : g_devices) {
-                        if (device.group.trimmed() == deletedGroupName) {
-                            device.group.clear(); // wjy: 设备原来属于被删分组时，清空 group，让它回到“我的设备”的无分组区域。
-                        }
-                    }
-
-                    g_deviceGroupNames.removeAt(groupIndex); // wjy: 从分组名称列表里删除这一项，界面上分组行会消失。
-                    if (groupIndex < g_deviceGroupIds.size()) {
-                        g_deviceGroupIds.removeAt(groupIndex); // wjy: 删除分组时同步移除同下标稳定 ID，后续分组不能误继承被删组身份。
-                    }
-                    if (groupIndex < g_deviceGroupExpandedStates.size()) {
-                        g_deviceGroupExpandedStates.removeAt(groupIndex); // wjy: 同步删除展开状态，避免状态数组和分组数组错位。
-                    }
+                    const QString deletedGroupId = g_deviceGroupIds.at(groupIndex);
+                    g_deviceCatalog.removeGroup(deletedGroupId); // wjy: 目录同时删除分组并把组内设备移回根部，避免 UI 手工维护三组数组。
                     if (m_renamingDeviceGroupIndex == groupIndex) {
                         m_deviceGroupNameEdit->hide(); // wjy: 如果正好在重命名这个分组，删除后隐藏输入框。
                         m_renamingDeviceGroupIndex = -1; // wjy: 清空重命名状态，避免保存时再访问已删除分组。
@@ -8975,7 +9863,6 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
                     m_deviceGroupExpanded));
 
     if (event->button() == Qt::RightButton
-        && !m_leftSidebarCollapsed
         && m_deviceGroupExpanded
         && blankHitRect.contains(event->pos())) { // wjy: 确认右键点在滚动后的预留空白区域里。
         QMenu menu(this); // wjy: 创建右键菜单，父对象设为当前控件，交给 Qt 管理生命周期。
@@ -8995,11 +9882,12 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         && event->pos().y() >= 0
         && event->pos().y() < kTitleBarHeight //窗口拖动
         && !titlebarLaunchButtonRect().contains(event->pos())
-        && !(m_updateAvailable && titlebarUpdateRect().contains(event->pos())) // wjy: 可见更新按钮属于点击区，不能被标题栏拖动逻辑抢走。
-        && !titlebarSettingsRect().contains(event->pos())
-        && !refreshRect().contains(event->pos())
+        && !(!m_detailPanelCollapsed && m_updateAvailable && titlebarUpdateRect().contains(event->pos())) // wjy: 只有完整标题栏中真实可见的更新按钮排除拖窗命中。
+        && !(!m_detailPanelCollapsed && titlebarSettingsRect().contains(event->pos()))
+        && !(!m_detailPanelCollapsed && refreshRect().contains(event->pos())) // wjy: 紧凑态隐藏设置和刷新后，对应旧矩形重新成为可拖动标题栏空白。
         && !minimizeRect().contains(event->pos())
         && !closeRect().contains(event->pos())) {
+        cancelTopEdgeAutoHide(); // wjy: 用户重新抓住标题栏即退出自动停靠；本次松开若仍贴近顶部会重新建立停靠状态。
         m_draggingWindow = true;
         m_dragOffset = event->globalPosition().toPoint() - window()->frameGeometry().topLeft();
         event->accept();
@@ -9007,7 +9895,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
     }
 
 // =====wjy====
-    if (event->button() == Qt::LeftButton && !m_leftSidebarCollapsed && m_deviceGroupExpanded) { // wjy: 左键按在“我的设备”的设备行上时，先记录为拖拽候选。
+    if (event->button() == Qt::LeftButton && m_deviceGroupExpanded) { // wjy: 详情栏收起时设备拖拽仍从完整设备栏正常开始。
         const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 拖拽按下也使用当前可见行顺序，避免分组行插入后设备下标错位。
         const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 只允许在当前可见滚动视口内开始拖拽。
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
@@ -9092,21 +9980,6 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
                     .arg(deviceDisplayName(
                         g_devices.at(deviceIndex))));
             break;
-            // if (rowRect.contains(event->pos())) {
-            //     const int deviceIndex = row.deviceIndex; // wjy: 记录真实设备下标，后面写 group 时才能改到正确设备。
-            //     if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
-            //         continue; // wjy: 防御性跳过异常设备行。
-            //     }
-            //     m_deviceDragCandidateActive = true; // wjy: 先标记候选，避免普通点击立即被当成拖拽。
-            //     m_draggingDevice = false; // wjy: 鼠标还没移动超过阈值，所以此时还不是正式拖拽。
-            //     m_draggingDeviceIndex = deviceIndex; // wjy: 保存真实设备下标，而不是界面行号。
-            //     m_deviceDragStartPos = event->pos(); // wjy: 记录起点，后续用移动距离判断是否进入拖拽。
-            //     m_deviceDragCurrentPos = event->pos(); // wjy: 初始化拖拽虚影位置，进入拖拽后从这个位置开始跟随鼠标。
-            //     writeDeviceGridStartupLog(QStringLiteral("[wjy-drag] candidate deviceIndex=%1 device=%2")
-            //         .arg(deviceIndex)
-            //         .arg(deviceDisplayName(g_devices.at(deviceIndex)))); // wjy: 日志输出真实设备名到文件，方便确认拖拽对象。
-            //     break;
-            // }
         }
     }
 // ===end====
@@ -9136,11 +10009,44 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
             return;
         }
 
+        if (m_deviceListScrollbarAnimation) m_deviceListScrollbarAnimation->stop(); // wjy: 用户按住轨道后主动移动鼠标时立即结束缓动，切换为完全跟手的直接拖拽。
         const int requestedThumbTop = event->pos().y() - m_deviceListScrollbarGrabOffsetY; // wjy: 保留按下点到滑块顶部的距离，拖动不会跳位。
         const int newOffset = deviceListScrollOffsetForThumbTop(requestedThumbTop); // wjy: 鼠标越过轨道上下端时映射函数会直接夹到 0 或最大偏移。
         if (newOffset != m_deviceListScrollOffset) {
             m_deviceListScrollOffset = newOffset; // wjy: 直接更新手绘列表偏移，拖到最底端即可立即看到最后内容。
             update(deviceListViewportRect(true));
+        }
+        setCursor(Qt::ClosedHandCursor);
+        event->accept();
+        return;
+    }
+    // ===end====
+
+    // =====wjy====
+    if (m_draggingSettingsScrollbar) {
+        const int maxScrollOffset = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded); // wjy: 卡片展开或窗口尺寸变化后始终使用最新滚动范围。
+        if (!(event->buttons() & Qt::LeftButton) || maxScrollOffset <= 0) {
+            m_draggingSettingsScrollbar = false;
+            m_settingsScrollbarGrabOffsetY = 0;
+            m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, qMax(0, maxScrollOffset)); // wjy: 左键状态丢失或内容不再溢出时安全结束并夹紧偏移。
+            unsetCursor();
+            updateSettingsControls();
+            updateAddDeviceControls();
+            updateLocalInfoControls();
+            update();
+            event->accept();
+            return;
+        }
+
+        if (m_settingsScrollbarAnimation) m_settingsScrollbarAnimation->stop(); // wjy: 鼠标移动表示用户接管滑块，特效立即让位给实时拖拽。
+        const int requestedThumbTop = event->pos().y() - m_settingsScrollbarGrabOffsetY; // wjy: 保留按下点相对滑块顶部的距离，拖动过程中滑块不会突然跳位。
+        const int newOffset = settingsScrollOffsetForThumbTop(requestedThumbTop, maxScrollOffset);
+        if (newOffset != m_settingsScrollOffset) {
+            m_settingsScrollOffset = newOffset;
+            updateSettingsControls();
+            updateAddDeviceControls();
+            updateLocalInfoControls();
+            update(); // wjy: 常规页手绘内容、下拉框和输入框全部跟随滑块实时移动。
         }
         setCursor(Qt::ClosedHandCursor);
         event->accept();
@@ -9198,13 +10104,18 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
     }
 // ===end====
 
-    updateDesktopHover(event->pos());
-    updateBottomActionHover(event->pos());
+    if (m_detailPanelCollapsed) {
+        setDesktopHoverActive(false);
+        clearBottomActionHover(); // wjy: 紧凑窗口没有右侧桌面卡片或底部动作，不保留不可见悬停状态。
+    } else {
+        updateDesktopHover(event->pos());
+        updateBottomActionHover(event->pos());
+    }
     // =====wjy====
     // wjy: 悬停远控数字徽标时用气泡显示控制端设备名；扩大命中区并强制弹出 tooltip。
     {
         QString tip;
-        if (m_deviceGroupExpanded && !m_leftSidebarCollapsed) {
+        if (m_deviceGroupExpanded) {
             const QVector<DeviceListRow> deviceRows = visibleDeviceRows();
             const QRect listClip = deviceListViewportRect(m_deviceGroupExpanded);
             for (int rowIndex = 0; rowIndex < deviceRows.size(); ++rowIndex) {
@@ -9244,7 +10155,7 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
         }
     }
     // ===end====
-    const int resizeEdges = windowResizeEdgesAt(event->pos(), size());
+    const int resizeEdges = windowResizeEdgesAt(event->pos(), size(), !m_detailPanelCollapsed); // wjy: 紧凑态不显示左右缩放光标，窗口宽度始终固定。
     if (resizeEdges == (kResizeLeft | kResizeTop) || resizeEdges == (kResizeRight | kResizeBottom)) {
         setCursor(Qt::SizeFDiagCursor);
         QFrame::mouseMoveEvent(event);
@@ -9267,47 +10178,65 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
     }
     // =====wjy====
     const int deviceListMaxScrollOffset = maxDeviceListScrollOffset();
-    const QRect deviceListScrollbarThumb = deviceListScrollbarThumbRect(m_deviceListScrollOffset);
-    const bool deviceListScrollbarHovered = !m_leftSidebarCollapsed
-        && m_deviceGroupExpanded
+    const bool deviceListScrollbarHovered = m_deviceGroupExpanded
         && deviceListMaxScrollOffset > 0
-        && deviceListScrollbarThumb.adjusted(-4, -2, 1, 2).intersected(deviceListViewportRect(true)).contains(event->pos()); // wjy: 悬停和按下使用相同扩大命中区，用户看到手型的位置都能开始拖拽。
-    // ===end====
-    const bool sidebarButtonHovered = sidebarCollapseButtonRect(m_leftSidebarCollapsed).contains(event->pos());
-    const bool titlebarButtonHovered = titlebarLaunchButtonRect().contains(event->pos())
-        || (m_updateAvailable && titlebarUpdateRect().contains(event->pos())) // wjy: 更新入口出现后使用按钮指针反馈。
-        || titlebarSettingsRect().contains(event->pos())
-        || refreshRect().contains(event->pos());
-    const bool wakeButtonHovered = false;
-    const bool settingsSwitchHovered = m_settingsSelected
+        && deviceListScrollbarTrackRect().adjusted(-4, -2, 1, 2).intersected(deviceListViewportRect(true)).contains(event->pos()); // wjy: 整条设备轨道都显示可抓取手型，滑块和空白位置使用相同点击语义。
+    const int settingsMaxScrollOffset = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+    const bool settingsScrollbarHovered = !m_detailPanelCollapsed
+        && m_settingsSelected
         && m_settingsTab == SettingsTab::General
-        && (settingsScrolledRect(settingsAutoRunSwitchRect(), m_settingsScrollOffset).contains(event->pos())
-            || settingsScrolledRect(settingsRemoteWakeupSwitchRect(), m_settingsScrollOffset).contains(event->pos())
-            || settingsScrolledRect(settingsPreventSleepSwitchRect(), m_settingsScrollOffset).contains(event->pos())
-            || settingsScrolledRect(settingsPeriodicDeviceDiscoverySwitchRect(), m_settingsScrollOffset).contains(event->pos())
+        && settingsMaxScrollOffset > 0
+        && settingsVerticalScrollbarTrackRect().adjusted(-5, -2, 5, 2).contains(event->pos()); // wjy: 常规页整条滚动轨道均可拖拽或点击跳转，悬停时提前给出手型反馈。
+    // ===end====
+    const bool detailPanelButtonHovered = detailPanelToggleButtonRect(m_detailPanelCollapsed).contains(event->pos());
+    const bool titlebarButtonHovered = titlebarLaunchButtonRect().contains(event->pos())
+        || (!m_detailPanelCollapsed
+            && ((m_updateAvailable && titlebarUpdateRect().contains(event->pos()))
+                || titlebarSettingsRect().contains(event->pos())
+                || refreshRect().contains(event->pos()))); // wjy: 紧凑态隐藏的标题栏入口不再产生手型或点击暗示。
+    const bool wakeButtonHovered = false;
+    const SettingsLayoutSnapshot settingsLayout = settingsLayoutSnapshot(
+        m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded, m_settingsScrollOffset); // wjy: 命中测试与绘制、子控件几何共用同一设置页快照。
+    const bool settingsSwitchHovered = !m_detailPanelCollapsed
+        && m_settingsSelected
+        && m_settingsTab == SettingsTab::General
+        && (settingsLayout.containsPoint(settingsAutoRunSwitchRect(), event->pos())
+            || settingsLayout.containsPoint(settingsRemoteWakeupSwitchRect(), event->pos())
+            || settingsLayout.containsPoint(settingsPreventSleepSwitchRect(), event->pos())
+            || settingsLayout.containsPoint(settingsPeriodicDeviceDiscoverySwitchRect(), event->pos())
+            || (m_rollbackVersionCombo
+                && !m_rollbackPreparing
+                && !m_rollbackVersionCombo->currentData().toString().isEmpty()
+                && settingsLayout.containsPoint(settingsRollbackButtonRect(), event->pos())) // wjy: 只有存在合法目标且未在准备时，回撤按钮才显示可点击手型。
             || (platform::UpdateService::canPublishCurrentBuild()
-                && settingsScrolledRect(settingsPublishUpdateButtonRect(), m_settingsScrollOffset).contains(event->pos())) // wjy: 只有构建版本的可见发布按钮提供点击光标。
-            || settingsScrolledRect(settingsLocalInfoHeaderRect(), m_settingsScrollOffset).contains(event->pos())
-            || settingsScrolledRect(settingsAddDeviceHeaderRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset).contains(event->pos()));
-    const bool settingsTabHovered = m_settingsSelected
+                && settingsLayout.containsPoint(settingsPublishUpdateButtonRect(), event->pos())) // wjy: 只有构建版本的可见发布按钮提供点击光标。
+            || settingsLayout.containsPoint(settingsLocalInfoHeaderRect(), event->pos())
+            || settingsLayout.containsPoint(settingsAddDeviceHeaderRect(m_settingsLocalInfoExpanded), event->pos()));
+    const bool settingsTabHovered = !m_detailPanelCollapsed
+        && m_settingsSelected
         && (settingsGeneralTabRect().contains(event->pos())
             || settingsKeyboardTabRect().contains(event->pos())
             || settingsRemoteControlTabRect().contains(event->pos())); // wjy: 第三个远控画质标签使用相同手型反馈和点击语义。
-    const bool detailTabHovered = !m_settingsSelected
+    const bool detailTabHovered = !m_detailPanelCollapsed
+        && !m_settingsSelected
         && !m_remoteAssistSelected
         && !m_localInfoSelected
-        && (detailConfigTabRect().contains(event->pos())
-            || detailScriptLogTabRect().contains(event->pos()));
-    const bool scriptButtonHovered = !m_settingsSelected
+        && (detailLocalTabRect().contains(event->pos())
+            || detailConfigTabRect().contains(event->pos())
+            || detailScriptLogTabRect().contains(event->pos())
+            // || detailSearchTabRect().contains(event->pos()) // wjy: 查找页隐藏期间同步关闭不可见区域的手型命中，后续启用时取消注释。
+        );
+    const bool scriptButtonHovered = !m_detailPanelCollapsed
+        && !m_settingsSelected
         && !m_remoteAssistSelected
         && !m_localInfoSelected
         && m_deviceDetailTab == DeviceDetailTab::ScriptLog
         && (scriptTerminalExecuteButtonRect().contains(event->position())
             || scriptTerminalStopButtonRect().contains(event->position()));
-    if (deviceListScrollbarHovered) {
-        setCursor(Qt::OpenHandCursor); // wjy: 未按下时用张开手型提示滑块可以抓取。
+    if (deviceListScrollbarHovered || settingsScrollbarHovered) {
+        setCursor(Qt::OpenHandCursor); // wjy: 两套滚动条未按下时统一用张开手型提示滑块和轨道都可操作。
     } else if (m_desktopHovered
-        || sidebarButtonHovered
+        || detailPanelButtonHovered
         || titlebarButtonHovered
         || wakeButtonHovered
         || m_hoveredBottomAction != BottomAction::None
@@ -9325,7 +10254,7 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
 void DeviceGrid::mouseDoubleClickEvent(QMouseEvent* event)
 {
 // =====wjy====
-    if (event->button() == Qt::LeftButton && !m_leftSidebarCollapsed && m_deviceGroupExpanded) { // wjy: 左键双击左侧列表时，设备行和分组行都进入原地重命名。
+    if (event->button() == Qt::LeftButton && m_deviceGroupExpanded) { // wjy: 紧凑窗口仍允许双击重命名设备和分组。
         const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 双击命中也使用可见行，分组和设备位置会跟随 UI 绘制变化。
         const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 双击只识别当前可见视口内的列表行。
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
@@ -9384,6 +10313,7 @@ void DeviceGrid::wheelEvent(QWheelEvent* event)
     syncResponsiveLayoutState();
 // =====wjy====
     if (m_scriptOutputVisible
+        && !m_detailPanelCollapsed
         && !m_settingsSelected
         && !m_remoteAssistSelected
         && !m_localInfoSelected
@@ -9413,7 +10343,8 @@ void DeviceGrid::wheelEvent(QWheelEvent* event)
     }
 
     const int maxSettingsOffset = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
-    if (m_settingsSelected
+    if (!m_detailPanelCollapsed
+        && m_settingsSelected
         && m_settingsTab == SettingsTab::General
         && maxSettingsOffset > 0
         && settingsScrollViewportRect().contains(event->position().toPoint())) {
@@ -9421,6 +10352,7 @@ void DeviceGrid::wheelEvent(QWheelEvent* event)
             ? event->pixelDelta().y()
             : event->angleDelta().y() / 3;
         if (wheelDelta != 0) {
+            if (m_settingsScrollbarAnimation) m_settingsScrollbarAnimation->stop(); // wjy: 滚轮输入优先级高于轨道点击特效，避免两种偏移同时生效。
             const int oldOffset = m_settingsScrollOffset;
             m_settingsScrollOffset = qBound(0, m_settingsScrollOffset - wheelDelta, maxSettingsOffset);
             if (m_settingsScrollOffset != oldOffset) {
@@ -9436,11 +10368,12 @@ void DeviceGrid::wheelEvent(QWheelEvent* event)
 
     const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 只有鼠标位于“我的设备”列表视口内，滚轮才控制设备列表。
     const int maxScrollOffset = maxDeviceListScrollOffset(); // wjy: 为 0 表示内容没有超过视口，不需要滚动。
-    if (!m_leftSidebarCollapsed && m_deviceGroupExpanded && maxScrollOffset > 0 && deviceListClip.contains(event->position().toPoint())) {
+    if (m_deviceGroupExpanded && maxScrollOffset > 0 && deviceListClip.contains(event->position().toPoint())) {
         const int wheelDelta = !event->pixelDelta().isNull()
             ? event->pixelDelta().y()
             : event->angleDelta().y() / 3; // wjy: 普通鼠标一格通常是 120，除以 3 后约等于滚动一行 40 像素。
         if (wheelDelta != 0) {
+            if (m_deviceListScrollbarAnimation) m_deviceListScrollbarAnimation->stop(); // wjy: 用户滚轮操作时停止设备滑块动画，列表立即按滚轮方向响应。
             const int oldOffset = m_deviceListScrollOffset;
             m_deviceListScrollOffset = qBound(0, m_deviceListScrollOffset - wheelDelta, maxScrollOffset); // wjy: 向下滚时偏移增大，向上滚时偏移减小，并限制在有效范围内。
             if (m_deviceListScrollOffset != oldOffset) {
@@ -9523,12 +10456,27 @@ void DeviceGrid::resizeEvent(QResizeEvent* event)
     updateScriptFileEditorControls();
 }
 
+// =====wjy====
+void DeviceGrid::showEvent(QShowEvent* event)
+{
+    QFrame::showEvent(event);
+    if (!m_topEdgeDocked || !m_topEdgeAutoHidden) {
+        return;
+    }
+    QTimer::singleShot(0, this, [this] {
+        if (m_topEdgeDocked && m_topEdgeAutoHidden && !m_shuttingDown) {
+            setTopEdgeAutoHidden(false); // wjy: 从托盘或最小化恢复时完整滑出，避免任务栏操作后窗口仍停留在屏幕外。
+        }
+    });
+}
+// ===end====
+
 void DeviceGrid::leaveEvent(QEvent* event)
 {
     setDesktopHoverActive(false);
     clearBottomActionHover();
-    if (!m_draggingDeviceListScrollbar) {
-        unsetCursor(); // wjy: 隐式鼠标抓取把指针带出控件时保持闭合手型，直到真正松开滑块。
+    if (!m_draggingDeviceListScrollbar && !m_draggingSettingsScrollbar) {
+        unsetCursor(); // wjy: 任一滚动条处于隐式鼠标抓取时都保持闭合手型，直到真正松开左键。
     }
     QFrame::leaveEvent(event);
 }
@@ -9544,6 +10492,16 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
             return;
         }
         // =====wjy====
+        if (m_draggingSettingsScrollbar) {
+            m_draggingSettingsScrollbar = false; // wjy: 左键松开结束常规页滚动条独占手势，恢复卡片和按钮的普通点击逻辑。
+            m_settingsScrollbarGrabOffsetY = 0;
+            unsetCursor();
+            update(); // wjy: 保留最终设置页偏移，仅恢复滚动条普通悬停视觉。
+            event->accept();
+            return;
+        }
+        // ===end====
+        // =====wjy====
         if (m_draggingDeviceListScrollbar) {
             m_draggingDeviceListScrollbar = false; // wjy: 左键松开结束滚动条独占手势，后续点击恢复设备和分组交互。
             m_deviceListScrollbarGrabOffsetY = 0;
@@ -9553,7 +10511,15 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
             return;
         }
         // ===end====
+        // =====wjy====
+        const bool finishedWindowDrag = m_draggingWindow;
         m_draggingWindow = false;
+        if (finishedWindowDrag) {
+            updateTopEdgeAutoHideAfterWindowDrag(event->globalPosition().toPoint()); // wjy: 只在真实标题栏拖窗手势结束时判断顶部吸附，普通设备或控件点击不会启用自动隐藏。
+            event->accept();
+            return;
+        }
+        // ===end====
 
 // =====wjy====
         if (m_draggingGroup) {
@@ -9563,20 +10529,9 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
             if (dropOnDissolveZone) {
                 if (sourceGroupIndex >= 0 && sourceGroupIndex < g_deviceGroupNames.size()) {
                     const QString dissolvedGroupName = g_deviceGroupNames.at(sourceGroupIndex).trimmed();
+                    const QString dissolvedGroupId = g_deviceGroupIds.at(sourceGroupIndex);
                     if (!dissolvedGroupName.isEmpty()) {
-                        for (DeviceEntry& device : g_devices) {
-                            if (device.group.trimmed() == dissolvedGroupName) {
-                                device.group.clear();
-                            }
-                        }
-                    }
-
-                    g_deviceGroupNames.removeAt(sourceGroupIndex);
-                    if (sourceGroupIndex < g_deviceGroupIds.size()) {
-                        g_deviceGroupIds.removeAt(sourceGroupIndex); // wjy: 拖到根部解散分组时同步删除稳定 ID，形成明确的分组删除变更。
-                    }
-                    if (sourceGroupIndex < g_deviceGroupExpandedStates.size()) {
-                        g_deviceGroupExpandedStates.removeAt(sourceGroupIndex);
+                        g_deviceCatalog.removeGroup(dissolvedGroupId); // wjy: 解散分组由目录完成，组内设备按稳定 groupId 回到根部。
                     }
                     if (m_renamingDeviceGroupIndex == sourceGroupIndex) {
                         m_deviceGroupNameEdit->hide();
@@ -9601,7 +10556,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
             }
 
             int targetInsertionIndex = g_deviceGroupNames.size();
-            if (!m_leftSidebarCollapsed && m_deviceGroupExpanded) {
+            if (m_deviceGroupExpanded) {
                 const QVector<DeviceListRow> rows = visibleDeviceRows();
                 const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded);
                 targetInsertionIndex = 0;
@@ -9628,28 +10583,18 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
 
             bool groupOrderChanged = false;
             if (sourceGroupIndex >= 0 && sourceGroupIndex < g_deviceGroupNames.size()) {
-                while (g_deviceGroupExpandedStates.size() < g_deviceGroupNames.size()) {
-                    g_deviceGroupExpandedStates.append(true);
-                }
-
                 int insertIndex = qBound(0, targetInsertionIndex, g_deviceGroupNames.size());
                 if (insertIndex > sourceGroupIndex) {
                     --insertIndex;
                 }
 
                 if (insertIndex != sourceGroupIndex) {
-                    const QString movedGroupName = g_deviceGroupNames.takeAt(sourceGroupIndex);
-                    const QString movedGroupId = sourceGroupIndex < g_deviceGroupIds.size()
-                        ? g_deviceGroupIds.takeAt(sourceGroupIndex)
-                        : QString(); // wjy: 分组重排必须让名称、稳定 ID 和展开状态作为一个整体移动。
-                    const bool movedExpanded = sourceGroupIndex < g_deviceGroupExpandedStates.size()
-                        ? g_deviceGroupExpandedStates.takeAt(sourceGroupIndex)
-                        : true;
-                    g_deviceGroupNames.insert(insertIndex, movedGroupName);
-                    g_deviceGroupIds.insert(insertIndex, movedGroupId);
-                    g_deviceGroupExpandedStates.insert(insertIndex, movedExpanded);
-                    groupOrderChanged = true;
-                    saveDevices();
+                    const QString movedGroupId = g_deviceGroupIds.at(sourceGroupIndex);
+                    const QString movedGroupName = g_deviceGroupNames.at(sourceGroupIndex);
+                    groupOrderChanged = g_deviceCatalog.moveGroup(movedGroupId, insertIndex); // wjy: 目录把名称、稳定 ID 和展开状态作为一个实体重排，UI 只保留动画下标。
+                    if (groupOrderChanged) {
+                        saveDevices();
+                    }
                     writeDeviceGridStartupLog(QStringLiteral("[wjy-group-drag] moved group=%1 from=%2 to=%3")
                         .arg(movedGroupName)
                         .arg(sourceGroupIndex)
@@ -9676,7 +10621,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         if (m_draggingDevice) { // wjy: 如果本次鼠标操作已经进入设备拖拽状态，松开时只输出落点日志。
             QString targetType = QStringLiteral("none"); // wjy: 默认表示没有落到可识别的分组目标。
             QString targetGroup;
-            if (!m_leftSidebarCollapsed && m_deviceGroupExpanded) {
+            if (m_deviceGroupExpanded) {
                 const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 拖拽落点按当前可见行识别，和 UI 绘制顺序保持一致。
                 const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 拖拽落点只在当前可见滚动视口内识别。
                 const QRect ghostRect = deviceDragGhostRect(m_deviceDragCurrentPos, size());
@@ -9735,49 +10680,28 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 .arg(targetGroup)); // wjy: 拖拽落点日志写入文件，不再输出到调试控制台。
             //在这里添加写入group的代码
             // =====wjy====
-            bool deviceGroupChanged = false;
-
             const QString normalizedTargetGroup =
                 targetGroup.trimmed();
-
-            // 遍历本次拖拽快照中的所有设备。
-            for (int deviceIndex
-                 : m_draggingDeviceIndexes) {
-
-                if (deviceIndex < 0
-                    || deviceIndex >= g_devices.size()) {
-                    continue;
-                }
-
-                DeviceEntry& draggedDevice =
-                    g_devices[deviceIndex];
-
-                if (targetType
-                    == QStringLiteral("group")) {
-
-                    if (!normalizedTargetGroup.isEmpty()
-                        && draggedDevice.group.trimmed()
-                               != normalizedTargetGroup) {
-
-                        draggedDevice.group =
-                            normalizedTargetGroup;
-
-                        deviceGroupChanged = true;
-                    }
-
-                } else if (
-                    targetType
-                    == QStringLiteral("rootBlank")) {
-
-                    if (!draggedDevice.group
-                             .trimmed()
-                             .isEmpty()) {
-
-                        draggedDevice.group.clear();
-                        deviceGroupChanged = true;
-                    }
+            QString targetGroupId;
+            if (targetType == QStringLiteral("group")) {
+                const int targetGroupIndex = g_deviceCatalog.groupIndexForName(normalizedTargetGroup);
+                if (targetGroupIndex >= 0) {
+                    targetGroupId = g_deviceGroupIds.at(targetGroupIndex); // wjy: 拖拽目标先由名称解析为稳定 groupId，真正写入不依赖名称字符串。
                 }
             }
+
+            QVector<QString> draggedDeviceIds;
+            for (const int deviceIndex : m_draggingDeviceIndexes) {
+                if (deviceIndex >= 0 && deviceIndex < g_devices.size()) {
+                    draggedDeviceIds.append(g_devices.at(deviceIndex).id); // wjy: 拖拽快照中的展示下标只用于提取稳定 ID，排序变化不会串设备。
+                }
+            }
+            const bool deviceGroupChanged =
+                (targetType == QStringLiteral("group") && !targetGroupId.isEmpty())
+                    ? g_deviceCatalog.assignDevicesToGroup(draggedDeviceIds, targetGroupId)
+                    : (targetType == QStringLiteral("rootBlank")
+                        ? g_deviceCatalog.assignDevicesToGroup(draggedDeviceIds, {})
+                        : false); // wjy: 归组和回根都复用目录批量操作，保持 group/groupId 两个兼容字段同步。
             //保存逻辑
             if (deviceGroupChanged) {
                 saveDevices();
@@ -9806,18 +10730,10 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         }
 // ===end====
 
-        if (sidebarCollapseButtonRect(m_leftSidebarCollapsed).contains(event->pos())) {
-            m_leftSidebarCollapsed = !m_leftSidebarCollapsed;
+        if (detailPanelToggleButtonRect(m_detailPanelCollapsed).contains(event->pos())) {
             finishDeviceGroupRename(true);
             finishDeviceRename(true);
-            syncResponsiveLayoutState();
-            setDesktopHoverActive(false);
-            clearBottomActionHover();
-            updateAddDeviceControls();
-            updateLocalInfoControls();
-            updateSettingsControls();
-            updateScriptFileEditorControls();
-            update();
+            setDetailPanelCollapsed(!m_detailPanelCollapsed); // wjy: << 收起右侧详情并缩窄窗口，>> 恢复详情和收起前宽度。
             event->accept();
             return;
         }
@@ -9831,7 +10747,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         }
 
         // =====wjy====
-        if (m_updateAvailable && titlebarUpdateRect().contains(event->pos())) {
+        if (!m_detailPanelCollapsed && m_updateAvailable && titlebarUpdateRect().contains(event->pos())) {
             if (!m_updatePreparing) {
                 m_updatePreparing = true; // wjy: 只有用户明确点击标题栏按钮后才开始暂存更新载荷。
                 update(titlebarUpdateRect().adjusted(-2, -2, 2, 2));
@@ -9847,7 +10763,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         }
         // ===end====
 
-        if (titlebarSettingsRect().contains(event->pos())) {
+        if (!m_detailPanelCollapsed && titlebarSettingsRect().contains(event->pos())) {
             finishDeviceGroupRename(true);
             finishDeviceRename(true);
             m_settingsSelected = true;
@@ -9869,12 +10785,16 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
             updateAddDeviceControls();
             updateLocalInfoControls();
             updateSettingsControls();
+            updateScriptFileEditorControls(); // wjy: 进入设置页立即隐藏脚本、配置和查找控件，并同步停止本机页三类资源定时器。
+            if (m_settingsTab == SettingsTab::General) {
+                refreshRollbackVersions(); // wjy: 设置页立即显示，历史版本由后台读取；30 秒内重复进入直接复用缓存。
+            }
             update();
             event->accept();
             return;
         }
 
-        if (refreshRect().contains(event->pos())) {
+        if (!m_detailPanelCollapsed && refreshRect().contains(event->pos())) {
             refreshDeviceStatuses();
             event->accept();
             return;
@@ -9892,7 +10812,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
             return;
         }
 
-        if (!m_leftSidebarCollapsed && m_deviceGroupExpanded) {
+        if (m_deviceGroupExpanded) {
             const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 普通点击也使用可见行，保证点击位置和绘制出来的行一致。
             const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 普通点击也只命中当前滚动视口内的列表行。
 // =====wjy====
@@ -9916,10 +10836,8 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                         event->accept(); // wjy: 双击进入重命名后的释放事件只关闭本次点击，不再切换分组箭头。
                         return;
                     }
-                    while (g_deviceGroupExpandedStates.size() <= groupIndex) {
-                        g_deviceGroupExpandedStates.append(true); // wjy: 防御性补齐状态数组，缺失状态默认按展开处理。
-                    }
-                    g_deviceGroupExpandedStates[groupIndex] = !g_deviceGroupExpandedStates.at(groupIndex); // wjy: 点击分组行时切换展开状态，从而让箭头上下倒转。
+                    const QString groupId = g_deviceGroupIds.at(groupIndex);
+                    g_deviceCatalog.setGroupExpanded(groupId, !g_deviceGroupExpandedStates.at(groupIndex)); // wjy: 点击分组行按稳定 groupId 切换展开状态，数组下标只负责当前命中行。
                     pruneHiddenDeviceSelections(); // wjy: 分组折叠后立即移除隐藏设备选择，避免后续 Shift/拖拽继续带着不可见设备。
                     saveDevices(); // wjy: 保存分组展开状态，重启后箭头方向保持一致。
                     update();
@@ -10073,7 +10991,9 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
 // ===end====
         }
 
-        if (m_settingsSelected) {
+        if (!m_detailPanelCollapsed && m_settingsSelected) {
+            const SettingsLayoutSnapshot settingsLayout = settingsLayoutSnapshot(
+                m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded, m_settingsScrollOffset); // wjy: 设置页点击命中与手绘/子控件布局共享同一滚动快照。
             if (settingsGeneralTabRect().contains(event->pos())
                 || settingsKeyboardTabRect().contains(event->pos())
                 || settingsRemoteControlTabRect().contains(event->pos())) {
@@ -10083,6 +11003,9 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                         ? SettingsTab::Keyboard
                         : SettingsTab::General); // wjy: 三个设置标签互斥切换，远控画质页不会误落入常规页点击处理。
                 m_settingsScrollOffset = 0;
+                if (m_settingsTab == SettingsTab::General) {
+                    refreshRollbackVersions(); // wjy: 切回常规页时按缓存期限请求后台刷新，不在页签点击事件中同步遍历共享目录。
+                }
                 updateSettingsControls();
                 updateAddDeviceControls();
                 updateLocalInfoControls();
@@ -10094,7 +11017,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 event->accept();
                 return;
             }
-            if (settingsScrolledRect(settingsLocalInfoHeaderRect(), m_settingsScrollOffset).contains(event->pos())) {
+            if (settingsLayout.containsPoint(settingsLocalInfoHeaderRect(), event->pos())) {
                 m_settingsLocalInfoExpanded = !m_settingsLocalInfoExpanded;
                 if (m_settingsLocalInfoExpanded) {
                     refreshLocalDeviceInfo();
@@ -10107,7 +11030,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 event->accept();
                 return;
             }
-            if (settingsScrolledRect(settingsAddDeviceHeaderRect(m_settingsLocalInfoExpanded), m_settingsScrollOffset).contains(event->pos())) {
+            if (settingsLayout.containsPoint(settingsAddDeviceHeaderRect(m_settingsLocalInfoExpanded), event->pos())) {
                 m_settingsAddDeviceExpanded = !m_settingsAddDeviceExpanded;
                 m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded));
                 updateSettingsControls();
@@ -10117,7 +11040,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 event->accept();
                 return;
             }
-            if (settingsScrolledRect(settingsAutoRunSwitchRect(), m_settingsScrollOffset).contains(event->pos())) {
+            if (settingsLayout.containsPoint(settingsAutoRunSwitchRect(), event->pos())) {
                 platform::StartupManager::setEnabled(!m_autoRunEnabled);
                 m_autoRunEnabled = platform::StartupManager::isEnabled();
                 update();
@@ -10125,11 +11048,50 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 return;
             }
             // =====wjy====
+            if (settingsLayout.containsPoint(settingsRollbackButtonRect(), event->pos())) {
+                const QString targetVersion = m_rollbackVersionCombo
+                    ? m_rollbackVersionCombo->currentData().toString()
+                    : QString();
+                if (targetVersion.isEmpty() || m_rollbackPreparing) {
+                    event->accept();
+                    return; // wjy: 占位项和准备中状态都直接拦截，不创建空版本任务或重复更新器进程。
+                }
+
+                QMessageBox confirmation(
+                    QMessageBox::Warning,
+                    QString::fromUtf8("确认回撤版本"),
+                    QString::fromUtf8("将从当前版本 v%1 回撤到 v%2。\n程序会自动关闭并在回撤完成后重新启动。\n旧版本可能无法识别新版本保存的部分设置，是否继续？")
+                        .arg(platform::UpdateService::displayVersion(), targetVersion),
+                    QMessageBox::NoButton,
+                    this);
+                QPushButton* rollbackButton = confirmation.addButton(QString::fromUtf8("回撤并重启"), QMessageBox::AcceptRole);
+                confirmation.addButton(QString::fromUtf8("取消"), QMessageBox::RejectRole);
+                confirmation.exec();
+                if (confirmation.clickedButton() != rollbackButton) {
+                    event->accept();
+                    return; // wjy: 用户取消后不暂存文件、不启动更新器，也不改变当前安装和下拉框选择。
+                }
+
+                m_rollbackPreparing = true;
+                updateSettingsControls();
+                update(); // wjy: 确认后立即禁用下拉框并显示“准备中”，大文件复制期间不会误以为按钮未响应。
+                QString error;
+                if (!platform::UpdateService::instance().applyVersionRollback(targetVersion, &error)) {
+                    m_rollbackPreparing = false;
+                    refreshRollbackVersions(true); // wjy: 准备失败时绕过缓存重新验证目录，目标被删除或损坏会从下拉框中移除。
+                    QMessageBox::warning(this, QString(), QString::fromUtf8("版本回撤准备失败：%1").arg(error));
+                }
+                event->accept();
+                return;
+            }
+            // ===end====
+            // =====wjy====
             if (platform::UpdateService::canPublishCurrentBuild()
-                && settingsScrolledRect(settingsPublishUpdateButtonRect(), m_settingsScrollOffset).contains(event->pos())) { // wjy: 普通运行包即使点击原按钮坐标也不会触发发布。
+                && settingsLayout.containsPoint(settingsPublishUpdateButtonRect(), event->pos())) { // wjy: 普通运行包即使点击原按钮坐标也不会触发发布。
                 QString error;
                 if (platform::UpdateService::instance().publishCurrentBuild(&error)) {
                     QMessageBox::information(this, QString(), QString::fromUtf8("已发布到共享目录，其它设备将自动检测到更新。"));
+                    refreshRollbackVersions(true); // wjy: 发布后强制后台刷新，原版本立即成为可回撤目标且不受 30 秒缓存影响。
                 } else {
                     QMessageBox::warning(this, QString(), QString::fromUtf8("发布失败：%1").arg(error));
                 }
@@ -10137,12 +11099,12 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 return;
             }
             // ===end====
-            if (settingsScrolledRect(settingsRemoteWakeupSwitchRect(), m_settingsScrollOffset).contains(event->pos())) {
+            if (settingsLayout.containsPoint(settingsRemoteWakeupSwitchRect(), event->pos())) {
                 toggleRemoteWakeup();
                 event->accept();
                 return;
             }
-            if (settingsScrolledRect(settingsPreventSleepSwitchRect(), m_settingsScrollOffset).contains(event->pos())) {
+            if (settingsLayout.containsPoint(settingsPreventSleepSwitchRect(), event->pos())) {
                 m_preventSleepEnabled = !m_preventSleepEnabled;
                 platform::AppSettings::setPreventSleepEnabled(m_preventSleepEnabled);
                 platform::PowerManager::setPreventSleepEnabled(m_preventSleepEnabled);
@@ -10151,7 +11113,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 return;
             }
             // =====wjy====
-            if (settingsScrolledRect(settingsPeriodicDeviceDiscoverySwitchRect(), m_settingsScrollOffset).contains(event->pos())) {
+            if (settingsLayout.containsPoint(settingsPeriodicDeviceDiscoverySwitchRect(), event->pos())) {
                 m_periodicDeviceDiscoveryEnabled = !m_periodicDeviceDiscoveryEnabled;
                 platform::AppSettings::setPeriodicDeviceDiscoveryEnabled(m_periodicDeviceDiscoveryEnabled);
                 applyPeriodicDeviceDiscoverySetting(m_periodicDeviceDiscoveryEnabled); // wjy: 开启时立即扫描一次，之后按 60 秒周期；关闭时立即停表。
@@ -10159,7 +11121,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 event->accept();
                 return;
             }
-            if (settingsScrolledRect(settingsWallpaperRotationSwitchRect(), m_settingsScrollOffset).contains(event->pos())) {
+            if (settingsLayout.containsPoint(settingsWallpaperRotationSwitchRect(), event->pos())) {
                 m_wallpaperRotationEnabled = !m_wallpaperRotationEnabled;
                 platform::AppSettings::setDesktopWallpaperRotationEnabled(m_wallpaperRotationEnabled);
                 applyDesktopWallpaperRotationSetting(m_wallpaperRotationEnabled); // wjy: 开启后立即后台切换首张并启动分钟周期；关闭后立即停表。
@@ -10169,7 +11131,20 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
             // ===end====
         }
 
-        if (!m_settingsSelected && !m_remoteAssistSelected && !m_localInfoSelected) {
+        if (!m_detailPanelCollapsed && !m_settingsSelected && !m_remoteAssistSelected && !m_localInfoSelected) {
+            if (detailLocalTabRect().contains(event->pos())) {
+                showLocalSystemInfoTab(); // wjy: 本机页签点击后刷新静态信息、建立 CPU/GPU 基线并启动三类资源一秒采样。
+                event->accept();
+                return;
+            }
+#if 0
+            // wjy: 查找页签暂缓启用；保留点击切页逻辑，后续删除门禁即可恢复。
+            if (detailSearchTabRect().contains(event->pos())) {
+                showDeviceSearchPanel(); // wjy: 点击查找页签时刷新最新设备快照并把输入焦点交给面板。
+                event->accept();
+                return;
+            }
+#endif
             if (detailConfigTabRect().contains(event->pos()) || detailScriptLogTabRect().contains(event->pos())) {
                 m_deviceDetailTab = detailScriptLogTabRect().contains(event->pos())
                     ? DeviceDetailTab::ScriptLog

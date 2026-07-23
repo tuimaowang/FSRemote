@@ -4,6 +4,8 @@
 #include "system/DeviceCommandService.h"
 #include "stream/StreamRuntime.h"
 #include "ui/D3D11FramePresenter.h"
+#include "ui/RemoteConnectionState.h"
+#include "ui/RemoteClipboardCodec.h"
 #include "ui/RemoteCursorShape.h"
 #include "ui/RemoteViewerLifecycleManager.h"
 
@@ -1258,7 +1260,7 @@ int FSREMOTE_STREAM_CALL onRemoteTextureFrame(void* user, int width, int height,
         if (!window || !window->acceptsViewerGeneration(context->generation) || width <= 0 || height <= 0 || !sharedHandle) {
             return 0;
         }
-        return window->enqueueRemoteTextureFrame(width, height, sharedHandle, frameId, encodedMbps, context->generation) ? 1 : 0;
+        return window->enqueueRemoteTextureFrame(width, height, sharedHandle, frameId, encodedMbps, context->generation); // wjy: 原样返回三态结果，受控丢帧不能触发BGRA回读。
     } catch (...) {
         return 0;
     } // wjy: Qt投递或单槽更新异常只让该帧走软件回退，不得越过原生解码回调边界。
@@ -1724,7 +1726,7 @@ QString RemoteDesktopWindow::remoteResourceDiagnosticSummary()
     QString quality = remoteQualityStatusSummary();
     quality.replace(QLatin1Char('\n'), QStringLiteral(" | "));
     const long d3dReason = m_texturePresenter ? m_texturePresenter->lastDeviceRemovalReason() : 0;
-    return QStringLiteral("host=%1 connected=%2 generation=%3 status=%4 bgra_pending=%5 texture_pending=%6 drain=%7 overwritten=%8 fallback=%9 d3d=0x%10 fps=%11 encoded_mbps=%12 quality={%13}")
+    return QStringLiteral("host=%1 connected=%2 generation=%3 status=%4 bgra_pending=%5 texture_pending=%6 drain=%7 dropped=%8 fallback=%9 d3d=0x%10 fps=%11 encoded_mbps=%12 quality={%13}")
         .arg(m_hostIp)
         .arg(m_viewerHandle ? 1 : 0)
         .arg(m_viewerGeneration.load(std::memory_order_acquire))
@@ -1732,7 +1734,7 @@ QString RemoteDesktopWindow::remoteResourceDiagnosticSummary()
         .arg(pendingBgra ? 1 : 0)
         .arg(m_pendingTextureFrames.pendingCount())
         .arg(m_pendingTextureFrames.drainScheduled() ? 1 : 0)
-        .arg(m_pendingTextureFrames.overwrittenFrameCount())
+        .arg(m_pendingTextureFrames.droppedFrameCount())
         .arg(m_softwareFallbackActive ? 1 : 0)
         .arg(static_cast<qulonglong>(static_cast<unsigned long>(d3dReason)), 0, 16)
         .arg(m_receiveFps, 0, 'f', 1)
@@ -2305,11 +2307,11 @@ void RemoteDesktopWindow::pushLocalClipboardIfNeeded()
     if (text.isEmpty() || text == m_lastLocalClipboardText || text == m_lastAppliedRemoteClipboardText) {
         return; // wjy: 空内容、未变化或刚从远端写入的内容不回推，避免环路。
     }
-    if (text.size() > 512 * 1024) {
+    const QByteArray encoded = RemoteClipboardCodec::encode(text);
+    if (encoded.isEmpty()) {
         return;
     }
     m_lastLocalClipboardText = text;
-    const QByteArray encoded = text.toUtf8().toBase64();
     sendInputMessage(QByteArray("cb ") + encoded); // wjy: Viewer -> Host 文本剪贴板同步。
 }
 
@@ -2318,12 +2320,9 @@ void RemoteDesktopWindow::applyRemoteClipboardPayload(const QString& encodedBase
     if (!m_clipboardSyncEnabled) {
         return;
     }
-    const QByteArray decoded = QByteArray::fromBase64(encodedBase64.toLatin1());
-    if (decoded.isEmpty()) {
-        return;
-    }
-    const QString text = QString::fromUtf8(decoded);
-    if (text.isEmpty() || text == m_lastAppliedRemoteClipboardText) {
+    QString text;
+    if (!RemoteClipboardCodec::decode(encodedBase64, &text)
+        || text == m_lastAppliedRemoteClipboardText) {
         return;
     }
     m_lastAppliedRemoteClipboardText = text;
@@ -2408,7 +2407,7 @@ bool RemoteDesktopWindow::dispatchRemoteInputEvent(const RemoteInputEvent& event
 bool RemoteDesktopWindow::synchronizedInputEligible() const
 {
     return m_viewerHandle != nullptr
-        && m_connectionStatusCode == 50
+        && RemoteConnectionState::acceptsRemoteInput(m_connectionStatusCode)
         && !m_closeInProgress
         && !remoteUpdateActive(); // wjy: 只有首帧已建立且未关闭、未更新的 Viewer 才能成为主控或接收跟随输入。
 }
@@ -2835,28 +2834,39 @@ void RemoteDesktopWindow::enqueueRemoteFrame(QImage image, quint64 viewerGenerat
     m_pendingRemoteFrame = std::move(image); // wjy: Overwrite stale frames; the UI timer will pull the newest one when the event loop is ready.
 }
 
-bool RemoteDesktopWindow::enqueueRemoteTextureFrame(int width, int height, void* sharedHandle, quint64 frameId, double encodedMbps, quint64 viewerGeneration)
+int RemoteDesktopWindow::enqueueRemoteTextureFrame(int width, int height, void* sharedHandle, quint64 frameId, double encodedMbps, quint64 viewerGeneration)
 {
     if (!acceptsViewerGeneration(viewerGeneration) || m_texturePresentFailed.load() || width <= 0 || height <= 0 || !sharedHandle) {
-        return false;
+        return FSREMOTE_TEXTURE_FRAME_FALLBACK;
     }
 
     // =====wjy====
-    const bool shouldScheduleDrain = m_pendingTextureFrames.push({
+    const TextureFramePushResult pushResult = m_pendingTextureFrames.push({
         width,
         height,
         sharedHandle,
         frameId,
         encodedMbps,
         viewerGeneration,
-    }); // wjy: 解码线程只覆盖单个最新纹理槽；已有drain时不会为这一帧继续增加Qt事件。
-    if (shouldScheduleDrain
+    }); // wjy: keyed mutex帧只在单槽空闲时接管；已有pending时拒绝新帧并让生产端立即归还纹理。
+    if (pushResult == TextureFramePushResult::DroppedWhilePending) {
+        return FSREMOTE_TEXTURE_FRAME_DROPPED; // wjy: 不排队、不做BGRA回读，保持一个pending和一个执行中帧的硬上限。
+    }
+    if (pushResult == TextureFramePushResult::AcceptedAndScheduleDrain
         && !QMetaObject::invokeMethod(this, &RemoteDesktopWindow::drainPendingRemoteTextureFrame, Qt::QueuedConnection)) {
         m_pendingTextureFrames.cancelScheduledDrain(); // wjy: Qt对象拒绝投递时释放唯一调度权，让原生解码器立即回退到安全BGRA路径。
-        return false;
+        return FSREMOTE_TEXTURE_FRAME_FALLBACK;
     }
     // ===end====
-    return true;
+    return FSREMOTE_TEXTURE_FRAME_ACCEPTED;
+}
+
+void RemoteDesktopWindow::discardPendingTextureFrame()
+{
+    const auto cancelledFrame = m_pendingTextureFrames.cancelPending(); // wjy: 从单槽原子取出被取消的已接受帧。
+    if (cancelledFrame.has_value() && m_texturePresenter && cancelledFrame->sharedHandle) {
+        m_texturePresenter->discardSharedTexture(cancelledFrame->sharedHandle); // wjy: Acquire消费者key后立即Release生产者key，不执行任何画面呈现。
+    }
 }
 
 // =====wjy====
@@ -2901,7 +2911,7 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
                 if (!canContinueDisplayingTexture) {
                     m_texturePresenter->hide();
                 }
-                m_pendingTextureFrames.cancelPending(); // wjy: 进入软件回退后丢弃执行期间到达的纹理，等待低成本BGRA首帧完成无缝交接。
+                discardPendingTextureFrame(); // wjy: 软件回退取消排队纹理时同步归还keyed mutex槽位。
                 const int retryDelayMs = qMin(10000, 1000 * (1 << qMin(m_textureFailureCount - 1, 3)));
                 if (m_textureRecoveryTimer) {
                     m_textureRecoveryTimer->start(retryDelayMs); // wjy: 1/2/4/8/10秒退避重试，持续故障时不每帧重建设备。
@@ -2910,6 +2920,7 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
                 update(QRect(0, 0, width(), titleBarHeight()));
             }
         } else {
+            updatePresentedFrameStats(0); // wjy: 共享纹理成功Present后计入FPS；零拷贝路径不虚构BGRA内存吞吐。
             m_remoteTextureSize = QSize(frame->width, frame->height); // wjy: 只有新纹理真正成功Present后才提交远端尺寸，失败帧不能污染缩放比例。
             m_remoteFrame = QImage(); // wjy: 成功切换到新纹理后才释放软件上一帧，整个提交过程不会提前露出黑色背景。
             m_encodedMbps = qMax(0.0, frame->encodedMbps); // wjy: 码率统计只跟随真正成功显示的新帧。
@@ -2932,11 +2943,16 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
             update(QRect(0, 0, width(), titleBarHeight()));
         }
         // ===end====
+    } else if (frame.has_value() && m_texturePresenter && frame->sharedHandle) {
+        m_texturePresenter->discardSharedTexture(frame->sharedHandle); // wjy: 关闭、代际失效或更新遮罩拒绝已取出的帧时仍完成消费者key交接。
     }
 
     if (m_pendingTextureFrames.completeDrainAndShouldReschedule()) {
         if (!QMetaObject::invokeMethod(this, &RemoteDesktopWindow::drainPendingRemoteTextureFrame, Qt::QueuedConnection)) {
-            m_pendingTextureFrames.cancelScheduledDrain(); // wjy: 极端关闭竞态下Qt拒绝下一轮投递，必须清理调度标志而不是永久卡住纹理槽。
+            const auto cancelledFrame = m_pendingTextureFrames.cancelScheduledDrain(); // wjy: 极端关闭竞态下清理调度标志并取回已经接受的pending帧。
+            if (cancelledFrame.has_value() && m_texturePresenter && cancelledFrame->sharedHandle) {
+                m_texturePresenter->discardSharedTexture(cancelledFrame->sharedHandle); // wjy: 续投失败的帧已由生产端交给消费者key，必须显式归还。
+            }
         }
     }
 }
@@ -2996,12 +3012,17 @@ void RemoteDesktopWindow::updateFrameStats(const QImage& image)
         return;
     }
     updateFrameColorStats(image); // wjy: Keep RGB diagnostics visible while testing pure-black remote pages.
+    updatePresentedFrameStats(static_cast<qint64>(image.sizeInBytes())); // wjy: 软件帧携带真实BGRA字节数，同时和共享纹理共用同一FPS时间窗。
+}
+
+void RemoteDesktopWindow::updatePresentedFrameStats(qint64 bgraBytes)
+{
     if (!m_frameStatsClock.isValid()) {
         m_frameStatsClock.start(); // wjy: Defensive start in case a frame arrives before the constructor timer state is valid.
     }
 
-    ++m_frameStatsCount; // wjy: Count frames that reached the Qt/UI handoff, which is the number users actually care about for visual smoothness.
-    m_frameStatsBytes += static_cast<qint64>(image.sizeInBytes()); // wjy: Track decoded BGRA bytes, not compressed WebRTC network bitrate.
+    ++m_frameStatsCount; // wjy: 只统计成功进入软件显示或D3D11 Present的帧，协调器据此判断真实可见流畅度。
+    m_frameStatsBytes += qMax<qint64>(0, bgraBytes); // wjy: 仅软件帧累计BGRA字节，共享纹理保持零以反映零拷贝路径。
     const qint64 elapsedMs = m_frameStatsClock.elapsed();
     if (elapsedMs < 1000) {
         return;
@@ -3098,7 +3119,7 @@ void RemoteDesktopWindow::invalidateViewerCallbacks()
     m_softwareFallbackActive = false;
     m_textureFailureCount = 0;
     if (m_textureRecoveryTimer) m_textureRecoveryTimer->stop(); // wjy: 新Viewer代际重新尝试纹理路径，不继承旧连接的D3D11失败退避。
-    m_pendingTextureFrames.cancelPending(); // wjy: 清掉旧代际尚未呈现的共享纹理，已排队drain随后只释放调度标志。
+    discardPendingTextureFrame(); // wjy: 清掉旧代际纹理并完成消费者交接，旧解码器停止前不会因槽位泄漏卡住。
     QMutexLocker locker(&m_pendingFrameMutex);
     m_pendingRemoteFrame = QImage(); // wjy: 软件回退路径也同步清空，重连首帧之前不会显示旧会话画面。
 }
@@ -3260,7 +3281,7 @@ void RemoteDesktopWindow::releaseViewerStartupAdmission()
 void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
 {
     // =====wjy====
-    if (code == 50 || code == 80 || code == 90) {
+    if (RemoteConnectionState::releasesViewerStartupAdmission(code)) {
         releaseViewerStartupAdmission(); // wjy: 首帧表示初始化完成；断开/失败表示本轮初始化终止，三种终态都立即补位下一窗口。
     }
     // ===end====
@@ -3284,34 +3305,8 @@ void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
     }
     // ===end====
     m_connectionStatusCode = code;
-    switch (code) {
-    case 10:
-        m_connectionStatus = zh("\xE6\xAD\xA3\xE5\x9C\xA8\xE8\xBF\x9E\xE6\x8E\xA5 TCP");
-        break;
-    case 20:
-        m_connectionStatus = zh("TCP \xE5\xB7\xB2\xE8\xBF\x9E\xE6\x8E\xA5");
-        break;
-    case 30:
-        m_connectionStatus = zh("\xE6\xAD\xA3\xE5\x9C\xA8\xE5\x88\x9D\xE5\xA7\x8B\xE5\x8C\x96 WebRTC");
-        break;
-    case 40:
-        m_connectionStatus = zh("\xE7\xAD\x89\xE5\xBE\x85\xE8\xBF\x9C\xE7\xA8\x8B\xE7\x94\xBB\xE9\x9D\xA2");
-        break;
-    case 50:
-        m_connectionStatus = zh("\xE6\xAD\xA3\xE5\x9C\xA8\xE6\x8E\xA5\xE6\x94\xB6\xE7\x94\xBB\xE9\x9D\xA2");
-        break;
-    case 80:
-        m_connectionStatus = zh("\xE8\xBF\x9E\xE6\x8E\xA5\xE5\xB7\xB2\xE6\x96\xAD\xE5\xBC\x80");
-        break;
-    case 90:
-        m_connectionStatus = message.isEmpty()
-            ? zh("\xE8\xBF\x9E\xE6\x8E\xA5\xE5\xA4\xB1\xE8\xB4\xA5")
-            : zh("\xE8\xBF\x9E\xE6\x8E\xA5\xE5\xA4\xB1\xE8\xB4\xA5\xEF\xBC\x9A%1").arg(message);
-        break;
-    default:
-        m_connectionStatus = message.isEmpty() ? zh("\xE6\xAD\xA3\xE5\x9C\xA8\xE8\xBF\x9E\xE6\x8E\xA5") : message;
-        break;
-    }
+    m_connectionStatus = RemoteConnectionState::displayText(code, message); // wjy: 状态码到文案的纯映射由独立辅助类负责，窗口只保留生命周期副作用和重绘。
+    m_connectionStatus = RemoteConnectionState::displayText(code, message); // wjy: 纯状态映射由独立辅助类复核，窗口继续负责协调器通知和重绘。
     if (m_inputBroadcastCoordinator) {
         m_inputBroadcastCoordinator->notifyEligibilityChanged(this); // wjy: 断线/失败会关闭主控或移除跟随端，连接成功后则从后续事件开始动态加入。
     }
@@ -3709,7 +3704,7 @@ void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
 
     event->ignore();
     m_closeInProgress = true;
-    m_pendingTextureFrames.cancelPending(); // wjy: 用户关闭窗口后立即停止消费新纹理，等待原生viewer安全退出期间不会继续积压画面任务。
+    discardPendingTextureFrame(); // wjy: 关闭窗口时取消排队帧并归还共享纹理槽，随后再异步停止Viewer。
     if (m_remoteUpdateTimer) {
         m_remoteUpdateTimer->stop();
     }

@@ -18,6 +18,10 @@ if(WIN32)
 endif()
 # ===end====
 
+# =====wjy====
+option(FSREMOTE_BUILD_TESTS "Create FSRemote test targets for explicit developer builds" OFF) # wjy: 日常 Qt Creator 配置默认不创建测试目标，避免 all 同时编译二十多个 tests.exe。
+# ===end====
+
 option(FSREMOTE_BUILD_UU_STREAM_WEBRTC "Build the vendored UU native WebRTC streaming tools" ON)
 
 if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
@@ -53,9 +57,10 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
         set_property(TARGET uu_session_protocol PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
     endif()
     option(FSREMOTE_BUILD_SESSION_PROTOCOL_TESTS "Build bounded session protocol parser tests" ON)
-    if(FSREMOTE_BUILD_SESSION_PROTOCOL_TESTS)
+    if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_SESSION_PROTOCOL_TESTS) # wjy: 只有显式开启测试总开关后才创建协议、会话和媒体管线测试目标。
         enable_testing() # wjy: 协议解析器无需启动 WebRTC、显卡或网络即可独立运行边界测试。
-        add_executable(uu_session_protocol_tests
+        # wjy: 本分类所有测试目标都排除出 all；需要验证时在 Qt Creator 中单独选择目标构建。
+        add_executable(uu_session_protocol_tests EXCLUDE_FROM_ALL
             third_party/uu_stream_webrtc/tests/session_protocol_tests.cpp
         )
         target_link_libraries(uu_session_protocol_tests PRIVATE uu_session_protocol) # wjy: 测试链接生产协议库，确保边界用例覆盖真实运行代码。
@@ -65,7 +70,7 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
         endif()
         add_test(NAME uu_session_protocol_tests COMMAND uu_session_protocol_tests) # wjy: CTest 通过退出码判断全部恶意输入边界是否通过。
 
-        add_executable(uu_viewer_quality_protocol_tests
+        add_executable(uu_viewer_quality_protocol_tests EXCLUDE_FROM_ALL
             third_party/uu_stream_webrtc/tests/viewer_quality_protocol_tests.cpp
         ) # wjy: 独立覆盖版本化画质请求/确认、畸形字段和不断流的非零FPS约束。
         target_link_libraries(uu_viewer_quality_protocol_tests PRIVATE uu_session_protocol)
@@ -75,7 +80,7 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
         endif()
         add_test(NAME uu_viewer_quality_protocol_tests COMMAND uu_viewer_quality_protocol_tests)
 
-        add_executable(uu_host_session_manager_tests
+        add_executable(uu_host_session_manager_tests EXCLUDE_FROM_ALL
             third_party/uu_stream_webrtc/tests/host_session_manager_tests.cpp
         ) # wjy: 用真实 DLL 和本机 TCP 验证持久 listener、容量拒绝、worker 回收与阻塞握手关闭。
         target_include_directories(uu_host_session_manager_tests PRIVATE include third_party/uu_stream_webrtc/src)
@@ -89,7 +94,7 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
         endif()
         add_test(NAME uu_host_session_manager_tests COMMAND uu_host_session_manager_tests)
 
-        add_executable(uu_host_media_pipeline_tests
+        add_executable(uu_host_media_pipeline_tests EXCLUDE_FROM_ALL
             third_party/uu_stream_webrtc/tests/host_media_pipeline_tests.cpp
         ) # wjy: 用无显卡假 source 验证共享管线的单次启动、复用、最后订阅者清理和关闭门禁。
         target_link_libraries(uu_host_media_pipeline_tests PRIVATE uu_stream_common)
@@ -102,7 +107,7 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
         endif()
         add_test(NAME uu_host_media_pipeline_tests COMMAND uu_host_media_pipeline_tests)
 
-        add_executable(uu_shared_input_state_tests
+        add_executable(uu_shared_input_state_tests EXCLUDE_FROM_ALL
             third_party/uu_stream_webrtc/tests/shared_input_state_tests.cpp
         ) # wjy: 无需启动 WebRTC 或真实 SendInput 即可覆盖多人同键、错误抬键和断线清理语义。
         target_include_directories(uu_shared_input_state_tests PRIVATE third_party/uu_stream_webrtc/src)
@@ -119,9 +124,9 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets Svg Network Gui) # wjy: 壁纸服�
 
 # =====wjy====
 option(FSREMOTE_BUILD_WALLPAPER_TESTS "Build shared wallpaper discovery tests" ON)
-if(FSREMOTE_BUILD_WALLPAPER_TESTS)
+if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_WALLPAPER_TESTS) # wjy: 壁纸测试受统一总开关控制，旧缓存中的分类 ON 不再拖慢普通构建。
     enable_testing()
-    add_executable(fsremote_desktop_wallpaper_service_tests
+    add_executable(fsremote_desktop_wallpaper_service_tests EXCLUDE_FROM_ALL # wjy: 显式测试目标保留，但不加入默认 all。
         tests/desktop_wallpaper_service_tests.cpp
         src/system/DesktopWallpaperService.cpp
         src/system/DesktopWallpaperService.h
@@ -140,9 +145,10 @@ endif()
 
 # =====wjy====
 option(FSREMOTE_BUILD_VIEWER_STABILITY_TESTS "Build bounded multi-viewer frame handoff tests" ON)
-if(FSREMOTE_BUILD_VIEWER_STABILITY_TESTS)
+if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_VIEWER_STABILITY_TESTS) # wjy: 多窗口稳定性测试仅在开发者主动开启总测试开关时创建。
     enable_testing()
-    add_executable(fsremote_latest_texture_frame_slot_tests
+    # wjy: 本分类测试均可单独构建，普通 FSRemote 构建不再生成对应 tests.exe。
+    add_executable(fsremote_latest_texture_frame_slot_tests EXCLUDE_FROM_ALL
         tests/latest_texture_frame_slot_tests.cpp
         src/ui/LatestTextureFrameSlot.h
     ) # wjy: 纯C++测试不启动Qt、WebRTC或显卡即可验证20路场景最关键的单槽覆盖与唯一drain语义。
@@ -152,7 +158,7 @@ if(FSREMOTE_BUILD_VIEWER_STABILITY_TESTS)
     endif()
     add_test(NAME fsremote_latest_texture_frame_slot_tests COMMAND fsremote_latest_texture_frame_slot_tests) # wjy: CTest通过断言确认上千帧输入仍只有一个pending和一个调度权。
 
-    add_executable(fsremote_remote_quality_policy_tests
+    add_executable(fsremote_remote_quality_policy_tests EXCLUDE_FROM_ALL
         tests/remote_quality_policy_tests.cpp
         src/stream/RemoteQualityPolicy.h
     ) # wjy: 纯C++测试验证FPS优先默认值、最小化不断流和异常持久化值归一化，无需启动Qt或真实设备。
@@ -162,7 +168,7 @@ if(FSREMOTE_BUILD_VIEWER_STABILITY_TESTS)
     endif()
     add_test(NAME fsremote_remote_quality_policy_tests COMMAND fsremote_remote_quality_policy_tests)
 
-    add_executable(fsremote_remote_quality_coordinator_tests
+    add_executable(fsremote_remote_quality_coordinator_tests EXCLUDE_FROM_ALL
         tests/remote_quality_coordinator_tests.cpp
         src/ui/RemoteQualityCoordinator.cpp
         src/ui/RemoteQualityCoordinator.h
@@ -175,7 +181,7 @@ if(FSREMOTE_BUILD_VIEWER_STABILITY_TESTS)
     add_test(NAME fsremote_remote_quality_coordinator_tests COMMAND fsremote_remote_quality_coordinator_tests)
 
     # =====wjy====
-    add_executable(fsremote_remote_input_broadcast_tests
+    add_executable(fsremote_remote_input_broadcast_tests EXCLUDE_FROM_ALL
         tests/remote_input_broadcast_coordinator_tests.cpp
         src/ui/RemoteInputBroadcastCoordinator.cpp
         src/ui/RemoteInputBroadcastCoordinator.h
@@ -187,7 +193,7 @@ if(FSREMOTE_BUILD_VIEWER_STABILITY_TESTS)
     endif()
     add_test(NAME fsremote_remote_input_broadcast_tests COMMAND fsremote_remote_input_broadcast_tests)
 
-    add_executable(fsremote_remote_cursor_shape_tests
+    add_executable(fsremote_remote_cursor_shape_tests EXCLUDE_FROM_ALL
         tests/remote_cursor_shape_tests.cpp
         src/ui/RemoteCursorShape.h
     ) # wjy: 无需启动远控会话即可验证全部 Windows 标准光标的 Qt 映射及版本、未知形状和多余字段拒绝规则。
@@ -197,15 +203,53 @@ if(FSREMOTE_BUILD_VIEWER_STABILITY_TESTS)
         target_compile_options(fsremote_remote_cursor_shape_tests PRIVATE /utf-8)
     endif()
     add_test(NAME fsremote_remote_cursor_shape_tests COMMAND fsremote_remote_cursor_shape_tests)
+
+    # =====wjy====
+    add_executable(fsremote_settings_layout_snapshot_tests EXCLUDE_FROM_ALL
+        tests/settings_layout_snapshot_tests.cpp
+        src/ui/SettingsLayoutSnapshot.cpp
+        src/ui/SettingsLayoutSnapshot.h
+    ) # wjy: 纯 Qt Core 测试验证滚动夹紧、矩形换算、完整可见性和鼠标命中，不启动主窗口或远控会话。
+    target_include_directories(fsremote_settings_layout_snapshot_tests PRIVATE src)
+    target_link_libraries(fsremote_settings_layout_snapshot_tests PRIVATE Qt6::Core)
+    if(MSVC)
+        target_compile_options(fsremote_settings_layout_snapshot_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME fsremote_settings_layout_snapshot_tests COMMAND fsremote_settings_layout_snapshot_tests)
+    add_executable(fsremote_remote_connection_state_tests EXCLUDE_FROM_ALL
+        tests/remote_connection_state_tests.cpp
+        src/ui/RemoteConnectionState.cpp
+        src/ui/RemoteConnectionState.h
+    ) # wjy: 纯 Qt Core 测试验证连接状态文案、启动名额终态和输入资格，不启动真实 Viewer。
+    target_include_directories(fsremote_remote_connection_state_tests PRIVATE src)
+    target_link_libraries(fsremote_remote_connection_state_tests PRIVATE Qt6::Core)
+    if(MSVC)
+        target_compile_options(fsremote_remote_connection_state_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME fsremote_remote_connection_state_tests COMMAND fsremote_remote_connection_state_tests)
+    add_executable(fsremote_remote_clipboard_codec_tests EXCLUDE_FROM_ALL
+        tests/remote_clipboard_codec_tests.cpp
+        src/ui/RemoteClipboardCodec.cpp
+        src/ui/RemoteClipboardCodec.h
+    ) # wjy: 纯 Qt Core 测试验证剪贴板 UTF-8/Base64、大小限制和无效 payload 拒绝，不访问系统剪贴板。
+    target_include_directories(fsremote_remote_clipboard_codec_tests PRIVATE src)
+    target_link_libraries(fsremote_remote_clipboard_codec_tests PRIVATE Qt6::Core)
+    if(MSVC)
+        target_compile_options(fsremote_remote_clipboard_codec_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME fsremote_remote_clipboard_codec_tests COMMAND fsremote_remote_clipboard_codec_tests)
+    # ===end====
+
     # ===end====
 endif()
 # ===end====
 
 # =====wjy====
 option(FSREMOTE_BUILD_DEVICE_SYNC_TESTS "Build device list synchronization model tests" ON)
-if(FSREMOTE_BUILD_DEVICE_SYNC_TESTS)
+if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_DEVICE_SYNC_TESTS) # wjy: 设备目录与同步测试受总开关控制，不影响生产设备列表代码进入主程序。
     enable_testing()
-    add_executable(fsremote_device_sync_tests
+    # wjy: 本分类测试目标全部排除出 all，仍可按目标名进行显式编译。
+    add_executable(fsremote_device_sync_tests EXCLUDE_FROM_ALL
         tests/device_list_sync_tests.cpp
         src/system/DeviceListSyncModel.cpp
         src/system/DeviceListSyncModel.h
@@ -216,14 +260,85 @@ if(FSREMOTE_BUILD_DEVICE_SYNC_TESTS)
         target_compile_options(fsremote_device_sync_tests PRIVATE /utf-8)
     endif()
     add_test(NAME fsremote_device_sync_tests COMMAND fsremote_device_sync_tests)
+
+    # =====wjy====
+    add_executable(fsremote_device_catalog_tests EXCLUDE_FROM_ALL
+        tests/device_catalog_tests.cpp
+        src/system/DeviceCatalog.cpp
+        src/system/DeviceCatalog.h
+        src/system/DeviceCatalogRepository.cpp
+        src/system/DeviceCatalogRepository.h
+        src/system/DeviceListSyncModel.cpp
+        src/system/DeviceListSyncModel.h
+    ) # wjy: 目录测试只依赖 Qt Core/Network 和纯快照逻辑，不启动主窗口、真实共享目录或远控会话。
+    target_include_directories(fsremote_device_catalog_tests PRIVATE src)
+    target_link_libraries(fsremote_device_catalog_tests PRIVATE Qt6::Core Qt6::Network)
+    if(MSVC)
+        target_compile_options(fsremote_device_catalog_tests PRIVATE /utf-8) # wjy: 新目录类型、测试名称和所有权注释包含中文，MSVC 必须统一按 UTF-8 编译。
+    endif()
+    add_test(NAME fsremote_device_catalog_tests COMMAND fsremote_device_catalog_tests)
+
+    # =====wjy====
+    add_executable(fsremote_device_action_target_tests EXCLUDE_FROM_ALL
+        tests/device_action_target_tests.cpp
+        src/system/DeviceActionPolicy.cpp
+        src/system/DeviceActionPolicy.h
+        src/system/DeviceStatusRefreshResult.h
+        src/system/DeviceActionTargetResolver.cpp
+        src/system/DeviceActionTargetResolver.h
+        src/system/DeviceCatalog.cpp
+        src/system/DeviceCatalog.h
+        src/system/DeviceListSyncModel.cpp
+        src/system/DeviceListSyncModel.h
+    ) # wjy: 目标解析测试只依赖纯目录和快照逻辑，不启动远控窗口或真实网络服务。
+    target_include_directories(fsremote_device_action_target_tests PRIVATE src)
+    target_link_libraries(fsremote_device_action_target_tests PRIVATE Qt6::Core Qt6::Network)
+    if(MSVC)
+        target_compile_options(fsremote_device_action_target_tests PRIVATE /utf-8) # wjy: 测试中的中文注释和设备名称统一使用 UTF-8 编译。
+    endif()
+    add_test(NAME fsremote_device_action_target_tests COMMAND fsremote_device_action_target_tests)
+    add_executable(fsremote_script_ui_state_store_tests EXCLUDE_FROM_ALL
+        tests/script_ui_state_store_tests.cpp
+        src/ui/ScriptUiStateStore.cpp
+        src/ui/ScriptUiStateStore.h
+    ) # wjy: 纯状态测试验证设备隔离、请求取消和删除清理，不启动 SSH、远控窗口或真实网络。
+    target_include_directories(fsremote_script_ui_state_store_tests PRIVATE src)
+    target_link_libraries(fsremote_script_ui_state_store_tests PRIVATE Qt6::Core)
+    if(MSVC)
+        target_compile_options(fsremote_script_ui_state_store_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME fsremote_script_ui_state_store_tests COMMAND fsremote_script_ui_state_store_tests)
+    add_executable(fsremote_script_panel_visibility_tests EXCLUDE_FROM_ALL
+        tests/script_panel_visibility_tests.cpp
+        src/ui/ScriptPanelVisibility.cpp
+        src/ui/ScriptPanelVisibility.h
+    ) # wjy: 纯页面可见性测试只验证脚本树、输出和编辑器的互斥规则，不启动 Qt 窗口或远端会话。
+    target_include_directories(fsremote_script_panel_visibility_tests PRIVATE src)
+    if(MSVC)
+        target_compile_options(fsremote_script_panel_visibility_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME fsremote_script_panel_visibility_tests COMMAND fsremote_script_panel_visibility_tests)
+    add_executable(fsremote_remote_window_registry_tests EXCLUDE_FROM_ALL
+        tests/remote_window_registry_tests.cpp
+        src/ui/RemoteWindowRegistry.cpp
+        src/ui/RemoteWindowRegistry.h
+    ) # wjy: 使用普通 QObject 验证窗口身份、激活顺序、平铺状态、恢复几何和退出去重，不启动 Viewer 或网络连接。
+    target_include_directories(fsremote_remote_window_registry_tests PRIVATE src)
+    target_link_libraries(fsremote_remote_window_registry_tests PRIVATE Qt6::Core)
+    if(MSVC)
+        target_compile_options(fsremote_remote_window_registry_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME fsremote_remote_window_registry_tests COMMAND fsremote_remote_window_registry_tests)
+    # ===end====
+    # ===end====
 endif()
 # ===end====
 
 # =====wjy====
 option(FSREMOTE_BUILD_UPDATE_TESTS "Build reliable updater behavior tests" ON)
-if(FSREMOTE_BUILD_UPDATE_TESTS)
+if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_UPDATE_TESTS) # wjy: 更新服务测试只在显式测试配置中创建，更新器生产目标继续正常构建。
     enable_testing()
-    add_executable(fsremote_update_service_tests
+    add_executable(fsremote_update_service_tests EXCLUDE_FROM_ALL # wjy: 更新测试保留单独构建能力，但不加入默认 all。
         tests/update_service_tests.cpp
         src/system/UpdateService.cpp
         src/system/UpdateService.h
@@ -249,6 +364,10 @@ qt_add_executable(FSRemote WIN32
     src/ui/MainWindow.h
     src/ui/RemoteControllerOverlay.cpp
     src/ui/RemoteControllerOverlay.h
+    # =====wjy====
+    src/ui/DeviceSearchPanel.cpp
+    src/ui/DeviceSearchPanel.h
+    # ===end====
     src/ui/DeviceGrid.cpp
     src/ui/DeviceGrid.h
     src/ui/RemoteDesktopWindow.cpp
@@ -283,12 +402,42 @@ qt_add_executable(FSRemote WIN32
     src/system/ParsecVddInstaller.h
     src/system/DeviceCommandService.cpp
     src/system/DeviceCommandService.h
+    # =====wjy====
+        src/system/DeviceCatalog.cpp
+        src/system/DeviceCatalog.h
+        src/system/DeviceCatalogRepository.cpp
+        src/system/DeviceCatalogRepository.h
+        src/system/DeviceActionTargetResolver.cpp
+        src/system/DeviceActionTargetResolver.h
+        src/system/DeviceActionPolicy.cpp
+    src/system/DeviceActionPolicy.h
+    # ===end====
+    src/ui/RemoteWindowCoordinator.cpp
+    src/ui/RemoteWindowCoordinator.h
+    src/ui/RemoteWindowRegistry.cpp
+    src/ui/RemoteWindowRegistry.h
+    src/ui/SettingsLayoutSnapshot.cpp
+    src/ui/SettingsLayoutSnapshot.h
+    src/ui/RemoteConnectionState.cpp
+    src/ui/RemoteConnectionState.h
+    src/ui/RemoteClipboardCodec.cpp
+    src/ui/RemoteClipboardCodec.h
+    src/ui/ScriptUiStateStore.cpp
+    src/ui/ScriptUiStateStore.h
+    src/ui/ScriptPanelController.h
+    src/ui/ScriptPanelController.cpp
+    src/ui/ScriptPanelVisibility.cpp
+    src/ui/ScriptPanelVisibility.h
     src/system/DeviceListSyncModel.cpp
     src/system/DeviceListSyncModel.h
     src/system/DeviceListSyncService.cpp
     src/system/DeviceListSyncService.h
     src/system/DeviceInfoService.cpp
     src/system/DeviceInfoService.h
+    # =====wjy====
+    src/system/LocalSystemInfoService.cpp
+    src/system/LocalSystemInfoService.h
+    # ===end====
     src/system/DeviceStatusService.cpp
     src/system/DeviceStatusService.h
     # =====wjy====
@@ -311,7 +460,7 @@ qt_add_executable(FSRemote WIN32
 target_include_directories(FSRemote PRIVATE src include third_party/parsec_vdd)
 target_link_libraries(FSRemote PRIVATE Qt6::Widgets Qt6::Svg Qt6::Network)
 if(WIN32)
-    target_link_libraries(FSRemote PRIVATE wbemuuid ole32 oleaut32 iphlpapi ws2_32 advapi32 shell32 setupapi cfgmgr32 d3d11 dxgi psapi user32) # wjy: 壁纸服务调用 SystemParametersInfoW，显式链接其 User32 实现。
+    target_link_libraries(FSRemote PRIVATE wbemuuid ole32 oleaut32 iphlpapi ws2_32 advapi32 shell32 setupapi cfgmgr32 d3d11 dxgi psapi user32 pdh) # wjy: 本机页 GPU 环形占用通过 Windows PDH 性能计数器只读采样。
 endif()
 
 if(MSVC)
@@ -395,9 +544,9 @@ endif()
 
 # =====wjy====
 option(FSREMOTE_BUILD_SESSION_IDENTITY_TESTS "Build real OpenSSH session identity tests" ON)
-if(FSREMOTE_BUILD_SESSION_IDENTITY_TESTS)
+if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_SESSION_IDENTITY_TESTS) # wjy: OpenSSH 身份测试默认不创建，避免普通构建复制额外测试运行库。
     enable_testing()
-    add_executable(fsremote_session_identity_tests
+    add_executable(fsremote_session_identity_tests EXCLUDE_FROM_ALL # wjy: 仅显式构建该目标时生成隔离测试目录和 OpenSSH 工具副本。
         tests/session_identity_tests.cpp
         src/system/PortableOpenSshManager.cpp
         src/system/PortableOpenSshManager.h
