@@ -10,12 +10,15 @@
 #include "system/PowerManager.h"
 #include "system/PortableOpenSshManager.h"
 #include "system/StartupManager.h"
+#include "system/SharedStorageAvailabilityService.h"
+#include "system/StartupPerformanceLog.h"
 #include "system/UpdateService.h"
 #include "system/WjyDiagnosticLog.h"
 
 #include <QApplication>
 #include <QCoreApplication>
 #include <QCryptographicHash>
+#include <QElapsedTimer>
 #include <QFont>
 #include <QLocalServer>
 #include <QLocalSocket>
@@ -39,6 +42,7 @@ namespace {
 void writeStartupLog(const QString& message)
 {
     platform::writeWjyDiagnosticLog(message); // wjy: Keep startup diagnostics behind one helper so logging can be changed centrally.
+    platform::StartupPerformanceLog::checkpoint(message); // wjy: 启动观察窗口内额外记录本步骤和累计耗时，结束后自动停止写盘。
 }
 
 // =====wjy====
@@ -143,8 +147,11 @@ platform::DeviceRealtimeLocalState currentRealtimeLocalState(FsRemoteStreamHandl
 
 int main(int argc, char* argv[])
 {
+    QElapsedTimer applicationCreationTimer;
+    applicationCreationTimer.start(); // wjy: 性能日志依赖 QApplication 获取可执行目录，因此用独立计时器补记 QApplication 构造耗时。
     QApplication app(argc, argv);
-    writeStartupLog(QStringLiteral("[wjy-main] app created"));
+    writeStartupLog(QStringLiteral("[wjy-main] app created qapplication_ms=%1")
+        .arg(applicationCreationTimer.elapsed())); // wjy: 第一条日志明确包含 Qt 平台插件和 QApplication 初始化耗时。
 
     QApplication::setApplicationName(QStringLiteral("FSRemote"));
     QApplication::setOrganizationName(QStringLiteral("FSRemote"));
@@ -304,8 +311,7 @@ int main(int argc, char* argv[])
 
     // wjy: 启动先轻量检查共享目录更新，再决定是否直接进托盘。
     // =====wjy====
-    platform::UpdateService::instance().checkNow(); // wjy: 启动时静默检查一次，只控制标题栏更新按钮是否出现。
-    platform::UpdateService::instance().startPeriodicCheck(); // wjy: 自动检查固定启用，不再受已移除的设置开关影响，也不会自动安装。
+    platform::UpdateService::instance().startPeriodicCheck(); // wjy: 启动时先异步探测 192.168.1.100:445，成功后才读取版本文件；离线时不阻塞主窗口。
     // ===end====
 
     const QStringList args = QCoreApplication::arguments();
@@ -328,9 +334,15 @@ int main(int argc, char* argv[])
     }
     // ===end====
 
+    writeStartupLog(QStringLiteral("[wjy-main] before app.exec"));
+    QTimer::singleShot(3000, &app, [] {
+        platform::StartupPerformanceLog::finish(QStringLiteral("[wjy-main] startup observation window complete")); // wjy: 覆盖首帧、500ms 延迟本机信息和 1.2 秒网盘探测，三秒后关闭计时写盘。
+    });
     const int result = app.exec();
     writeStartupLog(QStringLiteral("[wjy-main] app.exec returned"));
+    platform::StartupPerformanceLog::finish(QStringLiteral("[wjy-main] startup observation ended by application exit")); // wjy: 三秒内提前退出时也明确封口并关闭日志文件。
     platform::UpdateService::instance().stopPeriodicCheck();
+    platform::SharedStorageAvailabilityService::instance().stop(); // wjy: 事件循环结束后中止尚未完成的 SMB 端口探测，不留下晚到网络回调。
     singleInstanceServer.close();
     QLocalServer::removeServer(QString::fromLatin1(kSingleInstanceKey));
 

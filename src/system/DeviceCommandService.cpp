@@ -16,7 +16,10 @@
 #include <QTimer>
 #include <QUrl>
 
+#include <functional>
 #include <string>
+#include <thread>
+#include <utility>
 
 #if defined(Q_OS_WIN)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -202,9 +205,10 @@ void schedulePowerAction(DeviceControlAction action)
 
 class CommandConnection final : public QObject {
 public:
-    CommandConnection(QTcpSocket* socket, QObject* parent = nullptr)
+    CommandConnection(QTcpSocket* socket, std::function<void()> remoteUpdateStarter, QObject* parent = nullptr)
         : QObject(parent)
         , socket_(socket)
+        , remoteUpdateStarter_(std::move(remoteUpdateStarter)) // wjy: 连接对象只负责协议应答，耗时更新准备交给命令服务器统一拥有的可汇合线程。
     {
         socket_->setParent(this);
         connect(socket_, &QTcpSocket::readyRead, this, &CommandConnection::onReadyRead);
@@ -283,17 +287,12 @@ private:
             g_remoteUpdateScheduled = true;
             g_remoteUpdateFailure.clear(); // wjy: 新请求开始时清除上一轮失败，避免状态查询读到过期错误。
             replyAndClose(QByteArrayLiteral("accepted\n")); // wjy: 先把受理结果发回控制端，再开始可能耗时的大文件暂存，避免 1.5 秒命令超时。
-            QTimer::singleShot(150, [] {
-                QString errorMessage;
-                if (!UpdateService::instance().applyRemoteUpdate(&errorMessage)) {
-                    g_remoteUpdateScheduled = false;
-                    g_remoteUpdateFailure = errorMessage.trimmed().isEmpty()
-                        ? QString::fromUtf8("目标设备准备更新失败。")
-                        : errorMessage.trimmed(); // wjy: 主进程未退出时保留失败原因，控制端下一轮查询即可结束等待。
-                    writeCommandServerLog(QStringLiteral("[wjy-command] remote update prepare failed: %1")
-                        .arg(errorMessage.trimmed())); // wjy: 准备失败时保留当前进程并允许再次请求，原因写入目标端统一诊断日志。
-                }
-            });
+            if (remoteUpdateStarter_) {
+                remoteUpdateStarter_(); // wjy: 启动动作只创建专用后台线程并立即返回，目标端主界面和命令端口不会等待网盘复制。
+            } else {
+                g_remoteUpdateScheduled = false;
+                g_remoteUpdateFailure = QString::fromUtf8("目标设备更新后台任务不可用。"); // wjy: 极端初始化异常时恢复可重试状态，不能永久停留在 preparing。
+            }
             return;
         }
 // ===end====
@@ -354,6 +353,7 @@ private:
 
     QTcpSocket* socket_ = nullptr;
     QByteArray buffer_;
+    std::function<void()> remoteUpdateStarter_; // wjy: 使用窄回调隔离连接协议与线程生命周期，CommandConnection 不直接管理共享文件任务。
 };
 
 } // namespace
@@ -375,7 +375,9 @@ public:
         connect(server, &QTcpServer::newConnection, this, [this, server] {
             while (server->hasPendingConnections()) {
                 if (QTcpSocket* socket = server->nextPendingConnection()) {
-                    new CommandConnection(socket, this);
+                    new CommandConnection(socket, [this] {
+                        startRemoteUpdatePreparation(); // wjy: 所有远程更新请求汇入同一个服务器线程所有者，失败、取消和退出都能确定性收口。
+                    }, this);
                 }
             }
         });
@@ -393,6 +395,7 @@ public:
     {
         // =====wjy====
         writeCommandServerLog(QStringLiteral("[wjy-command] Impl::stop begin server=%1").arg(server_ ? 1 : 0)); // wjy: 记录命令服务内部 stop 开始，判断关闭异常是否发生在 QTcpServer 清理阶段。
+        cancelAndJoinRemoteUpdatePreparation(); // wjy: 关闭监听端口前先取消可能阻塞在 SMB 的更新线程，目标程序退出不会被后台网盘访问长期占用。
         // ===end====
         if (!server_) {
             // =====wjy====
@@ -421,7 +424,65 @@ public:
     }
 
 private:
+    // =====wjy====
+    void startRemoteUpdatePreparation()
+    {
+        if (remoteUpdateThread_.joinable()) {
+            return; // wjy: g_remoteUpdateScheduled 已阻止正常重复请求，这里再次防御旧线程尚未完成回收的竞态。
+        }
+
+        try {
+            remoteUpdateThread_ = std::thread([this] {
+                QString errorMessage;
+                const bool prepared = UpdateService::instance().applyRemoteUpdate(&errorMessage); // wjy: 目标端版本读取、复制和校验全部在命令服务器专用线程执行。
+                QMetaObject::invokeMethod(this, [this, prepared, errorMessage] {
+                    finishRemoteUpdatePreparation(prepared, errorMessage); // wjy: 全局协议状态只回到命令服务器所属主线程更新，避免跨线程读写 QString。
+                }, Qt::QueuedConnection);
+            });
+        } catch (...) {
+            g_remoteUpdateScheduled = false;
+            g_remoteUpdateFailure = QString::fromUtf8("无法创建目标设备更新后台线程。");
+            writeCommandServerLog(QStringLiteral("[wjy-command] failed to create remote update worker")); // wjy: 线程资源不足时保留主进程并允许控制端读取明确失败状态。
+        }
+    }
+
+    void finishRemoteUpdatePreparation(bool prepared, const QString& errorMessage)
+    {
+        if (remoteUpdateThread_.joinable()) {
+            remoteUpdateThread_.join(); // wjy: 工作函数已经投递完成回调，此处仅回收系统线程句柄，不再等待网络。
+        }
+        if (prepared) {
+            return; // wjy: 成功路径由 UpdateService 的 updateReadyToQuit 信号接管，保持 preparing 直到程序退出并重启。
+        }
+
+        g_remoteUpdateScheduled = false;
+        g_remoteUpdateFailure = errorMessage.trimmed().isEmpty()
+            ? QString::fromUtf8("目标设备准备更新失败。")
+            : errorMessage.trimmed(); // wjy: 失败状态只在主线程发布，后续 update_status 查询可以安全读取完整字符串。
+        writeCommandServerLog(QStringLiteral("[wjy-command] remote update prepare failed: %1")
+            .arg(g_remoteUpdateFailure));
+    }
+
+    void cancelAndJoinRemoteUpdatePreparation()
+    {
+        if (!remoteUpdateThread_.joinable()) {
+            return;
+        }
+#if defined(Q_OS_WIN)
+        if (!CancelSynchronousIo(remoteUpdateThread_.native_handle())) {
+            const DWORD errorCode = GetLastError();
+            if (errorCode != ERROR_NOT_FOUND) {
+                writeCommandServerLog(QStringLiteral("[wjy-command] update worker CancelSynchronousIo failed error=%1")
+                    .arg(errorCode)); // wjy: ERROR_NOT_FOUND 只表示线程当前没有可取消 I/O，其它错误保留到统一诊断日志。
+            }
+        }
+#endif
+        remoteUpdateThread_.join(); // wjy: 服务对象析构前确定性汇合，工作线程不会在 QObject 和 Qt 运行库销毁后继续回调。
+    }
+    // ===end====
+
     QPointer<QTcpServer> server_;
+    std::thread remoteUpdateThread_; // wjy: 目标端远程更新使用唯一可取消线程，弱网下不会阻塞 UI、命令服务或堆积任务。
 };
 
 DeviceCommandServer::~DeviceCommandServer()

@@ -2086,6 +2086,63 @@ void RemoteDesktopWindow::clearSnapPreviews()
     m_pendingSnapGeometries.clear(); // wjy: 拖离吸附范围时同时撤销整组待提交数据，避免释放后应用过期布局。
 }
 
+// =====wjy====
+bool RemoteDesktopWindow::restoreSavedGeometryForDrag(
+    const QPoint& cursorGlobal,
+    const QPoint& pressedPosition)
+{
+    const bool temporaryWindowLayout = isMaximized() || isFullScreen() || !m_rememberGeometry;
+    if (!temporaryWindowLayout) {
+        return false; // wjy: 普通窗口继续沿用当前几何，不重复读取 JSON 或改变用户正在使用的尺寸。
+    }
+
+    QScreen* cursorScreen = QGuiApplication::screenAt(cursorGlobal);
+    if (!cursorScreen) {
+        cursorScreen = screen();
+    }
+    if (!cursorScreen) {
+        cursorScreen = QGuiApplication::primaryScreen(); // wjy: 多显示器边界无法定位时回退当前窗口或主屏，保证恢复尺寸始终有可用范围。
+    }
+    const QRect availableGeometry = cursorScreen
+        ? cursorScreen->availableGeometry()
+        : QRect(0, 0, 1280, 720);
+
+    const QRect savedGeometry = normalizedSavedWindowGeometry(
+        platform::AppSettings::remoteDesktopWindowGeometry(m_hostIp),
+        minimumSize());
+    QSize restoredSize = savedGeometry.isValid()
+        ? savedGeometry.size()
+        : QSize(1280, 720); // wjy: 已保存设备严格使用 JSON 宽高；首次设备没有记录时使用和构造阶段一致的安全默认尺寸。
+    restoredSize.setWidth(qMin(
+        qMax(minimumWidth(), restoredSize.width()),
+        qMax(minimumWidth(), availableGeometry.width())));
+    restoredSize.setHeight(qMin(
+        qMax(minimumHeight(), restoredSize.height()),
+        qMax(minimumHeight(), availableGeometry.height()))); // wjy: JSON 尺寸超过当前屏幕时只在本次恢复中收敛，不改写原配置值。
+
+    const qreal horizontalRatio = width() > 0
+        ? qBound<qreal>(0.0, pressedPosition.x() / qreal(width()), 1.0)
+        : 0.5;
+    const int grabX = qBound(0, qRound(restoredSize.width() * horizontalRatio), qMax(0, restoredSize.width() - 1));
+    const int grabY = qBound(0, pressedPosition.y(), qMax(0, qMin(27, restoredSize.height() - 1))); // wjy: 横向按原抓取比例定位，纵向保持在恢复后的标题栏内，窗口不会从鼠标下突然跳开。
+
+    const int maximumLeft = qMax(availableGeometry.left(), availableGeometry.right() - restoredSize.width() + 1);
+    const int maximumTop = qMax(availableGeometry.top(), availableGeometry.bottom() - restoredSize.height() + 1);
+    const QPoint restoredTopLeft(
+        qBound(availableGeometry.left(), cursorGlobal.x() - grabX, maximumLeft),
+        qBound(availableGeometry.top(), cursorGlobal.y() - grabY, maximumTop));
+
+    if (isMaximized() || isFullScreen()) {
+        showNormal(); // wjy: 先退出 Qt 最大化/全屏状态，否则后续 setGeometry 仍可能被窗口管理器的全屏矩形覆盖。
+    }
+    setGeometry(QRect(restoredTopLeft, restoredSize)); // wjy: 位置跟随鼠标重新计算，但宽高只取当前设备 JSON 中保存的普通窗口尺寸。
+    m_rememberGeometry = true; // wjy: 用户主动把平铺窗口拖回普通状态后，释放鼠标即可保存新的普通位置和仍然相同的 JSON 尺寸。
+    updateWindowMask();
+    updateTexturePresenterGeometry();
+    return true;
+}
+// ===end====
+
 QRect RemoteDesktopWindow::remoteUpdateButtonRect() const
 {
     const QRect qualityRect = qualityButtonRect();
@@ -3745,6 +3802,10 @@ void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
             m_resizingWindow = true;
             m_resizeStartGlobal = event->globalPosition().toPoint();
             m_resizeStartGeometry = frameGeometry();
+            clearMask(); // wjy: 交互缩放开始时一次性移除圆角区域，拖拽期间使用完整矩形窗口避免每个像素尺寸都重建系统Region。
+            if (m_texturePresenter) {
+                m_texturePresenter->setInteractiveResize(true); // wjy: 冻结现有SwapChain和最后画面，拖拽期间不反复ResizeBuffers闪黑。
+            }
             event->accept();
             return;
         }
@@ -3752,9 +3813,13 @@ void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
         if (isTitleBarBlankArea(event->pos())) { // wjy: 标题栏空白区域同时支持拖动和双击最大化，命中规则集中到同一个函数里维护。
             // =====wjy====
             clearSnapPreviews(); // wjy: 每次开始拖拽都从无候选状态重新判断，防止提交旧的整组吸附位置。
+            const QPoint cursorGlobal = event->globalPosition().toPoint();
+            m_dragRestorePending = isMaximized() || isFullScreen() || !m_rememberGeometry; // wjy: 只登记临时布局恢复候选，必须发生真实拖动后才改变窗口状态。
+            m_dragPressGlobal = cursorGlobal;
+            m_dragPressPosition = event->pos();
             // ===end====
             m_draggingWindow = true;
-            m_dragOffset = event->globalPosition().toPoint() - frameGeometry().topLeft();
+            m_dragOffset = cursorGlobal - frameGeometry().topLeft();
             event->accept();
             return;
         }
@@ -3784,6 +3849,7 @@ void RemoteDesktopWindow::mouseDoubleClickEvent(QMouseEvent* event)
     emit activated(this);
     if (event->button() == Qt::LeftButton && isTitleBarBlankArea(event->pos())) {
         m_draggingWindow = false; // wjy: 双击时取消前一次按下建立的拖动状态，避免最大化后继续按拖动逻辑移动窗口。
+        m_dragRestorePending = false; // wjy: 双击只执行最大化切换，不消费第一次按下留下的平铺/全屏恢复候选。
         // =====wjy====
         clearSnapPreviews(); // wjy: 双击最大化不会沿用第一次按下时产生的整组吸附虚影。
         // ===end====
@@ -3862,6 +3928,18 @@ void RemoteDesktopWindow::mouseMoveEvent(QMouseEvent* event)
 
     if (m_draggingWindow && (event->buttons() & Qt::LeftButton)) {
         const QPoint cursorGlobal = event->globalPosition().toPoint();
+        // =====wjy====
+        if (m_dragRestorePending) {
+            const int dragDistance = (cursorGlobal - m_dragPressGlobal).manhattanLength();
+            if (dragDistance < QApplication::startDragDistance()) {
+                event->accept();
+                return; // wjy: 移动量未超过系统拖拽阈值时保持平铺/最大化，消除按下抖动造成的误恢复。
+            }
+            restoreSavedGeometryForDrag(cursorGlobal, m_dragPressPosition); // wjy: 确认真正拖动后，使用按下位置比例恢复当前设备 JSON 尺寸。
+            m_dragRestorePending = false;
+            m_dragOffset = cursorGlobal - frameGeometry().topLeft(); // wjy: 恢复后的第一帧重新取偏移，窗口继续贴着当前鼠标位置平滑移动。
+        }
+        // ===end====
         const QPoint proposedTopLeft = cursorGlobal - m_dragOffset;
         const QRect proposedGeometry(proposedTopLeft, frameGeometry().size());
         const SnapGeometryResult snapResult = snappedDraggedWindowGeometry(
@@ -3910,9 +3988,17 @@ void RemoteDesktopWindow::mouseReleaseEvent(QMouseEvent* event)
         const QHash<RemoteDesktopWindow*, QRect> snapGeometries = m_pendingSnapGeometries; // wjy: 先复制释放瞬间的完整布局，再统一隐藏虚影和清空候选。
         clearSnapPreviews();
         m_draggingWindow = false;
+        m_dragRestorePending = false; // wjy: 无论本次是否达到拖拽阈值，松开左键都结束临时布局恢复候选。
         m_resizingWindow = false;
         m_resizeEdges = ResizeNone;
         if (wasDraggingWindow || wasResizingWindow) {
+            if (wasResizingWindow) {
+                if (m_texturePresenter) {
+                    m_texturePresenter->setInteractiveResize(false); // wjy: 只标记最终尺寸待处理，下一张纹理帧会ResizeBuffers后立即Blt和Present。
+                }
+                updateWindowMask(); // wjy: 鼠标释放后按最终几何恢复一次圆角Mask，拖拽期间不重复修改窗口区域。
+                updateTexturePresenterGeometry();
+            }
             if (wasDraggingWindow && !snapGeometries.isEmpty()) {
                 const QList<QWidget*> topLevelWindows = QApplication::topLevelWidgets();
                 for (auto it = snapGeometries.cbegin(); it != snapGeometries.cend(); ++it) {
@@ -4091,7 +4177,9 @@ void RemoteDesktopWindow::focusOutEvent(QFocusEvent* event)
 
 void RemoteDesktopWindow::resizeEvent(QResizeEvent* event)
 {
-    updateWindowMask();
+    if (!m_resizingWindow) {
+        updateWindowMask(); // wjy: 最大化、还原等普通变化立即更新圆角；手动拖拽已在开始时清除Mask并在释放时统一恢复。
+    }
     updateTexturePresenterGeometry();
     QWidget::resizeEvent(event);
 }

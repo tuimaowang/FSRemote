@@ -37,6 +37,7 @@ class QComboBox;
 class QKeyEvent;
 class QJsonObject;
 class QLineEdit;
+class QMenu;
 class QMouseEvent;
 class QPaintEvent;
 class QPushButton;
@@ -80,7 +81,7 @@ protected:
     void keyPressEvent(QKeyEvent* event) override;
     bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override;
     void resizeEvent(QResizeEvent* event) override;
-    void showEvent(QShowEvent* event) override; // wjy: 从托盘或最小化恢复时确保顶部自动隐藏窗口完整滑出。
+    void showEvent(QShowEvent* event) override; // wjy: 从托盘或最小化恢复时确保任一屏幕边缘自动隐藏窗口完整滑出。
     void leaveEvent(QEvent* event) override;
 
 private:
@@ -96,6 +97,25 @@ private:
         Config, // wjy: 配置页固定排在脚本右侧，保持状态定义、绘制顺序和点击顺序一致。
         Search, // wjy: 查找与脚本、配置共用设备详情页签区域，不再使用独立弹窗。
     };
+
+    // =====wjy====
+    struct ScriptLaunchPreflightResult {
+        bool entryAvailable = false; // wjy: 后台已经确认脚本目录存在受支持入口，主线程不再对 UNC 路径调用 exists。
+        QString entryScriptPath; // wjy: 保存后台解析出的实际入口文件，后续运行命令和编辑器继续使用同一文件。
+        platform::DeviceStatusInfo remoteStatus; // wjy: 一次状态查询同时携带终端用户和权威脚本运行态，避免重复连接 49101。
+        bool authorizationSucceeded = false; // wjy: 公钥已成功登记到目标端后才允许进入原脚本启动状态机。
+        QString errorMessage; // wjy: 后台脚本入口、状态或授权失败的详细原因只在主线程显示。
+    };
+    // ===end====
+
+    // =====wjy====
+    enum class ScreenEdgeDock {
+        None, // wjy: 主窗口当前没有停靠，不启用自动隐藏监视和位置动画。
+        Top, // wjy: 顶部停靠时沿 y 轴向屏幕外收起，保持现有顶部行为不变。
+        Left, // wjy: 左侧停靠时沿 x 轴向左收起，仅保留窄触发条。
+        Right, // wjy: 右侧停靠时沿 x 轴向右收起，仅保留窄触发条。
+    };
+    // ===end====
 
     // =====wjy====
     void setupDeviceSearchPanel(); // wjy: 创建一次嵌入式查找面板，后续页签切换只更新快照、几何和显隐。
@@ -115,11 +135,12 @@ private:
     void finishDetailPanelCollapseTransition(); // wjy: 动画结束后统一固定最终宽度约束、控件显隐和本机采样状态。
     // ===end====
     // =====wjy====
-    void ensureTopEdgeAutoHideControllers(); // wjy: 首次顶部停靠时延迟创建位置动画、全局鼠标监视和收起延迟定时器。
-    void updateTopEdgeAutoHideAfterWindowDrag(const QPoint& releaseGlobalPosition); // wjy: 拖窗松开后按鼠标所在屏幕判断是否吸附顶部。
-    void setTopEdgeAutoHidden(bool hidden); // wjy: 在当前屏幕顶部与仅露出触发条的位置之间平滑移动主窗口。
-    void monitorTopEdgeAutoHide(); // wjy: 窗口缩入屏幕后仍检查全局鼠标，进入顶部触发条即可滑下。
-    void cancelTopEdgeAutoHide(); // wjy: 用户重新拖窗、缩放或退出时停止所有自动位置修改。
+    void ensureScreenEdgeAutoHideControllers(); // wjy: 首次停靠顶部、左侧或右侧时统一创建位置动画、全局鼠标监视和收起延迟定时器。
+    void updateScreenEdgeAutoHideAfterWindowDrag(const QPoint& releaseGlobalPosition); // wjy: 拖窗松开后按目标屏幕工作区判断顶部、左侧或右侧停靠方向。
+    QPoint screenEdgeAutoHideTargetPosition(bool hidden) const; // wjy: 根据当前停靠方向计算展开位置或仅露出触发条的隐藏位置。
+    void setScreenEdgeAutoHidden(bool hidden); // wjy: 使用同一段位置动画沿当前停靠方向平滑收起或展开主窗口。
+    void monitorScreenEdgeAutoHide(); // wjy: 窗口缩入任一边缘后继续检查全局鼠标，进入对应触发条即可滑出。
+    void cancelScreenEdgeAutoHide(); // wjy: 用户重新拖窗、缩放或退出时停止所有边缘自动位置修改。
     // ===end====
     void beginWindowResize(const QPoint& position, const QPoint& globalPosition);
     void updateWindowResize(const QPoint& globalPosition);
@@ -146,6 +167,7 @@ private:
     // ===end====
     void openCurrentDeviceTerminal();
     bool openTerminalForDeviceIndex(int deviceIndex, bool showMessages);
+    bool scheduleOpenTerminals(const QVector<int>& deviceIndexes, bool showMessages); // wjy: 终端用户名查询、密钥授权和进程启动统一在一个后台批次完成。
     void executeCurrentDeviceScriptFolder(const QString& scriptFolderPath); // wjy: Copy one shared script folder to remote work directory and run its entry script.
     bool executeDeviceScriptFolder(int deviceIndex, const QString& scriptFolderPath, bool showMessages); // wjy: Run one shared script folder on a specified device without forcing the current selection.
     void executeDeviceGroupScriptFolder(int groupIndex, const QString& scriptFolderPath); // wjy: Run one selected script folder for every device in a group.
@@ -153,6 +175,11 @@ private:
     void openRemoteDesktopWindowForDevice(int deviceIndex); // wjy: 首次窗口的位置由 RemoteDesktopWindow 统一按当前屏幕居中，不再由设备列表附加偏移。
     void launchSelectedRemoteDesktopWindows();
     void openDeviceGroupTiledWindows(int groupIndex); // wjy: Open all devices in one group and tile remote windows.
+    void authorizeRemoteControlDevices(
+        const QVector<QString>& deviceIds,
+        bool showMessages,
+        std::function<void(const QVector<QString>&)> completion); // wjy: 普通、多选和平铺远控共用一个后台公钥授权批次。
+    void openAuthorizedTiledWindows(const QVector<QString>& deviceIds); // wjy: 后台授权完成后仅在主线程创建、注册并排列平铺窗口。
     QVector<QPointer<RemoteDesktopWindow>> openedRemoteWindows() const;
     void setRemoteUpdateAvailability(const QString& hostIp, bool available); // wjy: 同步缓存并刷新同 IP 的普通/平铺远控窗口更新按钮。
     void refreshOpenedRemoteUpdateAvailability(); // wjy: 仅轮询当前已打开远控窗口的目标版本，不依赖设备列表自动刷新开关。
@@ -169,6 +196,8 @@ private:
     bool restartDeviceForIndex(int deviceIndex, bool showMessages);
     // =====wjy====
     bool updateDeviceForIndex(int deviceIndex, bool showMessages); // wjy: 向指定在线设备发送远程更新请求，并区分已受理、已是最新版和失败。
+    bool scheduleDevicePowerActions(const QVector<int>& deviceIndexes, bool restart, bool showMessages); // wjy: 单个和批量关机/重启统一进入一个后台批次，弱网等待不再停住 UI。
+    bool scheduleDeviceUpdateRequests(const QVector<int>& deviceIndexes, bool showMessages); // wjy: 单个和批量更新请求统一后台发送，并在主线程归并窗口遮罩和提示。
     // ===end====
     void renameCurrentDevice();
     void deleteCurrentDevice();
@@ -194,10 +223,13 @@ private:
     void updateSettingsControls();
     // =====wjy====
     void refreshRollbackVersions(bool forceRefresh = false); // wjy: 后台枚举共享历史版本；普通进入设置可复用短时缓存，发布或失败恢复时允许强制刷新。
+    void startRollbackVersionsRefresh(); // wjy: SMB 连接测试成功后才真正创建历史版本枚举任务。
+    void handleSharedStorageProbeFinished(bool available); // wjy: 一轮异步探测同时承接等待中的壁纸和回撤请求。
     // ===end====
     void applySettingsControlGeometry(QWidget* control, const QRect& geometry, bool visible, bool enabled, bool raiseWhenVisible); // wjy: 统一设置页真实控件的几何、显隐、可用状态和层级，避免每个字段重复维护同一套生命周期逻辑。
     void applyDesktopWallpaperRotationSetting(bool rotateImmediately); // wjy: 根据持久化开关启停分钟定时器，用户开启时可立即触发首轮。
-    void startDesktopWallpaperRotation(bool userInitiated); // wjy: 后台选择并应用下一张共享图片，防止网络访问阻塞设置界面或产生重叠任务。
+    void startDesktopWallpaperRotation(bool userInitiated); // wjy: 先异步探测 SMB，连接成功才进入真实壁纸任务。
+    void performDesktopWallpaperRotation(bool userInitiated); // wjy: 已通过连接门禁后在后台选择并应用下一张共享图片。
     void saveRemoteQualitySettingsFromControls(); // wjy: 收集远控画质页字段、统一归一化持久化并立即通知跟随全局的窗口。
     void registerRemoteQualityWindow(RemoteDesktopWindow* window); // wjy: 普通和平铺窗口共用同一套质量注册、销毁清理和即时重算逻辑。
     void requestRemoteQualityEvaluation(); // wjy: 合并同一事件循环内多次窗口变化，最多排队一个全局质量计算任务。
@@ -223,11 +255,24 @@ private:
     void finishDeviceRename(bool saveText);
     void applyDeviceRename(int deviceIndex, const QString& newName);
     void pruneHiddenDeviceSelections(); // wjy: Remove collapsed hidden devices from multi-selection state.
-    void runBackgroundTask(std::function<void()> task); // wjy: Keep background tasks joinable until DeviceGrid is destroyed.
+    // =====wjy====
+    struct BackgroundThreadEntry {
+        std::thread thread; // wjy: 保留可正常 join 的真实工作线程，禁止 detach 或强制终止。
+        std::shared_ptr<std::atomic_bool> finished; // wjy: 任务入口退出前置位，后续新任务可安全回收已完成线程句柄。
+    };
+    void reapCompletedBackgroundThreads(); // wjy: 每次登记新任务前移除并 join 已结束线程，长期运行不持续积累句柄。
+    void runBackgroundTask(std::function<void()> task); // wjy: 后台任务保持可汇合，并在统一线程入口拦截异常，避免异常越界导致进程终止。
+    void cancelBlockingBackgroundIo(); // wjy: 退出阶段请求中断 DeviceGrid 后台线程正在等待的 Windows 同步文件 I/O，防止不可达网盘拖住析构。
+    // ===end====
     void setupScriptFileEditor();
+    // =====wjy====
     void setupScriptFolderTree();
-    void populateScriptFolderTree();
-    void addScriptFolderTreeChildren(QTreeWidgetItem* parentItem, const QString& folderPath);
+    void requestScriptFolderTreeRefresh(); // wjy: 先异步检测共享服务器，主窗口构造阶段不直接触碰 UNC。
+    void startScriptFolderTreeLoad(); // wjy: 连接成功后才登记后台目录枚举任务。
+    void applyScriptFolderTreeSnapshot(const QJsonObject& snapshot); // wjy: 后台结果回到 UI 线程后一次性创建树节点。
+    void setScriptFolderTreePlaceholder(const QString& text); // wjy: 检测、加载和离线状态都使用无网络访问的本地占位节点。
+    void populateCachedScriptFolderMenu(QMenu* menu) const; // wjy: 右键菜单复用已加载树快照，不再临时同步遍历网盘。
+    // ===end====
     void selectScriptFolderTreeItem(QTreeWidgetItem* item);
     void syncScriptFolderTreeSelection();
     void updateScriptFileEditorControls();
@@ -251,8 +296,6 @@ private:
     void batchUpdateDevices(const QVector<int>& deviceIndexes); // wjy: 多选设备或分组菜单统一复用单设备更新请求逻辑。
     // ===end====
     void batchOpenDeviceTerminals(const QVector<int>& deviceIndexes);
-    bool ensureRemoteControlAuthorization(int deviceIndex, bool showMessages); // wjy: 远控窗口创建前确保当前控制端公钥已登记到目标设备。
-
     // =====wjy====
     platform::DeviceRealtimeStateService* m_realtimeStateService = nullptr; // wjy: 由 main 持有且晚于 MainWindow 销毁，DeviceGrid 只连接和调用，不负责释放。
     RemoteInputBroadcastCoordinator m_remoteInputBroadcastCoordinator; // wjy: 单一协调器覆盖普通和平铺窗口，DeviceGrid 析构前先由窗口注销并完成同步输入释放。
@@ -266,6 +309,11 @@ private:
     // ===end====
     QString m_currentDeviceName;
     ScriptUiStateStore m_scriptUiStateStore; // wjy: 每设备脚本状态由独立仓储唯一持有，DeviceGrid 只投影当前设备页面。
+    // =====wjy====
+    QSet<QString> m_pendingScriptLaunchKeys; // wjy: 按设备稳定 ID 和脚本目录组合去重，预检查期间连续点击不会重复访问网盘或目标端口。
+    QSet<QString> m_pendingScriptBatchValidationPaths; // wjy: 分组或多选脚本先后台验证一次共享入口，同一路径验证期间不重复创建整批任务。
+    QHash<QString, ScriptLaunchPreflightResult> m_scriptLaunchPreflightResults; // wjy: 后台结果暂存到主线程后由原执行函数一次性消费，保持后续脚本状态逻辑不变。
+    // ===end====
     QLineEdit* m_periodicDeviceDiscoveryIntervalEdit = nullptr; // wjy: 周期检查新增设备的秒数输入框，默认 60 秒。
     QLineEdit* m_batchSubnetEdit = nullptr; // wjy: 批量新增网段输入框，支持以空格分隔多个 IPv4 通配网段。
     QPushButton* m_batchAddButton = nullptr; // wjy: 批量新增按钮，扫描期间禁用避免重复启动。
@@ -311,17 +359,23 @@ private:
     QTextEdit* m_scriptFileEdit = nullptr;
     QTextEdit* m_scriptOutputEdit = nullptr; // wjy: 脚本日志正文使用只读文本控件，支持鼠标选择、Ctrl+C和右键复制。
     QPushButton* m_scriptFileSaveButton = nullptr;
-    QTreeWidget* m_scriptFolderTree = nullptr; // wjy: Script Log tab tree used to choose a shared script folder before execution.
+    // =====wjy====
+    QTreeWidget* m_scriptFolderTree = nullptr; // wjy: 只显示后台生成的脚本目录快照，UI 线程不直接访问共享路径。
+    bool m_scriptFolderShareProbePending = false; // wjy: 等待 TCP 445 探测时合并重复刷新请求。
+    bool m_scriptFolderLoadInProgress = false; // wjy: 后台递归枚举未完成时禁止启动第二个共享目录线程。
+    bool m_scriptFolderTreeLoaded = false; // wjy: 成功快照可供脚本页和右键菜单共同复用。
+    quint64 m_scriptFolderLoadRequestId = 0; // wjy: 过滤退出或后续刷新产生的过期目录结果。
+    // ===end====
     QPushButton* m_saveDeviceButton = nullptr;
     QPushButton* m_cancelDeviceButton = nullptr;
     QVector<QPushButton*> m_localInfoCopyButtons;
     // =====wjy====
-    QVariantAnimation* m_topEdgeAutoHideAnimation = nullptr; // wjy: 只改变顶层窗口 y 坐标，保持横向位置和窗口尺寸不变。
-    QTimer* m_topEdgeAutoHideMonitorTimer = nullptr; // wjy: 低频读取全局鼠标位置，使仅剩 4px 的隐藏窗口仍能响应顶部悬停。
-    QTimer* m_topEdgeAutoHideDelayTimer = nullptr; // wjy: 鼠标离开后延迟收起，避免经过标题栏边缘时窗口立即消失。
-    QRect m_topEdgeDockScreenGeometry; // wjy: 保存停靠屏幕的工作区，支持副屏负坐标和不同顶部位置。
-    bool m_topEdgeDocked = false; // wjy: true 表示本次拖窗已明确停靠到某块屏幕顶部。
-    bool m_topEdgeAutoHidden = false; // wjy: 记录位置动画的目标状态，用于滑动中途正确处理鼠标重新进入。
+    QVariantAnimation* m_screenEdgeAutoHideAnimation = nullptr; // wjy: 对完整窗口坐标做插值，顶部改变 y、左右边缘改变 x，窗口尺寸始终不变。
+    QTimer* m_screenEdgeAutoHideMonitorTimer = nullptr; // wjy: 低频读取全局鼠标位置，使仅剩 4px 的任一边缘触发条仍可唤回窗口。
+    QTimer* m_screenEdgeAutoHideDelayTimer = nullptr; // wjy: 鼠标离开后统一延迟收起，菜单、拖放和窗口操作期间保持展开。
+    QRect m_screenEdgeDockScreenGeometry; // wjy: 保存停靠屏幕工作区，兼容副屏负坐标以及任务栏位于顶部或左右侧。
+    ScreenEdgeDock m_screenEdgeDock = ScreenEdgeDock::None; // wjy: 单一枚举同时表达是否停靠和当前方向，避免多个布尔状态组合冲突。
+    bool m_screenEdgeAutoHidden = false; // wjy: 记录位置动画目标状态，滑动中途鼠标反向进入时可从当前位置平滑回转。
     // ===end====
     bool m_draggingWindow = false;
     bool m_resizingWindow = false;
@@ -369,6 +423,8 @@ private:
     bool m_batchAddInProgress = false; // wjy: 标记批量新增扫描是否正在后台执行。
     bool m_wallpaperRotationEnabled = false; // wjy: 新安装默认关闭，避免未经用户选择就修改当前桌面。
     bool m_wallpaperRotationInProgress = false; // wjy: 网络目录访问和缓存写入期间阻止定时器启动重叠任务。
+    bool m_wallpaperShareProbePending = false; // wjy: 壁纸正在等待共享连接测试时不创建工作线程，也不重复发起探测。
+    bool m_wallpaperShareProbeUserInitiated = false; // wjy: 合并等待期间的手动开启请求，失败时只对用户主动操作提示一次。
     int m_periodicDeviceDiscoveryIntervalSeconds = 60; // wjy: 周期新增设备默认每 60 秒扫描一次。
     int m_wallpaperRotationIntervalMinutes = 1; // wjy: 自动壁纸默认每 1 分钟切换一次，设置页允许修改。
     QString m_lastWallpaperSourcePath; // wjy: 只记录最后成功应用的共享源文件，下一轮据此按稳定顺序继续。
@@ -378,6 +434,14 @@ private:
     bool m_updatePreparing = false; // wjy: 防止用户连续点击重复创建多个更新任务和更新器进程。
     QString m_availableUpdateVersion; // wjy: 保存检测到的远端版本，供标题栏更新状态使用。
     bool m_rollbackPreparing = false; // wjy: 回撤载荷暂存期间禁用下拉框和按钮，防止同一目标重复启动多个事务任务。
+    bool m_publishPreparing = false; // wjy: 发布包在后台复制和校验期间禁用发布入口，防止重复发布同一版本或并发清理共享目录。
+    QSet<QString> m_pendingPowerActionIps; // wjy: 保存正在发送关机或重启命令的 IP，同一设备不能在弱网等待期间重复提交电源动作。
+    QSet<QString> m_pendingUpdateRequestIps; // wjy: 保存正在请求远程更新的 IP，批量和单设备入口共享去重状态。
+    QSet<QString> m_pendingTerminalOpenIps; // wjy: 终端预检查期间按 IP 去重，连续点击和批量菜单不会重复授权或打开多个黑窗。
+    QSet<QString> m_authorizedRemoteControlIps; // wjy: 本进程已经成功登记公钥的目标无需每次开窗重复访问 49102，远控连接失败仍由会话层独立判断。
+    QSet<QString> m_pendingRemoteControlAuthorizationIps; // wjy: 一个后台授权批次进行时阻止其它入口重复登记同一设备公钥。
+    bool m_rollbackShareProbePending = false; // wjy: 打开设置时先等待异步 SMB 探测，失败直接显示不可用而不创建枚举线程。
+    QString m_rollbackVersionBeforeProbe; // wjy: 连接测试期间暂存用户原选择，枚举成功后优先恢复同一历史版本。
     bool m_rollbackVersionsRefreshInProgress = false; // wjy: 共享目录扫描在后台运行时阻止设置点击重复创建遍历任务。
     bool m_rollbackVersionsRefreshPending = false; // wjy: 扫描期间收到强制刷新请求时，在当前结果返回后补做一次最新扫描。
     QElapsedTimer m_rollbackVersionsRefreshClock; // wjy: 普通重复进入设置在 30 秒内复用下拉框结果，减少网络目录元数据请求。
@@ -407,8 +471,10 @@ private:
 
     int m_previousDeviceIndex = 0;
     QString m_previousDeviceName;
-    std::mutex m_backgroundThreadsMutex; // wjy: Protects background thread list.
-    std::vector<std::thread> m_backgroundThreads; // wjy: Joined in destructor to avoid late UI callbacks.
+    // =====wjy====
+    std::mutex m_backgroundThreadsMutex; // wjy: 保护后台线程列表，启动任务、退出取消和析构搬移必须互斥。
+    std::vector<BackgroundThreadEntry> m_backgroundThreads; // wjy: 已完成项在运行期渐进回收，剩余活动项退出时取消阻塞 I/O 后正常 join。
+    // ===end====
     bool m_shuttingDown = false; // wjy: No new background tasks after destruction begins.
     QHash<QString, platform::DevicePresenceState> m_deviceStatuses;
     QHash<QString, bool> m_deviceUpdateAvailability; // wjy: 设备状态刷新线程统一维护目标是否需要更新，远控窗口只消费结果。

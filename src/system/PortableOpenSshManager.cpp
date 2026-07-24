@@ -137,6 +137,92 @@ PortableOpenSshManager::~PortableOpenSshManager()
 }
 
 // =====wjy====
+bool PortableOpenSshManager::ensureServerProcessJob(QString* errorMessage)
+{
+#if !defined(_WIN32)
+    Q_UNUSED(errorMessage);
+    return true;
+#else
+    if (m_serverProcessJob) {
+        return true;
+    }
+
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (!job) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("无法创建 SSH 服务进程组，错误码 %1").arg(GetLastError());
+        }
+        return false;
+    }
+
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; // wjy: 正常关闭句柄或 FSRemote 被 TerminateProcess 强制结束时，Windows 都会自动结束 sshd。
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+        const DWORD error = GetLastError();
+        CloseHandle(job);
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("无法设置 SSH 服务退出清理规则，错误码 %1").arg(error);
+        }
+        return false;
+    }
+
+    m_serverProcessJob = job;
+    return true;
+#endif
+}
+
+bool PortableOpenSshManager::attachServerProcessToJob(qint64 processId, QString* errorMessage)
+{
+#if !defined(_WIN32)
+    Q_UNUSED(processId);
+    Q_UNUSED(errorMessage);
+    return true;
+#else
+    HANDLE job = reinterpret_cast<HANDLE>(m_serverProcessJob);
+    if (!job || processId <= 0) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("SSH 服务进程组或进程 ID 无效。");
+        }
+        return false;
+    }
+
+    HANDLE process = OpenProcess(
+        PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE,
+        FALSE,
+        static_cast<DWORD>(processId));
+    if (!process) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("无法打开 SSH 服务进程，错误码 %1").arg(GetLastError());
+        }
+        return false;
+    }
+
+    const BOOL attached = AssignProcessToJobObject(job, process); // wjy: 绑定完成后 sshd 及其未来子进程都受同一退出生命周期约束。
+    const DWORD attachError = attached ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(process);
+    if (!attached) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("无法管理 SSH 服务进程，错误码 %1").arg(attachError);
+        }
+        return false;
+    }
+    return true;
+#endif
+}
+
+void PortableOpenSshManager::closeServerProcessJob()
+{
+#if defined(_WIN32)
+    HANDLE job = reinterpret_cast<HANDLE>(m_serverProcessJob);
+    if (!job) {
+        return;
+    }
+    m_serverProcessJob = nullptr; // wjy: 先清空成员，使托盘退出、main 兜底和单例析构连续调用时不会重复操作旧句柄。
+    TerminateJobObject(job, 0); // wjy: 主动退出立即结束 Job 中的 sshd/子进程，确保 openssh 目录不再被占用。
+    CloseHandle(job); // wjy: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 同时覆盖主进程异常死亡、来不及执行显式清理的路径。
+#endif
+}
+
 bool PortableOpenSshManager::ensureClientProcessJob(QString* errorMessage)
 {
 #if !defined(_WIN32)
@@ -173,6 +259,7 @@ bool PortableOpenSshManager::ensureClientProcessJob(QString* errorMessage)
 
 void PortableOpenSshManager::stopClientProcesses()
 {
+    std::lock_guard identityLock(m_identityMutex); // wjy: 后台终端可能正在创建或绑定客户端 Job，退出清理必须与 openTerminal 串行操作同一句柄。
 #if defined(_WIN32)
     HANDLE job = reinterpret_cast<HANDLE>(m_clientProcessJob);
     if (!job) {
@@ -199,6 +286,9 @@ bool PortableOpenSshManager::startServer(QString* errorMessage)
     if (!cleanupResidualServerProcesses(errorMessage)) {
         return false;
     }
+    if (!ensureServerProcessJob(errorMessage)) {
+        return false; // wjy: 无法建立退出兜底时不启动 sshd，禁止再次产生锁住版本目录的游离服务进程。
+    }
 
     auto* process = new QProcess();
     process->setProgram(sshdExePath());
@@ -220,6 +310,15 @@ bool PortableOpenSshManager::startServer(QString* errorMessage)
             }
         }
         delete process;
+        closeServerProcessJob(); // wjy: 启动失败时关闭尚未装入进程的空 Job，避免句柄泄漏。
+        return false;
+    }
+
+    if (!attachServerProcessToJob(process->processId(), errorMessage)) {
+        process->kill(); // wjy: Job 绑定失败时立即结束刚启动的 sshd，不能让它脱离 FSRemote 生命周期继续占用目录。
+        process->waitForFinished(1200);
+        delete process;
+        closeServerProcessJob();
         return false;
     }
 
@@ -233,6 +332,7 @@ bool PortableOpenSshManager::startServer(QString* errorMessage)
             }
         }
         delete process;
+        closeServerProcessJob(); // wjy: sshd 自行退出后同步释放 Job，下次启动会创建全新的受控进程组。
         return false;
     }
 
@@ -243,20 +343,24 @@ bool PortableOpenSshManager::startServer(QString* errorMessage)
 void PortableOpenSshManager::stopServer()
 {
     if (!m_sshdProcess) {
+        closeServerProcessJob(); // wjy: QProcess 指针已经丢失时仍关闭 Job，可清理异常路径留下但已经纳入管理的 sshd。
+        cleanupResidualServerProcesses(nullptr); // wjy: 再按当前版本目录的 sshd.exe 绝对路径清理，兼容旧版本遗留或启动绑定竞态。
         return;
     }
 
-    m_sshdProcess->terminate();
+    closeServerProcessJob(); // wjy: 退出目标是立即释放版本目录，优先结束整个 sshd Job，不再等待控制台程序处理普通 terminate。
     if (!m_sshdProcess->waitForFinished(1200)) {
-        m_sshdProcess->kill();
+        m_sshdProcess->kill(); // wjy: Job API 异常失败时保留 QProcess 最后一层兜底，退出不能无限等待。
         m_sshdProcess->waitForFinished(1200);
     }
     delete m_sshdProcess;
     m_sshdProcess = nullptr;
+    cleanupResidualServerProcesses(nullptr); // wjy: 扫描只终止路径完全等于本版本 openssh/sshd.exe 的进程，不影响系统或其它目录中的 OpenSSH 服务。
 }
 
 bool PortableOpenSshManager::openTerminal(const QString& hostIp, const QString& loginUser, QString* errorMessage)
 {
+    std::lock_guard identityLock(m_identityMutex); // wjy: 后台批量终端串行保护 OpenSSH 准备、客户端 Job 创建和进程绑定，避免多线程重复创建或关闭句柄。
     const QString normalizedHost = hostIp.trimmed();
     const QString normalizedUser = loginUser.trimmed();
     if (normalizedHost.isEmpty()) {

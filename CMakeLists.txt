@@ -342,11 +342,15 @@ if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_UPDATE_TESTS) # wjy: 更新服务测�
         tests/update_service_tests.cpp
         src/system/UpdateService.cpp
         src/system/UpdateService.h
+        src/system/SharedStorageAvailabilityService.cpp
+        src/system/SharedStorageAvailabilityService.h
+        src/system/StartupPerformanceLog.cpp
+        src/system/StartupPerformanceLog.h
         src/system/AppSettings.cpp
         src/system/AppSettings.h
     ) # wjy: 直接编译生产更新服务，验证真实语义版本逻辑而不是测试替身。
     target_include_directories(fsremote_update_service_tests PRIVATE src)
-    target_link_libraries(fsremote_update_service_tests PRIVATE Qt6::Widgets)
+    target_link_libraries(fsremote_update_service_tests PRIVATE Qt6::Widgets Qt6::Network) # wjy: 更新测试包含异步 SMB 端口门禁，需要 Qt Network。
     if(MSVC)
         target_compile_options(fsremote_update_service_tests PRIVATE /utf-8)
     endif()
@@ -393,6 +397,8 @@ qt_add_executable(FSRemote WIN32
     # =====wjy====
     src/system/DesktopWallpaperService.cpp
     src/system/DesktopWallpaperService.h
+    src/system/SharedStorageAvailabilityService.cpp
+    src/system/SharedStorageAvailabilityService.h
     # ===end====
     src/system/PortableOpenSshManager.cpp
     src/system/PortableOpenSshManager.h
@@ -450,6 +456,10 @@ qt_add_executable(FSRemote WIN32
     src/system/WolDetector.h
     src/system/WjyDiagnosticLog.cpp
     src/system/WjyDiagnosticLog.h
+    # =====wjy====
+    src/system/StartupPerformanceLog.cpp
+    src/system/StartupPerformanceLog.h
+    # ===end====
     src/system/UpdateService.cpp
     src/system/UpdateService.h
     resources/app.manifest

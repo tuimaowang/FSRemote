@@ -199,6 +199,9 @@ private:
     void updateTexturePresenterGeometry();
     void showSnapPreviews(const QHash<RemoteDesktopWindow*, QRect>& geometries); // wjy: 拖拽越界重排时同时显示整组窗口的最终虚影。
     void clearSnapPreviews(); // wjy: 拖离、释放、双击或关闭时统一清理整组吸附预览。
+    // =====wjy====
+    bool restoreSavedGeometryForDrag(const QPoint& cursorGlobal, const QPoint& pressedPosition); // wjy: 平铺或最大化窗口开始拖动时恢复 JSON 普通尺寸，并保持鼠标原抓取位置。
+    // ===end====
     void flushPendingRemoteFrame();
     void drainPendingRemoteTextureFrame(); // wjy: Qt线程一次消费一个已接受纹理；单槽忙时新帧由解码器受控丢弃并立即归还。
     void discardPendingTextureFrame(); // wjy: 取消单槽帧时完成keyed mutex消费者交接，避免解码纹理槽永久占用。
@@ -264,6 +267,11 @@ private:
     // ===end====
     QPoint m_hoveredPos = QPoint(-1, -1);
     bool m_draggingWindow = false;
+    // =====wjy====
+    bool m_dragRestorePending = false; // wjy: 平铺或最大化标题栏按下后先等待真实移动，单击和双击不会提前恢复窗口尺寸。
+    QPoint m_dragPressGlobal;
+    QPoint m_dragPressPosition; // wjy: 保存按下时的屏幕坐标和窗口内抓取点，超过系统拖拽阈值后用于恢复 JSON 尺寸。
+    // ===end====
     bool m_resizingWindow = false;
     int m_resizeEdges = 0;
     QPoint m_dragOffset;

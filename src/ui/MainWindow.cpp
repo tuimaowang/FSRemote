@@ -1,5 +1,6 @@
 #include "ui/MainWindow.h"
 
+#include "system/PortableOpenSshManager.h"
 #include "system/WjyDiagnosticLog.h"
 #include "ui/DeviceGrid.h"
 #include "ui/RemoteControllerOverlay.h"
@@ -210,6 +211,13 @@ void MainWindow::requestApplicationExit()
         ::TerminateProcess(::GetCurrentProcess(), 0); // wjy: 若代码还能执行到这里说明主进程仍未退出，强制结束避免托盘“退出”永久无效。
     });
 #endif
+
+    // =====wjy====
+    writeWindowStartupLog(QStringLiteral("[wjy-exit] early SSH process cleanup begin"));
+    platform::PortableOpenSshManager::instance().stopClientProcesses(); // wjy: 托盘退出一开始就关闭本程序启动的 cmd/ssh，后续后台汇合再慢也不锁住版本目录。
+    platform::PortableOpenSshManager::instance().stopServer(); // wjy: 在 DeviceGrid、共享同步和远控窗口清理前结束 sshd，避免托盘已消失但 openssh 文件仍被占用。
+    writeWindowStartupLog(QStringLiteral("[wjy-exit] early SSH process cleanup end"));
+    // ===end====
 
     QApplication::quit(); // wjy: 事件循环已运行时立即登记退出，即便下面的清理短暂阻塞，返回后也不会重新进入普通运行状态。
     QTimer::singleShot(0, qApp, &QCoreApplication::quit); // wjy: 启动阶段检查到更新时 app.exec 尚未进入，用零延迟任务保证事件循环启动第一拍就正常退出。
