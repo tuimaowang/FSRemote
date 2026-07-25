@@ -95,6 +95,7 @@ StreamRuntime::StreamRuntime()
     m_sendInput = reinterpret_cast<SendInputFn>(library->resolve("fsremote_stream_send_input"));
     m_setViewerQuality = reinterpret_cast<SetViewerQualityFn>(library->resolve("fsremote_stream_set_viewer_quality")); // wjy: 可选导出支持无重连画质更新，旧DLL继续使用原始流。
     m_getViewerQualityStatus = reinterpret_cast<GetViewerQualityStatusFn>(library->resolve("fsremote_stream_get_viewer_quality_status"));
+    m_getViewerPerformanceStats = reinterpret_cast<GetViewerPerformanceStatsFn>(library->resolve("fsremote_stream_get_viewer_performance_stats")); // wjy: 性能统计导出保持可选，避免新 UI 强制依赖旧 DLL 不具备的能力。
     m_isBusy = reinterpret_cast<IsBusyFn>(library->resolve("fsremote_stream_is_busy"));
     // =====wjy====
     m_activeSessionCount = reinterpret_cast<ActiveSessionCountFn>(library->resolve("fsremote_stream_active_session_count")); // wjy: 新 DLL 导出真实会话数；旧 DLL 缺失时状态服务回退 busy 布尔。
@@ -220,6 +221,14 @@ bool StreamRuntime::viewerQualityStatus(FsRemoteStreamHandle handle, FsRemoteVie
         return false;
     }
     return m_getViewerQualityStatus(handle, status) != 0; // wjy: 缺失导出或尚无确认都返回false，UI保持不断流并显示不支持/等待状态。
+}
+
+bool StreamRuntime::viewerPerformanceStats(FsRemoteStreamHandle handle, FsRemoteViewerPerformanceStats* stats) const
+{
+    if (!m_getViewerPerformanceStats || !handle || !stats) {
+        return false;
+    }
+    return m_getViewerPerformanceStats(handle, stats) != 0; // wjy: DLL 在互斥区内复制 POD 快照，UI 只做相邻采样差分，不阻塞 WebRTC 线程。
 }
 // ===end====
 

@@ -23,6 +23,7 @@
 #include <QGuiApplication>
 #include <QKeyEvent>
 #include <QKeySequence>
+#include <QLabel>
 #include <QMetaObject>
 #include <QMenu>
 #include <QMouseEvent>
@@ -44,6 +45,7 @@
 #include <algorithm>
 #include <exception>
 #include <limits>
+#include <vector>
 
 #if defined(Q_OS_WIN)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -71,6 +73,7 @@ RemoteDesktopWindow* g_keyboardForwardTarget = nullptr;
 HHOOK g_keyboardHook = nullptr;
 QSet<int> g_hookPressedKeys;
 QSet<int> g_hookConsumedKeys; // wjy: 仅记录当前钩子真正吞掉过KeyDown的键，KeyUp必须按相同归属决定留给远控还是放回本机。
+RemoteDesktopWindow* g_rawInputMouseTarget = nullptr; // wjy: Windows 每类 Raw Input 设备在单进程内只有一个注册目标，记录当前活动远控窗口以安全交接所有权。
 #endif
 
 enum ResizeEdge {
@@ -85,6 +88,44 @@ constexpr int kWindowResizeMargin = 6; // wjy: 无边框远控窗口四周统一
 constexpr int kWindowEdgeSnapDistance = 16; // wjy: 标题栏拖动到屏幕可用区域 16px 内时自动贴边，既容易触发又不会在远处突然跳动。
 constexpr int kWindowGroupJoinTolerance = 2; // wjy: 已贴齐窗口允许 2px 的系统边框/缩放误差，超过后不再视为同一连续窗口组。
 constexpr int kTextureFailuresBeforeSoftwareFallback = 3; // wjy: 单个瞬时共享纹理失败先保留上一帧，连续三次失败才进入有上限的软件保活。
+
+// =====wjy====
+class RemotePerformanceOverlayLabel final : public QLabel
+{
+public:
+    using QLabel::QLabel;
+
+protected:
+    void paintEvent(QPaintEvent*) override
+    {
+        QImage surface(size(), QImage::Format_ARGB32_Premultiplied); // wjy: 每次刷新创建一张完整ARGB面板，旧的FPS数字不会留在原生子窗口缓冲中。
+        surface.fill(Qt::transparent); // wjy: 先把浮层自身上一轮像素全部清成透明，只清浮层而不触碰下面的远控视频帧。
+
+        QPainter surfacePainter(&surface);
+        surfacePainter.setRenderHint(QPainter::Antialiasing, true);
+        QColor accent(property("overlayAccent").toString());
+        if (!accent.isValid()) {
+            accent = QColor(QStringLiteral("#38BDF8")); // wjy: 首次统计样本到达前使用健康状态颜色，避免出现无效画笔。
+        }
+        accent.setAlpha(150); // wjy: 边框同样保持轻透，不让一圈实色破坏高透明观感。
+        surfacePainter.setPen(QPen(accent, 1.0));
+        surfacePainter.setBrush(QColor(8, 15, 25, 56)); // wjy: 约22%不透明度只提供轻微暗色衬底，大部分远控画面仍清晰透出。
+        surfacePainter.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 6.0, 6.0);
+
+        const QRect textRect = rect().adjusted(margin(), margin(), -margin(), -margin());
+        surfacePainter.setFont(font());
+        surfacePainter.setPen(QColor(0, 0, 0, 180));
+        surfacePainter.drawText(textRect.translated(1, 1), int(alignment()), text()); // wjy: 很透明的背景上增加1px文字暗影，亮色远端桌面也能读清指标。
+        surfacePainter.setPen(QColor(QStringLiteral("#F8FAFC")));
+        surfacePainter.drawText(textRect, int(alignment()), text()); // wjy: 六行新文本在干净透明面板上一次完整绘制，不与上一秒数字叠加。
+        surfacePainter.end();
+
+        QPainter widgetPainter(this);
+        widgetPainter.setCompositionMode(QPainter::CompositionMode_Source); // wjy: 用新ARGB面板直接替换旧浮层像素，而不是把半透明颜色继续混合到旧内容上。
+        widgetPainter.drawImage(QPoint(0, 0), surface); // wjy: 单次提交完整结果，避免先清空再绘字时产生中间闪烁。
+    }
+};
+// ===end====
 
 // =====wjy====
 uint32_t viewerQualityModeValue(stream::RemoteQualityMode mode)
@@ -105,7 +146,7 @@ QString remoteQualityModeText(stream::RemoteQualityMode mode)
     switch (mode) {
     case stream::RemoteQualityMode::FollowGlobal: return QString::fromUtf8("自定义"); // wjy: 保留内部FollowGlobal兼容语义，但按产品文案在界面统一显示“自定义”。
     case stream::RemoteQualityMode::Automatic: return QString::fromUtf8("自动");
-    case stream::RemoteQualityMode::HighQualityLocked: return QString::fromUtf8("高质量"); // wjy: 仅精简用户可见名称，内部仍保持高优先级且受稳定性硬边界保护。
+    case stream::RemoteQualityMode::HighQualityLocked: return QString::fromUtf8("高质量"); // wjy: 高质量对应原始分辨率/固定请求60 FPS，实际结果仍由Host和传输层回报。
     case stream::RemoteQualityMode::Balanced: return QString::fromUtf8("均衡");
     case stream::RemoteQualityMode::Smooth: return QString::fromUtf8("流畅");
     }
@@ -118,8 +159,8 @@ QString remoteQualityReasonText(RemoteQualityDegradationReason reason)
     case RemoteQualityDegradationReason::None: return QString::fromUtf8("正常");
     case RemoteQualityDegradationReason::ModePreference: return QString::fromUtf8("模式预设");
     case RemoteQualityDegradationReason::Minimized: return QString::fromUtf8("最小化保活");
-    case RemoteQualityDegradationReason::ReceiveFpsPressure: return QString::fromUtf8("接收FPS持续不足");
-    case RemoteQualityDegradationReason::AggregateBudgetPressure: return QString::fromUtf8("总接收预算保护");
+    case RemoteQualityDegradationReason::PipelinePressure: return QString::fromUtf8("接收管线持续压力");
+    case RemoteQualityDegradationReason::SeverePipelinePressure: return QString::fromUtf8("接收管线严重压力");
     case RemoteQualityDegradationReason::SoftwareFallback: return QString::fromUtf8("D3D11恢复中，软件保活");
     }
     return QString::fromUtf8("正常");
@@ -1307,6 +1348,10 @@ void FSREMOTE_STREAM_CALL onViewerStatus(void* user, int code, const char* messa
             window->setRemoteCursorShape(text); // wjy: 原生层已严格验证协议；Qt 层仍按完整版本消息映射，避免状态码复用时误改光标。
             return;
         }
+        if (code == FSREMOTE_STATUS_MOUSE_BACKEND) {
+            window->setRemoteMouseBackendStatus(text); // wjy: 后端确认在 Qt 主线程提交，绘制、按钮 pending 和超时代际始终串行。
+            return;
+        }
         // ===end====
         if (code == FSREMOTE_STATUS_QUALITY_APPLIED) {
             window->refreshAppliedRemoteQualityStatus(); // wjy: 状态回调只通知“有新快照”，实际值通过稳定C ABI读取，避免解析脆弱文本。
@@ -1448,6 +1493,31 @@ RemoteDesktopWindow::RemoteDesktopWindow(
             mouseReleaseEvent(&forwardedEvent); // wjy: 纹理子控件的释放事件复用父窗口逻辑，确保缩放结束和远端按钮释放一致。
         });
     // =====wjy====
+    m_performanceOverlay = new RemotePerformanceOverlayLabel(
+        this,
+        Qt::Tool
+            | Qt::FramelessWindowHint
+            | Qt::WindowTransparentForInput
+            | Qt::WindowDoesNotAcceptFocus
+            | Qt::NoDropShadowWindowHint); // wjy: 使用主远控窗拥有的分层工具窗，Windows能稳定合成半透明背景与完全可见文字，并且不进入任务栏。
+    m_performanceOverlay->setObjectName(QStringLiteral("remotePerformanceOverlay"));
+    m_performanceOverlay->setAttribute(Qt::WA_TranslucentBackground); // wjy: 无边框顶层工具窗走Windows分层合成，背景保持高透明而白色文字保留完整Alpha。
+    m_performanceOverlay->setAttribute(Qt::WA_TransparentForMouseEvents); // wjy: 浮层不接管点击、滚轮和拖动，所有远控输入继续命中画面。
+    m_performanceOverlay->setAttribute(Qt::WA_ShowWithoutActivating);
+    m_performanceOverlay->setAttribute(Qt::WA_NoSystemBackground); // wjy: Windows移动或刷新原生浮层时不先擦成背景色，消除文字更新前的一帧空白。
+    // wjy: 不声明WA_OpaquePaintEvent，让Qt按样式表透明度合成远控画面；防闪烁继续由缓存更新和稳定Z序负责。
+    m_performanceOverlay->setFocusPolicy(Qt::NoFocus);
+    m_performanceOverlay->setTextFormat(Qt::PlainText);
+    m_performanceOverlay->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+    m_performanceOverlay->setMargin(10);
+    QFont performanceFont(QStringLiteral("Microsoft YaHei UI"));
+    performanceFont.setPixelSize(12);
+    performanceFont.setWeight(QFont::DemiBold);
+    m_performanceOverlay->setFont(performanceFont); // wjy: 六行短指标使用统一紧凑字号，小窗口也尽量少遮挡远端内容。
+    m_performanceOverlay->setFixedSize(132, 132); // wjy: 面板尺寸固定后数字变化只重绘文字，不再每秒调整原生HWND尺寸和锚点。
+    m_performanceOverlay->hide(); // wjy: 首帧到达前不显示空统计，最小化和更新等待状态也复用同一隐藏入口。
+    // ===end====
+    // =====wjy====
     m_textureRecoveryTimer = new QTimer(this);
     m_textureRecoveryTimer->setSingleShot(true);
     connect(m_textureRecoveryTimer, &QTimer::timeout, this, [this] {
@@ -1464,6 +1534,7 @@ RemoteDesktopWindow::RemoteDesktopWindow(
     m_sessionTimer = new QTimer(this);
     m_sessionTimer->setInterval(1000);
     connect(m_sessionTimer, &QTimer::timeout, this, [this] {
+        updatePerformanceOverlay(); // wjy: 复用已有一秒会话时钟刷新本机指标，不新增高频定时器或逐帧文本排版。
         if (!isFullScreen()) {
             update(QRect(0, 0, width(), titleBarHeight())); // wjy: 会话计时只显示在普通标题栏。
         }
@@ -1562,6 +1633,11 @@ RemoteDesktopWindow::~RemoteDesktopWindow()
 bool RemoteDesktopWindow::event(QEvent* event)
 {
     const bool windowStateChanged = event && event->type() == QEvent::WindowStateChange; // wjy: 监听 Ctrl+D 触发的窗口状态切换，让标题栏和画面区域在全屏/普通窗口之间同步更新。
+    const bool performanceOverlayAnchorChanged = event
+        && (event->type() == QEvent::Move
+            || event->type() == QEvent::WindowStateChange
+            || event->type() == QEvent::Show
+            || event->type() == QEvent::Hide); // wjy: 分层工具窗使用屏幕坐标，主远控窗移动、显示或最小化时必须立即同步位置和可见性。
     const bool qualityVisibilityChanged = event
         && (event->type() == QEvent::WindowStateChange
             || event->type() == QEvent::Show
@@ -1579,7 +1655,55 @@ bool RemoteDesktopWindow::event(QEvent* event)
     if (qualityVisibilityChanged && !m_closeInProgress) {
         emit remoteQualityInputsChanged(); // wjy: 最小化无需等待1秒定时器，下一轮Qt事件即下发后台FPS和分辨率。
     }
+    if (performanceOverlayAnchorChanged) {
+        updatePerformanceOverlayGeometry(); // wjy: 在主窗口事件完成后读取最终屏幕坐标，透明工具窗不会滞留在移动前的位置。
+    }
     return handled;
+}
+
+bool RemoteDesktopWindow::nativeEvent(const QByteArray& eventType, void* message, qintptr* result)
+{
+#if defined(Q_OS_WIN)
+    Q_UNUSED(eventType)
+    Q_UNUSED(result)
+    const auto* nativeMessage = static_cast<MSG*>(message);
+    if (nativeMessage
+        && nativeMessage->message == WM_INPUT
+        && m_remoteMouseCaptureActive
+        && m_rawInputMouseCaptureActive
+        && isActiveWindow()) {
+        UINT inputBytes = 0;
+        const HRAWINPUT rawHandle = reinterpret_cast<HRAWINPUT>(nativeMessage->lParam);
+        if (::GetRawInputData(rawHandle, RID_INPUT, nullptr, &inputBytes, sizeof(RAWINPUTHEADER)) == 0
+            && inputBytes >= sizeof(RAWINPUTHEADER)
+            && inputBytes <= 64 * 1024) {
+            std::vector<BYTE> storage(inputBytes); // wjy: 鼠标报告通常固定很小，但按系统返回长度分配并设置 64KB 上限，避免畸形长度消耗无界内存。
+            UINT copiedBytes = inputBytes;
+            if (::GetRawInputData(
+                    rawHandle,
+                    RID_INPUT,
+                    storage.data(),
+                    &copiedBytes,
+                    sizeof(RAWINPUTHEADER)) == inputBytes) {
+                const auto* raw = reinterpret_cast<const RAWINPUT*>(storage.data());
+                if (raw->header.dwType == RIM_TYPEMOUSE
+                    && (raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0) {
+                    const int dx = static_cast<int>(raw->data.mouse.lLastX);
+                    const int dy = static_cast<int>(raw->data.mouse.lLastY);
+                    if (dx != 0 || dy != 0) {
+                        sendRemoteRawMouseRelativeMove(dx, dy, QApplication::mouseButtons()); // wjy: 只读取实体设备相对计数；按钮仍由既有 Qt down/up 路径维护，避免同一按钮重复注入。
+                        recenterRemoteMouseCapture(); // wjy: Raw Input 不依赖系统光标位置，但继续把隐藏光标留在远控画面中心，防止点击落到其它本机窗口。
+                    }
+                }
+            }
+        }
+    }
+#else
+    Q_UNUSED(eventType)
+    Q_UNUSED(message)
+    Q_UNUSED(result)
+#endif
+    return QWidget::nativeEvent(eventType, message, result); // wjy: 不吞掉 WM_INPUT，让 Qt/DefWindowProc 完成 Windows 要求的前台原始输入清理。
 }
 // ===end====
 
@@ -1613,7 +1737,7 @@ void RemoteDesktopWindow::setGlobalQualityConfiguration(const stream::RemoteQual
     if (m_globalQualityConfiguration == normalized) {
         return;
     }
-    m_globalQualityConfiguration = normalized; // wjy: 每个窗口立即接收同一份安全配置；局部模式仍复用全局FPS、分辨率下限和恢复参数。
+    m_globalQualityConfiguration = normalized; // wjy: 每个窗口立即接收同一默认模式；局部覆盖继续直接使用自身固定预设。
     update(isFullScreen() ? rect() : QRect(0, 0, width(), titleBarHeight())); // wjy: 先刷新标题栏策略反馈，后续质量状态字段会在同一区域显示应用结果。
     emit remoteQualityInputsChanged(); // wjy: 主设置保存后立即重算全部窗口，无需关闭重连或等待周期轮询。
 }
@@ -1623,7 +1747,7 @@ stream::RemoteQualityMode RemoteDesktopWindow::qualityOverrideMode() const
     return m_qualityOverrideMode; // wjy: 只返回当前窗口内存状态，不从全局设置反推，保证“局部覆盖”语义清晰。
 }
 
-RemoteQualityWindowMetrics RemoteDesktopWindow::remoteQualityMetrics() const
+RemoteQualityWindowMetrics RemoteDesktopWindow::remoteQualityMetrics()
 {
     RemoteQualityWindowMetrics metrics;
     metrics.windowId = reinterpret_cast<uintptr_t>(this); // wjy: 顶层窗口对象生命周期内地址稳定，关闭时协调器显式删除对应滞回状态。
@@ -1638,6 +1762,49 @@ RemoteQualityWindowMetrics RemoteDesktopWindow::remoteQualityMetrics() const
     metrics.viewportHeight = qMax(1, height() - titleBarHeight()); // wjy: 平铺小窗口按真实显示高度降低像素，优先把资源留给FPS。
     metrics.receiveFps = qMax(0.0, m_receiveFps);
     metrics.encodedMbps = qMax(0.0, m_encodedMbps);
+
+    FsRemoteViewerPerformanceStats nativeStats = {};
+    nativeStats.struct_size = sizeof(nativeStats);
+    nativeStats.version = 1;
+    if (m_viewerHandle
+        && stream::StreamRuntime::instance().viewerPerformanceStats(m_viewerHandle, &nativeStats)) {
+        RemotePerformanceCounters counters;
+        counters.sampleTimeMs = nativeStats.sample_time_ms;
+        counters.framesReceived = nativeStats.frames_received;
+        counters.framesDecoded = nativeStats.frames_decoded;
+        counters.framesDropped = nativeStats.frames_dropped;
+        counters.freezeCount = nativeStats.freeze_count;
+        counters.jitterBufferEmittedCount = nativeStats.jitter_buffer_emitted_count;
+        counters.packetsReceived = nativeStats.packets_received;
+        counters.packetsLost = nativeStats.packets_lost;
+        counters.totalDecodeTimeMs = nativeStats.total_decode_time_ms;
+        counters.totalProcessingDelayMs = nativeStats.total_processing_delay_ms;
+        counters.totalFreezesDurationMs = nativeStats.total_freezes_duration_ms;
+        counters.totalJitterBufferDelayMs = nativeStats.total_jitter_buffer_delay_ms;
+        counters.roundTripTimeMs = nativeStats.round_trip_time_ms;
+        counters.availableIncomingBitrateKbps = nativeStats.available_incoming_bitrate_kbps;
+        metrics.performance = m_performanceSignalSampler.sample(counters); // wjy: 只有第二份单调快照开始产生有效压力，重连和旧 DLL 都不会虚假降档。
+    }
+
+    const quint64 totalDrops = m_pendingTextureFrames.droppedFrameCount();
+    const qint64 nowMs = m_sessionClock.isValid() ? m_sessionClock.elapsed() : 0;
+    if (m_lastPresenterSampleMs > 0 && nowMs > m_lastPresenterSampleMs
+        && m_totalPresentedFrames >= m_lastPresenterSampleFrames
+        && totalDrops >= m_lastPresenterSampleDrops) {
+        const quint64 presentedDelta = m_totalPresentedFrames - m_lastPresenterSampleFrames;
+        const quint64 droppedDelta = totalDrops - m_lastPresenterSampleDrops;
+        const quint64 attempted = presentedDelta + droppedDelta;
+        if (attempted > 0) {
+            metrics.presenterDropRatio = static_cast<double>(droppedDelta) / attempted; // wjy: 单槽忙导致的本地丢帧是直接呈现压力，不与网络接收FPS混为一谈。
+        }
+    }
+    m_lastPresenterSampleFrames = m_totalPresentedFrames;
+    m_lastPresenterSampleDrops = totalDrops;
+    m_lastPresenterSampleMs = nowMs;
+    // =====wjy====
+    m_latestPerformanceSignals = metrics.performance; // wjy: 协调器与浮层共享同一秒级差值，界面不会为了显示再调用一次原生GetStats。
+    m_latestPresenterDropRatio = metrics.presenterDropRatio; // wjy: 缓存本地单槽丢帧比例，用于区分解码压力与显示压力文案。
+    // ===end====
     return metrics;
 }
 
@@ -1819,6 +1986,9 @@ void RemoteDesktopWindow::beginRemoteUpdateWait()
     m_textureFrameActive = false;
     if (m_texturePresenter) {
         m_texturePresenter->hide(); // wjy: D3D 子窗口位于父窗口之上，更新时隐藏才能看见中央遮罩。
+    }
+    if (m_performanceOverlay) {
+        m_performanceOverlay->hide(); // wjy: 更新等待期间隐藏最后一秒的旧指标，避免把停止的视频误显示为实时状态。
     }
     {
         QMutexLocker locker(&m_pendingFrameMutex);
@@ -2042,6 +2212,7 @@ void RemoteDesktopWindow::finishRemoteUpdateWait()
     if (m_inputBroadcastCoordinator) {
         m_inputBroadcastCoordinator->notifyEligibilityChanged(this); // wjy: 更新完成后恢复资格；若同步仍由其它窗口主控，本窗口从下一事件起自动重新跟随。
     }
+    updatePerformanceOverlayGeometry(); // wjy: 更新后首帧已经可见时立即恢复本机浮层，不额外等待下一秒定时刷新。
     update();
 }
 // ===end====
@@ -2145,8 +2316,14 @@ bool RemoteDesktopWindow::restoreSavedGeometryForDrag(
 
 QRect RemoteDesktopWindow::remoteUpdateButtonRect() const
 {
+    const QRect mouseModeRect = mouseInputModeRect();
+    return QRect(mouseModeRect.left() - 58, 3, 54, qMax(0, titleBarHeight() - 6)); // wjy: 新增鼠标后端按钮后，更新入口继续位于整条按钮链最左侧并保持 4px 间距。
+}
+
+QRect RemoteDesktopWindow::mouseInputModeRect() const
+{
     const QRect qualityRect = qualityButtonRect();
-    return QRect(qualityRect.left() - 58, 3, 54, qMax(0, titleBarHeight() - 6)); // wjy: 更新按钮随画质按钮左移，右侧局部画质入口始终可见且互不重叠。
+    return QRect(qualityRect.left() - 58, 3, 54, qMax(0, titleBarHeight() - 6)); // wjy: 54px 足够显示“系统/驱动”及异常标记，不挤压画质按钮。
 }
 
 QRect RemoteDesktopWindow::qualityButtonRect() const
@@ -2186,6 +2363,7 @@ bool RemoteDesktopWindow::isTitleBarBlankArea(const QPoint& position) const
         && position.y() >= 0
         && position.y() < titleBarHeight()
         && !(m_remoteUpdateAvailable && remoteUpdateButtonRect().contains(position)) // wjy: 更新按钮可见时从拖动、双击和右键空白区中排除。
+        && !mouseInputModeRect().contains(position) // wjy: 键鼠注入后端是本地标题栏开关，不能触发拖窗、右键设备菜单或远端输入。
         && !qualityButtonRect().contains(position) // wjy: 单窗口画质按钮不能被标题栏拖动、双击或设备右键菜单抢占。
         && !inputSyncRect().contains(position) // wjy: 键鼠同步是纯本地标题栏操作，不能落入拖窗或远端鼠标路径。
         && !clipboardSyncRect().contains(position)
@@ -2245,7 +2423,7 @@ void RemoteDesktopWindow::showQualityMenu(const QPoint& globalPosition)
     } actions[] = {
         {"自定义", stream::RemoteQualityMode::FollowGlobal}, // wjy: 文案改为“自定义”，底层枚举保持兼容，避免改动在线质量协议。
         {"自动", stream::RemoteQualityMode::Automatic},
-        {"高质量", stream::RemoteQualityMode::HighQualityLocked}, // wjy: 菜单对用户显示简洁名称，实际仍按高质量优先级协调资源。
+        {"高质量", stream::RemoteQualityMode::HighQualityLocked}, // wjy: 菜单高质量直接选择原始分辨率/固定请求60 FPS，不进入控制端自动降档。
         {"均衡", stream::RemoteQualityMode::Balanced},
         {"流畅", stream::RemoteQualityMode::Smooth},
     };
@@ -2327,7 +2505,7 @@ QString RemoteDesktopWindow::remoteQualityStatusSummary() const
     QString state = QString::fromUtf8("状态：%1").arg(remoteQualityReasonText(m_remoteQualityDecision.reason));
     if (m_remoteQualityDecision.effectiveMode == stream::RemoteQualityMode::HighQualityLocked
         && remoteQualityIsDegraded()) {
-        state += QString::fromUtf8("（高质量已受稳定性硬边界保护）"); // wjy: 状态提示跟随新文案，同时明确稳定性保护仍会限制过高请求。
+        state += QString::fromUtf8("（实际结果受Host或传输边界限制）"); // wjy: 高质量请求保持原始/60，向下提示只解释实际应用或兼容限制，不再暗示控制端主动降档。
     }
     return requested + QLatin1Char('\n') + applied + QLatin1Char('\n') + state;
 }
@@ -2338,8 +2516,8 @@ bool RemoteDesktopWindow::remoteQualityIsDegraded() const
         return false;
     }
     if (m_remoteQualityDecision.reason == RemoteQualityDegradationReason::Minimized
-        || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::ReceiveFpsPressure
-        || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::AggregateBudgetPressure
+        || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::PipelinePressure
+        || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::SeverePipelinePressure
         || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::SoftwareFallback
         || m_qualityProtocolUnavailable) {
         return true;
@@ -2405,6 +2583,145 @@ QRect RemoteDesktopWindow::remoteImageRect() const
         scaled.width(),
         scaled.height());
 }
+
+// =====wjy====
+void RemoteDesktopWindow::updatePerformanceOverlay()
+{
+    if (!m_performanceOverlay) {
+        return;
+    }
+
+    const RemotePerformanceSignals& performance = m_latestPerformanceSignals;
+    const int targetFps = m_hasRemoteQualityDecision ? qMax(1, m_remoteQualityDecision.targetFps) : 60;
+    const double frameBudgetMs = 1000.0 / targetFps;
+    const bool decoderPressure = performance.valid
+        && (performance.averageDecodeMs >= frameBudgetMs * 0.70
+            || performance.averageProcessingDelayMs >= frameBudgetMs * 0.90
+            || performance.decoderDropRatio >= 0.05); // wjy: 浮层沿用协调器阈值识别解码来源，只解释状态而不反向驱动画质策略。
+    const bool networkPressure = performance.valid
+        && ((performance.packetLossRatio >= 0.03 && performance.roundTripTimeMs >= 80.0)
+            || performance.averageJitterBufferDelayMs >= 80.0);
+    const bool freezePressure = performance.valid
+        && (performance.freezeCountDelta > 0 || performance.freezeDurationDeltaMs >= 100.0);
+    const bool presenterPressure = m_latestPresenterDropRatio >= 0.08;
+
+    QString stateText = QString::fromUtf8("接收正常"); // wjy: “接收正常”只描述本机管线没有压力，不再暗示已经达到所选模式的目标FPS。
+    QString accentColor = QStringLiteral("#34D399");
+    if (!performance.valid) {
+        stateText = QString::fromUtf8("统计暂不可用");
+        accentColor = QStringLiteral("#94A3B8");
+    }
+    if (m_hasRemoteQualityDecision) {
+        switch (m_remoteQualityDecision.reason) {
+        case RemoteQualityDegradationReason::SeverePipelinePressure:
+            stateText = QString::fromUtf8("严重压力");
+            accentColor = QStringLiteral("#F87171");
+            break;
+        case RemoteQualityDegradationReason::PipelinePressure:
+            stateText = decoderPressure
+                ? QString::fromUtf8("解码压力")
+                : (networkPressure
+                        ? QString::fromUtf8("网络压力")
+                        : (freezePressure
+                                ? QString::fromUtf8("冻结压力")
+                                : (presenterPressure ? QString::fromUtf8("显示压力") : QString::fromUtf8("恢复中"))));
+            accentColor = QStringLiteral("#FBBF24");
+            break;
+        case RemoteQualityDegradationReason::SoftwareFallback:
+            stateText = QString::fromUtf8("显示恢复中");
+            accentColor = QStringLiteral("#FBBF24");
+            break;
+        case RemoteQualityDegradationReason::Minimized:
+            stateText = QString::fromUtf8("后台保活");
+            accentColor = QStringLiteral("#94A3B8");
+            break;
+        case RemoteQualityDegradationReason::None:
+        case RemoteQualityDegradationReason::ModePreference:
+            break;
+        }
+    }
+    if (performance.valid
+        && m_hasRemoteQualityDecision
+        && (m_remoteQualityDecision.reason == RemoteQualityDegradationReason::None
+            || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::ModePreference)
+        && m_receiveFps > 1.0
+        && m_receiveFps < static_cast<double>(targetFps) * 0.90) {
+        stateText = QString::fromUtf8("未达目标");
+        accentColor = QStringLiteral("#FBBF24"); // wjy: 请求60但实际只有39等情况明确提示未达目标；这只是观测结果，不会让固定模式主动降帧。
+    }
+
+    const stream::RemoteQualityMode displayedMode = m_hasRemoteQualityDecision
+        ? m_remoteQualityDecision.effectiveMode
+        : effectiveQualityMode(); // wjy: 第一行显示真正生效模式，FollowGlobal窗口不会把“自定义”冒充为实际清晰度档位。
+    const QString decodeText = performance.valid
+        ? QString::number(performance.averageDecodeMs, 'f', 1)
+        : QStringLiteral("--");
+    const bool hasDropSample = performance.valid || m_latestPresenterDropRatio > 0.0;
+    const double displayedDropRatio = qMax(
+        performance.valid ? performance.decoderDropRatio : 0.0,
+        m_latestPresenterDropRatio); // wjy: 丢帧行显示解码与本地呈现两段中较高的实际比例，避免零拷贝拥塞被显示为0。
+    const QString dropText = hasDropSample
+        ? QString::number(displayedDropRatio * 100.0, 'f', 1)
+        : QStringLiteral("--");
+    const QString overlayText = QStringLiteral("%1\n%2 FPS\n%3 Mbps\n%4\n%5 %6 ms\n%7 %8%")
+        .arg(remoteQualityModeText(displayedMode))
+        .arg(qRound(qMax(0.0, m_receiveFps)))
+        .arg(qRound(qMax(0.0, m_encodedMbps)))
+        .arg(stateText)
+        .arg(QString::fromUtf8("解码"), decodeText)
+        .arg(QString::fromUtf8("丢帧"), dropText); // wjy: 严格保持用户确认的六行竖排格式，不显示请求FPS或分辨率。
+    if (m_performanceOverlayText != overlayText) {
+        m_performanceOverlayText = overlayText;
+        m_performanceOverlay->setText(overlayText); // wjy: 只有可见数值变化才重绘文字，相同秒级样本不触发原生子窗口刷新。
+        m_performanceOverlay->update(); // wjy: 数字变化时明确请求整块浮层刷新，由ARGB离屏面板清掉59 FPS等上一轮文字。
+    }
+    if (m_performanceOverlayAccent != accentColor) {
+        m_performanceOverlayAccent = accentColor;
+        m_performanceOverlay->setProperty("overlayAccent", accentColor); // wjy: 只缓存新的状态色，专用绘制器下一次完整提交半透明边框，不再重建样式表。
+        m_performanceOverlay->update(); // wjy: 接收正常、未达目标或压力状态改变时重画一次完整ARGB面板，保持颜色与文字同步。
+    }
+    updatePerformanceOverlayGeometry();
+}
+
+void RemoteDesktopWindow::updatePerformanceOverlayGeometry()
+{
+    if (!m_performanceOverlay) {
+        return;
+    }
+    const QRect target = remoteImageRect();
+    const bool hasVisibleVideo = m_connectionStatusCode == 50
+        && (!m_remoteFrame.isNull() || (m_textureFrameActive && m_remoteTextureSize.isValid()));
+    if (!isVisible() || !hasVisibleVideo || target.isEmpty() || m_performanceOverlay->text().isEmpty()
+        || isMinimized() || m_closeInProgress || remoteUpdateActive()) {
+        m_performanceOverlay->hide(); // wjy: 主窗口隐藏、最小化、首帧前、关闭和更新遮罩期间都隐藏独立工具窗，避免浮在其它应用上方。
+        return;
+    }
+
+    constexpr int overlayMargin = 12;
+    const QSize overlaySize = m_performanceOverlay->size();
+    const QPoint overlayLocalPosition(
+        qMax(target.left(), target.right() - overlaySize.width() - overlayMargin + 1),
+        qMax(target.top(), target.bottom() - overlaySize.height() - overlayMargin + 1)); // wjy: 先在远控内容坐标中计算固定右下角锚点，保留黑边和12px边距规则。
+    const QRect overlayGeometry(
+        mapToGlobal(overlayLocalPosition),
+        overlaySize); // wjy: 分层工具窗使用屏幕坐标，主窗口移动后仍准确覆盖远控画面的右下角。
+    if (m_performanceOverlay->geometry() != overlayGeometry) {
+        m_performanceOverlay->setGeometry(overlayGeometry); // wjy: 只有主窗位置、缩放、全屏或远端宽高比改变时才调用一次原生SetWindowPos。
+    }
+    if (m_performanceOverlay->isHidden()) {
+        m_performanceOverlay->show();
+        m_performanceOverlay->raise(); // wjy: 首帧、恢复或更新结束后的首次显示只提升一次，常规一秒刷新不改变Z序。
+    }
+}
+
+void RemoteDesktopWindow::raisePerformanceOverlay()
+{
+    updatePerformanceOverlayGeometry();
+    if (m_performanceOverlay && !m_performanceOverlay->isHidden()) {
+        m_performanceOverlay->raise(); // wjy: Presenter从隐藏切到显示后仅恢复一次浮层层级，禁止在每个视频帧上来回raise。
+    }
+}
+// ===end====
 
 QSize RemoteDesktopWindow::remoteFrameSize() const
 {
@@ -2521,6 +2838,7 @@ void RemoteDesktopWindow::setRemoteMouseCaptureActive(bool active)
     }
     if (m_remoteMouseCaptureActive == active) {
         if (active) {
+            setRawInputMouseCaptureEnabled(true); // wjy: 状态重复通知时允许上次注册失败的设备重新尝试，仍失败则保留旧 Qt 相对路径。
             recenterRemoteMouseCapture();
         }
         return;
@@ -2529,8 +2847,10 @@ void RemoteDesktopWindow::setRemoteMouseCaptureActive(bool active)
     m_remoteMouseCaptureActive = active;
     if (active) {
         setWindowAndPresenterCursor(Qt::BlankCursor); // wjy: 相对鼠标模式始终拥有最高优先级，远端形状更新只能缓存不能显示。
+        setRawInputMouseCaptureEnabled(true); // wjy: Windows 活动窗口优先注册 Raw Input；失败不会改变捕获状态，后续 mouseMoveEvent 自动使用旧中心差值代码。
         recenterRemoteMouseCapture();
     } else {
+        setRawInputMouseCaptureEnabled(false); // wjy: 退出相对捕获立即释放进程级 Raw Input 鼠标注册，普通桌面移动继续完全交给 Qt。
         updateResizeCursor(mapFromGlobal(QCursor::pos())); // wjy: 退出捕获后立即按当前位置恢复本地边框或已缓存的远端桌面光标。
         RemoteInputEvent event;
         event.type = RemoteInputEventType::CaptureRelease;
@@ -2551,11 +2871,141 @@ void RemoteDesktopWindow::setRemoteCursorShape(const QString& statusMessage)
         updateResizeCursor(mapFromGlobal(QCursor::pos())); // wjy: 状态到达时鼠标可能静止，主动刷新才能无需再次移动就看到远端窗口缩放光标。
     }
 }
+
+void RemoteDesktopWindow::setRemoteMouseBackendStatus(const QString& statusMessage)
+{
+    const QStringList parts = statusMessage.split(QLatin1Char(' '), Qt::SkipEmptyParts);
+    if (parts.size() != 3 || parts.at(0) != QStringLiteral("__fsremote_mouse_backend_status")) {
+        return; // wjy: 即使原生 DLL 已校验，Qt 层仍拒绝字段数或前缀异常的状态，旧值保持不变。
+    }
+    const bool system = parts.at(1) == QStringLiteral("system");
+    const bool faker = parts.at(1) == QStringLiteral("faker");
+    const bool ready = parts.at(2) == QStringLiteral("ready");
+    const bool fallback = parts.at(2) == QStringLiteral("fallback");
+    // =====wjy====
+    const bool installing = parts.at(2) == QStringLiteral("installing");
+    if ((!system && !faker) || (!ready && !fallback && !installing)
+        || ((fallback || installing) && !system)) {
+        return; // wjy: 当前协议只允许 system/faker ready、system fallback 与 system installing，驱动准备完成前不能显示 faker。
+    }
+
+    m_remoteMouseBackend = faker ? RemoteMouseBackend::Faker : RemoteMouseBackend::System;
+    m_pendingRemoteMouseBackend = m_remoteMouseBackend;
+    m_remoteMouseBackendKnown = true;
+    m_remoteMouseBackendPending = installing; // wjy: 安装期间按钮保持禁用，避免重复请求并发启动多个 Windows Installer。
+    m_remoteMouseBackendFallback = fallback;
+    const quint64 requestGeneration = ++m_remoteMouseBackendRequestGeneration; // wjy: 使初始两秒超时失效；安装态再创建独立的长超时保护。
+    if (installing) {
+        m_remoteMouseBackendMessage = zh("目标端正在静默安装 FakerInput 并启动驱动服务…");
+        QTimer::singleShot(6 * 60 * 1000, this, [this, requestGeneration] {
+            if (requestGeneration != m_remoteMouseBackendRequestGeneration || !m_remoteMouseBackendPending) return;
+            m_remoteMouseBackendPending = false;
+            m_remoteMouseBackendFallback = true;
+            m_remoteMouseBackendMessage = zh("目标端驱动安装等待超时，当前继续使用系统键鼠"); // wjy: 超时仅恢复控制端按钮，不中断目标端可能仍在提交的 MSI 事务。
+            update(mouseInputModeRect());
+        });
+    } else if (fallback) {
+        m_remoteMouseBackendMessage = zh("驱动键鼠不可用，已自动回退系统键鼠"); // wjy: 后端现已同时承载键盘和鼠标，回退提示不得继续误导为仅鼠标变化。
+    } else if (faker) {
+        m_remoteMouseBackendMessage = zh("驱动键鼠已启用（FakerInputBridge）");
+    } else {
+        m_remoteMouseBackendMessage = zh("系统键鼠已启用（SendInput）");
+    }
+    update(mouseInputModeRect());
+    // ===end====
+}
+// ===end====
+
+// =====wjy====
+void RemoteDesktopWindow::toggleRemoteMouseBackend()
+{
+    if (m_remoteMouseBackendPending) return;
+    requestRemoteMouseBackend(m_remoteMouseBackend == RemoteMouseBackend::System
+            ? RemoteMouseBackend::Faker
+            : RemoteMouseBackend::System); // wjy: 只根据 Host 最后确认值选择相反后端，不使用上一次未确认的点击结果。
+}
+
+void RemoteDesktopWindow::requestRemoteMouseBackend(RemoteMouseBackend backend)
+{
+    if (m_remoteMouseBackendPending) return;
+    m_pendingRemoteMouseBackend = backend;
+    m_remoteMouseBackendPending = true;
+    m_remoteMouseBackendFallback = false;
+    m_remoteMouseBackendMessage = backend == RemoteMouseBackend::Faker
+        ? zh("正在请求驱动键鼠…")
+        : zh("正在请求系统键鼠…"); // wjy: 保留现有兼容协议前缀，但界面明确一次切换会同时改变键盘和鼠标注入后端。
+    const quint64 request_generation = ++m_remoteMouseBackendRequestGeneration;
+    const QByteArray wire = backend == RemoteMouseBackend::Faker
+        ? QByteArrayLiteral("__fsremote_mouse_backend faker")
+        : QByteArrayLiteral("__fsremote_mouse_backend system");
+    if (!sendInputMessage(wire)) {
+        m_remoteMouseBackendPending = false;
+        m_remoteMouseBackendMessage = zh("键鼠模式请求未发送，远控连接尚未就绪");
+        update(mouseInputModeRect());
+        return;
+    }
+    update(mouseInputModeRect());
+    QTimer::singleShot(2000, this, [this, request_generation] {
+        if (request_generation != m_remoteMouseBackendRequestGeneration || !m_remoteMouseBackendPending) return;
+        m_remoteMouseBackendPending = false; // wjy: 旧 Host 不识别新协议时两秒后恢复按钮，当前真实模式继续按最后确认值或安全系统默认显示。
+        m_remoteMouseBackendMessage = zh("目标端未确认键鼠模式，可能需要更新 FSRemote");
+        update(mouseInputModeRect());
+    });
+}
+
+void RemoteDesktopWindow::queryRemoteMouseBackend()
+{
+    if (m_remoteMouseBackendPending || !m_viewerHandle) return;
+    m_pendingRemoteMouseBackend = m_remoteMouseBackend;
+    m_remoteMouseBackendPending = true;
+    m_remoteMouseBackendMessage = zh("正在读取目标端键鼠模式…");
+    const quint64 request_generation = ++m_remoteMouseBackendRequestGeneration;
+    if (!sendInputMessage(QByteArrayLiteral("__fsremote_mouse_backend query"))) {
+        m_remoteMouseBackendPending = false;
+        m_remoteMouseBackendMessage = zh("暂时无法读取目标端键鼠模式");
+        update(mouseInputModeRect());
+        return;
+    }
+    update(mouseInputModeRect());
+    QTimer::singleShot(2000, this, [this, request_generation] {
+        if (request_generation != m_remoteMouseBackendRequestGeneration || !m_remoteMouseBackendPending) return;
+        m_remoteMouseBackendPending = false;
+        m_remoteMouseBackendKnown = false; // wjy: 无确认时不把本地默认值冒充 Host 状态，按钮仍可尝试切换以兼容刚升级的目标端。
+        m_remoteMouseBackendMessage = zh("目标端未返回键鼠模式，可能是旧版本 FSRemote");
+        update(mouseInputModeRect());
+    });
+}
+
+QString RemoteDesktopWindow::remoteMouseBackendToolTip() const
+{
+    if (m_remoteMouseBackendPending) return m_remoteMouseBackendMessage;
+    if (m_remoteMouseBackendFallback) {
+        return m_remoteMouseBackendMessage
+            // =====wjy====
+            + zh("\n请确认目标端使用管理员安装的新版 FSRemote，且 MSI/Bridge 文件完整；当前系统键鼠仍可使用。");
+            // ===end====
+    }
+    if (!m_remoteMouseBackendKnown) {
+        return m_remoteMouseBackendMessage.isEmpty()
+            ? zh("系统键鼠（SendInput）；点击可请求驱动键鼠")
+            : m_remoteMouseBackendMessage;
+    }
+    return m_remoteMouseBackend == RemoteMouseBackend::Faker
+        ? zh("驱动键鼠（FakerInputBridge）\n键盘与鼠标均通过虚拟 HID；点击切换为系统键鼠")
+        : zh("系统键鼠（SendInput）\n点击切换为驱动键鼠"); // wjy: 用户可直接确认键盘已经接入驱动，不再显示旧的“键盘仍使用 SendInput”。
+}
 // ===end====
 
 bool RemoteDesktopWindow::sendRemoteMouseMove(const QPoint& position, Qt::MouseButtons buttons)
 {
     if (m_remoteMouseCaptureActive) {
+        // =====wjy====
+#if defined(Q_OS_WIN)
+        if (m_rawInputMouseCaptureActive) {
+            return true; // wjy: WM_INPUT 已承担相对位移时吞掉 Qt 的真实/回中心合成 MouseMove，禁止同一次物理移动发送两遍。
+        }
+#endif
+        // ===end====
         return sendRemoteMouseRelativeMove(position, buttons);
     }
 
@@ -2614,6 +3064,85 @@ bool RemoteDesktopWindow::sendRemoteMouseRelativeMove(const QPoint& position, Qt
     recenterRemoteMouseCapture();
     return true;
 }
+
+// =====wjy====
+bool RemoteDesktopWindow::sendRemoteRawMouseRelativeMove(int dx, int dy, Qt::MouseButtons buttons)
+{
+    if (dx == 0 && dy == 0) {
+        return true;
+    }
+
+    const QSize remoteSize = remoteFrameSize();
+    const int remoteButtons =
+        (buttons & Qt::LeftButton ? 1 : 0) |
+        (buttons & Qt::RightButton ? 2 : 0) |
+        (buttons & Qt::MiddleButton ? 4 : 0);
+    RemoteInputEvent event;
+    event.type = RemoteInputEventType::RelativeMove;
+    event.relativeX = remoteSize.width() > 0 ? double(dx) / double(remoteSize.width()) : 0.0; // wjy: 当前目标还原为原始设备计数；同步目标继续沿用既有按远端分辨率换算语义。
+    event.relativeY = remoteSize.height() > 0 ? double(dy) / double(remoteSize.height()) : 0.0;
+    event.fallbackDeltaX = dx; // wjy: 首帧远端尺寸未知时直接发送 Raw Input 计数，原有 ±200 协议保护仍在协调器和 Host 两端生效。
+    event.fallbackDeltaY = dy;
+    event.buttons = remoteButtons;
+    dispatchRemoteInputEvent(event);
+    return true;
+}
+// ===end====
+
+// =====wjy====
+bool RemoteDesktopWindow::setRawInputMouseCaptureEnabled(bool enabled)
+{
+#if defined(Q_OS_WIN)
+    if (!enabled) {
+        if (g_rawInputMouseTarget == this) {
+            RAWINPUTDEVICE device{};
+            device.usUsagePage = 0x01; // wjy: Generic Desktop Controls。
+            device.usUsage = 0x02; // wjy: Mouse；RIDEV_REMOVE 时 hwndTarget 必须为空。
+            device.dwFlags = RIDEV_REMOVE;
+            device.hwndTarget = nullptr;
+            ::RegisterRawInputDevices(&device, 1, sizeof(device)); // wjy: 即使系统返回失败也清除本对象状态，已销毁窗口不能继续被当作有效接收者。
+            g_rawInputMouseTarget = nullptr;
+        }
+        m_rawInputMouseCaptureActive = false;
+        return true;
+    }
+
+    if (m_rawInputMouseCaptureActive && g_rawInputMouseTarget == this) {
+        return true;
+    }
+    if (!isActiveWindow()) {
+        m_rawInputMouseCaptureActive = false;
+        return false; // wjy: 后台远控窗口不抢占进程唯一的 Raw Input 鼠标目标，仍保留其远端连接和旧相对代码状态。
+    }
+    if (g_rawInputMouseTarget && g_rawInputMouseTarget != this) {
+        g_rawInputMouseTarget->setRawInputMouseCaptureEnabled(false); // wjy: 活动远控窗口切换时先让旧窗口撤销注册，再把同一设备类安全交给本窗口。
+    }
+
+    const HWND targetWindow = reinterpret_cast<HWND>(winId());
+    if (!targetWindow || !::IsWindow(targetWindow)) {
+        m_rawInputMouseCaptureActive = false;
+        return false;
+    }
+    RAWINPUTDEVICE device{};
+    device.usUsagePage = 0x01; // wjy: HID Generic Desktop Controls。
+    device.usUsage = 0x02; // wjy: 仅注册鼠标原始位移；键盘继续使用现有低级钩子和快捷键门禁。
+    device.dwFlags = 0; // wjy: 不使用 RIDEV_NOLEGACY，保留 Qt 按钮、滚轮和窗口交互消息，只有移动量改走 WM_INPUT。
+    device.hwndTarget = targetWindow;
+    if (!::RegisterRawInputDevices(&device, 1, sizeof(device))) {
+        m_rawInputMouseCaptureActive = false;
+        return false; // wjy: 注册失败时不影响远控相对模式，sendRemoteMouseMove 会自动回退原中心差值实现。
+    }
+
+    g_rawInputMouseTarget = this;
+    m_rawInputMouseCaptureActive = true;
+    return true;
+#else
+    Q_UNUSED(enabled)
+    m_rawInputMouseCaptureActive = false;
+    return false;
+#endif
+}
+// ===end====
 
 void RemoteDesktopWindow::recenterRemoteMouseCapture()
 {
@@ -2817,6 +3346,10 @@ void RemoteDesktopWindow::updateResizeCursor(const QPoint& position)
         setWindowAndPresenterCursor(Qt::PointingHandCursor);
         return; // wjy: 更新入口使用手型指针；按钮远离 6px 缩放边缘，不影响窗口缩放命中。
     }
+    if (!isFullScreen() && mouseInputModeRect().contains(position)) {
+        setWindowAndPresenterCursor(Qt::PointingHandCursor);
+        return; // wjy: 系统/驱动后端开关使用手型指针，全屏时该区域仍属于远端画面。
+    }
     const int edges = resizeEdgesAt(position);
     if ((edges & ResizeLeft && edges & ResizeTop) || (edges & ResizeRight && edges & ResizeBottom)) {
         setWindowAndPresenterCursor(Qt::SizeFDiagCursor);
@@ -2958,8 +3491,11 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
                 && m_textureFailureCount < kTextureFailuresBeforeSoftwareFallback; // wjy: 普通单帧句柄竞争不触发黑屏或昂贵BGRA回退，直接等待下一张最新纹理。
             if (keepLastFrame) {
                 m_textureFrameActive = true;
-                m_texturePresenter->show();
-                m_texturePresenter->raise(); // wjy: 新帧失败时继续保留旧SwapChain前台内容，用户只看到上一帧短暂停留。
+                if (!m_texturePresenter->isVisible()) {
+                    m_texturePresenter->show();
+                    m_texturePresenter->raise(); // wjy: 只有旧SwapChain此前被隐藏时才恢复层级，连续失败帧不重复操作原生窗口Z序。
+                    raisePerformanceOverlay(); // wjy: Presenter真实恢复显示后一次性把本机指标放回最上层。
+                }
                 update(QRect(0, 0, width(), titleBarHeight()));
             } else {
                 m_texturePresentFailed.store(true); // wjy: 连续失败或真实设备移除只切换当前窗口软件保活，不影响其它十九路会话。
@@ -2992,8 +3528,12 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
             }
             m_connectionStatusCode = 50;
             m_connectionStatus = QString::fromUtf8("画面已接收");
-            m_texturePresenter->show();
-            m_texturePresenter->raise();
+            if (!m_remoteMouseBackendKnown && !m_remoteMouseBackendPending) queryRemoteMouseBackend(); // wjy: 纹理首帧若先于状态回调到达，也会在输入资格建立后立即同步 Host 全局后端。
+            if (!m_texturePresenter->isVisible()) {
+                m_texturePresenter->show();
+                m_texturePresenter->raise(); // wjy: 首帧或BGRA回切D3D时才提升Presenter，正常60 FPS Present不再逐帧改变Z序。
+                raisePerformanceOverlay(); // wjy: Presenter层级变化完成后只恢复一次浮层，消除两个原生子窗口交替闪烁。
+            }
             if (m_remoteUpdateState == RemoteUpdateState::Reconnecting) {
                 finishRemoteUpdateWait(); // wjy: 共享纹理首帧成功呈现后才移除更新遮罩并恢复输入。
             }
@@ -3054,12 +3594,14 @@ void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
     // ===end====
     m_connectionStatusCode = 50;
     m_connectionStatus = QString::fromUtf8("画面已接收");
+    if (!m_remoteMouseBackendKnown && !m_remoteMouseBackendPending) queryRemoteMouseBackend(); // wjy: BGRA 首帧与纹理路径使用相同查询门禁，事件先后顺序不同也只发送一次。
     if (m_remoteUpdateState == RemoteUpdateState::Reconnecting) {
         finishRemoteUpdateWait(); // wjy: 软件帧路径同样以首帧到达作为恢复正常远控的唯一完成点。
     }
     if (!textureWasVisible) {
         update(contentRect); // wjy: 普通软件帧继续异步刷新；只有D3D→BGRA交接首帧使用一次同步重绘。
     }
+    updatePerformanceOverlayGeometry(); // wjy: BGRA首帧切换完成后同样显示固定右下角浮层，和D3D11路径保持一致。
     // appendViewerDebugLog(QStringLiteral("setRemoteFrame update requested")); // wjy: per-frame repaint log disabled to avoid disk IO on every frame.
 }
 
@@ -3079,6 +3621,7 @@ void RemoteDesktopWindow::updatePresentedFrameStats(qint64 bgraBytes)
     }
 
     ++m_frameStatsCount; // wjy: 只统计成功进入软件显示或D3D11 Present的帧，协调器据此判断真实可见流畅度。
+    ++m_totalPresentedFrames; // wjy: 长周期单调计数供协调器与纹理单槽拒绝数求差，和一秒悬浮层统计互不影响。
     m_frameStatsBytes += qMax<qint64>(0, bgraBytes); // wjy: 仅软件帧累计BGRA字节，共享纹理保持零以反映零拷贝路径。
     const qint64 elapsedMs = m_frameStatsClock.elapsed();
     if (elapsedMs < 1000) {
@@ -3274,6 +3817,14 @@ void RemoteDesktopWindow::startViewerConnectionWithAdmission()
     m_viewerStartQueued = false;
     m_viewerStartAdmissionActive = true; // wjy: 从此刻到连接成功/失败/stop完成期间占用一个初始化预算。
     m_remoteCursorShape = Qt::ArrowCursor; // wjy: 替换 Viewer 会话不得继承旧 Host 最后的缩放形状；旧 Host 或暂未发送状态时保持普通箭头。
+    m_remoteMouseBackend = RemoteMouseBackend::System;
+    m_pendingRemoteMouseBackend = RemoteMouseBackend::System;
+    m_remoteMouseBackendKnown = false;
+    m_remoteMouseBackendPending = false;
+    m_remoteMouseBackendFallback = false;
+    m_mouseBackendButtonPressed = false;
+    ++m_remoteMouseBackendRequestGeneration; // wjy: 新 Viewer 代际从安全系统默认重新查询，旧连接迟到确认和超时都不能污染本次标题栏。
+    m_remoteMouseBackendMessage = zh("等待目标端确认键鼠模式");
     if (!m_remoteMouseCaptureActive) {
         updateResizeCursor(mapFromGlobal(QCursor::pos())); // wjy: 鼠标静止在远端画面内时也立即清除上一会话遗留光标，无需等待下一次移动。
     }
@@ -3337,6 +3888,8 @@ void RemoteDesktopWindow::releaseViewerStartupAdmission()
 
 void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
 {
+    const bool should_query_mouse_backend = code == FSREMOTE_STATUS_RECEIVING_VIDEO
+        && m_connectionStatusCode != FSREMOTE_STATUS_RECEIVING_VIDEO; // wjy: 每个 Viewer 代际首次进入可输入状态时查询一次，持续帧状态不会重复刷控制通道。
     // =====wjy====
     if (RemoteConnectionState::releasesViewerStartupAdmission(code)) {
         releaseViewerStartupAdmission(); // wjy: 首帧表示初始化完成；断开/失败表示本轮初始化终止，三种终态都立即补位下一窗口。
@@ -3357,6 +3910,7 @@ void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
         if (m_inputBroadcastCoordinator) {
             m_inputBroadcastCoordinator->notifyEligibilityChanged(this); // wjy: 更新遮罩分支提前返回前仍通知协调器移除不可输入目标。
         }
+        updatePerformanceOverlayGeometry(); // wjy: 更新状态的提前返回分支也确保本机浮层保持隐藏。
         update(isFullScreen() ? rect() : QRect(0, titleBarHeight(), width(), height() - titleBarHeight()));
         return; // wjy: 更新遮罩接管连接文字，不显示“连接失败/已断开”。
     }
@@ -3367,7 +3921,9 @@ void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
     if (m_inputBroadcastCoordinator) {
         m_inputBroadcastCoordinator->notifyEligibilityChanged(this); // wjy: 断线/失败会关闭主控或移除跟随端，连接成功后则从后续事件开始动态加入。
     }
+    updatePerformanceOverlayGeometry(); // wjy: 断线立即隐藏旧统计，重新收到有效画面后再显示。
     update(isFullScreen() ? rect() : QRect(0, titleBarHeight(), width(), height() - titleBarHeight())); // wjy: 连接状态在全屏覆盖整窗。
+    if (should_query_mouse_backend) queryRemoteMouseBackend(); // wjy: 先提交 code=50 再发送 query，sendInputMessage 的连接资格门禁此时已经满足。
 }
 
 void RemoteDesktopWindow::setEncodedBitrateMbps(double mbps)
@@ -3391,42 +3947,7 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
         const QRect target = remoteImageRect();
         painter.setRenderHint(QPainter::SmoothPixmapTransform, false); // wjy: Prefer low-latency full-screen remote drawing over expensive smooth scaling.
         painter.drawImage(target, m_remoteFrame);
-        // =====wjy====
-        const QStringList statLines = {
-            QStringLiteral("UI %1 fps").arg(m_receiveFps, 0, 'f', 1),
-            QStringLiteral("%1 x %2").arg(m_remoteFrame.width()).arg(m_remoteFrame.height()),
-            QStringLiteral("ENC %1 Mbps").arg(m_encodedMbps, 0, 'f', 2),
-            QStringLiteral("RAW %1 Mbps").arg(m_rawBgraMbps, 0, 'f', 1),
-            QStringLiteral("RGB %1/%2/%3").arg(m_rgbMin).arg(m_rgbAvg).arg(m_rgbMax),
-            QStringLiteral("CTR %1/%2/%3").arg(m_centerRgbMin).arg(m_centerRgbAvg).arg(m_centerRgbMax),
-        }; // wjy: Show real compressed bitrate first; RAW stays as a local decoded-throughput diagnostic.
-        QFont statFont(QStringLiteral("Consolas"));
-        statFont.setPixelSize(12);
-        painter.setFont(statFont);
-        const QFontMetrics statMetrics(statFont);
-        int statWidth = 0;
-        for (const QString& line : statLines) {
-            statWidth = qMax(statWidth, statMetrics.horizontalAdvance(line)); // wjy: Size the panel to the widest metric line so text never clips.
-        }
-        const int panelPaddingX = 10;
-        const int panelPaddingY = 7;
-        const int panelWidth = statWidth + panelPaddingX * 2;
-        const int panelHeight = statLines.size() * statMetrics.height() + panelPaddingY * 2;
-        const QRect statPanel(
-            target.right() - panelWidth - 12,
-            target.bottom() - panelHeight - 12,
-            panelWidth,
-            panelHeight); // wjy: Anchor stats to the remote image bottom-right so window chrome and letterboxing stay clear.
-        painter.setPen(Qt::NoPen);
-        painter.setBrush(QColor(0, 0, 0, 156));
-        painter.drawRoundedRect(QRectF(statPanel), 5, 5);
-        painter.setPen(QColor(QStringLiteral("#EAF2FF")));
-        int textY = statPanel.top() + panelPaddingY + statMetrics.ascent();
-        for (const QString& line : statLines) {
-            painter.drawText(statPanel.left() + panelPaddingX, textY, line); // wjy: Draw one metric per line for quick reading during remote-control testing.
-            textY += statMetrics.height();
-        }
-        // ===end====
+        // wjy: 旧的RAW/RGB调试面板已由统一本机性能浮层替代，BGRA和D3D11路径现在显示完全相同的六行实际指标。
     } else {
         const int barHeight = fullScreen ? 0 : titleBarHeight();
         const QRect contentRect(0, barHeight, width(), qMax(0, height() - barHeight));
@@ -3530,7 +4051,7 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     constexpr int elapsedGap = 14;
     const int titleTextRight = m_remoteUpdateAvailable
         ? remoteUpdateButtonRect().left()
-        : qualityButtonRect().left(); // wjy: 无更新按钮时文字截止到画质按钮左侧，局部策略入口不会与IP/计时重叠。
+        : mouseInputModeRect().left(); // wjy: 无更新按钮时文字截止到新增鼠标后端按钮左侧，IP/计时不会覆盖任何本地开关。
     const int maxIpWidth = qMax(0, titleTextRight - ipX - elapsedGap - elapsedTextWidth - 8);
     const QFontMetrics titleMetrics(textFont);
     const int ipWidth = qMin(titleMetrics.horizontalAdvance(m_hostIp), maxIpWidth);
@@ -3575,6 +4096,40 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     }
 
     // =====wjy====
+    const QRect mouseModeRect = mouseInputModeRect();
+    const bool mouseModeHovered = mouseModeRect.contains(m_hoveredPos);
+    QColor mouseModeAccent = m_remoteMouseBackend == RemoteMouseBackend::Faker
+        ? QColor(QStringLiteral("#0F766E"))
+        : QColor(QStringLiteral("#3A7BFC")); // wjy: 绿色表示虚拟 HID 驱动，蓝色表示原有 SendInput，两个后端不与相对捕获状态混色。
+    if (m_remoteMouseBackendFallback) mouseModeAccent = QColor(QStringLiteral("#D97706"));
+    if (m_remoteMouseBackendPending) mouseModeAccent = QColor(QStringLiteral("#64748B"));
+    QColor mouseModeBackground = mouseModeHovered
+        ? mouseModeAccent.lighter(180)
+        : mouseModeAccent.lighter(205);
+    if (m_mouseBackendButtonPressed) mouseModeBackground = mouseModeBackground.darker(112); // wjy: 只有按下并在同一热区释放才切换，按压色让拖出取消过程可见。
+    painter.setPen(QPen(mouseModeAccent, 1));
+    painter.setBrush(mouseModeBackground);
+    painter.drawRoundedRect(QRectF(mouseModeRect), 4, 4);
+    QFont mouseModeFont(QStringLiteral("Microsoft YaHei UI"));
+    mouseModeFont.setPixelSize(11);
+    mouseModeFont.setWeight(QFont::DemiBold);
+    painter.setFont(mouseModeFont);
+    painter.setPen(mouseModeAccent.darker(115));
+    QString mouseModeText = (m_remoteMouseBackendPending ? m_pendingRemoteMouseBackend : m_remoteMouseBackend)
+            == RemoteMouseBackend::Faker
+        ? zh("驱动")
+        : zh("系统");
+    if (m_remoteMouseBackendPending) {
+        mouseModeText += QString::fromUtf8("…");
+    } else if (m_remoteMouseBackendFallback) {
+        mouseModeText += QLatin1Char('!');
+    } else if (!m_remoteMouseBackendKnown) {
+        mouseModeText += QLatin1Char('?');
+    }
+    painter.drawText(mouseModeRect, Qt::AlignCenter, mouseModeText); // wjy: pending、回退和旧版本未确认分别使用省略号、感叹号和问号，避免把请求值冒充生效值。
+    // ===end====
+
+    // =====wjy====
     const QRect qualityRect = qualityButtonRect();
     const bool qualityHovered = qualityRect.contains(m_hoveredPos);
     QString qualityText;
@@ -3604,7 +4159,7 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
         qualityText = QString::fromUtf8("后台"); // wjy: 普通最小化窗口直接显示后台保活状态；高质量锁定仍保留“高质”持久标识。
         qualityAccent = QColor(QStringLiteral("#64748B"));
     } else if (remoteQualityIsDegraded()) {
-        qualityText += QString::fromUtf8("↓"); // wjy: 高质量或普通可见窗口被稳定性硬边界降级时，在标题栏持续显示向下标记。
+        qualityText += QString::fromUtf8("↓"); // wjy: 向下标记表示后台/软件回退、自动降档或Host实际限制；固定模式本身不会因接收压力改变请求。
     }
     if (m_qualityProtocolUnavailable) {
         qualityText += QLatin1Char('!'); // wjy: 旧Host/旧DLL不支持在线调节时以非致命感叹号提示，流不会中断。
@@ -3787,6 +4342,12 @@ void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
     // ===end====
     if (event->button() == Qt::LeftButton) {
         // =====wjy====
+        if (!isFullScreen() && mouseInputModeRect().contains(event->pos())) {
+            m_mouseBackendButtonPressed = true;
+            update(mouseInputModeRect());
+            event->accept();
+            return; // wjy: 按下只进入视觉态，必须在同一按钮内释放才发送后端切换请求。
+        }
         if (!isFullScreen() && inputSyncRect().contains(event->pos())) {
             m_inputSyncButtonPressed = true;
             update(inputSyncRect());
@@ -3872,13 +4433,15 @@ void RemoteDesktopWindow::mouseMoveEvent(QMouseEvent* event)
     const QString titleButtonTip = !isFullScreen() && m_remoteUpdateAvailable
             && remoteUpdateButtonRect().contains(event->pos())
         ? zh("更新目标设备")
-        : (!isFullScreen() && qualityButtonRect().contains(event->pos())
-                ? remoteQualityStatusSummary()
-                : (!isFullScreen() && inputSyncRect().contains(event->pos())
-                        ? inputSynchronizationToolTip()
-                        : (!isFullScreen() && clipboardSyncRect().contains(event->pos())
-                                ? zh("开关剪切板")
-                                : QString()))); // wjy: 更新、画质、键鼠同步和剪切板按钮共用标题栏气泡，全屏远端画面不显示本地提示。
+        : (!isFullScreen() && mouseInputModeRect().contains(event->pos())
+                ? remoteMouseBackendToolTip()
+                : (!isFullScreen() && qualityButtonRect().contains(event->pos())
+                        ? remoteQualityStatusSummary()
+                        : (!isFullScreen() && inputSyncRect().contains(event->pos())
+                                ? inputSynchronizationToolTip()
+                                : (!isFullScreen() && clipboardSyncRect().contains(event->pos())
+                                        ? zh("开关剪切板")
+                                        : QString())))); // wjy: 五个本地标题栏入口共用气泡，全屏远端画面不显示或拦截任何本地按钮。
     if (toolTip() != titleButtonTip) {
         setToolTip(titleButtonTip); // wjy: 保存当前提示内容，避免鼠标在同一按钮内移动时反复重置气泡。
         if (!titleButtonTip.isEmpty()) {
@@ -3972,6 +4535,14 @@ void RemoteDesktopWindow::mouseReleaseEvent(QMouseEvent* event)
 {
     if (event->button() == Qt::LeftButton) {
         // =====wjy====
+        if (m_mouseBackendButtonPressed) {
+            const bool activate = !isFullScreen() && mouseInputModeRect().contains(event->pos());
+            m_mouseBackendButtonPressed = false;
+            update(mouseInputModeRect());
+            if (activate) toggleRemoteMouseBackend(); // wjy: 松开位置仍在热区才切换，拖出按钮等同取消且不会影响远端鼠标。
+            event->accept();
+            return;
+        }
         if (m_inputSyncButtonPressed) {
             const bool activate = !isFullScreen() && inputSyncRect().contains(event->pos());
             m_inputSyncButtonPressed = false;
@@ -4163,6 +4734,12 @@ void RemoteDesktopWindow::keyReleaseEvent(QKeyEvent* event)
 void RemoteDesktopWindow::focusInEvent(QFocusEvent* event)
 {
     emit activated(this);
+    // =====wjy====
+    if (m_remoteMouseCaptureActive) {
+        setRawInputMouseCaptureEnabled(true); // wjy: 同步跟随窗口可能在后台收到 relative 状态，真正获得焦点时再接管进程唯一的 WM_INPUT 鼠标目标。
+        recenterRemoteMouseCapture();
+    }
+    // ===end====
     setKeyboardForwardingActive(!remoteUpdateActive()); // wjy: 更新遮罩获得焦点时也不安装全局键盘转发钩子。
     QWidget::focusInEvent(event);
 }
@@ -4181,6 +4758,7 @@ void RemoteDesktopWindow::resizeEvent(QResizeEvent* event)
         updateWindowMask(); // wjy: 最大化、还原等普通变化立即更新圆角；手动拖拽已在开始时清除Mask并在释放时统一恢复。
     }
     updateTexturePresenterGeometry();
+    updatePerformanceOverlayGeometry(); // wjy: 窗口缩放、全屏或黑边变化后让本机浮层继续贴住实际画面右下角。
     QWidget::resizeEvent(event);
 }
 

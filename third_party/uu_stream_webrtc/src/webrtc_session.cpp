@@ -5,7 +5,11 @@
 #include "uu_profile.h"
 
 #include <api/media_stream_interface.h>
+#include <api/make_ref_counted.h>
 #include <api/rtp_parameters.h>
+#include <api/stats/rtc_stats_collector_callback.h>
+#include <api/stats/rtc_stats_report.h>
+#include <api/stats/rtcstats_objects.h>
 #include <api/create_peerconnection_factory.h>
 #include <api/data_channel_interface.h>
 #include <api/field_trials.h>
@@ -15,6 +19,7 @@
 #include <rtc_base/ref_counted_object.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <iostream>
 #include <map>
@@ -26,6 +31,14 @@
 #include <windows.h>
 
 namespace uu {
+
+// =====wjy====
+struct ReceiverStatsRequestState {
+    std::atomic_bool alive = true; // wjy: WebrtcSession 析构先清除此标志，迟到的统计回调只归还 pending，不访问上层对象。
+    std::atomic_bool pending = false; // wjy: 每个 PeerConnection 最多允许一个在途统计请求，避免 60 FPS 回调堆积异步任务。
+};
+// ===end====
+
 namespace {
 
 webrtc::SdpType sdp_type_from_kind(const std::string& kind)
@@ -126,6 +139,56 @@ public:
 private:
     WebrtcSession* session_ = nullptr;
 };
+
+// =====wjy====
+class ReceiverStatsCollector : public webrtc::RTCStatsCollectorCallback {
+public:
+    ReceiverStatsCollector(
+        std::weak_ptr<ReceiverStatsRequestState> state,
+        WebrtcSession::ReceiverStatsCallback callback)
+        : state_(std::move(state)), callback_(std::move(callback))
+    {
+    }
+
+    void OnStatsDelivered(const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override
+    {
+        const std::shared_ptr<ReceiverStatsRequestState> state = state_.lock();
+        if (!state) return;
+        state->pending.store(false, std::memory_order_release); // wjy: 无论会话是否仍存活都先释放下一次采样资格。
+        if (!state->alive.load(std::memory_order_acquire) || !report || !callback_) return;
+
+        ReceiverPerformanceStats result;
+        result.sample_time_ms = static_cast<uint64_t>(::GetTickCount64());
+        for (const auto* inbound : report->GetStatsOfType<webrtc::RTCInboundRtpStreamStats>()) {
+            if (!inbound->kind || *inbound->kind != "video") continue;
+            result.frames_received += inbound->frames_received.value_or(0);
+            result.frames_decoded += inbound->frames_decoded.value_or(0);
+            result.frames_dropped += inbound->frames_dropped.value_or(0);
+            result.freeze_count += inbound->freeze_count.value_or(0);
+            result.jitter_buffer_emitted_count += inbound->jitter_buffer_emitted_count.value_or(0);
+            result.packets_received += inbound->packets_received.value_or(0);
+            result.packets_lost += static_cast<uint64_t>(std::max(0, inbound->packets_lost.value_or(0)));
+            result.total_decode_time_ms += inbound->total_decode_time.value_or(0.0) * 1000.0;
+            result.total_processing_delay_ms += inbound->total_processing_delay.value_or(0.0) * 1000.0;
+            result.total_freezes_duration_ms += inbound->total_freezes_duration.value_or(0.0) * 1000.0;
+            result.total_jitter_buffer_delay_ms += inbound->jitter_buffer_delay.value_or(0.0) * 1000.0;
+        }
+        for (const auto* pair : report->GetStatsOfType<webrtc::RTCIceCandidatePairStats>()) {
+            const bool usable = pair->state && *pair->state == "succeeded";
+            const bool nominated = pair->nominated.value_or(false);
+            if (!usable || (!nominated && result.round_trip_time_ms > 0.0)) continue;
+            result.round_trip_time_ms = pair->current_round_trip_time.value_or(0.0) * 1000.0;
+            result.available_incoming_bitrate_kbps = pair->available_incoming_bitrate.value_or(0.0) / 1000.0;
+            if (nominated) break;
+        }
+        callback_(result); // wjy: 原生层只交付标准累计统计，是否降档由控制端结合显示和交互状态统一决定。
+    }
+
+private:
+    std::weak_ptr<ReceiverStatsRequestState> state_;
+    WebrtcSession::ReceiverStatsCallback callback_;
+};
+// ===end====
 
 } // namespace
 
@@ -328,7 +391,7 @@ void apply_sender_rate(webrtc::RtpSenderInterface* sender, uint32_t min_bitrate_
 } // namespace
 
 WebrtcSession::WebrtcSession(NativeWebrtcRuntime* runtime, SessionConfig config)
-    : runtime_(runtime), config_(config)
+    : runtime_(runtime), config_(config), receiver_stats_state_(std::make_shared<ReceiverStatsRequestState>())
 {
     // =====wjy====
     append_viewer_log(std::string("session ctor role=") + (config_.role == SessionRole::Host ? "host" : "viewer")); // wjy: identify which PeerConnection instance is producing later callbacks.
@@ -340,6 +403,9 @@ WebrtcSession::~WebrtcSession()
     // =====wjy====
     append_viewer_log("session dtor begin"); // wjy: if crash happens during close, this marks the start of teardown.
     // ===end====
+    if (receiver_stats_state_) {
+        receiver_stats_state_->alive.store(false, std::memory_order_release); // wjy: 关闭媒体对象前让所有迟到 getStats 回调立即失效。
+    }
     // =====wjy====
     {
         std::lock_guard lock(control_channel_mutex_);
@@ -471,6 +537,24 @@ bool WebrtcSession::apply_sender_quality(
         if (error) *error = std::string(result.message());
         return false;
     }
+    return true;
+}
+// ===end====
+
+// =====wjy====
+bool WebrtcSession::request_receiver_performance_stats(ReceiverStatsCallback callback)
+{
+    const std::shared_ptr<ReceiverStatsRequestState> state = receiver_stats_state_;
+    if (config_.role != SessionRole::Viewer || !pc_ || !state || !callback
+        || !state->alive.load(std::memory_order_acquire)) {
+        return false;
+    }
+    bool expected = false;
+    if (!state->pending.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return false; // wjy: 上一次统计尚未返回时跳过本轮，不创建等待队列也不影响视频解码。
+    }
+    auto collector = webrtc::make_ref_counted<ReceiverStatsCollector>(state, std::move(callback));
+    pc_->GetStats(collector.get()); // wjy: WebRTC 持有回调引用直至异步报告完成，collector 局部引用可安全释放。
     return true;
 }
 // ===end====

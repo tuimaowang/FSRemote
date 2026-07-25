@@ -287,9 +287,25 @@ int main(int argc, char* argv[])
     // ===end====
 
     // =====wjy====
+    bool updateShutdownPrepared = false; // wjy: 更新退出只允许一个调用者执行服务和媒体预清理，重复信号不能二次释放 Host 句柄。
     QObject::connect(&platform::UpdateService::instance(), &platform::UpdateService::updateReadyToQuit,
-        &app, [&window] {
-            window.requestApplicationExit(); // wjy: 更新退出恢复为本机直接退出；控制端仅在设备右键菜单主动更新时维护远控等待窗口。
+        &app, [&] {
+            if (updateShutdownPrepared) return;
+            updateShutdownPrepared = true;
+            writeStartupLog(QStringLiteral("[wjy-update-exit] deterministic cleanup begin"));
+
+            remoteControllerOverlayTimer.stop(); // wjy: Host 句柄释放前停止控制端列表轮询，后续事件不再读取已关闭的原生会话表。
+            commandServer.stop(); // wjy: 先关闭 49102 并汇合已经完成暂存的更新线程，禁止退出期间再受理第二个更新或电源命令。
+            statusServer.stop(); // wjy: 关闭 49101 后控制端会把本机视为预期更新离线，不再从旧 Host 句柄生成 busy 快照。
+            realtimeStateService.stop(); // wjy: 停止 UDP 心跳和会话采样，确保下面销毁 Host 时没有并发读取会话状态。
+            if (hostHandle) {
+                writeStartupLog(QStringLiteral("[wjy-update-exit] stream host stop begin"));
+                stream::StreamRuntime::instance().stop(hostHandle); // wjy: 在 UI 析构前主动关闭监听、WebRTC 会话、采集编码管线和 FakerInput Bridge 客户端。
+                hostHandle = nullptr; // wjy: 主退出尾声据此跳过重复 stop，防止对已经释放的原生句柄二次调用。
+                writeStartupLog(QStringLiteral("[wjy-update-exit] stream host stop end"));
+            }
+            writeStartupLog(QStringLiteral("[wjy-update-exit] deterministic cleanup end"));
+            window.requestApplicationExit(); // wjy: 关键媒体和服务资源确认释放后再进入窗口、后台任务、SSH 和 Qt 的统一退出路径。
         });
     // ===end====
     writeStartupLog(QStringLiteral("[wjy-main] after MainWindow create"));

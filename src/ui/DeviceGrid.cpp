@@ -32,7 +32,6 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QClipboard>
-#include <QCheckBox>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QCursor>
@@ -78,7 +77,6 @@
 #include <QShortcut>
 #include <QShowEvent>
 #include <QSignalBlocker>
-#include <QSpinBox>
 #include <QStringList>
 #include <QTimer>
 #include <QToolButton>
@@ -2812,7 +2810,7 @@ QRect settingsRemoteQualityControlRect(int index)
     const int columnWidth = qMax(220, (card.width() - 84) / 2);
     const int x = card.x() + 28 + column * (columnWidth + 28) + columnWidth - 150;
     const int y = card.y() + 66 + row * 58;
-    return QRect(x, y, 150, 32); // wjy: 两列六行使用统一真实控件矩形，窗口缩放时左右列保持等宽且不会互相覆盖。
+    return QRect(x, y, 150, 32); // wjy: 保留原设置卡片的首个控件位置，现在只用于全局默认模式下拉框。
 }
 // ===end====
 
@@ -2941,7 +2939,7 @@ void drawSettingsPage(
         painter.setPen(QColor(QStringLiteral("#040B18")));
         painter.drawText(QRectF(qualityCard.x() + 28, qualityCard.y() + 16, qualityCard.width() - 56, 22),
             Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("远控画质与资源策略"));
+            QString::fromUtf8("远控画质预设"));
 
         QFont detail(textFont);
         detail.setPixelSize(11);
@@ -2949,31 +2947,38 @@ void drawSettingsPage(
         painter.setPen(QColor(QStringLiteral("#687384")));
         painter.drawText(QRectF(qualityCard.x() + 28, qualityCard.y() + 38, qualityCard.width() - 56, 18),
             Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("可见清晰度按模式固定，性能压力只降低FPS；最小化使用后台档；所有连接始终保持不断流。")); // wjy: 设置页明确展示固定清晰度与FPS适配规则，避免用户误以为画面会自动降分辨率。
+            QString::fromUtf8("固定模式不主动降帧；只有自动模式根据性能在60、45、30 FPS间调节。")); // wjy: 页面直接说明唯一自适应入口，避免固定模式再次被复杂策略悄悄降档。
 
-        const char* labels[] = {
-            "全局模式",
-            "目标FPS",
-            "可见最低FPS",
-            "严重压力最低FPS",
-            "可见清晰度策略",
-            "最小化FPS",
-            "最小化分辨率",
-            "降级持续时间",
-            "恢复稳定时间",
-            "总接收预算",
-            "资源恢复后自动回升",
-        };
         QFont labelFont(textFont);
         labelFont.setPixelSize(12);
         painter.setFont(labelFont);
         painter.setPen(QColor(QStringLiteral("#111827")));
-        for (int index = 0; index < 11; ++index) {
-            const QRect controlRect = settingsRemoteQualityControlRect(index);
-            painter.drawText(
-                QRectF(controlRect.x() - 142, controlRect.y(), 132, controlRect.height()),
-                Qt::AlignVCenter | Qt::AlignRight,
-                QString::fromUtf8(labels[index])); // wjy: 手绘标签和真实控件共享索引，调整布局时不会出现字段错位。
+        const QRect modeControlRect = settingsRemoteQualityControlRect(0);
+        painter.drawText(
+            QRectF(modeControlRect.x() - 142, modeControlRect.y(), 132, modeControlRect.height()),
+            Qt::AlignVCenter | Qt::AlignRight,
+            QString::fromUtf8("全局默认模式"));
+
+        QFont presetFont(textFont);
+        presetFont.setPixelSize(12);
+        painter.setFont(presetFont);
+        const QStringList presetLines = {
+            QString::fromUtf8("高质量    原始分辨率 · 固定请求 60 FPS"),
+            QString::fromUtf8("自动        原始分辨率 · 60 / 45 / 30 FPS 自动调节"),
+            QString::fromUtf8("均衡        1080p · 固定请求 45 FPS"),
+            QString::fromUtf8("流畅        720p · 固定请求 60 FPS"),
+            QString::fromUtf8("最小化    所有模式统一 540p · 15 FPS"),
+        };
+        for (int index = 0; index < presetLines.size(); ++index) {
+            const QRectF lineRect(
+                qualityCard.x() + 28,
+                qualityCard.y() + 118 + index * 30,
+                qualityCard.width() - 56,
+                24);
+            painter.setPen(index == presetLines.size() - 1
+                    ? QColor(QStringLiteral("#687384"))
+                    : QColor(QStringLiteral("#111827")));
+            painter.drawText(lineRect, Qt::AlignVCenter | Qt::AlignLeft, presetLines.at(index)); // wjy: 固定展示四档映射和统一后台档，用户无需推断隐藏的阈值参数。
         }
         painter.restore();
         return;
@@ -5743,101 +5748,26 @@ void DeviceGrid::setupSettingsControls()
     // ===end====
 
     // =====wjy====
-    m_remoteQualityConfiguration = platform::AppSettings::remoteQualityConfiguration(); // wjy: 创建控件前一次性读取并归一化全局设置，所有字段从同一快照初始化。
+    m_remoteQualityConfiguration = platform::AppSettings::remoteQualityConfiguration(); // wjy: 简化设置只读取全局默认模式，旧版复杂参数不再影响四档固定预设。
     const QString qualityControlStyle = QStringLiteral(
-        "QComboBox,QSpinBox{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;padding:0 8px;"
+        "QComboBox{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;padding:0 8px;"
         "font-family:'Microsoft YaHei UI';font-size:13px;color:#040B18;}"
-        "QComboBox:focus,QSpinBox:focus{border:1px solid #3A7BFC;}"
-        "QComboBox:disabled,QSpinBox:disabled{background:#F5F7FA;color:#94A3B8;}"
-        "QCheckBox{font-family:'Microsoft YaHei UI';font-size:13px;color:#040B18;spacing:8px;}"
-        "QCheckBox::indicator{width:18px;height:18px;}"
-        "QCheckBox::indicator:checked{background:#3A7BFC;border:1px solid #3A7BFC;border-radius:3px;}"
-        "QCheckBox::indicator:unchecked{background:#FFFFFF;border:1px solid #CBD5E1;border-radius:3px;}"); // wjy: 远控画质页真实控件与现有设置页的白底蓝色焦点样式保持一致。
+        "QComboBox:focus{border:1px solid #3A7BFC;}"
+        "QComboBox:disabled{background:#F5F7FA;color:#94A3B8;}"); // wjy: 远控画质页只保留一个默认模式下拉框，避免高级参数继续暗示固定预设可被改写。
 
     m_remoteQualityModeCombo = new QComboBox(this);
     m_remoteQualityModeCombo->addItem(QString::fromUtf8("自动"), static_cast<int>(stream::RemoteQualityMode::Automatic));
-    m_remoteQualityModeCombo->addItem(QString::fromUtf8("高质量"), static_cast<int>(stream::RemoteQualityMode::HighQualityLocked)); // wjy: 主窗口全局选项与远控标题栏统一显示“高质量”，内部优先级策略保持不变。
+    m_remoteQualityModeCombo->addItem(QString::fromUtf8("高质量"), static_cast<int>(stream::RemoteQualityMode::HighQualityLocked)); // wjy: 主窗口全局选项与远控标题栏统一显示“高质量”，对应原始分辨率/固定请求60 FPS。
     m_remoteQualityModeCombo->addItem(QString::fromUtf8("均衡"), static_cast<int>(stream::RemoteQualityMode::Balanced));
-    m_remoteQualityModeCombo->addItem(QString::fromUtf8("流畅"), static_cast<int>(stream::RemoteQualityMode::Smooth)); // wjy: 全局模式不提供FollowGlobal，避免无效递归配置。
+    m_remoteQualityModeCombo->addItem(QString::fromUtf8("流畅"), static_cast<int>(stream::RemoteQualityMode::Smooth)); // wjy: 全局模式不提供FollowGlobal，四项直接对应固定预设或唯一自动策略。
     m_remoteQualityModeCombo->setCurrentIndex(qMax(0, m_remoteQualityModeCombo->findData(static_cast<int>(m_remoteQualityConfiguration.defaultMode))));
-
-    const auto createFpsSpin = [this, &qualityControlStyle](int minimum, int maximum, int value) {
-        auto* spin = new QSpinBox(this);
-        spin->setRange(minimum, maximum);
-        spin->setSuffix(QStringLiteral(" FPS"));
-        spin->setValue(value);
-        spin->setStyleSheet(qualityControlStyle);
-        return spin; // wjy: 所有FPS输入统一范围、单位和视觉，保存时仍会做字段间归一化。
-    };
-    m_remoteTargetFpsSpin = createFpsSpin(15, 60, m_remoteQualityConfiguration.targetFps);
-    m_remoteMinimumVisibleFpsSpin = createFpsSpin(15, 60, m_remoteQualityConfiguration.minimumVisibleFps);
-    m_remoteSevereMinimumFpsSpin = createFpsSpin(5, 60, m_remoteQualityConfiguration.severePressureMinimumFps);
-    m_remoteMinimizedFpsSpin = createFpsSpin(1, 60, m_remoteQualityConfiguration.minimizedFps);
-
-    const auto populateResolutionCombo = [](QComboBox* combo) {
-        combo->addItem(QString::fromUtf8("原始"), static_cast<int>(stream::RemoteResolutionTier::Native));
-        combo->addItem(QStringLiteral("1440p"), static_cast<int>(stream::RemoteResolutionTier::P1440));
-        combo->addItem(QStringLiteral("1080p"), static_cast<int>(stream::RemoteResolutionTier::P1080));
-        combo->addItem(QStringLiteral("900p"), static_cast<int>(stream::RemoteResolutionTier::P900));
-        combo->addItem(QStringLiteral("720p"), static_cast<int>(stream::RemoteResolutionTier::P720));
-        combo->addItem(QStringLiteral("540p"), static_cast<int>(stream::RemoteResolutionTier::P540));
-        combo->addItem(QStringLiteral("360p"), static_cast<int>(stream::RemoteResolutionTier::P360)); // wjy: 固定档位和协调器/协议共用同一枚举顺序。
-    };
-    m_remoteMinimumResolutionCombo = new QComboBox(this);
-    m_remoteMinimumResolutionCombo->addItem(QString::fromUtf8("按模式固定"), static_cast<int>(stream::RemoteResolutionTier::P720)); // wjy: 保留旧控件位置和配置字段兼容，但不再提供会触发动态尺寸变化的可见下限选项。
-    m_remoteMinimumResolutionCombo->setCurrentIndex(0);
-    m_remoteMinimumResolutionCombo->setToolTip(QString::fromUtf8("高质量/自动：原始；均衡：1080p；流畅：720p")); // wjy: 直接说明四种可见模式的固定清晰度映射。
-    m_remoteMinimizedResolutionCombo = new QComboBox(this);
-    populateResolutionCombo(m_remoteMinimizedResolutionCombo);
-    m_remoteMinimizedResolutionCombo->setCurrentIndex(qMax(0, m_remoteMinimizedResolutionCombo->findData(static_cast<int>(m_remoteQualityConfiguration.minimizedResolution))));
-
-    m_remoteDegradationDelaySpin = new QSpinBox(this);
-    m_remoteDegradationDelaySpin->setRange(1, 30);
-    m_remoteDegradationDelaySpin->setSuffix(QString::fromUtf8(" 秒"));
-    m_remoteDegradationDelaySpin->setValue(qMax(1, m_remoteQualityConfiguration.degradationHoldMs / 1000));
-    m_remoteRecoveryDelaySpin = new QSpinBox(this);
-    m_remoteRecoveryDelaySpin->setRange(1, 120);
-    m_remoteRecoveryDelaySpin->setSuffix(QString::fromUtf8(" 秒"));
-    m_remoteRecoveryDelaySpin->setValue(qMax(1, m_remoteQualityConfiguration.recoveryHoldMs / 1000));
-    m_remoteReceiveBudgetSpin = new QSpinBox(this);
-    m_remoteReceiveBudgetSpin->setRange(0, 2000);
-    m_remoteReceiveBudgetSpin->setSuffix(QStringLiteral(" Mbps"));
-    m_remoteReceiveBudgetSpin->setSpecialValueText(QString::fromUtf8("自动"));
-    m_remoteReceiveBudgetSpin->setValue(m_remoteQualityConfiguration.aggregateReceiveBudgetMbps); // wjy: 0显示“自动”，预算只触发降档而绝不作为断开会话条件。
-    m_remoteAutomaticRecoveryCheck = new QCheckBox(QString::fromUtf8("启用"), this);
-    m_remoteAutomaticRecoveryCheck->setChecked(m_remoteQualityConfiguration.automaticRecoveryEnabled);
-
-    const QList<QWidget*> qualityControls = {
-        m_remoteQualityModeCombo,
-        m_remoteTargetFpsSpin,
-        m_remoteMinimumVisibleFpsSpin,
-        m_remoteSevereMinimumFpsSpin,
-        m_remoteMinimumResolutionCombo,
-        m_remoteMinimizedFpsSpin,
-        m_remoteMinimizedResolutionCombo,
-        m_remoteDegradationDelaySpin,
-        m_remoteRecoveryDelaySpin,
-        m_remoteReceiveBudgetSpin,
-        m_remoteAutomaticRecoveryCheck,
-    };
-    for (QWidget* control : qualityControls) {
-        control->setStyleSheet(qualityControlStyle);
-        control->setVisible(false); // wjy: 首次显隐统一交给updateSettingsControls，构造阶段不会闪到常规页上。
-    }
+    m_remoteQualityModeCombo->setStyleSheet(qualityControlStyle);
+    m_remoteQualityModeCombo->setVisible(false); // wjy: 首次显隐统一交给updateSettingsControls，构造阶段不会闪到常规页上。
 
     const auto persistRemoteQuality = [this] {
-        saveRemoteQualitySettingsFromControls(); // wjy: 任一字段变化都保存完整快照，并立即通知当前打开窗口。
+        saveRemoteQualitySettingsFromControls(); // wjy: 默认模式变化立即保存，并把对应固定预设下发给当前跟随全局的窗口。
     };
     connect(m_remoteQualityModeCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, persistRemoteQuality);
-    connect(m_remoteTargetFpsSpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
-    connect(m_remoteMinimumVisibleFpsSpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
-    connect(m_remoteSevereMinimumFpsSpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
-    connect(m_remoteMinimizedFpsSpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
-    connect(m_remoteMinimizedResolutionCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, persistRemoteQuality);
-    connect(m_remoteDegradationDelaySpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
-    connect(m_remoteRecoveryDelaySpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
-    connect(m_remoteReceiveBudgetSpin, qOverload<int>(&QSpinBox::valueChanged), this, persistRemoteQuality);
-    connect(m_remoteAutomaticRecoveryCheck, &QCheckBox::toggled, this, persistRemoteQuality);
     // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after batch add controls create")); // wjy: 批量新增输入框和按钮创建完成。
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before updateSettingsControls in setup")); // wjy: 判断是否崩在首次刷新设置控件显隐状态。
@@ -6320,28 +6250,14 @@ void DeviceGrid::updateSettingsControls()
     }
 
     // =====wjy====
-    const QList<QWidget*> qualityControls = {
-        m_remoteQualityModeCombo,
-        m_remoteTargetFpsSpin,
-        m_remoteMinimumVisibleFpsSpin,
-        m_remoteSevereMinimumFpsSpin,
-        m_remoteMinimumResolutionCombo,
-        m_remoteMinimizedFpsSpin,
-        m_remoteMinimizedResolutionCombo,
-        m_remoteDegradationDelaySpin,
-        m_remoteRecoveryDelaySpin,
-        m_remoteReceiveBudgetSpin,
-        m_remoteAutomaticRecoveryCheck,
-    };
     const bool qualityVisible = m_settingsSelected && m_settingsTab == SettingsTab::RemoteControl;
-    for (int index = 0; index < qualityControls.size(); ++index) {
-        QWidget* control = qualityControls.at(index);
-        if (!control) {
-            continue;
-        }
-        const QRect controlRect = settingsRemoteQualityControlRect(index);
-        const bool controlEnabled = qualityVisible && control != m_remoteMinimumResolutionCombo; // wjy: 可见清晰度策略只读展示，其他资源参数继续允许在线修改。
-        applySettingsControlGeometry(control, controlRect, qualityVisible, controlEnabled, true);
+    if (m_remoteQualityModeCombo) {
+        applySettingsControlGeometry(
+            m_remoteQualityModeCombo,
+            settingsRemoteQualityControlRect(0),
+            qualityVisible,
+            qualityVisible,
+            true); // wjy: 简化页只管理默认模式下拉框，其余预设值作为只读说明绘制，不再创建复杂参数控件。
     }
     // ===end====
 
@@ -6351,41 +6267,14 @@ void DeviceGrid::updateSettingsControls()
 // =====wjy====
 void DeviceGrid::saveRemoteQualitySettingsFromControls()
 {
-    if (!m_remoteQualityModeCombo || !m_remoteTargetFpsSpin || !m_remoteMinimumVisibleFpsSpin
-        || !m_remoteSevereMinimumFpsSpin || !m_remoteMinimumResolutionCombo
-        || !m_remoteMinimizedFpsSpin || !m_remoteMinimizedResolutionCombo
-        || !m_remoteDegradationDelaySpin || !m_remoteRecoveryDelaySpin
-        || !m_remoteReceiveBudgetSpin || !m_remoteAutomaticRecoveryCheck) {
-        return; // wjy: 构造中控件尚未齐全时不保存半份配置，避免默认0覆盖用户设置。
+    if (!m_remoteQualityModeCombo) {
+        return; // wjy: 构造阶段下拉框尚未创建时不写入默认模式。
     }
 
     stream::RemoteQualityConfiguration configuration;
     configuration.defaultMode = static_cast<stream::RemoteQualityMode>(m_remoteQualityModeCombo->currentData().toInt());
-    configuration.targetFps = m_remoteTargetFpsSpin->value();
-    configuration.minimumVisibleFps = m_remoteMinimumVisibleFpsSpin->value();
-    configuration.severePressureMinimumFps = m_remoteSevereMinimumFpsSpin->value();
-    configuration.minimumVisibleResolution = stream::RemoteResolutionTier::P720; // wjy: 旧字段固定保留兼容值，协调器不再读取它执行可见分辨率降级。
-    configuration.minimizedFps = m_remoteMinimizedFpsSpin->value();
-    configuration.minimizedResolution = static_cast<stream::RemoteResolutionTier>(m_remoteMinimizedResolutionCombo->currentData().toInt());
-    configuration.degradationHoldMs = m_remoteDegradationDelaySpin->value() * 1000;
-    configuration.recoveryHoldMs = m_remoteRecoveryDelaySpin->value() * 1000;
-    configuration.aggregateReceiveBudgetMbps = m_remoteReceiveBudgetSpin->value();
-    configuration.automaticRecoveryEnabled = m_remoteAutomaticRecoveryCheck->isChecked();
-    m_remoteQualityConfiguration = stream::normalizedRemoteQualityConfiguration(configuration); // wjy: UI允许独立编辑，最终仍统一保证最低FPS/恢复时间等字段关系安全。
+    m_remoteQualityConfiguration = stream::normalizedRemoteQualityConfiguration(configuration); // wjy: 只接受四种可持久化默认模式，其余FPS/分辨率字段恢复代码内置预设。
     platform::AppSettings::setRemoteQualityConfiguration(m_remoteQualityConfiguration);
-
-    const QSignalBlocker targetBlocker(m_remoteTargetFpsSpin);
-    const QSignalBlocker minimumBlocker(m_remoteMinimumVisibleFpsSpin);
-    const QSignalBlocker severeBlocker(m_remoteSevereMinimumFpsSpin);
-    const QSignalBlocker minimizedBlocker(m_remoteMinimizedFpsSpin);
-    const QSignalBlocker degradationBlocker(m_remoteDegradationDelaySpin);
-    const QSignalBlocker recoveryBlocker(m_remoteRecoveryDelaySpin);
-    m_remoteTargetFpsSpin->setValue(m_remoteQualityConfiguration.targetFps);
-    m_remoteMinimumVisibleFpsSpin->setValue(m_remoteQualityConfiguration.minimumVisibleFps);
-    m_remoteSevereMinimumFpsSpin->setValue(m_remoteQualityConfiguration.severePressureMinimumFps);
-    m_remoteMinimizedFpsSpin->setValue(m_remoteQualityConfiguration.minimizedFps);
-    m_remoteDegradationDelaySpin->setValue(qMax(1, m_remoteQualityConfiguration.degradationHoldMs / 1000));
-    m_remoteRecoveryDelaySpin->setValue(qMax(1, m_remoteQualityConfiguration.recoveryHoldMs / 1000)); // wjy: 归一化改变相关字段后立即回写控件，用户看到的值就是实际生效值。
 
     const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
     for (const QPointer<RemoteDesktopWindow>& window : windows) {
@@ -6404,7 +6293,7 @@ void DeviceGrid::registerRemoteQualityWindow(RemoteDesktopWindow* window)
     if (!window) {
         return;
     }
-    window->setGlobalQualityConfiguration(m_remoteQualityConfiguration); // wjy: 新窗口读取全局FPS和稳定性边界，但局部模式默认“自动”且只活到本对象关闭。
+    window->setGlobalQualityConfiguration(m_remoteQualityConfiguration); // wjy: 新窗口读取全局默认模式；设备没有已保存选择时仍从“自动”固定预设开始。
     connect(window, &RemoteDesktopWindow::remoteQualityInputsChanged,
         this, &DeviceGrid::requestRemoteQualityEvaluation); // wjy: 最小化/恢复/模式切换即时生效，不等待下一次1秒采样。
     connect(window, &QObject::destroyed, this, [this, window] {

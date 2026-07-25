@@ -32,7 +32,6 @@
 
 class QEvent;
 class QByteArray;
-class QCheckBox;
 class QComboBox;
 class QKeyEvent;
 class QJsonObject;
@@ -43,7 +42,6 @@ class QPaintEvent;
 class QPushButton;
 class QResizeEvent;
 class QShowEvent;
-class QSpinBox;
 class QTextEdit;
 class QTimer;
 class QTreeWidget;
@@ -233,7 +231,7 @@ private:
     void saveRemoteQualitySettingsFromControls(); // wjy: 收集远控画质页字段、统一归一化持久化并立即通知跟随全局的窗口。
     void registerRemoteQualityWindow(RemoteDesktopWindow* window); // wjy: 普通和平铺窗口共用同一套质量注册、销毁清理和即时重算逻辑。
     void requestRemoteQualityEvaluation(); // wjy: 合并同一事件循环内多次窗口变化，最多排队一个全局质量计算任务。
-    void evaluateRemoteQuality(); // wjy: 每秒汇总全部不断流窗口并下发分辨率优先、FPS次级的在线质量决策。
+    void evaluateRemoteQuality(); // wjy: 每秒汇总窗口；固定模式重复确认预设，仅自动模式计算60/45/30 FPS档位。
     void saveShortcutKeySetting(int shortcutIndex, const QString& shortcutText); // wjy: Save one keyboard shortcut when its editor loses focus or receives Enter.
     void registerGlobalShortcuts();
     void unregisterGlobalShortcuts();
@@ -300,7 +298,7 @@ private:
     platform::DeviceRealtimeStateService* m_realtimeStateService = nullptr; // wjy: 由 main 持有且晚于 MainWindow 销毁，DeviceGrid 只连接和调用，不负责释放。
     RemoteInputBroadcastCoordinator m_remoteInputBroadcastCoordinator; // wjy: 单一协调器覆盖普通和平铺窗口，DeviceGrid 析构前先由窗口注销并完成同步输入释放。
     std::unique_ptr<RemoteViewerLifecycleManager> m_remoteViewerLifecycleManager; // wjy: 生命周期晚于窗口批量stop，析构时再次兜底join固定工作线程。
-    RemoteQualityCoordinator m_remoteQualityCoordinator; // wjy: 一个控制端统一协调全部远控窗口，高质量锁定按优先级最后降级但不能突破稳定性硬边界。
+    RemoteQualityCoordinator m_remoteQualityCoordinator; // wjy: 一个控制端统一下发四档预设，并只为自动模式维护有界FPS状态。
     QTimer* m_remoteQualityTimer = nullptr; // wjy: 1秒采样接收FPS/码率，最小化和用户切换模式另走即时重算信号。
     bool m_remoteQualityEvaluationQueued = false; // wjy: 多窗口同时最小化或创建时合并为一个Qt任务，避免事件队列放大。
     qint64 m_lastRemoteResourceDiagnosticAtMs = 0; // wjy: 资源快照限制为30秒一次，避免稳定性诊断本身成为性能热点。
@@ -324,17 +322,7 @@ private:
     QVector<QLineEdit*> m_shortcutKeyEdits; // wjy: Keyboard settings shortcut editors, one per remote-window action.
     // =====wjy====
     stream::RemoteQualityConfiguration m_remoteQualityConfiguration; // wjy: 主窗口缓存当前持久化全局画质，所有跟随全局窗口读取同一份值。
-    QComboBox* m_remoteQualityModeCombo = nullptr;
-    QSpinBox* m_remoteTargetFpsSpin = nullptr;
-    QSpinBox* m_remoteMinimumVisibleFpsSpin = nullptr;
-    QSpinBox* m_remoteSevereMinimumFpsSpin = nullptr;
-    QComboBox* m_remoteMinimumResolutionCombo = nullptr;
-    QSpinBox* m_remoteMinimizedFpsSpin = nullptr;
-    QComboBox* m_remoteMinimizedResolutionCombo = nullptr;
-    QSpinBox* m_remoteDegradationDelaySpin = nullptr;
-    QSpinBox* m_remoteRecoveryDelaySpin = nullptr;
-    QSpinBox* m_remoteReceiveBudgetSpin = nullptr;
-    QCheckBox* m_remoteAutomaticRecoveryCheck = nullptr; // wjy: 数值和下拉框使用真实Qt控件，保证键盘输入和可访问性可靠。
+    QComboBox* m_remoteQualityModeCombo = nullptr; // wjy: 远控画质设置只保留默认模式，下方固定预设由手绘说明展示。
     // ===end====
     QSet<int> m_registeredGlobalShortcutIds;
     quintptr m_globalShortcutWindowHandle = 0;

@@ -248,37 +248,16 @@ stream::RemoteQualityConfiguration AppSettings::remoteQualityConfiguration()
     stream::RemoteQualityConfiguration configuration;
     configuration.defaultMode = static_cast<stream::RemoteQualityMode>(
         appSettings.value(QStringLiteral("remoteQuality/defaultMode"), static_cast<int>(stream::RemoteQualityMode::Automatic)).toInt()); // wjy: 全局默认模式读取整数枚举，未知值在统一归一化阶段回退自动。
-    configuration.targetFps = appSettings.value(QStringLiteral("remoteQuality/targetFps"), 60).toInt();
-    configuration.minimumVisibleFps = appSettings.value(QStringLiteral("remoteQuality/minimumVisibleFps"), 30).toInt();
-    configuration.severePressureMinimumFps = appSettings.value(QStringLiteral("remoteQuality/severePressureMinimumFps"), 15).toInt();
-    configuration.minimizedFps = appSettings.value(QStringLiteral("remoteQuality/minimizedFps"), 15).toInt();
-    configuration.minimumVisibleResolution = static_cast<stream::RemoteResolutionTier>(
-        appSettings.value(QStringLiteral("remoteQuality/minimumVisibleResolution"), static_cast<int>(stream::RemoteResolutionTier::P720)).toInt());
-    configuration.minimizedResolution = static_cast<stream::RemoteResolutionTier>(
-        appSettings.value(QStringLiteral("remoteQuality/minimizedResolution"), static_cast<int>(stream::RemoteResolutionTier::P540)).toInt());
-    configuration.degradationHoldMs = appSettings.value(QStringLiteral("remoteQuality/degradationHoldMs"), 2500).toInt();
-    configuration.recoveryHoldMs = appSettings.value(QStringLiteral("remoteQuality/recoveryHoldMs"), 10000).toInt();
-    configuration.automaticRecoveryEnabled = appSettings.value(QStringLiteral("remoteQuality/automaticRecoveryEnabled"), true).toBool();
-    configuration.aggregateReceiveBudgetMbps = appSettings.value(QStringLiteral("remoteQuality/aggregateReceiveBudgetMbps"), 0).toInt();
-    return stream::normalizedRemoteQualityConfiguration(configuration); // wjy: 旧注册表、手工篡改或未来版本值都先夹紧再进入协调器。
+    return stream::normalizedRemoteQualityConfiguration(configuration); // wjy: 旧版复杂FPS/预算参数不再读取，仅保留默认模式；四档预设和后台档由代码统一定义。
 }
 
 void AppSettings::setRemoteQualityConfiguration(const stream::RemoteQualityConfiguration& configuration)
 {
     const stream::RemoteQualityConfiguration normalized =
-        stream::normalizedRemoteQualityConfiguration(configuration); // wjy: 保存前再次执行字段间约束，保证最低FPS不会高于目标FPS。
+        stream::normalizedRemoteQualityConfiguration(configuration); // wjy: 保存前校验默认模式，固定预设参数不再开放持久化修改。
     QSettings appSettings = settings();
     appSettings.setValue(QStringLiteral("remoteQuality/defaultMode"), static_cast<int>(normalized.defaultMode));
-    appSettings.setValue(QStringLiteral("remoteQuality/targetFps"), normalized.targetFps);
-    appSettings.setValue(QStringLiteral("remoteQuality/minimumVisibleFps"), normalized.minimumVisibleFps);
-    appSettings.setValue(QStringLiteral("remoteQuality/severePressureMinimumFps"), normalized.severePressureMinimumFps);
-    appSettings.setValue(QStringLiteral("remoteQuality/minimizedFps"), normalized.minimizedFps);
-    appSettings.setValue(QStringLiteral("remoteQuality/minimumVisibleResolution"), static_cast<int>(normalized.minimumVisibleResolution));
-    appSettings.setValue(QStringLiteral("remoteQuality/minimizedResolution"), static_cast<int>(normalized.minimizedResolution));
-    appSettings.setValue(QStringLiteral("remoteQuality/degradationHoldMs"), normalized.degradationHoldMs);
-    appSettings.setValue(QStringLiteral("remoteQuality/recoveryHoldMs"), normalized.recoveryHoldMs);
-    appSettings.setValue(QStringLiteral("remoteQuality/automaticRecoveryEnabled"), normalized.automaticRecoveryEnabled);
-    appSettings.setValue(QStringLiteral("remoteQuality/aggregateReceiveBudgetMbps"), normalized.aggregateReceiveBudgetMbps); // wjy: 0保留“自动预算”语义，绝不据此断开健康会话。
+    // wjy: 旧键保留在注册表中以便历史诊断，但新版本既不读取也不覆盖，避免它们再次改变固定预设。
 }
 // ===end====
 

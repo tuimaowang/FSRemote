@@ -54,6 +54,7 @@ enum FsRemoteStreamStatusCode {
     FSREMOTE_STATUS_MOUSE_MODE = 61,
     FSREMOTE_STATUS_QUALITY_APPLIED = 63,
     FSREMOTE_STATUS_CURSOR_SHAPE = 64, // wjy: Host 标准光标形状经现有状态回调交给 Qt，不改变 C ABI 函数签名。
+    FSREMOTE_STATUS_MOUSE_BACKEND = 65, // wjy: 为兼容既有 ABI 保留名称；状态现在确认系统/FakerInputBridge 键鼠注入后端。
     FSREMOTE_STATUS_ADMITTED = 70,
     FSREMOTE_STATUS_VIEW_ONLY = 71,
     FSREMOTE_STATUS_CONTROL_GRANTED = 72,
@@ -134,6 +135,27 @@ typedef struct FsRemoteViewerQualityStatus {
     uint32_t applied_bitrate_kbps;
     uint32_t limitation;
 } FsRemoteViewerQualityStatus; // wjy: Qt读取Host确认的实际值，标题栏不会把“请求值”冒充“已应用值”。
+
+// =====wjy====
+typedef struct FsRemoteViewerPerformanceStats {
+    uint32_t struct_size; // wjy: 独立可选快照不扩大旧质量确认结构，旧 DLL 缺少导出时控制端继续按健康状态运行。
+    uint32_t version; // wjy: 当前版本为 1，所有计数器均为 WebRTC 会话启动以来的累计值。
+    uint64_t sample_time_ms;
+    uint64_t frames_received;
+    uint64_t frames_decoded;
+    uint64_t frames_dropped;
+    uint64_t freeze_count;
+    uint64_t jitter_buffer_emitted_count;
+    uint64_t packets_received;
+    uint64_t packets_lost;
+    double total_decode_time_ms;
+    double total_processing_delay_ms;
+    double total_freezes_duration_ms;
+    double total_jitter_buffer_delay_ms;
+    double round_trip_time_ms;
+    double available_incoming_bitrate_kbps;
+} FsRemoteViewerPerformanceStats; // wjy: 控制端对相邻快照求差，区分真实解码/网络压力与静止桌面自然低帧率。
+// ===end====
 // ===end====
 
 FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_host(uint16_t port);
@@ -162,6 +184,7 @@ int FSREMOTE_STREAM_CALL fsremote_stream_send_input(FsRemoteStreamHandle handle,
 // =====wjy====
 int FSREMOTE_STREAM_CALL fsremote_stream_set_viewer_quality(FsRemoteStreamHandle handle, const FsRemoteViewerQualityConfig* config);
 int FSREMOTE_STREAM_CALL fsremote_stream_get_viewer_quality_status(FsRemoteStreamHandle handle, FsRemoteViewerQualityStatus* status);
+int FSREMOTE_STREAM_CALL fsremote_stream_get_viewer_performance_stats(FsRemoteStreamHandle handle, FsRemoteViewerPerformanceStats* stats);
 // ===end====
 int FSREMOTE_STREAM_CALL fsremote_stream_is_busy(FsRemoteStreamHandle handle);
 // =====wjy====

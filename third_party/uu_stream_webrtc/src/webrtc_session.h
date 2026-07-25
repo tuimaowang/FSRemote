@@ -7,6 +7,7 @@
 #include <api/video/video_sink_interface.h>
 
 #include <functional>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -15,6 +16,7 @@ namespace uu {
 
 class NativeWebrtcRuntime;
 class ControlDataObserver;
+struct ReceiverStatsRequestState;
 
 enum class SessionRole {
     Host,
@@ -32,6 +34,25 @@ struct SessionConfig {
     // ===end====
 };
 
+// =====wjy====
+struct ReceiverPerformanceStats {
+    uint64_t sample_time_ms = 0;
+    uint64_t frames_received = 0;
+    uint64_t frames_decoded = 0;
+    uint64_t frames_dropped = 0;
+    uint64_t freeze_count = 0;
+    uint64_t jitter_buffer_emitted_count = 0;
+    uint64_t packets_received = 0;
+    uint64_t packets_lost = 0;
+    double total_decode_time_ms = 0.0;
+    double total_processing_delay_ms = 0.0;
+    double total_freezes_duration_ms = 0.0;
+    double total_jitter_buffer_delay_ms = 0.0;
+    double round_trip_time_ms = 0.0;
+    double available_incoming_bitrate_kbps = 0.0;
+}; // wjy: 只保存标准 WebRTC 接收统计，不在原生层提前猜测降档结论。
+// ===end====
+
 class WebrtcSession final : public webrtc::PeerConnectionObserver {
 public:
     using SignalCallback = std::function<void(const std::string& kind, const std::string& body)>;
@@ -39,6 +60,7 @@ public:
     using ControlCallback = std::function<void(const std::string& message)>;
     // =====wjy====
     using ConnectionStateCallback = std::function<void(webrtc::PeerConnectionInterface::IceConnectionState state)>; // wjy: 把 ICE 存活状态上报给 Host 会话管理器，异常断网后可立即清理人数记录。
+    using ReceiverStatsCallback = std::function<void(const ReceiverPerformanceStats& stats)>;
     // ===end====
 
     WebrtcSession(NativeWebrtcRuntime* runtime, SessionConfig config);
@@ -62,6 +84,7 @@ public:
         uint32_t max_bitrate_kbps,
         uint32_t priority,
         std::string* error); // wjy: Host按会话在线更新sender参数，不停止、不重建PeerConnection或媒体源。
+    bool request_receiver_performance_stats(ReceiverStatsCallback callback); // wjy: 同一会话最多保留一个在途 getStats 请求，避免逐帧统计堆积。
 
     bool start_offer(std::string* error);
     bool accept_remote_description(const std::string& kind, const std::string& sdp, std::string* error);
@@ -112,6 +135,7 @@ private:
     webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> local_video_source_;
     webrtc::scoped_refptr<webrtc::VideoTrackInterface> remote_video_track_;
     std::unique_ptr<webrtc::VideoSinkInterface<webrtc::VideoFrame>> remote_video_sink_;
+    std::shared_ptr<ReceiverStatsRequestState> receiver_stats_state_; // wjy: 回调可能晚于请求线程，独立共享状态在析构时阻止迟到回调访问会话。
 };
 
 } // namespace uu

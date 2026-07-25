@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QByteArray>
 #include <QPoint>
 #include <QRect>
 #include <QSet>
@@ -25,6 +26,7 @@ class QCloseEvent;
 class QFocusEvent;
 class QKeyEvent;
 class QKeySequence;
+class QLabel;
 class QMouseEvent;
 class QPaintEvent;
 class QResizeEvent;
@@ -57,6 +59,7 @@ public:
     void setRemoteMouseCaptureActive(bool active);
     // =====wjy====
     void setRemoteCursorShape(const QString& statusMessage); // wjy: 查看器状态回调在 Qt 主线程缓存远端 Windows 标准光标，并按当前命中区域安全刷新。
+    void setRemoteMouseBackendStatus(const QString& statusMessage); // wjy: 只接受 Host 已确认的 system/faker 状态，不在按钮点击时乐观修改真实后端。
     // ===end====
     void setRememberGeometryEnabled(bool enabled);
     bool isClosingConnection() const;
@@ -78,7 +81,7 @@ public:
     void setRemoteUpdateAvailable(bool available); // wjy: 主界面统一探测目标版本后控制标题栏更新按钮，不让远控流线程参与版本检测。
     void setGlobalQualityConfiguration(const stream::RemoteQualityConfiguration& configuration); // wjy: 主窗口全局设置变化时立即更新跟随全局窗口的会话内策略快照。
     stream::RemoteQualityMode qualityOverrideMode() const; // wjy: 返回当前窗口模式；每次选择都会按设备持久化并在下次打开时恢复。
-    RemoteQualityWindowMetrics remoteQualityMetrics() const; // wjy: 协调器每秒读取窗口可见性、源尺寸、显示尺寸、接收FPS和编码码率，不触碰原生Viewer线程。
+    RemoteQualityWindowMetrics remoteQualityMetrics(); // wjy: 协调器每秒读取只读原生统计并对累计值求差，不阻塞或修改 WebRTC 会话。
     void applyRemoteQualityDecision(const RemoteQualityDecision& decision); // wjy: 在线下发最新质量档位；相同请求去重，连接建立后自动补发，不停止或重建流。
     void refreshAppliedRemoteQualityStatus(); // wjy: 收到状态码63后从类型化ABI读取Host实际应用值，标题栏不会把请求值冒充结果。
     QString remoteResourceDiagnosticSummary(); // wjy: 低频汇总代际、单槽队列、FPS、码率、质量和D3D11原因，禁止逐帧调用。
@@ -105,6 +108,7 @@ signals:
 
 protected:
     bool event(QEvent* event) override;
+    bool nativeEvent(const QByteArray& eventType, void* message, qintptr* result) override; // wjy: Windows 相对捕获优先接收 WM_INPUT 原始鼠标位移；未注册时继续由既有 Qt 事件路径处理。
     void paintEvent(QPaintEvent* event) override;
     void closeEvent(QCloseEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
@@ -130,6 +134,11 @@ private:
         Reconnecting,
         Failed,
     }; // wjy: 把更新过程与普通连接状态分开，避免目标重启被误显示为普通断线。
+
+    enum class RemoteMouseBackend {
+        System,
+        Faker,
+    }; // wjy: 仅表示注入来源；与远端游戏自动进入的相对鼠标捕获状态完全独立。
     // ===end====
     void startViewerConnection();
     void startViewerConnectionWithAdmission(); // wjy: 仅在共享管理器授予名额后真正调用原生startViewer。
@@ -151,6 +160,7 @@ private:
 
     // =====wjy====
     QRect remoteUpdateButtonRect() const; // wjy: 更新按钮位于剪切板按钮左侧，对应用户标出的标题栏空白区域。
+    QRect mouseInputModeRect() const; // wjy: 兼容保留既有函数名；该标题栏开关现在统一切换系统/驱动键鼠后端。
     QRect qualityButtonRect() const; // wjy: 单窗口画质按钮位于剪切板左侧，菜单设置只影响当前远控窗口。
     QRect clipboardSyncRect() const;
     QRect inputSyncRect() const; // wjy: 键鼠同步按钮固定在剪切板按钮左侧，并作为标题栏本地点击区排除远端输入。
@@ -163,6 +173,10 @@ private:
     void toggleClipboardSync();
     void toggleInputSynchronization(); // wjy: 标题栏一次点击根据关闭、主控、跟随三态执行开启、关闭或主控切换。
     QString inputSynchronizationToolTip() const;
+    void toggleRemoteMouseBackend(); // wjy: 兼容沿用现有协议入口，根据 Host 确认状态同时切换键盘和鼠标注入后端。
+    void requestRemoteMouseBackend(RemoteMouseBackend backend);
+    void queryRemoteMouseBackend(); // wjy: 每次新 Viewer 收到画面后查询 Host 全局状态，多控制窗口由真实值对齐。
+    QString remoteMouseBackendToolTip() const;
     void showQualityMenu(const QPoint& globalPosition); // wjy: 构建自定义/自动/高质量/均衡/流畅菜单，并保存当前窗口临时选择。
     void setQualityOverrideMode(stream::RemoteQualityMode mode); // wjy: 修改当前窗口会话内模式，不写AppSettings也不影响其它窗口。
     stream::RemoteQualityMode effectiveQualityMode() const; // wjy: FollowGlobal解析为最新全局模式，局部覆盖则直接返回覆盖值。
@@ -180,6 +194,10 @@ private:
     void synchronizedInputRoleChanged(RemoteInputSyncRole role) override;
     bool sendRemoteMouseMove(const QPoint& position, Qt::MouseButtons buttons);
     bool sendRemoteMouseRelativeMove(const QPoint& position, Qt::MouseButtons buttons);
+    // =====wjy====
+    bool sendRemoteRawMouseRelativeMove(int dx, int dy, Qt::MouseButtons buttons); // wjy: 将控制端实体鼠标的 Raw Input 计数送入现有相对移动协议，不删除旧的中心差值实现。
+    bool setRawInputMouseCaptureEnabled(bool enabled); // wjy: 每个进程只把 Raw Input 鼠标注册给当前活动远控窗口，失败时返回 false 触发 Qt 回退。
+    // ===end====
     void recenterRemoteMouseCapture();
     void setKeyboardForwardingActive(bool active);
     void beginShortcutReleaseGuard(const QKeySequence& shortcut);
@@ -210,6 +228,11 @@ private:
     void updateFrameStats(const QImage& image); // wjy: Update the bottom-right stream stats overlay from each received remote frame.
     void updatePresentedFrameStats(qint64 bgraBytes); // wjy: BGRA和共享纹理成功呈现统一计入真实接收FPS，零拷贝纹理不增加RAW带宽。
     void updateFrameColorStats(const QImage& image); // wjy: Update right-bottom RGB diagnostics for pure-black webpage tests.
+    // =====wjy====
+    void updatePerformanceOverlay(); // wjy: 每秒把实际FPS、码率和接收压力快照更新到本机浮层，不参与远端编码或策略计算。
+    void updatePerformanceOverlayGeometry(); // wjy: 浮层固定吸附实际画面右下角，并在D3D11原生子窗口之上恢复正确层级。
+    void raisePerformanceOverlay(); // wjy: 仅在D3D Presenter真正从隐藏切到显示时恢复一次层级，禁止逐帧交换原生子窗口Z序。
+    // ===end====
     void sampleFrameColorRegion(const QImage& image, const QRect& region, int* minValue, int* avgValue, int* maxValue) const; // wjy: Sample RGB values cheaply without scanning every pixel.
     QString m_deviceName;
     QString m_hostIp;
@@ -235,6 +258,10 @@ private:
     bool m_hasAppliedQualityStatus = false;
     bool m_qualityRequestPending = false;
     bool m_qualityProtocolUnavailable = false; // wjy: 旧DLL缺导出或旧Host三秒未确认时只显示不支持，现有流继续。
+    RemotePerformanceSignalSampler m_performanceSignalSampler; // wjy: 每个窗口独立维护 WebRTC 累计统计基线，重连计数器回退不会污染其它会话。
+    quint64 m_lastPresenterSampleFrames = 0;
+    quint64 m_lastPresenterSampleDrops = 0;
+    qint64 m_lastPresenterSampleMs = 0;
     FsRemoteStreamHandle m_viewerHandle = nullptr;
     std::shared_ptr<RemoteDesktopViewerCallbackContext> m_viewerCallbackContext; // wjy: stop返回前持续持有原生回调user指针，避免异步销毁期间访问已经释放的上下文。
     std::atomic<quint64> m_viewerGeneration = 0; // wjy: viewer每次创建、停止或关闭都推进代际，跨线程回调只读取这一原子值。
@@ -284,10 +311,18 @@ private:
     QElapsedTimer m_sessionClock;
     QElapsedTimer m_frameStatsClock; // wjy: Measures one-second windows for the remote desktop stats overlay.
     int m_frameStatsCount = 0; // wjy: 统计当前窗口真正成功进入显示路径的BGRA或共享纹理帧数。
+    quint64 m_totalPresentedFrames = 0; // wjy: 单调累计成功 Present 数，与单槽拒绝计数求差得到本地呈现压力而非网络结果。
     qint64 m_frameStatsBytes = 0; // wjy: Accumulates decoded BGRA bytes for raw-throughput diagnostics.
     double m_receiveFps = 0.0; // wjy: Last calculated UI-side received FPS shown in the overlay.
     double m_rawBgraMbps = 0.0; // wjy: Last calculated decoded BGRA throughput, separate from compressed network bitrate.
     double m_encodedMbps = 0.0; // wjy: Last calculated compressed video bitrate reported by the decoder from encoded frame bytes.
+    // =====wjy====
+    RemotePerformanceSignals m_latestPerformanceSignals; // wjy: 保存最近一次WebRTC累计统计差值，仅供本机一秒刷新浮层读取。
+    double m_latestPresenterDropRatio = 0.0; // wjy: 没有解码丢帧时仍可用本地呈现丢帧解释显示压力。
+    QLabel* m_performanceOverlay = nullptr; // wjy: 原生鼠标穿透子控件覆盖D3D11与BGRA路径，固定显示在远控画面右下角。
+    QString m_performanceOverlayText; // wjy: 缓存上一秒六行文本，相同内容不触发QLabel重绘和原生窗口更新。
+    QString m_performanceOverlayAccent; // wjy: 缓存状态边框颜色，只有健康/压力级别改变时才重新应用样式。
+    // ===end====
     int m_rgbMin = 0; // wjy: Whole-frame minimum sampled RGB value.
     int m_rgbAvg = 0; // wjy: Whole-frame average sampled RGB value.
     int m_rgbMax = 0; // wjy: Whole-frame maximum sampled RGB value.
@@ -296,7 +331,16 @@ private:
     int m_centerRgbMax = 0; // wjy: Center-region maximum sampled RGB value for black-page testing.
     bool m_remoteMouseCaptureActive = false;
     // =====wjy====
+    bool m_rawInputMouseCaptureActive = false; // wjy: 仅表示控制端 WM_INPUT 已成功注册；目标端仍独立选择系统或 FakerInput 注入后端。
     Qt::CursorShape m_remoteCursorShape = Qt::ArrowCursor; // wjy: 缓存最近一次远端桌面光标，退出相对鼠标模式后无需等待下一条状态即可恢复。
+    RemoteMouseBackend m_remoteMouseBackend = RemoteMouseBackend::System;
+    RemoteMouseBackend m_pendingRemoteMouseBackend = RemoteMouseBackend::System;
+    bool m_remoteMouseBackendKnown = false; // wjy: 新连接未收到 Host 回应前显示安全默认值，但气泡明确标注“等待确认”。
+    bool m_remoteMouseBackendPending = false;
+    bool m_remoteMouseBackendFallback = false;
+    bool m_mouseBackendButtonPressed = false;
+    quint64 m_remoteMouseBackendRequestGeneration = 0; // wjy: 两秒超时按请求代际判定，迟到定时器不能覆盖后续成功确认。
+    QString m_remoteMouseBackendMessage;
     // ===end====
     QTimer* m_framePresentTimer = nullptr; // wjy: Presents the newest pending frame at a fixed UI pace instead of posting one UI task per decoded frame.
     QTimer* m_sessionTimer = nullptr;

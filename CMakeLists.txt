@@ -33,9 +33,14 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
     ) # wjy: 子项目 CMake 含历史非 UTF-8 字节，顶层显式登记共享媒体管线可避免整文件转码破坏既有配置。
     target_sources(fsremote_stream PRIVATE
         third_party/uu_stream_webrtc/src/control_admission_policy.h
+        third_party/uu_stream_webrtc/src/faker_input_keyboard_state.h # wjy: 注册可独立测试的 VK→USB HID 键盘状态机，驱动键盘映射与生产 DLL 使用同一实现。
+        third_party/uu_stream_webrtc/src/faker_input_runtime_provisioner.h # wjy: 将静默驱动准备器登记到原生 DLL，便于 Qt Creator 审阅并随 Host 编译。
         third_party/uu_stream_webrtc/src/shared_input_state.h
         third_party/uu_stream_webrtc/src/windows_cursor_classifier.h
     ) # wjy: DLL 的协同准入、输入状态与 Windows 边缘光标映射都登记为可独立测试的生产策略。
+    if(WIN32)
+        target_link_libraries(fsremote_stream PRIVATE advapi32 crypt32) # wjy: Advapi32 校验文件哈希和管理员令牌；Crypt32 校验 MSI 发布者指纹并写入本机 TrustedPublisher。
+    endif()
     if(MSVC)
         target_compile_options(uu_stream_common PRIVATE /utf-8) # wjy: 原生公共库已有中文 WJY 注释，统一 UTF-8 可避免系统代码页把多字节尾部误判为续行反斜杠。
         target_compile_options(fsremote_stream PRIVATE /utf-8) # wjy: DLL API 和实现新增中文说明后也必须按 UTF-8 编译，否则可能破坏 extern "C" 边界。
@@ -479,13 +484,67 @@ endif()
 
 if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
     add_dependencies(FSRemote fsremote_stream)
-    add_custom_command(TARGET FSRemote POST_BUILD
+    # =====wjy====
+    add_custom_target(FSRemoteStreamRuntimeCopy
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "$<TARGET_FILE:fsremote_stream>"
             "$<TARGET_FILE_DIR:FSRemote>"
+        DEPENDS fsremote_stream
         VERBATIM
-    )
+    ) # wjy: 使用始终执行的旁车目标；即使主 EXE 无需重链接，更新后的 DLL 也会复制到正式发布根目录。
+    add_dependencies(FSRemote FSRemoteStreamRuntimeCopy)
+    # ===end====
 endif()
+
+# =====wjy====
+set(FSREMOTE_FAKER_INPUT_BRIDGE_EXE "" CACHE FILEPATH "Prebuilt FakerInputBridge.exe copied beside FSRemote.exe")
+if(NOT FSREMOTE_FAKER_INPUT_BRIDGE_EXE
+        AND EXISTS "C:/Users/test/Documents/FakerInputBridge/dist/FakerInputBridge.exe")
+    set(FSREMOTE_FAKER_INPUT_BRIDGE_EXE "C:/Users/test/Documents/FakerInputBridge/dist/FakerInputBridge.exe") # wjy: 当前独立 Bridge 项目保持在 FSRemote 仓库外，只消费其已验证发布成品。
+endif()
+if(FSREMOTE_FAKER_INPUT_BRIDGE_EXE AND EXISTS "${FSREMOTE_FAKER_INPUT_BRIDGE_EXE}")
+    add_custom_target(FSRemoteFakerInputBridgeCopy
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${FSREMOTE_FAKER_INPUT_BRIDGE_EXE}"
+            "$<TARGET_FILE_DIR:FSRemote>/FakerInputBridge.exe"
+        DEPENDS "${FSREMOTE_FAKER_INPUT_BRIDGE_EXE}"
+        VERBATIM
+    ) # wjy: 旁车复制目标不依赖主 EXE 是否重链接，每次构建都确认发布根目录中的 Bridge 为最新成品。
+    add_dependencies(FSRemote FSRemoteFakerInputBridgeCopy)
+else()
+    message(WARNING "FakerInputBridge.exe source is missing; set FSREMOTE_FAKER_INPUT_BRIDGE_EXE before publishing")
+endif()
+
+set(FSREMOTE_FAKER_INPUT_MSI "" CACHE FILEPATH "FakerInput 0.1.1 x64 MSI copied beside FSRemote.exe")
+if(FSREMOTE_FAKER_INPUT_MSI AND EXISTS "${FSREMOTE_FAKER_INPUT_MSI}")
+    add_custom_target(FSRemoteFakerInputMsiCopy
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${FSREMOTE_FAKER_INPUT_MSI}"
+            "$<TARGET_FILE_DIR:FSRemote>/FakerInput_Setup_0.1.1_x64.msi"
+        DEPENDS "${FSREMOTE_FAKER_INPUT_MSI}"
+        VERBATIM
+    ) # wjy: 配置稳定源路径后，每次主目标构建都确认驱动安装包进入发布目录。
+    add_dependencies(FSRemote FSRemoteFakerInputMsiCopy)
+elseif(EXISTS "${CMAKE_BINARY_DIR}/FakerInput_Setup_0.1.1_x64.msi")
+    message(STATUS "Using FakerInput MSI already present in the build output directory") # wjy: 兼容用户已放入当前 build 根目录的安装包，避免同源同目标复制失败。
+else()
+    message(WARNING "FakerInput_Setup_0.1.1_x64.msi is missing; set FSREMOTE_FAKER_INPUT_MSI before publishing")
+endif()
+
+set(FSREMOTE_FAKER_INPUT_PUBLISHER_CERT "${CMAKE_CURRENT_SOURCE_DIR}/resources/FakerInput_Ryodigi_Solutions_LLC.cer")
+if(EXISTS "${FSREMOTE_FAKER_INPUT_PUBLISHER_CERT}")
+    add_custom_target(FSRemoteFakerInputPublisherCertificateCopy
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${FSREMOTE_FAKER_INPUT_PUBLISHER_CERT}"
+            "$<TARGET_FILE_DIR:FSRemote>/FakerInput_Ryodigi_Solutions_LLC.cer"
+        DEPENDS "${FSREMOTE_FAKER_INPUT_PUBLISHER_CERT}"
+        VERBATIM
+    ) # wjy: 全新网络安装器用固定证书预置信任；运行时升级仍直接读取 MSI 签名，不依赖旧客户端认识这个新增文件。
+    add_dependencies(FSRemote FSRemoteFakerInputPublisherCertificateCopy)
+else()
+    message(WARNING "FakerInput publisher certificate is missing; new device installation cannot remain unattended")
+endif()
+# ===end====
 
 set_target_properties(FSRemote PROPERTIES
     WIN32_EXECUTABLE TRUE

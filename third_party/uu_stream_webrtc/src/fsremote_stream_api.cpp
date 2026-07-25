@@ -12,6 +12,9 @@
 #include "host_media_pipeline.h"
 // =====wjy====
 #include "control_admission_policy.h"
+#include "faker_input_bridge_client.h" // wjy: FSRemote 仅作为已验证本机桥接服务的客户端，不把驱动访问或网络监听并入主程序。
+#include "faker_input_keyboard_state.h" // wjy: 将 Viewer 虚拟键转换成稳定的 USB HID 键盘快照，并集中限制 boot-keyboard 六键上限。
+#include "faker_input_runtime_provisioner.h" // wjy: Host 后台校验发布文件、按需静默安装驱动并隐藏启动独立 Bridge，输入线程不等待 MSI。
 #include "shared_input_state.h"
 // ===end====
 #include "native_webrtc_runtime.h"
@@ -187,29 +190,35 @@ std::string cursor_lock_probe_text()
 {
     POINT cursor = {};
     const BOOL cursor_ok = ::GetCursorPos(&cursor);
-    const int screen_x = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
-    const int screen_y = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
-    const int screen_w = ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    const int screen_h = ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    const int center_x = screen_x + screen_w / 2;
-    const int center_y = screen_y + screen_h / 2;
+    // =====wjy====
+    const int virtual_x = ::GetSystemMetrics(SM_XVIRTUALSCREEN); // wjy: 虚拟桌面范围仅保留在日志中，便于确认副屏位于主屏左侧还是右侧。
+    const int virtual_y = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int virtual_w = ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int virtual_h = ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    const int screen_w = ::GetSystemMetrics(SM_CXSCREEN); // wjy: 远控画面和绝对注入都使用主屏语义，相对模式探测必须使用同一块主屏的宽高。
+    const int screen_h = ::GetSystemMetrics(SM_CYSCREEN);
+    const int center_x = screen_w / 2; // wjy: Windows 主屏原点固定为 (0,0)，双屏虚拟桌面中心可能位于两块屏幕交界处，不能用于 FPS 锁鼠判定。
+    const int center_y = screen_h / 2;
     const int dx = cursor_ok ? cursor.x - center_x : 0;
     const int dy = cursor_ok ? cursor.y - center_y : 0;
 
-    char text[256] = {};
+    char text[320] = {};
     std::snprintf(text, sizeof(text),
-                  " cursor_ok=%d cursor=%ld,%ld vdesk=%d,%d,%d,%d center=%d,%d dist=%d,%d",
+                  " cursor_ok=%d cursor=%ld,%ld vdesk=%d,%d,%d,%d primary=0,0,%d,%d center=%d,%d dist=%d,%d",
                   cursor_ok ? 1 : 0,
                   static_cast<long>(cursor.x),
                   static_cast<long>(cursor.y),
-                  screen_x,
-                  screen_y,
+                  virtual_x,
+                  virtual_y,
+                  virtual_w,
+                  virtual_h,
                   screen_w,
                   screen_h,
                   center_x,
                   center_y,
                   dx,
                   dy);
+    // ===end====
     return text;
 }
 
@@ -839,6 +848,204 @@ void move_mouse_relative(int dx, int dy, bool log_result)
 }
 
 // =====wjy====
+void send_mouse_button(DWORD flag); // wjy: 后端路由器失败回退时复用下方现有 SendInput 按钮实现。
+void send_mouse_wheel(int delta); // wjy: FakerInputBridge 断管后，同一个滚轮事件立即交给系统注入，避免用户操作丢失。
+void send_key(int vk, bool down); // wjy: 驱动键盘不支持的 Consumer 键及运行时回退继续复用既有系统键盘实现。
+
+enum class MouseInjectionBackend {
+    System,
+    Faker,
+}; // wjy: 注入后端与既有 desktop/relative 捕获模式是两条独立状态轴，禁止互相覆盖。
+
+const char* mouse_backend_token(MouseInjectionBackend backend)
+{
+    return backend == MouseInjectionBackend::Faker ? "faker" : "system";
+}
+
+DWORD system_mouse_button_flag(int button, bool down)
+{
+    if (button == 1) return down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+    if (button == 2) return down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
+    if (button == 4) return down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
+    return 0; // wjy: 当前 Viewer 协议只允许左、右、中三种按钮，未知值绝不生成系统或 HID 报告。
+}
+
+std::uint8_t faker_mouse_button_bit(int button)
+{
+    if (button == 1) return 0x01;
+    if (button == 2) return 0x02;
+    if (button == 4) return 0x04;
+    return 0;
+}
+
+class MouseInputBackendRouter final {
+public:
+    MouseInjectionBackend backend() const noexcept
+    {
+        return backend_;
+    }
+
+    bool selectFaker(std::string* error)
+    {
+        if (backend_ == MouseInjectionBackend::Faker) return true;
+        std::string bridge_error;
+        if (!bridge_.connectAndPing(&bridge_error)) {
+            backend_ = MouseInjectionBackend::System; // wjy: 服务未启动、驱动未就绪或协议不匹配时，真实键鼠后端始终保持系统 SendInput。
+            button_mask_ = 0;
+            keyboard_state_.clear(); // wjy: 连接失败不得保留准备阶段的虚拟按键镜像，系统后端从空状态继续接收新输入。
+            if (error) *error = bridge_error;
+            append_input_debug_log("host FakerInputBridge enable failed error=" + bridge_error);
+            return false;
+        }
+        backend_ = MouseInjectionBackend::Faker; // wjy: 只有本机管道完成 ping 且驱动 ready 后才对所有 Viewer 公布驱动模式。
+        button_mask_ = 0;
+        keyboard_state_.clear(); // wjy: 调用方已在旧后端释放共享键鼠，驱动会话必须从全零 HID 快照开始。
+        return true;
+    }
+
+    void selectSystem()
+    {
+        if (backend_ == MouseInjectionBackend::Faker) {
+            std::string bridge_error;
+            if (!bridge_.releaseAll(&bridge_error)) {
+                append_input_debug_log("host FakerInputBridge release before system failed error=" + bridge_error); // wjy: 断管也会触发桥接服务端 release-all，因此这里只记录而不阻止安全回退。
+            }
+            bridge_.close(); // wjy: 系统模式不长期占用命名管道，服务端可明确观察到客户端已退出驱动输入会话。
+        }
+        backend_ = MouseInjectionBackend::System;
+        button_mask_ = 0;
+        keyboard_state_.clear(); // wjy: Bridge 的 release-all 已清空虚拟键盘，路由器镜像同步归零以防下一次误抬旧键。
+    }
+
+    void moveAbsolute(int x, int y, bool log_result)
+    {
+        if (backend_ == MouseInjectionBackend::Faker) {
+            const auto hid_x = static_cast<std::uint16_t>(
+                (static_cast<std::int64_t>(std::clamp(x, 0, 65535)) * 32767 + 32767) / 65535); // wjy: Viewer 的 0..65535 坐标按四舍五入缩放为 FakerInput 绝对鼠标的 0..32767。
+            const auto hid_y = static_cast<std::uint16_t>(
+                (static_cast<std::int64_t>(std::clamp(y, 0, 65535)) * 32767 + 32767) / 65535);
+            std::string bridge_error;
+            if (bridge_.sendAbsoluteMouse(0, hid_x, hid_y, 0, &bridge_error)) return; // wjy: 绝对与相对鼠标是两个 HID collection，按钮只由相对 collection 持有，禁止在拖拽时形成第二份无法同步抬起的状态。
+            fallbackToSystem(bridge_error); // wjy: 当前报告失败就转回 SendInput，并在本次调用内补发同一个移动事件。
+        }
+        move_mouse_absolute(x, y, log_result);
+    }
+
+    void moveRelative(int dx, int dy, bool log_result)
+    {
+        if (dx == 0 && dy == 0) return;
+        if (backend_ == MouseInjectionBackend::Faker) {
+            std::string bridge_error;
+            if (bridge_.sendRelativeMouse(
+                    button_mask_,
+                    static_cast<std::int16_t>(std::clamp(dx, -32768, 32767)),
+                    static_cast<std::int16_t>(std::clamp(dy, -32768, 32767)),
+                    0,
+                    0,
+                    &bridge_error)) {
+                return;
+            }
+            fallbackToSystem(bridge_error); // wjy: 相对视角移动也遵循同事件回退，游戏不会因桥接服务退出而完全失去鼠标。
+        }
+        move_mouse_relative(dx, dy, log_result);
+    }
+
+    void sendButton(int button, bool down)
+    {
+        const std::uint8_t bit = faker_mouse_button_bit(button);
+        const DWORD system_flag = system_mouse_button_flag(button, down);
+        if (bit == 0 || system_flag == 0) return;
+        if (down) {
+            button_mask_ |= bit; // wjy: FakerInput HID 报告携带完整按钮快照，先更新目标状态再发送本次 down。
+        } else {
+            button_mask_ &= static_cast<std::uint8_t>(~bit); // wjy: 抬起只清当前按钮，其他控制端仍持有的按钮继续保留在快照中。
+        }
+        if (backend_ == MouseInjectionBackend::Faker) {
+            std::string bridge_error;
+            if (bridge_.sendRelativeMouse(button_mask_, 0, 0, 0, 0, &bridge_error)) return;
+            fallbackToSystem(bridge_error); // wjy: 回退函数会按最新按钮掩码在 SendInput 侧重建仍应按住的按钮，无需重复注入当前 down/up。
+            return;
+        }
+        send_mouse_button(system_flag);
+    }
+
+    void sendKey(int virtualKey, bool down)
+    {
+        const uu::FakerInputKeyboardUpdate update = keyboard_state_.update(virtualKey, down); // wjy: 系统与驱动后端都维护同一逻辑镜像，断管时才能重建仍按住的键。
+        if (backend_ != MouseInjectionBackend::Faker) {
+            send_key(virtualKey, down); // wjy: 系统模式保持原始 SendInput 重复按键语义，不因新增 HID 状态机改变桌面行为。
+            return;
+        }
+        if (update == uu::FakerInputKeyboardUpdate::Unsupported) {
+            send_key(virtualKey, down); // wjy: 音量、浏览器等当前 FakerInput 键盘 collection 无法表达的键单独保留系统兼容路径。
+            return;
+        }
+        if (update == uu::FakerInputKeyboardUpdate::Rollover) {
+            append_input_debug_log("host FakerInput keyboard dropped reason=6-key-rollover vk=" + std::to_string(virtualKey)); // wjy: 第七个普通键不破坏已按下六键，也不触发整套后端突然回退。
+            return;
+        }
+        if (update == uu::FakerInputKeyboardUpdate::Unchanged) {
+            return; // wjy: 驱动保持键按下后由目标 Windows 产生重复字符，重复写相同快照不会形成新的物理边沿。
+        }
+
+        const uu::FakerInputKeyboardReport report = keyboard_state_.report();
+        std::string bridge_error;
+        if (bridge_.sendKeyboard(report.modifiers, report.usages, &bridge_error)) return; // wjy: 每次 down/up 都发送当前完整快照，断线重连不依赖服务端保存增量事件。
+        fallbackToSystem(bridge_error); // wjy: 当前键已进入逻辑镜像，回退函数会一次性用 SendInput 重建所有仍按住的键。
+    }
+
+    void sendWheel(int delta)
+    {
+        if (delta == 0) return;
+        if (backend_ == MouseInjectionBackend::Faker) {
+            int wheel_steps = delta / WHEEL_DELTA;
+            if (wheel_steps == 0) wheel_steps = delta > 0 ? 1 : -1; // wjy: 高精度设备不足 120 的非零滚动仍转换成一个 HID 滚轮刻度。
+            wheel_steps = std::clamp(wheel_steps, -127, 127);
+            std::string bridge_error;
+            if (bridge_.sendRelativeMouse(
+                    button_mask_, 0, 0, static_cast<std::int8_t>(wheel_steps), 0, &bridge_error)) {
+                return;
+            }
+            fallbackToSystem(bridge_error);
+        }
+        send_mouse_wheel(delta); // wjy: 系统后端保留原始 WHEEL_DELTA 数值；驱动失败时也补发原事件而不是缩放后的 HID 刻度。
+    }
+
+    bool consumeFallback(std::string* error)
+    {
+        if (!fallback_pending_) return false;
+        fallback_pending_ = false;
+        if (error) *error = fallback_error_;
+        fallback_error_.clear();
+        return true; // wjy: 每次断管只广播一次 system fallback，后续 SendInput 事件不会重复刷状态栏。
+    }
+
+private:
+    void fallbackToSystem(const std::string& bridge_error)
+    {
+        bridge_.close(); // wjy: 关闭管道触发服务端 release-all，先清除虚拟 HID 键鼠状态再在系统后端重建仍按住的输入。
+        backend_ = MouseInjectionBackend::System;
+        for (const int virtualKey : keyboard_state_.pressedVirtualKeys()) {
+            send_key(virtualKey, true); // wjy: 驱动报告失败后按原 VK 重建当前键盘 down，WASD/修饰键不会在回退瞬间全部丢失。
+        }
+        if ((button_mask_ & 0x01) != 0) send_mouse_button(MOUSEEVENTF_LEFTDOWN);
+        if ((button_mask_ & 0x02) != 0) send_mouse_button(MOUSEEVENTF_RIGHTDOWN);
+        if ((button_mask_ & 0x04) != 0) send_mouse_button(MOUSEEVENTF_MIDDLEDOWN); // wjy: 只重建仍处于逻辑按下的按钮，已经抬起的按钮不会在系统后端复活。
+        fallback_pending_ = true;
+        fallback_error_ = bridge_error;
+        append_input_debug_log("host FakerInputBridge runtime fallback error=" + bridge_error);
+    }
+
+    MouseInjectionBackend backend_ = MouseInjectionBackend::System;
+    uu::FakerInputBridgeClient bridge_; // wjy: 单个 Host 调度器长期复用一个本机管道连接，禁止为每个鼠标报告反复连接。
+    uu::FakerInputKeyboardState keyboard_state_; // wjy: 与鼠标共用同一有序管道，键盘报告不会越过按钮或位移报告乱序到达驱动。
+    std::uint8_t button_mask_ = 0;
+    bool fallback_pending_ = false;
+    std::string fallback_error_;
+};
+// ===end====
+
+// =====wjy====
 struct MouseInputModeState {
     bool game_relative_mode = false;
     int lock_score = 0;
@@ -941,14 +1148,19 @@ bool get_cursor_center_distance(int& dx, int& dy, int& screen_w, int& screen_h)
         return false;
     }
 
-    const int screen_x = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
-    const int screen_y = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
-    screen_w = ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    screen_h = ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    const int center_x = screen_x + screen_w / 2;
-    const int center_y = screen_y + screen_h / 2;
+    // =====wjy====
+    screen_w = ::GetSystemMetrics(SM_CXSCREEN); // wjy: 系统与 FakerInput 后端共用这里的探测结果；主屏宽高与控制端 0..65535 坐标、主屏绝对注入保持一致。
+    screen_h = ::GetSystemMetrics(SM_CYSCREEN);
+    if (screen_w <= 0 || screen_h <= 0) {
+        dx = 0;
+        dy = 0;
+        return false; // wjy: 系统未返回有效主屏尺寸时禁止误判相对模式，继续保留桌面绝对移动。
+    }
+    const int center_x = screen_w / 2; // wjy: 双屏设备不再使用整个虚拟桌面的几何中心，避免把两屏交界处误当作游戏锁鼠点。
+    const int center_y = screen_h / 2;
     dx = cursor.x - center_x;
     dy = cursor.y - center_y;
+    // ===end====
     return true;
 }
 
@@ -1014,20 +1226,32 @@ void update_relative_unlock_probe(bool log_result, uu::WebrtcSession* session)
     }
 }
 
-bool should_use_relative_mouse_for_move(int x, int y, bool log_result, uu::WebrtcSession* session)
+// =====wjy====
+enum class MouseMoveRoutingDecision {
+    Absolute,
+    SuppressFakerAbsoluteProbe,
+    Relative,
+}; // wjy: 将“桌面绝对移动、驱动探测静默、游戏相对移动”分开表达，避免用单个 bool 把探测阶段误当成普通桌面移动。
+
+MouseMoveRoutingDecision decide_mouse_move_routing(
+    int x,
+    int y,
+    bool log_result,
+    uu::WebrtcSession* session,
+    bool faker_backend)
 {
-    (void)x;
-    (void)y;
     int center_dx = 0;
     int center_dy = 0;
     int screen_w = 0;
     int screen_h = 0;
+    bool center_lock_candidate = false; // wjy: 记录“目标坐标离中心较远但系统光标仍被游戏锁在中心”的候选状态，供 FakerInput 探测帧静默使用。
 #if 1
     const bool cursor_ok = get_cursor_center_distance(center_dx, center_dy, screen_w, screen_h);
     const bool cursor_near_center = cursor_ok && std::abs(center_dx) <= 3 && std::abs(center_dy) <= 3;
     const bool target_far = normalized_point_far_from_center(x, y, screen_w, screen_h);
+    center_lock_candidate = cursor_near_center && target_far; // wjy: 完全复用系统模式原有的中心锁定判据，不改变锁定灵敏度和坐标阈值。
 
-    if (cursor_near_center && target_far) {
+    if (center_lock_candidate) {
         g_mouse_input_mode.lock_score = std::min(g_mouse_input_mode.lock_score + 1, 4);
         g_mouse_input_mode.unlock_score = 0;
     } else if (g_mouse_input_mode.game_relative_mode) {
@@ -1056,17 +1280,41 @@ bool should_use_relative_mouse_for_move(int x, int y, bool log_result, uu::Webrt
     (void)screen_h;
 #endif
 
-    return g_mouse_input_mode.game_relative_mode;
+    if (g_mouse_input_mode.game_relative_mode) {
+        return MouseMoveRoutingDecision::Relative; // wjy: 达到原有三次确认门槛后，系统与 FakerInput 都继续走同一套相对移动算法。
+    }
+    if (faker_backend && center_lock_candidate) {
+        return MouseMoveRoutingDecision::SuppressFakerAbsoluteProbe; // wjy: 第一次和第二次探测只积累锁定分数，禁止绝对 HID 被 FPS Raw Input 解读成巨大视角位移。
+    }
+    return MouseMoveRoutingDecision::Absolute; // wjy: 系统模式以及未命中中心锁定判据的驱动桌面模式，都保留原来的绝对移动行为。
 }
 
-void move_mouse_auto(int x, int y, bool log_result, uu::WebrtcSession* session, SessionPointerState* pointer)
+void move_mouse_auto(
+    int x,
+    int y,
+    bool log_result,
+    uu::WebrtcSession* session,
+    SessionPointerState* pointer,
+    MouseInputBackendRouter* mouse_backend)
 {
-    if (!pointer) return;
-    if (!should_use_relative_mouse_for_move(x, y, log_result, session)) {
+    if (!pointer || !mouse_backend) return;
+    const MouseMoveRoutingDecision routing = decide_mouse_move_routing(
+        x,
+        y,
+        log_result,
+        session,
+        mouse_backend->backend() == MouseInjectionBackend::Faker); // wjy: 注入后端只影响探测阶段是否静默，不改变系统模式的自动锁鼠逻辑。
+    if (routing != MouseMoveRoutingDecision::Relative) {
         pointer->has_last_viewer_pos = true;
         pointer->last_viewer_x = x;
         pointer->last_viewer_y = y;
-        move_mouse_absolute(x, y, log_result);
+        if (routing == MouseMoveRoutingDecision::SuppressFakerAbsoluteProbe) {
+            if (log_result) {
+                append_input_debug_log("host FakerInput abs suppressed reason=center-lock-probe" + cursor_lock_probe_text()); // wjy: 日志明确区分主动抑制与桥接失败，便于目标机复测 FPS 锁鼠切换。
+            }
+            return; // wjy: 候选帧仍更新 Viewer 坐标基线，但不向虚拟绝对鼠标 collection 发送任何报告。
+        }
+        mouse_backend->moveAbsolute(x, y, log_result); // wjy: desktop 捕获模式只决定绝对坐标语义，实际由当前系统/驱动后端发送。
         return;
     }
 
@@ -1100,8 +1348,9 @@ void move_mouse_auto(int x, int y, bool log_result, uu::WebrtcSession* session, 
     int rel_dy = (raw_dy * screen_h) / 65535;
     rel_dx = std::clamp(rel_dx, -200, 200);
     rel_dy = std::clamp(rel_dy, -200, 200);
-    move_mouse_relative(rel_dx, rel_dy, log_result);
+    mouse_backend->moveRelative(rel_dx, rel_dy, log_result); // wjy: 游戏中心锁定仍使用原相对算法，但输出统一经过可回退后端。
 }
+// ===end====
 
 void send_mouse_button(DWORD flag)
 {
@@ -1280,9 +1529,10 @@ void inject_input_message(
     const std::string& message,
     uu::WebrtcSession* session,
     SessionPointerState* pointer,
-    uu::SharedInputState* held_input)
+    uu::SharedInputState* held_input,
+    MouseInputBackendRouter* mouse_backend)
 {
-    if (!pointer || !held_input) return;
+    if (!pointer || !held_input || !mouse_backend) return;
     const bool log_message = should_log_input_message(message);
     if (log_message) {
         append_input_debug_log("host recv msg=\"" + message + "\"" + cursor_lock_probe_text());
@@ -1296,7 +1546,7 @@ void inject_input_message(
         int y = 0;
         int buttons = 0;
         if (input >> x >> y >> buttons) {
-            move_mouse_auto(x, y, log_message, session, pointer);
+            move_mouse_auto(x, y, log_message, session, pointer, mouse_backend);
         }
         return;
     }
@@ -1306,7 +1556,7 @@ void inject_input_message(
         int buttons = 0;
         if (input >> dx >> dy >> buttons) {
             update_relative_unlock_probe(log_message, session);
-            move_mouse_relative(std::clamp(dx, -200, 200), std::clamp(dy, -200, 200), log_message);
+            mouse_backend->moveRelative(std::clamp(dx, -200, 200), std::clamp(dy, -200, 200), log_message);
         }
         return;
     }
@@ -1327,15 +1577,15 @@ void inject_input_message(
         if (g_mouse_input_mode.game_relative_mode) {
             pointer->has_last_viewer_pos = false;
         } else {
-            move_mouse_absolute(x, y, log_message);
+            mouse_backend->moveAbsolute(x, y, log_message);
         }
         const bool down = kind == "d";
         const uu::SharedInputTransition transition = held_input->updateButton(session_id, button, down);
         const bool inject_down = transition == uu::SharedInputTransition::InjectDown;
         const bool inject_up = transition == uu::SharedInputTransition::InjectUp;
-        if (button == 1 && (inject_down || inject_up)) send_mouse_button(inject_down ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP);
-        if (button == 2 && (inject_down || inject_up)) send_mouse_button(inject_down ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP);
-        if (button == 4 && (inject_down || inject_up)) send_mouse_button(inject_down ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP); // wjy: 同一按钮由多人持有时只注入首次 down 和最终 up。
+        if ((button == 1 || button == 2 || button == 4) && (inject_down || inject_up)) {
+            mouse_backend->sendButton(button, inject_down); // wjy: 同一按钮由多人持有时只把首次 down 和最终 up 交给当前注入后端。
+        }
         return;
     }
     if (kind == "w") {
@@ -1344,9 +1594,9 @@ void inject_input_message(
         int y = 0;
         if (input >> delta >> x >> y) {
             if (!g_mouse_input_mode.game_relative_mode) {
-                move_mouse_absolute(x, y, log_message);
+                mouse_backend->moveAbsolute(x, y, log_message);
             }
-            send_mouse_wheel(delta);
+            mouse_backend->sendWheel(delta);
         }
         return;
     }
@@ -1360,9 +1610,9 @@ void inject_input_message(
             }
             if (transition == uu::SharedInputTransition::InjectDown
                 || transition == uu::SharedInputTransition::InjectRepeat) {
-                send_key(vk, true);
+                mouse_backend->sendKey(vk, true); // wjy: 驱动后端把首次 down 转为 HID 快照；重复 down 在状态机内交给目标系统的键盘重复机制。
             } else if (transition == uu::SharedInputTransition::InjectUp) {
-                send_key(vk, false); // wjy: 非持有者的抬键被忽略，最后一个持有者才真正释放系统按键。
+                mouse_backend->sendKey(vk, false); // wjy: 非持有者的抬键被忽略，最后一个持有者才在当前系统/驱动后端真正释放按键。
             }
         }
         return;
@@ -1381,6 +1631,7 @@ void inject_input_message(
 class InputDispatcher final {
 public:
     using MouseModeCallback = std::function<void(bool relative, const char* reason)>;
+    using MouseBackendCallback = std::function<void(const char* backend, const char* state)>; // wjy: Host 的全局注入后端状态通过每个控制会话的可靠 DataChannel 同步到标题栏。
     using ClipboardCallback = std::function<void(const std::string& encodedText)>;
     using CursorShapeCallback = std::function<bool(uu::StandardCursorShape shape)>; // wjy: 回调返回可靠通道是否真正接收消息，未打开的会话保留待发送状态并在下一轮重试。
     struct CursorSubscription {
@@ -1394,14 +1645,30 @@ public:
         uint64_t generation = 0;
     };
 
+    // =====wjy====
+    InputDispatcher()
+    {
+        faker_provision_worker_ = std::thread([this] {
+            provisionFakerInputRuntime(); // wjy: Host 启动即在独立线程准备驱动，远控视频和现有 SendInput 在安装期间继续工作。
+        });
+    }
+
+    ~InputDispatcher()
+    {
+        if (faker_provision_worker_.joinable()) faker_provision_worker_.join(); // wjy: 禁止后台线程越过调度器生命周期访问互斥量或会话回调。
+    }
+    // ===end====
+
     void registerSession(
         const std::string& session_id,
         MouseModeCallback callback,
-        ClipboardCallback clipboard_callback = {})
+        ClipboardCallback clipboard_callback = {},
+        MouseBackendCallback mouse_backend_callback = {})
     {
         std::lock_guard lock(mutex_);
         mouse_mode_callbacks_[session_id] = std::move(callback); // wjy: 每个已授权会话登记弱引用通知，鼠标模式变化时所有控制窗口保持一致。
         if (clipboard_callback) clipboard_callbacks_[session_id] = std::move(clipboard_callback);
+        if (mouse_backend_callback) mouse_backend_callbacks_[session_id] = std::move(mouse_backend_callback); // wjy: 只登记有控制权的 Viewer，view-only 无法查询或改变注入后端。
     }
 
     void registerCursorSession(const std::string& session_id, CursorShapeCallback callback)
@@ -1417,19 +1684,46 @@ public:
     void dispatch(const std::string& session_id, const std::string& message)
     {
         std::vector<MouseModeCallback> mode_callbacks;
+        std::vector<MouseBackendCallback> backend_callbacks;
+        std::string backend_token;
+        std::string backend_state;
         bool relative = false;
         {
             std::lock_guard lock(mutex_); // wjy: 所有 WebRTC data-channel 回调在这里汇合，SendInput 与全局鼠标模式按唯一顺序执行。
             const bool was_relative = g_mouse_input_mode.game_relative_mode;
-            inject_input_message(session_id, message, nullptr, &pointer_by_session_[session_id], &held_input_);
+            const bool backend_message = handleMouseBackendMessageLocked(
+                session_id,
+                message,
+                &backend_callbacks,
+                &backend_token,
+                &backend_state); // wjy: 保留前缀命令在进入普通 m/r/d/u/w/k 解析前分流，绝不被当成鼠标事件。
+            if (!backend_message) {
+                inject_input_message(
+                    session_id,
+                    message,
+                    nullptr,
+                    &pointer_by_session_[session_id],
+                    &held_input_,
+                    &mouse_backend_);
+            }
             relative = g_mouse_input_mode.game_relative_mode;
             if (was_relative != relative) {
                 for (const auto& [id, callback] : mouse_mode_callbacks_) {
                     if (callback) mode_callbacks.push_back(callback);
                 }
             }
+            std::string fallback_error;
+            if (mouse_backend_.consumeFallback(&fallback_error)) {
+                backend_token = "system";
+                backend_state = "fallback";
+                collectAllMouseBackendCallbacksLocked(&backend_callbacks); // wjy: 驱动运行中断管后，全体控制窗口同时看到真实系统回退状态。
+                append_input_debug_log("host mouse backend broadcast fallback error=" + fallback_error);
+            }
         }
         for (const auto& callback : mode_callbacks) callback(relative, "shared-dispatcher"); // wjy: 模式通知在互斥区外发送，避免 WebRTC 回调反向阻塞其他控制端输入。
+        for (const auto& callback : backend_callbacks) {
+            callback(backend_token.c_str(), backend_state.c_str()); // wjy: 管道连接与输入状态已在锁内提交，锁外发送确认避免 WebRTC 回调形成互锁。
+        }
     }
 
     void pollHostClipboard()
@@ -1505,14 +1799,24 @@ public:
 
     void releaseSession(const std::string& session_id)
     {
-        std::lock_guard lock(mutex_);
-        const uu::SharedInputReleaseBatch released = held_input_.releaseSession(session_id);
-        for (const int key : released.keys) send_key(key, false);
-        for (const int button : released.buttons) send_button_up(button); // wjy: 断线只补发该会话最后持有的输入，其他控制端的按住状态继续有效。
-        pointer_by_session_.erase(session_id);
-        mouse_mode_callbacks_.erase(session_id);
-        clipboard_callbacks_.erase(session_id);
-        if (mouse_mode_callbacks_.empty()) reset_mouse_relative_mode("last-controller-left", false, nullptr);
+        std::vector<MouseBackendCallback> fallback_callbacks;
+        {
+            std::lock_guard lock(mutex_);
+            const uu::SharedInputReleaseBatch released = held_input_.releaseSession(session_id);
+            for (const int key : released.keys) mouse_backend_.sendKey(key, false); // wjy: 会话断线在当前真实键盘后端补发最终抬键，FakerInput 不会残留移动键。
+            for (const int button : released.buttons) mouse_backend_.sendButton(button, false); // wjy: 断线只在当前真实后端补发最终抬起，其他控制端的按住状态继续有效。
+            pointer_by_session_.erase(session_id);
+            mouse_mode_callbacks_.erase(session_id);
+            mouse_backend_callbacks_.erase(session_id);
+            clipboard_callbacks_.erase(session_id);
+            if (mouse_mode_callbacks_.empty()) reset_mouse_relative_mode("last-controller-left", false, nullptr);
+            std::string fallback_error;
+            if (mouse_backend_.consumeFallback(&fallback_error)) {
+                collectAllMouseBackendCallbacksLocked(&fallback_callbacks); // wjy: 某会话断开时若恰好发现桥接管道失败，剩余 Viewer 仍会收到系统回退状态。
+                append_input_debug_log("host mouse backend disconnect fallback error=" + fallback_error);
+            }
+        }
+        for (const auto& callback : fallback_callbacks) callback("system", "fallback"); // wjy: WebRTC 通知继续放在调度器锁外，断线清理不会阻塞其他会话输入。
     }
 
     void releaseCursorSession(const std::string& session_id)
@@ -1523,31 +1827,166 @@ public:
 
     void shutdown()
     {
+        // =====wjy====
+        if (faker_provision_worker_.joinable()) faker_provision_worker_.join(); // wjy: 等待 Windows Installer 自己结束；不能在驱动提交阶段强杀 msiexec。
+        // ===end====
         std::lock_guard lock(mutex_);
         for (const auto& [session_id, callback] : mouse_mode_callbacks_) {
             const uu::SharedInputReleaseBatch released = held_input_.releaseSession(session_id);
-            for (const int key : released.keys) send_key(key, false);
-            for (const int button : released.buttons) send_button_up(button);
+            for (const int key : released.keys) mouse_backend_.sendKey(key, false); // wjy: Host 关闭先通过当前后端释放共享键盘，再让 Bridge 执行全局 release-all 兜底。
+            for (const int button : released.buttons) mouse_backend_.sendButton(button, false);
         }
+        mouse_backend_.selectSystem(); // wjy: Host 关闭前释放虚拟 HID 并断开本机管道，Bridge 服务端也会执行自己的 release-all 兜底。
         pointer_by_session_.clear();
         mouse_mode_callbacks_.clear();
+        mouse_backend_callbacks_.clear();
         clipboard_callbacks_.clear();
         cursor_shape_callbacks_.clear();
         reset_mouse_relative_mode("host-shutdown", false, nullptr); // wjy: Host 资源销毁前兜底清空所有会话输入与相对鼠标状态。
     }
 
 private:
-    static void send_button_up(int button)
+    bool handleMouseBackendMessageLocked(
+        const std::string& session_id,
+        const std::string& message,
+        std::vector<MouseBackendCallback>* callbacks,
+        std::string* backend_token_out,
+        std::string* backend_state_out)
     {
-        if (button == 1) send_mouse_button(MOUSEEVENTF_LEFTUP);
-        if (button == 2) send_mouse_button(MOUSEEVENTF_RIGHTUP);
-        if (button == 4) send_mouse_button(MOUSEEVENTF_MIDDLEUP);
+        constexpr std::string_view kPrefix = "__fsremote_mouse_backend ";
+        if (message.rfind(kPrefix, 0) != 0) return false;
+        const std::string command = message.substr(kPrefix.size());
+        if (command == "query") {
+            const auto callback = mouse_backend_callbacks_.find(session_id);
+            if (callback != mouse_backend_callbacks_.end() && callback->second) {
+                callbacks->push_back(callback->second); // wjy: query 只回复请求会话，避免每次新窗口连接都让其他窗口重复刷新。
+            }
+            *backend_token_out = mouse_backend_token(mouse_backend_.backend());
+            // =====wjy====
+            *backend_state_out = faker_requested_ && !faker_provision_complete_
+                ? "installing"
+                : "ready"; // wjy: 新 Viewer 加入正在安装的 Host 时得到真实中间态，不把系统回退误显示为最终完成。
+            // ===end====
+            return true;
+        }
+        if (command != "system" && command != "faker") {
+            append_input_debug_log("host rejected mouse backend command=" + command);
+            return true; // wjy: 命中保留前缀但值非法时直接丢弃，绝不落入普通输入解析。
+        }
+
+        const MouseInjectionBackend requested = command == "faker"
+            ? MouseInjectionBackend::Faker
+            : MouseInjectionBackend::System;
+        // =====wjy====
+        faker_requested_ = requested == MouseInjectionBackend::Faker; // wjy: 后台完成时只兑现最新一次全局请求，安装期间切回系统可取消自动切换。
+        if (requested == MouseInjectionBackend::Faker
+            && mouse_backend_.backend() != MouseInjectionBackend::Faker
+            && !faker_provision_complete_) {
+            *backend_token_out = "system";
+            *backend_state_out = "installing";
+            collectAllMouseBackendCallbacksLocked(callbacks); // wjy: 立即通知所有控制端“系统键鼠仍可用、驱动正在准备”，不阻塞 WebRTC data-channel 线程。
+            append_input_debug_log("host mouse backend request=faker applied=system state=installing");
+            return true;
+        }
+        // ===end====
+        bool ready = true;
+        if (requested != mouse_backend_.backend()) {
+            const uu::SharedInputReleaseBatch released = held_input_.releaseAll(); // wjy: 现在标题栏切换的是完整键鼠后端，必须同时终止旧键盘和鼠标持有关系。
+            for (const int key : released.keys) {
+                mouse_backend_.sendKey(key, false); // wjy: 先在旧后端释放所有共享键，禁止 key-down 在系统而 key-up 落到 FakerInput。
+            }
+            for (const int button : released.buttons) {
+                mouse_backend_.sendButton(button, false); // wjy: 键盘释放完成后再释放共享按钮，Bridge 收到的最终快照保持有序。
+            }
+            std::string ignored_fallback;
+            mouse_backend_.consumeFallback(&ignored_fallback); // wjy: 释放阶段若恰好断管，显式切换的最终结果覆盖这条中间状态。
+            if (requested == MouseInjectionBackend::Faker) {
+                std::string bridge_error;
+                ready = mouse_backend_.selectFaker(&bridge_error);
+                if (!ready) append_input_debug_log("host mouse backend kept system error=" + bridge_error);
+            } else {
+                mouse_backend_.selectSystem();
+            }
+        }
+
+        *backend_token_out = mouse_backend_token(mouse_backend_.backend());
+        *backend_state_out = ready ? "ready" : "fallback";
+        collectAllMouseBackendCallbacksLocked(callbacks); // wjy: 后端属于 Host 全局状态，任一控制端切换后向全部控制 Viewer 广播一致结果。
+        append_input_debug_log("host mouse backend request=" + command
+            + " applied=" + *backend_token_out
+            + " state=" + *backend_state_out);
+        return true;
+    }
+
+    // =====wjy====
+    void releaseSharedInputsLocked()
+    {
+        const uu::SharedInputReleaseBatch released = held_input_.releaseAll(); // wjy: 后台安装完成兑现驱动请求时，键盘与鼠标使用同一个原子释放屏障。
+        for (const int key : released.keys) {
+            mouse_backend_.sendKey(key, false); // wjy: 先在系统后端补齐键盘抬起，再连接驱动，防止安装期间按住的键跨后端卡住。
+        }
+        for (const int button : released.buttons) {
+            mouse_backend_.sendButton(button, false);
+        }
+        std::string ignoredFallback;
+        mouse_backend_.consumeFallback(&ignoredFallback); // wjy: 最终切换结果覆盖释放阶段偶发的旧 Bridge 断管状态。
+    }
+
+    void provisionFakerInputRuntime()
+    {
+        std::string provisionError;
+        const bool provisioned = faker_provisioner_.ensureReady(&provisionError); // wjy: 包含哈希校验、管理员令牌检查、静默 MSI、Bridge 启动和 driver-ready ping。
+        append_input_debug_log(std::string("host FakerInput runtime provision ")
+            + (provisioned ? "ready" : "failed")
+            + (provisionError.empty() ? std::string() : " error=" + provisionError));
+
+        std::vector<MouseBackendCallback> callbacks;
+        std::string backendToken;
+        std::string backendState;
+        {
+            std::lock_guard lock(mutex_);
+            faker_provision_complete_ = true; // wjy: 受同一互斥量保护，点击线程不会观察到半提交的安装结果。
+            faker_provision_error_ = provisionError;
+            if (!faker_requested_) return; // wjy: 用户未选择驱动或安装期间已切回系统时，仅保留已准备的 Bridge，不擅自改变键鼠后端。
+
+            releaseSharedInputsLocked(); // wjy: 驱动 ready 后同时清理旧系统键盘与鼠标状态，再由下一次物理按下建立 FakerInput 快照。
+            std::string bridgeError;
+            const bool ready = mouse_backend_.selectFaker(&bridgeError); // wjy: 即使安装结果失败也做一次快速连接，兼容用户同期手工启动的可信 Bridge。
+            if (!ready) {
+                faker_provision_error_ = bridgeError.empty() ? provisionError : bridgeError;
+                append_input_debug_log("host mouse backend kept system after provision error=" + faker_provision_error_);
+            }
+            backendToken = mouse_backend_token(mouse_backend_.backend());
+            backendState = ready ? "ready" : "fallback";
+            collectAllMouseBackendCallbacksLocked(&callbacks); // wjy: 安装完成只广播一次最终 ready/fallback，所有 Viewer 的标题栏保持一致。
+        }
+        for (const auto& callback : callbacks) {
+            callback(backendToken.c_str(), backendState.c_str()); // wjy: 状态发送继续位于互斥区外，避免 Bridge 准备线程与 WebRTC 会话互锁。
+        }
+    }
+    // ===end====
+
+    void collectAllMouseBackendCallbacksLocked(std::vector<MouseBackendCallback>* callbacks) const
+    {
+        callbacks->clear(); // wjy: 同一条消息最多生成一轮最终后端通知，避免中间回退与显式切换结果重复发送。
+        for (const auto& [id, callback] : mouse_backend_callbacks_) {
+            if (callback) callbacks->push_back(callback);
+        }
     }
 
     std::mutex mutex_;
     uu::SharedInputState held_input_;
+    MouseInputBackendRouter mouse_backend_; // wjy: 一个 Host 只允许一个注入后端，与跨会话按钮合并状态保持同一互斥顺序。
+    // =====wjy====
+    uu::FakerInputRuntimeProvisioner faker_provisioner_; // wjy: 管理本进程启动的 Bridge 生命周期，手工启动的现有服务不会被误杀。
+    std::thread faker_provision_worker_; // wjy: MSI 最长等待与 PnP 枚举全部脱离输入分发线程。
+    bool faker_provision_complete_ = false;
+    bool faker_requested_ = false;
+    std::string faker_provision_error_; // wjy: 失败原因进入本机诊断日志，网络协议只暴露有限状态而不泄漏目标端路径。
+    // ===end====
     std::unordered_map<std::string, SessionPointerState> pointer_by_session_;
     std::unordered_map<std::string, MouseModeCallback> mouse_mode_callbacks_;
+    std::unordered_map<std::string, MouseBackendCallback> mouse_backend_callbacks_;
     std::unordered_map<std::string, ClipboardCallback> clipboard_callbacks_;
     std::unordered_map<std::string, CursorSubscription> cursor_shape_callbacks_; // wjy: 每个 Viewer 独立保存最后成功形状，新增或暂未打开通道的会话不会被全局去重漏发。
     uint64_t next_cursor_subscription_generation_ = 0;
@@ -1579,6 +2018,7 @@ public:
     virtual bool sendInput(const char*) { return false; }
     virtual bool setViewerQuality(const FsRemoteViewerQualityConfig*) { return false; } // wjy: 只有Viewer覆盖在线质量更新，Host或旧句柄安全返回false。
     virtual bool viewerQualityStatus(FsRemoteViewerQualityStatus*) const { return false; } // wjy: 非Viewer句柄没有应用状态。
+    virtual bool viewerPerformanceStats(FsRemoteViewerPerformanceStats*) const { return false; } // wjy: Host 句柄不提供接收端统计，错误句柄安全返回 false。
     virtual bool isBusy() const { return false; }
     // =====wjy====
     virtual uint32_t activeSessionCount() const { return 0; } // wjy: Viewer 无会话表；Host 覆盖为当前登记会话数。
@@ -1926,6 +2366,14 @@ private:
                             locked->webrtc->send_control_message(std::string("cb ") + encoded);
                         }
                     }
+                },
+                [weak = std::weak_ptr<HostClientSession>(context)](const char* backend, const char* state) {
+                    if (const auto locked = weak.lock(); locked && !locked->cancelled) {
+                        const std::string wire = std::string("__fsremote_mouse_backend_status ")
+                            + backend + " " + state; // wjy: 固定三段状态消息让旧 Viewer 忽略、新 Viewer 严格解析，且不改动公开输入函数签名。
+                        std::lock_guard webrtc_lock(locked->webrtc_mutex);
+                        if (locked->webrtc) locked->webrtc->send_control_message(wire); // wjy: 后端确认与普通控制消息复用可靠有序 DataChannel。
+                    }
                 });
             // ===end====
         } // wjy: view_only 会话不登记输入回调，即使发送 data-channel 输入也无法到达系统注入路径。
@@ -2160,6 +2608,14 @@ private:
 // ===end====
 
 class ViewerInstance final : public StreamInstance {
+    // =====wjy====
+    struct PerformanceState {
+        std::mutex mutex;
+        FsRemoteViewerPerformanceStats stats = {};
+        bool available = false;
+    }; // wjy: getStats 回调只捕获独立共享状态，ViewerInstance 关闭时不会留下悬空 this 指针。
+    // ===end====
+
 public:
     ViewerInstance(
         std::string hostIp,
@@ -2255,10 +2711,60 @@ public:
         *status = quality_status_; // wjy: 在互斥区内复制固定POD快照，Qt不会读到一半新一半旧的确认字段。
         return true;
     }
+
+    bool viewerPerformanceStats(FsRemoteViewerPerformanceStats* stats) const override
+    {
+        if (!stats || stats->struct_size < sizeof(FsRemoteViewerPerformanceStats) || stats->version != 1) {
+            return false;
+        }
+        const std::shared_ptr<PerformanceState> state = performance_state_;
+        std::lock_guard lock(state->mutex);
+        if (!state->available) return false;
+        *stats = state->stats; // wjy: 固定 POD 在互斥区内一次复制，UI 不会混读两个 WebRTC 采样周期。
+        return true;
+    }
     // ===end====
 
 private:
     // =====wjy====
+    void requestPerformanceStats()
+    {
+        const uint64_t now = ::GetTickCount64();
+        uint64_t previous = last_performance_stats_request_ms_.load(std::memory_order_acquire);
+        if (now - previous < 1000
+            || !last_performance_stats_request_ms_.compare_exchange_strong(
+                previous, now, std::memory_order_acq_rel)) {
+            return; // wjy: 纹理/BGRA 两条回调共用一秒采样门，任何时刻都不会按帧调用 getStats。
+        }
+
+        const std::shared_ptr<PerformanceState> output = performance_state_;
+        std::lock_guard lock(session_mutex_);
+        if (!active_session_) return;
+        active_session_->request_receiver_performance_stats(
+            [output](const uu::ReceiverPerformanceStats& input) {
+                FsRemoteViewerPerformanceStats snapshot = {};
+                snapshot.struct_size = sizeof(snapshot);
+                snapshot.version = 1;
+                snapshot.sample_time_ms = input.sample_time_ms;
+                snapshot.frames_received = input.frames_received;
+                snapshot.frames_decoded = input.frames_decoded;
+                snapshot.frames_dropped = input.frames_dropped;
+                snapshot.freeze_count = input.freeze_count;
+                snapshot.jitter_buffer_emitted_count = input.jitter_buffer_emitted_count;
+                snapshot.packets_received = input.packets_received;
+                snapshot.packets_lost = input.packets_lost;
+                snapshot.total_decode_time_ms = input.total_decode_time_ms;
+                snapshot.total_processing_delay_ms = input.total_processing_delay_ms;
+                snapshot.total_freezes_duration_ms = input.total_freezes_duration_ms;
+                snapshot.total_jitter_buffer_delay_ms = input.total_jitter_buffer_delay_ms;
+                snapshot.round_trip_time_ms = input.round_trip_time_ms;
+                snapshot.available_incoming_bitrate_kbps = input.available_incoming_bitrate_kbps;
+                std::lock_guard stats_lock(output->mutex);
+                output->stats = snapshot;
+                output->available = true; // wjy: 首份完整异步报告到达后才允许 UI 读取，避免把全零初始化误判为健康样本。
+            });
+    }
+
     void trySendPendingQualityRequest()
     {
         uu::ViewerQualityRequest request;
@@ -2429,6 +2935,7 @@ private:
                 std::snprintf(stats, sizeof(stats), "ENC %.2f", encoded_mbps);
                 report_status(status_callback_, user_, 60, stats);
             }
+            requestPerformanceStats(); // wjy: 低频拉取标准接收统计，为原因感知降帧提供解码、网络和冻结证据。
             trySendPendingQualityRequest(); // wjy: data-channel通常在首帧前后打开，未发送请求在每帧以单槽状态低成本重试。
             checkPendingQualityTimeout();
             return texture_callback_(user_, width, height, shared_handle, frame_id, encoded_mbps); // wjy: 原样传递接受/回退/受控丢帧，不能把结果2压缩成bool。
@@ -2446,6 +2953,7 @@ private:
                 std::snprintf(stats, sizeof(stats), "ENC %.2f", encoded_mbps);
                 report_status(status_callback_, user_, 60, stats); // wjy: code 60 carries viewer-side compressed video bitrate for the Qt overlay.
             }
+            requestPerformanceStats(); // wjy: 软件回退路径同样采集 WebRTC 接收统计，性能判断不依赖 D3D11 是否可用。
             trySendPendingQualityRequest();
             checkPendingQualityTimeout(); // wjy: BGRA回退路径和共享纹理路径使用相同质量发送/超时语义。
             if (frame_callback_ && running_) {
@@ -2482,6 +2990,13 @@ private:
                 report_status(status_callback_, user_, 61, "MOUSE relative");
             } else if (message == "__fsremote_mouse_mode desktop") {
                 report_status(status_callback_, user_, 61, "MOUSE desktop");
+            } else if (message == "__fsremote_mouse_backend_status system ready"
+                || message == "__fsremote_mouse_backend_status faker ready"
+                || message == "__fsremote_mouse_backend_status system fallback"
+                // =====wjy====
+                || message == "__fsremote_mouse_backend_status system installing") {
+                report_status(status_callback_, user_, FSREMOTE_STATUS_MOUSE_BACKEND, message.c_str()); // wjy: 安装中只允许 system installing，驱动未 ready 前绝不伪造 faker 状态。
+                // ===end====
             } else if (uu::is_cursor_shape_message(message)) {
                 uu::StandardCursorShape shape = uu::StandardCursorShape::Arrow;
                 std::string error;
@@ -2538,6 +3053,8 @@ private:
     uint64_t pending_quality_sent_at_ms_ = 0;
     FsRemoteViewerQualityStatus quality_status_ = {};
     bool quality_status_available_ = false;
+    std::shared_ptr<PerformanceState> performance_state_ = std::make_shared<PerformanceState>(); // wjy: 统计回调与 Viewer 生命周期解耦，停止时无需等待 UI 读取者。
+    std::atomic_uint64_t last_performance_stats_request_ms_ = 0; // wjy: 两条解码回调共用无锁限频时间戳。
     uint64_t last_stats_status_ms_ = 0;
     std::unique_ptr<uu::ViewerAudioPlayer> audio_player_;
 };
@@ -2698,6 +3215,14 @@ int FSREMOTE_STREAM_CALL fsremote_stream_get_viewer_quality_status(
 {
     if (!handle || !status) return 0;
     return static_cast<StreamInstance*>(handle)->viewerQualityStatus(status) ? 1 : 0; // wjy: 返回固定POD快照，调用方无需解析data-channel文本。
+}
+
+int FSREMOTE_STREAM_CALL fsremote_stream_get_viewer_performance_stats(
+    FsRemoteStreamHandle handle,
+    FsRemoteViewerPerformanceStats* stats)
+{
+    if (!handle || !stats) return 0;
+    return static_cast<StreamInstance*>(handle)->viewerPerformanceStats(stats) ? 1 : 0; // wjy: 可选只读统计接口不改变会话状态，旧调用方完全不受影响。
 }
 // ===end====
 
