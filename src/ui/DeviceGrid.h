@@ -180,7 +180,8 @@ private:
     void openAuthorizedTiledWindows(const QVector<QString>& deviceIds); // wjy: 后台授权完成后仅在主线程创建、注册并排列平铺窗口。
     QVector<QPointer<RemoteDesktopWindow>> openedRemoteWindows() const;
     void setRemoteUpdateAvailability(const QString& hostIp, bool available); // wjy: 同步缓存并刷新同 IP 的普通/平铺远控窗口更新按钮。
-    void refreshOpenedRemoteUpdateAvailability(); // wjy: 仅轮询当前已打开远控窗口的目标版本，不依赖设备列表自动刷新开关。
+    bool realtimeUpdateAvailable(const platform::DeviceRealtimeUpdateState& updateState) const;
+    void refreshRealtimeUpdateAvailability();
     void rememberRemoteWindowActivation(RemoteDesktopWindow* window);
     RemoteDesktopWindow* topmostRemoteWindow() const;
     void toggleTopmostRemoteWindowFullscreen();
@@ -406,7 +407,6 @@ private:
     bool m_preventSleepEnabled = true;
     bool m_periodicDeviceDiscoveryEnabled = false; // wjy: 默认关闭，开启后按批量新增输入框中的网段周期扫描。
     bool m_statusRefreshInProgress = false;
-    bool m_remoteUpdateAvailabilityRefreshInProgress = false; // wjy: 防止上一轮目标版本查询未结束时重复创建后台任务。
     bool m_wakeProbeInProgress = false;
     bool m_batchAddInProgress = false; // wjy: 标记批量新增扫描是否正在后台执行。
     bool m_wallpaperRotationEnabled = false; // wjy: 新安装默认关闭，避免未经用户选择就修改当前桌面。
@@ -466,6 +466,7 @@ private:
     bool m_shuttingDown = false; // wjy: No new background tasks after destruction begins.
     QHash<QString, platform::DevicePresenceState> m_deviceStatuses;
     QHash<QString, bool> m_deviceUpdateAvailability; // wjy: 设备状态刷新线程统一维护目标是否需要更新，远控窗口只消费结果。
+    QHash<QString, platform::DeviceRealtimeUpdateState> m_deviceRealtimeUpdateStates;
     // =====wjy====
     QHash<QString, int> m_deviceRemoteSessionCounts; // wjy: 目标端远控会话数 0-10，设备行数字徽标的权威缓存。
     QHash<QString, QString> m_deviceRemoteControllerNames; // wjy: 控制端设备名列表，悬停远控徽标气泡展示。
@@ -476,7 +477,6 @@ private:
     // =====wjy====
     QTimer* m_settingsGearTimer = nullptr; // wjy: 设置齿轮点击后旋转半圈的动画定时器。
     // ===end====
-    QTimer* m_remoteUpdateAvailabilityTimer = nullptr; // wjy: 打开远控窗口期间每 10 秒检查一次目标是否发现共享新版。
     QTimer* m_periodicDeviceDiscoveryTimer = nullptr; // wjy: 到期后复用批量新增扫描，已有扫描进行中时自动跳过本轮。
     QTimer* m_wallpaperRotationTimer = nullptr; // wjy: 开关开启后按用户分钟数触发下一张壁纸，关闭或退出时立即停止。
     QTimer* m_wakeVisualTimer = nullptr;

@@ -1,4 +1,5 @@
 #include "parsec_vdd_session.h"
+#include "stream_capture_diagnostics.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -11,15 +12,21 @@
 #include "parsec-vdd.h"
 
 #include <chrono>
+#include <cstdint>
 #include <vector>
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 
 namespace uu {
 namespace {
+
+// =====wjy====
+using lsp::append_stream_capture_diagnostic_log; // wjy: 仅把统一诊断函数引入当前VDD实现作用域，不改变显示创建、复用或释放流程。
+// ===end====
 
 constexpr DWORD kDisplayEnumerateTimeoutMs = 5000;
 constexpr int kTargetWidth = 1920;
@@ -32,6 +39,10 @@ struct DisplayInfo {
     bool active = false;
     int64_t monitor_id = 0;
 };
+
+// =====wjy====
+std::string narrow(const std::wstring& value); // wjy: 前置声明供显示枚举阶段直接把\\.\DISPLAYx写入统一UTF-8诊断日志。
+// ===end====
 
 int parse_display_address(const std::wstring& path)
 {
@@ -232,23 +243,48 @@ void remove_existing_parsec_displays(HANDLE handle)
 
     auto indexes = enumerate_parsec_display_indexes();
     std::sort(indexes.rbegin(), indexes.rend());
+    {
+        std::ostringstream line;
+        line << "remove-existing count=" << indexes.size() << " indexes=";
+        for (size_t position = 0; position < indexes.size(); ++position) {
+            if (position > 0) line << ",";
+            line << indexes[position];
+        }
+        append_stream_capture_diagnostic_log(
+            "vdd",
+            line.str()); // wjy: 删除前记录驱动中全部Parsec显示索引，确认ToDesk或旧FSRemote是否留下共享VDD实例。
+    }
     for (const int index : indexes) {
+        append_stream_capture_diagnostic_log(
+            "vdd",
+            "remove-existing index=" + std::to_string(index)); // wjy: 每个实际移除动作单独记录，复现后可核对是否误删外部远控拥有的显示器。
         parsec_vdd::VddRemoveDisplay(handle, index);
     }
 }
 
 bool wait_for_display_ready(int display_index, DisplayInfo* out)
 {
+    append_stream_capture_diagnostic_log(
+        "vdd",
+        "wait-ready begin index=" + std::to_string(display_index)
+            + " timeout_ms=" + std::to_string(kDisplayEnumerateTimeoutMs)); // wjy: 记录VDD添加后进入Windows显示枚举等待的明确边界。
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kDisplayEnumerateTimeoutMs);
     while (std::chrono::steady_clock::now() < deadline) {
         DisplayInfo info;
         if (enumerate_parsec_display_by_index(display_index, &info) && !info.device_name.empty()) {
             for (int attempt = 0; attempt < 20; ++attempt) {
                 if (set_display_mode(info.device_name)) {
-                    set_display_primary(info.device_name);
+                    const bool primary_ready = set_display_primary(info.device_name); // wjy: 保持原有忽略主屏失败的行为，仅把结果写入诊断文件。
                     info.active = true;
                     info.monitor_id = reinterpret_cast<int64_t>(monitor_for_device_name(info.device_name));
                     *out = info;
+                    append_stream_capture_diagnostic_log(
+                        "vdd",
+                        "wait-ready success index=" + std::to_string(display_index)
+                            + " attempt=" + std::to_string(attempt + 1)
+                            + " device='" + narrow(info.device_name) + "'"
+                            + " primary=" + std::to_string(primary_ready ? 1 : 0)
+                            + " monitor_id=" + std::to_string(info.monitor_id)); // wjy: 模式、主屏和HMONITOR结果集中记录，直接定位“设备OK但监视器句柄无效”。
                     return true;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -257,6 +293,11 @@ bool wait_for_display_ready(int display_index, DisplayInfo* out)
             info.monitor_id = reinterpret_cast<int64_t>(monitor_for_device_name(info.device_name));
             if (info.monitor_id != 0) {
                 *out = info;
+                append_stream_capture_diagnostic_log(
+                    "vdd",
+                    "wait-ready monitor-fallback index=" + std::to_string(display_index)
+                        + " device='" + narrow(info.device_name) + "'"
+                        + " monitor_id=" + std::to_string(info.monitor_id)); // wjy: 分辨率设置连续失败但HMONITOR可用时保留原有回退，并明确标记该异常路径。
                 return true;
             }
         }
@@ -264,6 +305,9 @@ bool wait_for_display_ready(int display_index, DisplayInfo* out)
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
+    append_stream_capture_diagnostic_log(
+        "vdd",
+        "wait-ready timeout index=" + std::to_string(display_index)); // wjy: 五秒枚举失败必须成为持久日志终点，避免控制端只看到“等待远程画面”。
     return false;
 }
 
@@ -273,14 +317,32 @@ std::string narrow(const std::wstring& value)
         return {};
     }
 
-    const int size = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (size <= 1) {
+    // =====wjy====
+    const int size = WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        value.data(),
+        static_cast<int>(value.size()),
+        nullptr,
+        0,
+        nullptr,
+        nullptr);
+    if (size <= 0) {
         return {};
     }
 
-    std::string result(static_cast<size_t>(size - 1), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, result.data(), size, nullptr, nullptr);
+    std::string result(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(
+        CP_UTF8,
+        0,
+        value.data(),
+        static_cast<int>(value.size()),
+        result.data(),
+        size,
+        nullptr,
+        nullptr); // wjy: 按不含终止符的实际字符数分配和转换，避免写入UTF-8终止符时越过string缓冲区。
     return result;
+    // ===end====
 }
 
 bool driver_ready()
@@ -299,19 +361,36 @@ public:
     bool acquire(int64_t* preferred_source_id, std::string* preferred_device_name, std::string* error)
     {
         std::lock_guard lock(mutex_);
+        append_stream_capture_diagnostic_log(
+            "vdd",
+            "acquire begin ready=" + std::to_string(ready_ ? 1 : 0)
+                + " ref_count=" + std::to_string(ref_count_)
+                + " display_index=" + std::to_string(display_index_)); // wjy: 每个首订阅进入VDD前记录共享状态，判断旧会话是否遗留ready或引用计数。
 
         if (ready_) {
             DisplayInfo info;
             if (!refresh_display_info(&info)) {
+                append_stream_capture_diagnostic_log(
+                    "vdd",
+                    "existing display refresh failed; stopping stale display"); // wjy: 旧共享显示无法重新枚举时标记清理原因，不改变原有stop后重建流程。
                 stop_locked();
             } else {
                 ++ref_count_;
                 publish(info, preferred_source_id, preferred_device_name);
+                append_stream_capture_diagnostic_log(
+                    "vdd",
+                    "acquire reused index=" + std::to_string(display_index_)
+                        + " ref_count=" + std::to_string(ref_count_)
+                        + " device='" + preferred_device_name_ + "'"); // wjy: 多会话复用时记录已发布设备名，排除重复创建VDD。
                 return true;
             }
         }
 
-        if (!driver_ready()) {
+        const bool parsec_driver_ready = driver_ready();
+        append_stream_capture_diagnostic_log(
+            "vdd",
+            "driver ready=" + std::to_string(parsec_driver_ready ? 1 : 0)); // wjy: PnP显示OK之外再记录parsec-vdd API自己的设备状态判断。
+        if (!parsec_driver_ready) {
             if (error) *error = "parsec-vdd driver is not ready";
             return false;
         }
@@ -320,13 +399,22 @@ public:
         if (handle_ == nullptr || handle_ == INVALID_HANDLE_VALUE) {
             handle_ = INVALID_HANDLE_VALUE;
             if (error) *error = "parsec-vdd open handle failed";
+            append_stream_capture_diagnostic_log(
+                "vdd",
+                "open-device failed"); // wjy: 驱动状态正常但设备句柄打不开时留下独立阶段，区分权限和驱动占用问题。
             return false;
         }
+        append_stream_capture_diagnostic_log(
+            "vdd",
+            "open-device success handle=" + std::to_string(reinterpret_cast<uintptr_t>(handle_))); // wjy: 句柄值仅用于同一日志内核对生命周期，不包含认证或用户隐私信息。
 
         remove_existing_parsec_displays(handle_);
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
         display_index_ = parsec_vdd::VddAddDisplay(handle_);
+        append_stream_capture_diagnostic_log(
+            "vdd",
+            "add-display result index=" + std::to_string(display_index_)); // wjy: 记录驱动返回的显示索引，后续Windows枚举和停止阶段都用同一值核对。
         if (display_index_ < 0) {
             if (error) *error = "parsec-vdd add display failed";
             stop_locked();
@@ -351,6 +439,11 @@ public:
         ready_ = true;
         ref_count_ = 1;
         publish(info, preferred_source_id, preferred_device_name);
+        append_stream_capture_diagnostic_log(
+            "vdd",
+            "acquire success index=" + std::to_string(display_index_)
+                + " device='" + preferred_device_name_ + "'"
+                + " monitor_id=" + std::to_string(preferred_source_id_)); // wjy: VDD最终发布给DXGI的设备名和HMONITOR在同一行落盘。
         return true;
     }
 
@@ -361,6 +454,10 @@ public:
         if (ref_count_ > 0) {
             --ref_count_;
         }
+        append_stream_capture_diagnostic_log(
+            "vdd",
+            "release ref_count=" + std::to_string(ref_count_)
+                + " ready=" + std::to_string(ready_ ? 1 : 0)); // wjy: 会话关闭时确认引用是否真正归零，排查僵尸订阅阻止VDD重建。
         if (ref_count_ == 0 && ready_) {
             stop_locked(); // wjy: 最后一个 HostMediaPipeline 订阅释放后立即移除虚拟显示器，不把空闲 VDD 留到进程退出。
         }
@@ -382,13 +479,23 @@ private:
 
         DisplayInfo info;
         if (!enumerate_parsec_display_by_index(display_index_, &info) || info.device_name.empty()) {
+            append_stream_capture_diagnostic_log(
+                "vdd",
+                "refresh enumerate failed index=" + std::to_string(display_index_)); // wjy: 外部远控改变显示拓扑后若旧索引消失，直接记录失败索引。
             return false;
         }
 
-        set_display_mode(info.device_name);
-        set_display_primary(info.device_name);
+        const bool mode_ready = set_display_mode(info.device_name);
+        const bool primary_ready = set_display_primary(info.device_name);
         info.monitor_id = reinterpret_cast<int64_t>(monitor_for_device_name(info.device_name));
         info.active = info.monitor_id != 0;
+        append_stream_capture_diagnostic_log(
+            "vdd",
+            "refresh index=" + std::to_string(display_index_)
+                + " device='" + narrow(info.device_name) + "'"
+                + " mode=" + std::to_string(mode_ready ? 1 : 0)
+                + " primary=" + std::to_string(primary_ready ? 1 : 0)
+                + " monitor_id=" + std::to_string(info.monitor_id)); // wjy: 复用显示时完整记录模式、主屏和句柄状态，行为仍与原来一样继续按HMONITOR判定。
         if (!info.active) {
             return false;
         }
@@ -413,6 +520,11 @@ private:
 
     void stop_locked()
     {
+        append_stream_capture_diagnostic_log(
+            "vdd",
+            "stop begin index=" + std::to_string(display_index_)
+                + " ready=" + std::to_string(ready_ ? 1 : 0)
+                + " ref_count=" + std::to_string(ref_count_)); // wjy: VDD清理前保存最后状态，确认应用重启为何不能复原时是否真的执行移除。
         heartbeat_running_ = false;
         if (heartbeat_thread_.joinable()) {
             heartbeat_thread_.join();
@@ -432,6 +544,9 @@ private:
         ref_count_ = 0;
         preferred_source_id_ = 0;
         preferred_device_name_.clear();
+        append_stream_capture_diagnostic_log(
+            "vdd",
+            "stop end"); // wjy: 句柄关闭和状态清零完成后写入终点，异常中断时可与stop begin成对核对。
     }
 
     std::mutex mutex_;

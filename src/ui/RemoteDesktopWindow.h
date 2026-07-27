@@ -184,6 +184,7 @@ private:
     QString remoteQualityStatusSummary() const; // wjy: 统一生成标题栏气泡和菜单中的请求/实际/降级说明，避免两处反馈不一致。
     bool remoteQualityIsDegraded() const; // wjy: 判断当前是否处于最小化、自动降级、Host限制或高质量硬边界保护状态。
     // ===end====
+    QRect remoteContentRect() const; // wjy: D3D11 Presenter覆盖标题栏下的完整内容区，真实远端矩形仍由remoteImageRect单独计算。
     QRect remoteImageRect() const;
     bool normalizedRemotePoint(const QPoint& position, int* x, int* y) const;
     bool sendInputMessage(const QByteArray& message);

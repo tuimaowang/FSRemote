@@ -15,6 +15,8 @@ add_library(lan_stream_common STATIC
     src/ffmpeg_decoder.cpp
     src/nvenc_h264_encoder.cpp
     src/protocol.cpp
+    src/stream_capture_diagnostics.cpp # wjy: LAN探针与正式远控共用同一套低开销采集诊断写入器。
+    src/stream_capture_diagnostics.h
     src/udp_socket.cpp
 )
 

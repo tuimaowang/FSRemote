@@ -8,6 +8,7 @@
 #include "system/WjyDiagnosticLog.h"
 
 #include <QAbstractSocket>
+#include <QCoreApplication>
 #include <QNetworkProxy>
 #include <QPointer>
 #include <QProcess>
@@ -261,23 +262,36 @@ private:
                 replyAndClose(QByteArrayLiteral("preparing\n"));
                 return; // wjy: 仅设备右键菜单发起的远程更新向控制端返回准备阶段。
             }
+            UpdateService& updateService = UpdateService::instance();
+            if (!updateService.confirmedRemoteVersion().trimmed().isEmpty()
+                && !updateService.isUpdateAvailable()) {
+                g_remoteUpdateFailure.clear();
+                replyAndClose(QByteArrayLiteral("complete\n"));
+                return; // wjy: 当前已追平共享版本且依赖完整时清除旧失败，避免手动刷新重新点亮无效按钮。
+            }
             if (!g_remoteUpdateFailure.trimmed().isEmpty()) {
                 replyAndClose(QByteArrayLiteral("failed|")
                     + QUrl::toPercentEncoding(g_remoteUpdateFailure.trimmed())
                     + QByteArrayLiteral("\n"));
                 return; // wjy: 目标端准备失败时把真实原因传给远控窗口。
             }
-            replyAndClose(UpdateService::instance().isUpdateAvailable()
+            replyAndClose(updateService.isUpdateAvailable()
                     ? QByteArrayLiteral("idle\n")
-                    : QByteArrayLiteral("complete\n")); // wjy: 重启后本地版本已追上共享版本即视为更新完成。
+                    : QByteArrayLiteral("complete\n"));
             return;
         }
 
         if (command == "update") {
             UpdateService& updateService = UpdateService::instance();
-            if (!updateService.isUpdateAvailable()) {
+            const QString expectedVersion = QString::fromUtf8(parts.value(1)).trimmed();
+            const bool expectedUpdateAvailable = !expectedVersion.isEmpty()
+                && UpdateService::remoteUpdateOrRepairAvailable(
+                    expectedVersion,
+                    UpdateService::localVersionText(),
+                    QCoreApplication::applicationDirPath());
+            if (!updateService.isUpdateAvailable() && !expectedUpdateAvailable) {
                 replyAndClose(QByteArrayLiteral("up_to_date\n"));
-                return; // wjy: 目标端以自己的本地版本和共享版本为准判断，避免控制端版本状态影响目标设备。
+                return; // wjy: 本机缓存和控制端确认版本都不指向可执行更新时才返回已最新。
             }
             if (g_remoteUpdateScheduled) {
                 replyAndClose(QByteArrayLiteral("accepted\n"));
@@ -559,7 +573,12 @@ bool DeviceCommandService::send(const QString& hostIp, DeviceControlAction actio
 }
 
 // =====wjy====
-RemoteUpdateRequestResult DeviceCommandService::requestUpdate(const QString& hostIp, QString* errorMessage, uint16_t port, int timeoutMs)
+RemoteUpdateRequestResult DeviceCommandService::requestUpdate(
+    const QString& hostIp,
+    QString* errorMessage,
+    uint16_t port,
+    int timeoutMs,
+    const QString& expectedVersion)
 {
     if (hostIp.trimmed().isEmpty()) {
         if (errorMessage) *errorMessage = QString::fromUtf8("目标 IP 为空。");
@@ -574,7 +593,13 @@ RemoteUpdateRequestResult DeviceCommandService::requestUpdate(const QString& hos
         return RemoteUpdateRequestResult::Failed;
     }
 
-    const QByteArray payload = QByteArrayLiteral("update\n");
+    QByteArray payload = QByteArrayLiteral("update");
+    const QString normalizedExpectedVersion = expectedVersion.trimmed();
+    if (!normalizedExpectedVersion.isEmpty()) {
+        payload.append('|');
+        payload.append(normalizedExpectedVersion.toUtf8());
+    }
+    payload.append('\n');
     if (socket.write(payload) != payload.size() || !socket.waitForBytesWritten(timeoutMs)) {
         if (errorMessage) *errorMessage = socket.errorString().trimmed();
         socket.disconnectFromHost();

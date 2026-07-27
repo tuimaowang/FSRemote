@@ -28,6 +28,16 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
     add_subdirectory(third_party/uu_stream_webrtc)
     # =====wjy====
     target_sources(uu_stream_common PRIVATE
+        third_party/lan_stream_probe/src/dxgi_capture.cpp
+        third_party/lan_stream_probe/src/dxgi_capture.h # wjy: 正式Host复用Desktop Duplication纹理采集，并按Parsec设备名选择输出及管理租约纹理环。
+        third_party/lan_stream_probe/src/dxgi_capture_policy.h # wjy: 设备名匹配与槽位租约拆成无显卡可测试策略，覆盖误抓屏和纹理覆盖风险。
+        third_party/lan_stream_probe/src/stream_capture_diagnostics.cpp
+        third_party/lan_stream_probe/src/stream_capture_diagnostics.h # wjy: 被控端各媒体阶段共用一个线程安全、限频且立即落盘的采集诊断文件。
+        third_party/uu_stream_webrtc/src/d3d11_frame_transformer.cpp
+        third_party/uu_stream_webrtc/src/d3d11_frame_transformer.h # wjy: 固定档位的裁剪缩放在D3D11 VideoProcessor内完成，并优先产生NV12给NVENC。
+        third_party/uu_stream_webrtc/src/d3d11_native_frame_buffer.cpp
+        third_party/uu_stream_webrtc/src/d3d11_native_frame_buffer.h # wjy: 原生WebRTC帧在采集与自定义H265编码器之间保持D3D11纹理，不强制往返CPU。
+        third_party/uu_stream_webrtc/src/latest_encode_frame_slot.h # wjy: 编码器单槽最新帧策略独立成可测试头文件，过载时覆盖旧帧并继承关键帧请求。
         third_party/uu_stream_webrtc/src/host_media_pipeline.cpp
         third_party/uu_stream_webrtc/src/host_media_pipeline.h
     ) # wjy: 子项目 CMake 含历史非 UTF-8 字节，顶层显式登记共享媒体管线可避免整文件转码破坏既有配置。
@@ -39,7 +49,7 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
         third_party/uu_stream_webrtc/src/windows_cursor_classifier.h
     ) # wjy: DLL 的协同准入、输入状态与 Windows 边缘光标映射都登记为可独立测试的生产策略。
     if(WIN32)
-        target_link_libraries(fsremote_stream PRIVATE advapi32 crypt32) # wjy: Advapi32 校验文件哈希和管理员令牌；Crypt32 校验 MSI 发布者指纹并写入本机 TrustedPublisher。
+        target_link_libraries(fsremote_stream PRIVATE advapi32 crypt32 wtsapi32) # wjy: Wtsapi32 查询 Host 所在会话是否真实锁屏，只有新远控打开且状态为 LOCK 时才允许虚拟 HID Enter。
     endif()
     if(MSVC)
         target_compile_options(uu_stream_common PRIVATE /utf-8) # wjy: 原生公共库已有中文 WJY 注释，统一 UTF-8 可避免系统代码页把多字节尾部误判为续行反斜杠。
@@ -111,6 +121,28 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
             set_property(TARGET uu_host_media_pipeline_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
         endif()
         add_test(NAME uu_host_media_pipeline_tests COMMAND uu_host_media_pipeline_tests)
+
+        add_executable(uu_latest_encode_frame_slot_tests EXCLUDE_FROM_ALL
+            third_party/uu_stream_webrtc/tests/latest_encode_frame_slot_tests.cpp
+            third_party/uu_stream_webrtc/src/latest_encode_frame_slot.h
+        ) # wjy: 纯C++验证最新帧覆盖、容量恒一和关键帧请求继承，不需要WebRTC、显卡或真实远控会话。
+        target_include_directories(uu_latest_encode_frame_slot_tests PRIVATE third_party/uu_stream_webrtc/src)
+        if(MSVC)
+            target_compile_options(uu_latest_encode_frame_slot_tests PRIVATE /utf-8)
+            set_property(TARGET uu_latest_encode_frame_slot_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+        endif()
+        add_test(NAME uu_latest_encode_frame_slot_tests COMMAND uu_latest_encode_frame_slot_tests)
+
+        add_executable(uu_dxgi_capture_policy_tests EXCLUDE_FROM_ALL
+            third_party/uu_stream_webrtc/tests/dxgi_capture_policy_tests.cpp
+            third_party/lan_stream_probe/src/dxgi_capture_policy.h
+        ) # wjy: 无显卡验证Parsec输出精确匹配、租约互斥和多引用最后释放语义。
+        target_include_directories(uu_dxgi_capture_policy_tests PRIVATE third_party/lan_stream_probe/src)
+        if(MSVC)
+            target_compile_options(uu_dxgi_capture_policy_tests PRIVATE /utf-8)
+            set_property(TARGET uu_dxgi_capture_policy_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+        endif()
+        add_test(NAME uu_dxgi_capture_policy_tests COMMAND uu_dxgi_capture_policy_tests)
 
         add_executable(uu_shared_input_state_tests EXCLUDE_FROM_ALL
             third_party/uu_stream_webrtc/tests/shared_input_state_tests.cpp

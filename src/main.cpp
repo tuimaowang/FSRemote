@@ -107,10 +107,13 @@ platform::DeviceRealtimeScriptRuntime currentRealtimeScriptRuntime()
     return realtime; // wjy: 广播只转换已验证结果，不根据控制端本地脚本 UI 缓存推测目标状态。
 }
 
-platform::DeviceRealtimeLocalState currentRealtimeLocalState(FsRemoteStreamHandle hostHandle)
+platform::DeviceRealtimeLocalState currentRealtimeLocalState(
+    FsRemoteStreamHandle hostHandle,
+    const platform::DeviceRealtimeUpdateState& updateState)
 {
     platform::DeviceRealtimeLocalState state;
     state.script = currentRealtimeScriptRuntime();
+    state.update = updateState;
     if (!hostHandle) {
         return state;
     }
@@ -240,12 +243,29 @@ int main(int argc, char* argv[])
     writeStartupLog(QStringLiteral("[wjy-main] after status server start"));
 
     // =====wjy====
+    platform::DeviceRealtimeUpdateState realtimeUpdateState;
+    realtimeUpdateState.installedVersion = platform::UpdateService::displayVersion();
+    realtimeUpdateState.runtimeRepairRequired = platform::UpdateService::runtimeDependenciesNeedRepair(
+        QCoreApplication::applicationDirPath());
+
     platform::DeviceRealtimeStateService realtimeStateService;
     writeStartupLog(QStringLiteral("[wjy-main] before realtime state service start"));
-    const bool realtimeStateStarted = realtimeStateService.start([hostHandle] {
-        return currentRealtimeLocalState(hostHandle); // wjy: 主机会话和脚本进程只在本机读取，网络层始终发送一份完整权威快照。
+    const bool realtimeStateStarted = realtimeStateService.start([hostHandle, &realtimeUpdateState] {
+        return currentRealtimeLocalState(hostHandle, realtimeUpdateState); // wjy: 主机会话、脚本和版本状态都从本机权威来源组成一份完整快照。
     });
     writeStartupLog(QStringLiteral("[wjy-main] after realtime state service start ok=%1").arg(realtimeStateStarted ? 1 : 0));
+    QObject::connect(&platform::UpdateService::instance(), &platform::UpdateService::updateAvailabilityChanged,
+        &realtimeStateService, [&realtimeStateService, &realtimeUpdateState](bool, const QString&) {
+            platform::DeviceRealtimeUpdateState refreshed;
+            refreshed.installedVersion = platform::UpdateService::displayVersion();
+            refreshed.runtimeRepairRequired = platform::UpdateService::runtimeDependenciesNeedRepair(
+                QCoreApplication::applicationDirPath());
+            if (refreshed == realtimeUpdateState) {
+                return;
+            }
+            realtimeUpdateState = std::move(refreshed);
+            realtimeStateService.notifyLocalStateChanged();
+        });
     // ===end====
 
     writeStartupLog(QStringLiteral("[wjy-main] before command server start")); // wjy: Start the remote command endpoint.
@@ -290,14 +310,26 @@ int main(int argc, char* argv[])
     bool updateShutdownPrepared = false; // wjy: 更新退出只允许一个调用者执行服务和媒体预清理，重复信号不能二次释放 Host 句柄。
     QObject::connect(&platform::UpdateService::instance(), &platform::UpdateService::updateReadyToQuit,
         &app, [&] {
-            if (updateShutdownPrepared) return;
+            writeStartupLog(QStringLiteral("[wjy-update-exit] updateReadyToQuit received")); // wjy: 这是主线程真正收到后台退出信号的第一条证据，可与 emit begin/returned 判断队列投递是否成功。
+            if (updateShutdownPrepared) {
+                writeStartupLog(QStringLiteral("[wjy-update-exit] duplicate signal ignored"));
+                return;
+            }
             updateShutdownPrepared = true;
             writeStartupLog(QStringLiteral("[wjy-update-exit] deterministic cleanup begin"));
 
+            writeStartupLog(QStringLiteral("[wjy-update-exit] overlay timer stop begin"));
             remoteControllerOverlayTimer.stop(); // wjy: Host 句柄释放前停止控制端列表轮询，后续事件不再读取已关闭的原生会话表。
+            writeStartupLog(QStringLiteral("[wjy-update-exit] overlay timer stop end"));
+            writeStartupLog(QStringLiteral("[wjy-update-exit] command server stop begin"));
             commandServer.stop(); // wjy: 先关闭 49102 并汇合已经完成暂存的更新线程，禁止退出期间再受理第二个更新或电源命令。
+            writeStartupLog(QStringLiteral("[wjy-update-exit] command server stop end"));
+            writeStartupLog(QStringLiteral("[wjy-update-exit] status server stop begin"));
             statusServer.stop(); // wjy: 关闭 49101 后控制端会把本机视为预期更新离线，不再从旧 Host 句柄生成 busy 快照。
+            writeStartupLog(QStringLiteral("[wjy-update-exit] status server stop end"));
+            writeStartupLog(QStringLiteral("[wjy-update-exit] realtime state service stop begin"));
             realtimeStateService.stop(); // wjy: 停止 UDP 心跳和会话采样，确保下面销毁 Host 时没有并发读取会话状态。
+            writeStartupLog(QStringLiteral("[wjy-update-exit] realtime state service stop end"));
             if (hostHandle) {
                 writeStartupLog(QStringLiteral("[wjy-update-exit] stream host stop begin"));
                 stream::StreamRuntime::instance().stop(hostHandle); // wjy: 在 UI 析构前主动关闭监听、WebRTC 会话、采集编码管线和 FakerInput Bridge 客户端。
@@ -305,7 +337,9 @@ int main(int argc, char* argv[])
                 writeStartupLog(QStringLiteral("[wjy-update-exit] stream host stop end"));
             }
             writeStartupLog(QStringLiteral("[wjy-update-exit] deterministic cleanup end"));
+            writeStartupLog(QStringLiteral("[wjy-update-exit] requestApplicationExit begin"));
             window.requestApplicationExit(); // wjy: 关键媒体和服务资源确认释放后再进入窗口、后台任务、SSH 和 Qt 的统一退出路径。
+            writeStartupLog(QStringLiteral("[wjy-update-exit] requestApplicationExit returned")); // wjy: 若主程序仍存活但缺少本行，DeviceGrid、SSH 或窗口退出准备就是最后阻塞区间。
         });
     // ===end====
     writeStartupLog(QStringLiteral("[wjy-main] after MainWindow create"));

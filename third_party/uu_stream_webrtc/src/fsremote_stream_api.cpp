@@ -8,6 +8,7 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <wtsapi32.h>
 
 #include "host_media_pipeline.h"
 // =====wjy====
@@ -21,6 +22,7 @@
 #include "session_protocol.h"
 #include "signaling.h"
 #include "system_audio_stream.h"
+#include "stream_capture_diagnostics.h"
 #include "uu_codec_factory.h"
 #include "viewer_quality_protocol.h"
 #include "webrtc_session.h"
@@ -852,6 +854,56 @@ void send_mouse_button(DWORD flag); // wjy: 后端路由器失败回退时复用
 void send_mouse_wheel(int delta); // wjy: FakerInputBridge 断管后，同一个滚轮事件立即交给系统注入，避免用户操作丢失。
 void send_key(int vk, bool down); // wjy: 驱动键盘不支持的 Consumer 键及运行时回退继续复用既有系统键盘实现。
 
+enum class CurrentSessionLockState {
+    Unknown,
+    Locked,
+    Unlocked,
+}; // wjy: 锁屏自动 Enter 只接受 WTS 明确返回的锁定状态，查询失败或未知值绝不注入。
+
+struct CurrentSessionLockQuery {
+    CurrentSessionLockState state = CurrentSessionLockState::Unknown;
+    DWORD session_id = 0;
+    DWORD session_flags = 0;
+    DWORD error = ERROR_SUCCESS;
+};
+
+CurrentSessionLockQuery query_current_session_lock_state()
+{
+    CurrentSessionLockQuery result;
+    if (!::ProcessIdToSessionId(::GetCurrentProcessId(), &result.session_id)) {
+        result.error = ::GetLastError();
+        return result; // wjy: 只查询承载 FSRemote Host 的真实会话，禁止误操作其他登录用户的锁屏桌面。
+    }
+
+    LPWSTR raw_information = nullptr;
+    DWORD information_bytes = 0;
+    if (!::WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            result.session_id,
+            WTSSessionInfoEx,
+            &raw_information,
+            &information_bytes)) {
+        result.error = ::GetLastError();
+        return result;
+    }
+
+    if (raw_information && information_bytes >= sizeof(WTSINFOEXW)) {
+        const auto* information = reinterpret_cast<const WTSINFOEXW*>(raw_information);
+        if (information->Level == 1) {
+            result.session_flags = information->Data.WTSInfoExLevel1.SessionFlags;
+            if (result.session_flags == WTS_SESSIONSTATE_LOCK) {
+                result.state = CurrentSessionLockState::Locked;
+            } else if (result.session_flags == WTS_SESSIONSTATE_UNLOCK) {
+                result.state = CurrentSessionLockState::Unlocked;
+            }
+        }
+    } else {
+        result.error = ERROR_INVALID_DATA;
+    }
+    ::WTSFreeMemory(raw_information); // wjy: WTS 查询缓冲区必须由配对 API 释放，Host 长期运行时不能按远控次数累积泄漏。
+    return result;
+}
+
 enum class MouseInjectionBackend {
     System,
     Faker,
@@ -880,6 +932,12 @@ std::uint8_t faker_mouse_button_bit(int button)
 
 class MouseInputBackendRouter final {
 public:
+    struct OneShotEnterAttempt {
+        bool completed = false;
+        bool success = false;
+        std::string error;
+    }; // wjy: completed 区分“尚未触碰键盘、可以稍后重连”和“已经开始一次按键、绝不允许重复”。
+
     MouseInjectionBackend backend() const noexcept
     {
         return backend_;
@@ -992,6 +1050,53 @@ public:
         std::string bridge_error;
         if (bridge_.sendKeyboard(report.modifiers, report.usages, &bridge_error)) return; // wjy: 每次 down/up 都发送当前完整快照，断线重连不依赖服务端保存增量事件。
         fallbackToSystem(bridge_error); // wjy: 当前键已进入逻辑镜像，回退函数会一次性用 SendInput 重建所有仍按住的键。
+    }
+
+    OneShotEnterAttempt sendOneShotEnter()
+    {
+        OneShotEnterAttempt attempt;
+        if (!keyboard_state_.pressedVirtualKeys().empty()) {
+            attempt.error = "FakerInput keyboard is not idle";
+            return attempt; // wjy: 其他控制端仍按住修饰键或普通键时暂缓，避免自动 Enter 变成 Alt+Enter 等组合键。
+        }
+
+        uu::FakerInputBridgeClient temporary_bridge;
+        uu::FakerInputBridgeClient* bridge = &bridge_;
+        const bool uses_persistent_bridge = backend_ == MouseInjectionBackend::Faker;
+        std::string bridge_error;
+        if (uses_persistent_bridge) {
+            if (!bridge_.connectAndPing(&bridge_error)) {
+                fallbackToSystem(bridge_error); // wjy: 长连接已失效时先回到系统后端，本次尚未写键盘，后续可重新连接 Bridge 再尝试。
+                attempt.error = bridge_error;
+                return attempt;
+            }
+        } else {
+            bridge = &temporary_bridge; // wjy: 系统键鼠模式不改变用户选择，只为锁屏 Enter 短暂占用本机虚拟 HID 管道。
+            if (!bridge->connectAndPing(&bridge_error)) {
+                attempt.error = bridge_error;
+                return attempt;
+            }
+        }
+
+        std::array<std::uint8_t, 6> enter_down{};
+        enter_down[0] = uu::fakerInputUsageForVirtualKey(VK_RETURN); // wjy: 只发送标准 USB HID Enter usage 0x28，不组合密码、SAS、鼠标或其他键。
+        attempt.completed = true; // wjy: 从第一次键盘请求开始即熔断重试；即使响应丢失，也不能冒险再产生第二次 Enter。
+        if (!bridge->sendKeyboard(0, enter_down, &bridge_error)) {
+            if (uses_persistent_bridge) fallbackToSystem(bridge_error);
+            attempt.error = bridge_error;
+            return attempt;
+        }
+
+        ::Sleep(60); // wjy: 保持一个短而完整的物理按键边沿，随后无条件发送全零键盘快照抬起 Enter。
+        const std::array<std::uint8_t, 6> enter_up{};
+        if (!bridge->sendKeyboard(0, enter_up, &bridge_error)) {
+            if (uses_persistent_bridge) fallbackToSystem(bridge_error); // wjy: 断管时服务端会 release-all，系统回退也从空键盘镜像开始。
+            attempt.error = bridge_error;
+            return attempt;
+        }
+
+        attempt.success = true;
+        return attempt;
     }
 
     void sendWheel(int delta)
@@ -1671,6 +1776,87 @@ public:
         if (mouse_backend_callback) mouse_backend_callbacks_[session_id] = std::move(mouse_backend_callback); // wjy: 只登记有控制权的 Viewer，view-only 无法查询或改变注入后端。
     }
 
+    // =====wjy====
+    void requestLockScreenEnter(const std::string& session_id)
+    {
+        if (session_id.empty()) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard lock(mutex_);
+        LockScreenEnterRequest request;
+        request.deadline = now + std::chrono::seconds(10); // wjy: 给 Bridge 后台准备留出有限时间，超时后不再让旧连接请求影响后续桌面状态。
+        request.next_probe = now;
+        pending_lock_enter_requests_[session_id] = request; // wjy: 每个已认证控制会话仅登记一次；相同 session id 重入只刷新尚未执行的同一请求。
+        append_input_debug_log("host lock-enter requested session=" + session_id);
+    }
+
+    void pollLockScreenEnter()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        {
+            std::lock_guard lock(mutex_);
+            for (auto iterator = pending_lock_enter_requests_.begin(); iterator != pending_lock_enter_requests_.end();) {
+                if (now >= iterator->second.deadline) {
+                    append_input_debug_log("host lock-enter expired session=" + iterator->first);
+                    iterator = pending_lock_enter_requests_.erase(iterator); // wjy: 过期请求只清自己，不改变其他远控会话或键鼠后端。
+                } else {
+                    ++iterator;
+                }
+            }
+            if (pending_lock_enter_requests_.empty()) return;
+            const bool probe_due = std::any_of(
+                pending_lock_enter_requests_.begin(),
+                pending_lock_enter_requests_.end(),
+                [now](const auto& item) { return now >= item.second.next_probe; });
+            if (!probe_due) return;
+        }
+
+        const CurrentSessionLockQuery query = query_current_session_lock_state(); // wjy: WTS 调用放在输入互斥量外，系统服务响应慢时不阻塞正常远控键鼠。
+        std::lock_guard lock(mutex_);
+        if (pending_lock_enter_requests_.empty()) return;
+        const auto next_probe = now + std::chrono::milliseconds(250);
+        for (auto& [session_id, request] : pending_lock_enter_requests_) request.next_probe = next_probe;
+
+        if (query.state == CurrentSessionLockState::Unlocked) {
+            append_input_debug_log("host lock-enter skipped state=unlocked session_id="
+                + std::to_string(query.session_id)
+                + " requests=" + std::to_string(pending_lock_enter_requests_.size()));
+            pending_lock_enter_requests_.clear(); // wjy: 普通桌面打开远控只完成检测，绝不发送 Enter。
+            return;
+        }
+        if (query.state == CurrentSessionLockState::Unknown) {
+            if (!lock_state_query_failure_logged_) {
+                append_input_debug_log("host lock-enter state=unknown session_id="
+                    + std::to_string(query.session_id)
+                    + " flags=" + std::to_string(query.session_flags)
+                    + " error=" + std::to_string(query.error));
+                lock_state_query_failure_logged_ = true; // wjy: 同一批请求只记录一次查询失败，250ms 重试不会刷爆诊断日志。
+            }
+            return;
+        }
+
+        lock_state_query_failure_logged_ = false;
+        if (!faker_provision_complete_) {
+            return; // wjy: 锁屏确认后等待现有后台线程完成 Bridge/驱动准备，只重试就绪检查，不提前使用 SendInput。
+        }
+        if (!held_input_.empty()) {
+            return; // wjy: 存在真实控制端持有键或鼠标时等待空闲，防止自动 Enter 与正在进行的组合操作交叉。
+        }
+
+        const MouseInputBackendRouter::OneShotEnterAttempt attempt = mouse_backend_.sendOneShotEnter();
+        if (!attempt.completed) {
+            append_input_debug_log("host lock-enter waiting bridge error=" + attempt.error);
+            return; // wjy: Ping/连接阶段失败尚未触碰键盘，可在十秒窗口内继续等待现有 Bridge 恢复。
+        }
+
+        append_input_debug_log(std::string("host lock-enter completed success=")
+            + (attempt.success ? "1" : "0")
+            + " session_id=" + std::to_string(query.session_id)
+            + " requests=" + std::to_string(pending_lock_enter_requests_.size())
+            + (attempt.error.empty() ? std::string() : " error=" + attempt.error));
+        pending_lock_enter_requests_.clear(); // wjy: 一旦开始键盘请求就清除同批全部打开事件，响应丢失或多路同时连接都不会重复按 Enter。
+    }
+    // ===end====
+
     void registerCursorSession(const std::string& session_id, CursorShapeCallback callback)
     {
         if (!callback) return;
@@ -1809,6 +1995,7 @@ public:
             mouse_mode_callbacks_.erase(session_id);
             mouse_backend_callbacks_.erase(session_id);
             clipboard_callbacks_.erase(session_id);
+            pending_lock_enter_requests_.erase(session_id); // wjy: 会话在执行前退出时同步撤销自动 Enter，过期请求不能在无人连接后解锁设备。
             if (mouse_mode_callbacks_.empty()) reset_mouse_relative_mode("last-controller-left", false, nullptr);
             std::string fallback_error;
             if (mouse_backend_.consumeFallback(&fallback_error)) {
@@ -1842,10 +2029,18 @@ public:
         mouse_backend_callbacks_.clear();
         clipboard_callbacks_.clear();
         cursor_shape_callbacks_.clear();
+        pending_lock_enter_requests_.clear(); // wjy: Host 关闭后不保留任何等待中的锁屏输入请求。
         reset_mouse_relative_mode("host-shutdown", false, nullptr); // wjy: Host 资源销毁前兜底清空所有会话输入与相对鼠标状态。
     }
 
 private:
+    // =====wjy====
+    struct LockScreenEnterRequest {
+        std::chrono::steady_clock::time_point deadline;
+        std::chrono::steady_clock::time_point next_probe;
+    };
+    // ===end====
+
     bool handleMouseBackendMessageLocked(
         const std::string& session_id,
         const std::string& message,
@@ -1983,6 +2178,8 @@ private:
     bool faker_provision_complete_ = false;
     bool faker_requested_ = false;
     std::string faker_provision_error_; // wjy: 失败原因进入本机诊断日志，网络协议只暴露有限状态而不泄漏目标端路径。
+    std::unordered_map<std::string, LockScreenEnterRequest> pending_lock_enter_requests_; // wjy: 只保存已认证控制会话的短期请求，不保存密码或任何用户输入内容。
+    bool lock_state_query_failure_logged_ = false;
     // ===end====
     std::unordered_map<std::string, SessionPointerState> pointer_by_session_;
     std::unordered_map<std::string, MouseModeCallback> mouse_mode_callbacks_;
@@ -2245,11 +2442,40 @@ private:
             append_log("host listener failed: " + error);
             return;
         }
+        // =====wjy====
+        constexpr long kAcceptPollTimeoutMicroseconds = 200 * 1000; // wjy: Accept 管理线程最长每 200ms 检查一次退出标志，不再依赖其它线程关闭 socket 来唤醒永久阻塞的 accept。
+        append_log("host accept loop ready poll_ms=200");
         while (running_) {
-            append_log("host waiting accept");
+            fd_set readable;
+            FD_ZERO(&readable);
+            FD_SET(static_cast<SOCKET>(listener), &readable); // wjy: 只有本管理线程监视和接收 listener，select 可安全作为 accept 前的可读门禁。
+            timeval timeout = {};
+            timeout.tv_usec = kAcceptPollTimeoutMicroseconds;
+
+            const int ready = ::select(0, &readable, nullptr, nullptr, &timeout); // wjy: Windows 忽略第一个 nfds 参数；超时返回后循环会重新读取原子 running_。
+            if (!running_) {
+                break; // wjy: 关闭请求到达后由 Accept 线程自己退出并在循环后关闭 listener，消除跨线程 closesocket 与阻塞 accept 的竞态。
+            }
+            if (ready == 0) {
+                continue; // wjy: 没有新连接只是正常轮询超时，不写高频日志也不改变现有会话。
+            }
+            if (ready == SOCKET_ERROR) {
+                append_log("host select failed error=" + std::to_string(::WSAGetLastError()));
+                break;
+            }
+            if (!FD_ISSET(static_cast<SOCKET>(listener), &readable)) {
+                continue; // wjy: 防御异常返回；未明确标记 listener 可读时绝不进入可能阻塞的 accept。
+            }
+
             const SOCKET accepted = ::accept(static_cast<SOCKET>(listener), nullptr, nullptr);
             if (accepted == INVALID_SOCKET) {
-                if (running_) append_log("host accept failed error=" + std::to_string(::WSAGetLastError()));
+                const int accept_error = ::WSAGetLastError();
+                if (running_) append_log("host accept failed error=" + std::to_string(accept_error));
+                if (accept_error == WSAEWOULDBLOCK
+                    || accept_error == WSAEINTR
+                    || accept_error == WSAECONNRESET) {
+                    continue; // wjy: select 与 accept 之间连接被撤销属于可恢复竞态，下一轮继续监听；其它错误退出以免无休止空转刷日志。
+                }
                 break;
             }
             reapCompletedSessions(); // wjy: 新连接到达后先回收已结束 worker，容量判断不会被僵尸记录占用。
@@ -2289,8 +2515,11 @@ private:
             });
             append_log("host client worker started session=" + session->admission.session_id);
         }
+        append_log("host accept loop exit");
         const uintptr_t published = server_socket_.exchange(0);
-        if (published) uu::close_socket(published);
+        if (published) uu::close_socket(published); // wjy: listener 由创建并使用它的 Accept 管理线程关闭，句柄不会在 select/accept 期间被其它线程抢先回收或复用。
+        append_log("host accept listener closed by manager");
+        // ===end====
         shutdownSessionsOnManagerThread(); // wjy: accept 退出后由同一 manager 线程 join 客户端并销毁共享 runtime。
     }
 
@@ -2306,21 +2535,51 @@ private:
             return; // wjy: 认证失败路径不会触碰音频、PeerConnection、桌面采集或编码器。
         }
         append_log("host admission accepted session=" + context->admission.session_id + " client=" + context->admission.client_id);
+        lsp::append_stream_capture_diagnostic_log(
+            "session",
+            "admission accepted session=" + context->admission.session_id
+                + " client=" + context->admission.client_id
+                + " capabilities='" + context->admission.capabilities + "'"
+                + " ownership='" + context->admission.ownership + "'"); // wjy: 认证成功后立即写入采集日志，后续无画面可按session id串起全部媒体阶段。
         // =====wjy====
         cancelSupersededControllerSessions(context); // wjy: 同一授权设备重新连接时先踢掉旧会话，避免异常退出记录和新连接同时显示为两台相同设备。
+        const auto media_subscribe_started = std::chrono::steady_clock::now(); // wjy: 记录VDD、DXGI和source创建总耗时，不改变同步订阅流程。
+        lsp::append_stream_capture_diagnostic_log(
+            "session",
+            "media subscribe begin session=" + context->admission.session_id); // wjy: 如果日志停在此行，问题就在共享媒体管线启动而非WebRTC。
         context->media_subscription = media_pipeline_.subscribe(&error); // wjy: 认证成功后才加入共享桌面源，未授权连接不会启动或占用采集资源。
+        const auto media_subscribe_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - media_subscribe_started).count();
         if (!context->media_subscription) {
             append_log("host media subscribe failed session=" + context->admission.session_id + " error=" + error);
+            lsp::append_stream_capture_diagnostic_log(
+                "session",
+                "media subscribe failed session=" + context->admission.session_id
+                    + " elapsed_ms=" + std::to_string(media_subscribe_ms)
+                    + " error=" + error); // wjy: 两种采集后端均失败时保存总耗时和最终错误。
             releaseAdmissionClaims(context); // wjy: 新会话媒体创建失败只回收自己的兼容槽和音频槽，不影响现有控制与视频订阅者。
             context->cancel();
             context->completed = true;
             return;
         }
+        lsp::append_stream_capture_diagnostic_log(
+            "session",
+            "media subscribe success session=" + context->admission.session_id
+                + " elapsed_ms=" + std::to_string(media_subscribe_ms)); // wjy: 共享source取得成功后，后续等待首帧应转查WebRTC和编码器。
         // ===end====
         const bool has_control = context->admission.ownership == "control_granted";
+        if (has_control) {
+            input_dispatcher_.requestLockScreenEnter(context->admission.session_id); // wjy: 新控制会话取得视频源后立即检测目标锁屏；只读观看和未认证连接绝不触发按键。
+        }
         const bool owns_audio = context->admission.audio_primary;
         if (owns_audio && has_capability(context->admission.capabilities, "audio")) {
+            lsp::append_stream_capture_diagnostic_log(
+                "session",
+                "audio start begin session=" + context->admission.session_id); // wjy: 音频启动位于媒体订阅和WebRTC之间，记录边界可发现单路音频监听意外阻塞。
             startAudioForSingleSession(); // wjy: 单路音频拥有者与协同控制权限完全解耦，第二、第三控制端不会因没有音频而降为只读。
+            lsp::append_stream_capture_diagnostic_log(
+                "session",
+                "audio start returned session=" + context->admission.session_id); // wjy: 保留现有无返回值行为，仅确认调用已返回。
         }
 
         uu::SessionConfig sessionConfig;
@@ -2330,12 +2589,24 @@ private:
         sessionConfig.host_video_source = context->media_subscription->source(); // wjy: 每个 PeerConnection 使用同一帧源，但后续仍创建独立 track、sender 和编码器。
         sessionConfig.media_id = context->admission.session_id; // wjy: 生成会话唯一的 WebRTC track/stream 标识。
         // ===end====
+        lsp::append_stream_capture_diagnostic_log(
+            "session",
+            "WebrtcSession construct begin session=" + context->admission.session_id); // wjy: PeerConnection对象创建前写入阶段，构造异常时仍有最后检查点。
         context->webrtc = std::make_unique<uu::WebrtcSession>(&runtime_, sessionConfig);
+        lsp::append_stream_capture_diagnostic_log(
+            "session",
+            "WebrtcSession construct success session=" + context->admission.session_id); // wjy: 对象创建完成后再进入回调和媒体配置。
         context->webrtc->set_signal_callback([weak = std::weak_ptr<HostClientSession>(context)](const std::string& kind, const std::string& body) {
             if (const auto locked = weak.lock()) locked->send(kind + "\n" + body); // wjy: 回调只持弱引用，会话销毁后不会访问悬空 socket。
         });
         // =====wjy====
         context->webrtc->set_connection_state_callback([weak = std::weak_ptr<HostClientSession>(context)](webrtc::PeerConnectionInterface::IceConnectionState state) {
+            if (const auto locked = weak.lock()) {
+                lsp::append_stream_capture_diagnostic_log(
+                    "webrtc",
+                    "ICE state session=" + locked->admission.session_id
+                        + " value=" + std::to_string(static_cast<int>(state))); // wjy: new/checking/connected/completed/disconnected/failed/closed全部持久化，不再只记录终止状态。
+            }
             if (state != webrtc::PeerConnectionInterface::kIceConnectionDisconnected
                 && state != webrtc::PeerConnectionInterface::kIceConnectionFailed
                 && state != webrtc::PeerConnectionInterface::kIceConnectionClosed) {
@@ -2457,7 +2728,38 @@ private:
                 }
             });
         // ===end====
-        if (context->webrtc->initialize(&error) && context->webrtc->start_offer(&error)) {
+        lsp::append_stream_capture_diagnostic_log(
+            "session",
+            "WebRTC initialize begin session=" + context->admission.session_id); // wjy: 若初始化内部卡住，日志会停在本行并与编码/VDD日志交叉定位。
+        const auto webrtc_initialize_started = std::chrono::steady_clock::now();
+        const bool webrtc_initialized = context->webrtc->initialize(&error);
+        const auto webrtc_initialize_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - webrtc_initialize_started).count();
+        lsp::append_stream_capture_diagnostic_log(
+            "session",
+            "WebRTC initialize end session=" + context->admission.session_id
+                + " ok=" + std::to_string(webrtc_initialized ? 1 : 0)
+                + " elapsed_ms=" + std::to_string(webrtc_initialize_ms)
+                + " error=" + error); // wjy: CreatePeerConnection、Track、Sender和编码器初始化的整体结果持久化。
+
+        bool offer_started = false;
+        if (webrtc_initialized) {
+            lsp::append_stream_capture_diagnostic_log(
+                "session",
+                "WebRTC offer begin session=" + context->admission.session_id); // wjy: SDP创建和媒体初始化分开计时，避免都归为“等待画面”。
+            const auto offer_started_at = std::chrono::steady_clock::now();
+            offer_started = context->webrtc->start_offer(&error);
+            const auto offer_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - offer_started_at).count();
+            lsp::append_stream_capture_diagnostic_log(
+                "session",
+                "WebRTC offer end session=" + context->admission.session_id
+                    + " ok=" + std::to_string(offer_started ? 1 : 0)
+                    + " elapsed_ms=" + std::to_string(offer_elapsed_ms)
+                    + " error=" + error); // wjy: offer返回结果和耗时与ICE状态一起判断是否进入真正媒体传输。
+        }
+
+        if (webrtc_initialized && offer_started) {
             std::string message;
             while (running_ && !context->cancelled && uu::recv_message(socket, &message)) {
                 handle_message(*context->webrtc, message);
@@ -2465,6 +2767,10 @@ private:
         } else {
             append_log("host session init/start failed session=" + context->admission.session_id + " error=" + error);
         }
+        lsp::append_stream_capture_diagnostic_log(
+            "session",
+            "session teardown begin session=" + context->admission.session_id
+                + " cancelled=" + std::to_string(context->cancelled ? 1 : 0)); // wjy: 信令循环结束后先记录会话退出原因状态，再依次释放PeerConnection和媒体订阅。
         std::unique_ptr<uu::WebrtcSession> retiring_webrtc;
         {
             std::lock_guard webrtc_lock(context->webrtc_mutex);
@@ -2474,11 +2780,17 @@ private:
         if (has_control) input_dispatcher_.releaseSession(context->admission.session_id); // wjy: 销毁输入回调后释放该会话独有的键、按钮和相对坐标状态。
         input_dispatcher_.releaseCursorSession(context->admission.session_id); // wjy: 无论控制或只读会话都精确注销光标订阅，避免后台轮询继续尝试已关闭通道。
         context->media_subscription.reset(); // wjy: 先销毁 PeerConnection/track，再减少共享 source 订阅计数，避免捕获线程提前停止。
+        lsp::append_stream_capture_diagnostic_log(
+            "session",
+            "media subscription released session=" + context->admission.session_id); // wjy: 确认最后订阅是否触发管线、DXGI和VDD停止日志。
         context->cancel();
         if (owns_audio) stopAudioForSingleSession(); // wjy: 非音频主会话退出不能停止首个会话仍在使用的音频连接。
         releaseAdmissionClaims(context);
         context->completed = true;
         append_log("host client worker completed session=" + context->admission.session_id);
+        lsp::append_stream_capture_diagnostic_log(
+            "session",
+            "session teardown end session=" + context->admission.session_id); // wjy: 会话全部本地状态清理完成后写入最终终点。
     }
 
     void releaseAdmissionClaims(const std::shared_ptr<HostClientSession>& context)
@@ -2564,6 +2876,7 @@ private:
     {
         int clipboardCountdown = 0;
         while (running_) {
+            input_dispatcher_.pollLockScreenEnter(); // wjy: 新远控打开后的锁屏检测与 Bridge 就绪等待独立于信令线程，不让画面建立过程阻塞。
             input_dispatcher_.pollHostCursor(); // wjy: 25ms 采样使应用边缘缩放光标变化接近本地 Windows 反馈速度。
             if (clipboardCountdown <= 0) {
                 input_dispatcher_.pollHostClipboard();
@@ -2579,11 +2892,11 @@ private:
     {
         bool expected = true;
         if (!running_.compare_exchange_strong(expected, false)) return;
-        const uintptr_t listener = server_socket_.exchange(0);
-        if (listener) uu::close_socket(listener); // wjy: 第一步关闭 listener，阻止关闭期间登记新会话并解除 accept。
-        append_log("host shutdown listener closed");
-        if (worker_.joinable()) worker_.join(); // wjy: 第二步先等待 accept manager 退出，杜绝它与关闭线程同时回收并 join 同一个 worker。
+        // =====wjy====
+        append_log("host shutdown accept worker join begin"); // wjy: 这里只发布 running_=false；Accept 管理线程最多在 200ms select 超时后自行关闭 listener 和全部会话。
+        if (worker_.joinable()) worker_.join(); // wjy: listener 单线程所有权消除跨线程关闭竞态，同时保持 manager 仍是会话 worker 的唯一 join 所有者。
         append_log("host shutdown accept worker joined");
+        // ===end====
         // =====wjy====
         if (host_state_worker_.joinable()) host_state_worker_.join(); // wjy: 光标/剪贴板状态线程在 accept worker 之后 join，避免关闭竞态。
         // ===end====
@@ -3065,6 +3378,11 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_host(uint16_t po
 {
     // =====wjy====
     install_crash_logger(); // wjy: host also installs the crash logger because FSRemote can host and view in one process.
+    lsp::reset_stream_capture_diagnostic_log(); // wjy: 旧API启动Host时也为本轮复现创建全新的目标端采集诊断文件。
+    lsp::append_stream_capture_diagnostic_log(
+        "host",
+        "start requested port=" + std::to_string(port)
+            + " api=legacy"); // wjy: 日志首行记录Host入口和监听端口，确认部署DLL已经包含本次诊断版本。
     append_viewer_log("api start_host port=" + std::to_string(port));
     // ===end====
     try {
@@ -3094,6 +3412,13 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_host_with_config
 {
     install_crash_logger();
     const HostRuntimeConfig normalized = normalized_host_config(config); // wjy: DLL 在返回前复制并夹紧全部字段，调用方随后可安全释放配置结构。
+    lsp::reset_stream_capture_diagnostic_log(); // wjy: Qt正式配置入口启动Host时截断旧日志，只保留当前进程和本轮远控复现。
+    lsp::append_stream_capture_diagnostic_log(
+        "host",
+        "start requested port=" + std::to_string(port)
+            + " api=config"
+            + " sessions=" + std::to_string(normalized.effective_max_sessions)
+            + " aggregate_kbps=" + std::to_string(normalized.max_aggregate_video_kbps)); // wjy: 首行保存Host关键配置，后续编码码率可与其核对。
     append_log("host config requested_sessions=" + std::to_string(normalized.requested_max_sessions)
         + " effective_sessions=" + std::to_string(normalized.effective_max_sessions)
         + " aggregate_kbps=" + std::to_string(normalized.max_aggregate_video_kbps)

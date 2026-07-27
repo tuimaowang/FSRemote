@@ -1261,6 +1261,26 @@ const auto& g_deviceGroupNames = g_deviceCatalog.groupNames(); // wjy: 分组名
 const auto& g_deviceGroupExpandedStates = g_deviceCatalog.groupExpandedStates(); // wjy: 展开状态只读消费，切换操作统一交给目录校验分组身份。
 const auto& g_deviceGroupIds = g_deviceCatalog.groupIds(); // wjy: 稳定 groupId 与展示顺序仍保持同位，但匿名命名空间不再拥有可写容器。
 // ===end====
+
+// =====wjy====
+bool deviceIndexesAreAllUngrouped(const QSet<int>& deviceIndexes)
+{
+    if (deviceIndexes.isEmpty()) {
+        return false; // wjy: 没有有效拖拽设备时不能把顶部危险区域误显示为删除入口。
+    }
+    for (const int deviceIndex : deviceIndexes) {
+        if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
+            return false; // wjy: 同步或删除造成下标失效时采用安全行为，不允许通过旧拖拽快照删除其它设备。
+        }
+        const auto& device = g_devices.at(deviceIndex);
+        if (!device.groupId.trimmed().isEmpty() || !device.group.trimmed().isEmpty()) {
+            return false; // wjy: 只要本次拖动中仍有分组设备，顶部区域就继续执行“移出分组”，避免批量误删。
+        }
+    }
+    return true; // wjy: 本次拖动的全部设备都位于根部时，顶部区域才允许切换为删除设备。
+}
+// ===end====
+
 int deviceIndexForIp(const QString& ip)
 {
     const QString trimmedIp = ip.trimmed();
@@ -3315,12 +3335,14 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
         this, &DeviceGrid::handleSharedStorageProbeFinished); // wjy: 更新、回撤和壁纸共享同一轮非阻塞 SMB 端口探测，离线时不会分别启动任务。
     connect(&platform::UpdateService::instance(), &platform::UpdateService::updateAvailabilityChanged,
         this, [this](bool available, const QString& remoteVersion) {
+            const QString confirmedRemoteVersion = remoteVersion.trimmed();
             const bool updateStateChanged = m_updateAvailable != available
-                || m_availableUpdateVersion != (available ? remoteVersion : QString()); // wjy: 周期连接结果相同不重复刷新历史版本，减少长期运行时的共享目录枚举。
+                || m_availableUpdateVersion != confirmedRemoteVersion; // wjy: 即使本机已是最新版，也保留已确认的共享版本供目标设备按钮比较。
             m_updateAvailable = available; // wjy: 后台检查仅改变标题栏入口可见性，不在信号处理中启动安装或弹出窗口。
-            m_availableUpdateVersion = available ? remoteVersion : QString(); // wjy: 无更新时同步清除旧版本状态，避免共享目录异常后残留按钮。
+            m_availableUpdateVersion = confirmedRemoteVersion;
             // wjy: 不在周期检查信号中重置 m_updatePreparing；后台载荷仍在复制时必须继续阻止重复更新任务。
             update(titlebarUpdateRect().adjusted(-2, -2, 2, 2)); // wjy: 只重绘标题栏更新区域，及时显示或隐藏按钮。
+            refreshRealtimeUpdateAvailability();
             if (updateStateChanged && m_settingsSelected && m_settingsTab == SettingsTab::General) {
                 refreshRollbackVersions(true); // wjy: 只有远端版本状态变化时才重新探测并刷新回撤列表，固定一分钟检查不会反复创建枚举线程。
             }
@@ -3552,14 +3574,6 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     // ===end====
 
     // =====wjy====
-    m_remoteUpdateAvailabilityTimer = new QTimer(this);
-    m_remoteUpdateAvailabilityTimer->setInterval(10000);
-    connect(m_remoteUpdateAvailabilityTimer, &QTimer::timeout,
-        this, &DeviceGrid::refreshOpenedRemoteUpdateAvailability); // wjy: 只要存在远控窗口，就周期确认其目标是否需要更新；不要求用户开启列表自动刷新。
-    m_remoteUpdateAvailabilityTimer->start();
-    // ===end====
-
-    // =====wjy====
     m_remoteQualityTimer = new QTimer(this);
     m_remoteQualityTimer->setTimerType(Qt::CoarseTimer); // wjy: 质量协调是1秒级资源控制，不使用高精度唤醒，降低20窗口场景下主线程定时器开销。
     m_remoteQualityTimer->setInterval(1000);
@@ -3777,6 +3791,20 @@ void DeviceGrid::updateRealtimeConfiguredDevices()
             configuredIps.insert(ip);
         }
     }
+    for (auto it = m_deviceRealtimeUpdateStates.begin(); it != m_deviceRealtimeUpdateStates.end();) {
+        if (!configuredIps.contains(it.key())) {
+            it = m_deviceRealtimeUpdateStates.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = m_deviceUpdateAvailability.begin(); it != m_deviceUpdateAvailability.end();) {
+        if (!configuredIps.contains(it.key())) {
+            it = m_deviceUpdateAvailability.erase(it);
+        } else {
+            ++it;
+        }
+    }
     m_realtimeStateService->setConfiguredDeviceIps(configuredIps); // wjy: 来源过滤与设备列表共用一份 IP 集合，未知广播不会写入任何 UI 缓存。
 }
 
@@ -3793,6 +3821,13 @@ void DeviceGrid::applyRealtimeDeviceState(
     m_deviceRemoteSessionCounts.insert(ip, qBound(0, state.remoteSessionCount, 10)); // wjy: 徽标人数只接收目标主机快照里的会话数。
     m_deviceRemoteControllerNames.insert(ip, state.remoteControllerLabels.join(QLatin1Char(',')));
     m_deviceRealtimeScriptStates.insert(ip, state.script.state);
+    if (!state.update.installedVersion.trimmed().isEmpty()) {
+        m_deviceRealtimeUpdateStates.insert(ip, state.update);
+        setRemoteUpdateAvailability(ip, realtimeUpdateAvailable(state.update));
+    } else if (state.presence == platform::DevicePresenceState::Offline) {
+        m_deviceRealtimeUpdateStates.remove(ip);
+        setRemoteUpdateAvailability(ip, false);
+    }
 
     if (state.script.state != platform::RealtimeScriptState::Unknown) {
         platform::RemoteScriptRuntimeInfo runtime;
@@ -6838,6 +6873,7 @@ void DeviceGrid::saveNewDevice()
     updateRealtimeConfiguredDevices(); // wjy: 手动新增后把新 IP 加入广播白名单，下一份心跳即可实时显示状态。
     m_deviceStatuses.remove(ip);
     m_deviceUpdateAvailability.remove(ip); // wjy: 新增同 IP 记录时清掉旧版本判断，等待下一轮目标状态刷新重新确认。
+    m_deviceRealtimeUpdateStates.remove(ip);
     m_deviceRemoteSessionCounts.remove(ip); // wjy: 新增同 IP 前清掉旧远控人数，避免误显示上一次会话徽标。
     m_deviceRemoteControllerNames.remove(ip);
     m_deviceIpEdit->clear();
@@ -7071,9 +7107,11 @@ void DeviceGrid::refreshDeviceStatuses()
 // =====wjy====
 void DeviceGrid::applyDeviceStatusRefreshResult(platform::DeviceStatusRefreshResult refreshResult)
 {
-    m_deviceUpdateAvailability.clear(); // wjy: 新一轮刷新先清空更新按钮缓存，随后按结果包重新写入。
     const bool realtimeAvailable = m_realtimeStateService
         && m_realtimeStateService->isRunning(); // wjy: 实时广播服务运行时交给归并器决定新旧状态优先级。
+    if (!realtimeAvailable) {
+        m_deviceUpdateAvailability.clear();
+    }
     if (realtimeAvailable) {
         for (auto it = refreshResult.devices.cbegin(); it != refreshResult.devices.cend(); ++it) {
             m_realtimeStateService->applyManualCalibration(it.key(), it.value()); // wjy: 手动刷新结果进入实时归并器，避免一次超时覆盖已收到的新鲜广播。
@@ -7089,7 +7127,11 @@ void DeviceGrid::applyDeviceStatusRefreshResult(platform::DeviceStatusRefreshRes
         }
     }
     for (auto it = refreshResult.updateAvailability.cbegin(); it != refreshResult.updateAvailability.cend(); ++it) {
-        setRemoteUpdateAvailability(it.key(), it.value()); // wjy: 更新可用性通过统一入口写入，避免迟到结果重新显示已受理任务。
+        const platform::DeviceRealtimeUpdateState realtimeUpdate = m_deviceRealtimeUpdateStates.value(it.key());
+        const bool hasRealtimeVersion = realtimeAvailable && !realtimeUpdate.installedVersion.trimmed().isEmpty();
+        setRemoteUpdateAvailability(it.key(), hasRealtimeVersion
+                ? realtimeUpdateAvailable(realtimeUpdate)
+                : it.value()); // wjy: 新版目标继续以实时版本为准；旧目标缺少扩展字段时手动刷新仍可用 TCP 校准。
     }
     // wjy: 状态刷新只更新设备状态，不根据一次 Offline 探测关闭远控窗口；窗口生命周期由专门流程管理。
     bool deviceRecordChanged = false;
@@ -8351,7 +8393,6 @@ void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex)
     remoteWindow->activateWindow();
     remoteWindow->setFocus(Qt::ActiveWindowFocusReason);
     rememberRemoteWindowActivation(remoteWindow);
-    refreshOpenedRemoteUpdateAvailability(); // wjy: 新窗口创建后立即查询一次，最快显示目标更新按钮，不必等待 10 秒定时器。
 }
 
 void DeviceGrid::launchSelectedRemoteDesktopWindows()
@@ -8504,7 +8545,6 @@ void DeviceGrid::openAuthorizedTiledWindows(const QVector<QString>& deviceIds)
         remoteWindow->setFocus(Qt::ActiveWindowFocusReason);
         rememberRemoteWindowActivation(remoteWindow);
     }
-    refreshOpenedRemoteUpdateAvailability(); // wjy: 一批平铺窗口创建完后统一查询去重后的目标 IP，避免每个窗口各发一轮请求。
 // ===end====
 }
 
@@ -8537,52 +8577,22 @@ void DeviceGrid::setRemoteUpdateAvailability(const QString& hostIp, bool availab
     }
 }
 
-void DeviceGrid::refreshOpenedRemoteUpdateAvailability()
+bool DeviceGrid::realtimeUpdateAvailable(const platform::DeviceRealtimeUpdateState& updateState) const
 {
-    if (m_statusRefreshInProgress || m_remoteUpdateAvailabilityRefreshInProgress) {
-        return; // wjy: 全量设备刷新已包含更新查询，两类任务不并发占用目标命令端口。
+    const QString confirmedRelease = m_availableUpdateVersion.trimmed();
+    const QString installedVersion = updateState.installedVersion.trimmed();
+    if (confirmedRelease.isEmpty() || installedVersion.isEmpty()) {
+        return false;
     }
+    const int comparison = platform::UpdateService::compareSemanticVersions(confirmedRelease, installedVersion);
+    return comparison > 0 || (comparison == 0 && updateState.runtimeRepairRequired);
+}
 
-    QStringList ips;
-    for (const QPointer<RemoteDesktopWindow>& window : openedRemoteWindows()) {
-        if (!window || window->isRemoteUpdateActive()) {
-            continue;
-        }
-        const QString ip = window->hostIp().trimmed();
-        if (!ip.isEmpty() && !ips.contains(ip, Qt::CaseInsensitive)) {
-            ips.append(ip);
-        }
+void DeviceGrid::refreshRealtimeUpdateAvailability()
+{
+    for (auto it = m_deviceRealtimeUpdateStates.cbegin(); it != m_deviceRealtimeUpdateStates.cend(); ++it) {
+        setRemoteUpdateAvailability(it.key(), realtimeUpdateAvailable(it.value()));
     }
-    if (ips.isEmpty()) {
-        return;
-    }
-
-    m_remoteUpdateAvailabilityRefreshInProgress = true;
-    QPointer<DeviceGrid> self(this);
-    runBackgroundTask([self, ips] {
-        QHash<QString, bool> availability;
-        availability.reserve(ips.size());
-        for (const QString& ip : ips) {
-            const platform::RemoteUpdateStatus status =
-                platform::DeviceCommandService::queryUpdateStatus(ip, nullptr, 49102, 500);
-            availability.insert(ip,
-                status == platform::RemoteUpdateStatus::Idle
-                    || status == platform::RemoteUpdateStatus::Failed); // wjy: 每 10 秒只读查询，不发送 update 命令，也不接触远控流对象。
-        }
-        if (!self) {
-            return;
-        }
-        QMetaObject::invokeMethod(self, [self, availability = std::move(availability)] {
-            if (!self) {
-                return;
-            }
-            DeviceGrid* grid = self.data();
-            grid->m_remoteUpdateAvailabilityRefreshInProgress = false;
-            for (auto it = availability.cbegin(); it != availability.cend(); ++it) {
-                grid->setRemoteUpdateAvailability(it.key(), it.value()); // wjy: 网络查询完成后回到 UI 线程统一刷新标题栏按钮。
-            }
-        }, Qt::QueuedConnection);
-    });
 }
 
 void DeviceGrid::rememberRemoteWindowActivation(RemoteDesktopWindow* window)
@@ -8790,6 +8800,7 @@ bool DeviceGrid::scheduleDeviceUpdateRequests(const QVector<int>& deviceIndexes,
 {
     struct UpdateTarget {
         QString ip;
+        QString expectedVersion;
     };
     struct UpdateOutcome {
         QString ip;
@@ -8813,7 +8824,7 @@ bool DeviceGrid::scheduleDeviceUpdateRequests(const QVector<int>& deviceIndexes,
         if (duplicate) {
             continue;
         }
-        targets.append(UpdateTarget{ip});
+        targets.append(UpdateTarget{ip, m_availableUpdateVersion.trimmed()});
         m_pendingUpdateRequestIps.insert(ip); // wjy: 请求发送前占用目标 IP，列表菜单和远控标题栏连续点击不会并发请求同一设备。
     }
     if (targets.isEmpty()) {
@@ -8827,7 +8838,8 @@ bool DeviceGrid::scheduleDeviceUpdateRequests(const QVector<int>& deviceIndexes,
         for (const UpdateTarget& target : targets) {
             UpdateOutcome outcome;
             outcome.ip = target.ip;
-            outcome.result = platform::DeviceCommandService::requestUpdate(target.ip, &outcome.error); // wjy: 每台设备最多 1.5 秒的 TCP 等待在后台顺序执行，批量数量不再决定界面冻结时长。
+            outcome.result = platform::DeviceCommandService::requestUpdate(
+                target.ip, &outcome.error, 49102, 1500, target.expectedVersion); // wjy: 控制端确认版本随明确请求传递，目标缓存未刷新时仍由共享目录完成最终校验。
             outcomes.append(std::move(outcome));
         }
         if (!self) {
@@ -8988,6 +9000,7 @@ void DeviceGrid::deleteDeviceForIndex(int deviceIndex)
     updateRealtimeConfiguredDevices(); // wjy: 删除后立即拒绝该 IP 的后续广播并清理服务端序号/TTL 状态。
     m_deviceStatuses.remove(removedIp);
     m_deviceUpdateAvailability.remove(removedIp); // wjy: 删除设备时同步清理更新按钮缓存，避免以后复用 IP 继承旧状态。
+    m_deviceRealtimeUpdateStates.remove(removedIp);
     m_deviceRemoteSessionCounts.remove(removedIp); // wjy: 删除设备时同步清掉远控人数缓存。
     m_deviceRemoteControllerNames.remove(removedIp);
     m_deviceRealtimeScriptStates.remove(removedIp); // wjy: 删除设备时同步清掉实时脚本三态，未来复用该 IP 不继承旧 Logo。
@@ -9712,7 +9725,12 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
 
 // =====wjy====
     if (m_draggingDevice && !m_draggingDeviceIndexes.isEmpty()) {
-        drawTopDragDropZone(painter, QString::fromUtf8("移出分组"));
+        const bool deleteUngroupedDevices = deviceIndexesAreAllUngrouped(m_draggingDeviceIndexes); // wjy: 绘制提示和松开动作复用同一判断，避免界面写“删除”但实际只移出分组。
+        drawTopDragDropZone(
+            painter,
+            deleteUngroupedDevices
+                ? QString::fromUtf8("删除设备")
+                : QString::fromUtf8("移出分组")); // wjy: 根部设备显示删除入口；包含分组设备的拖拽继续显示原有移出分组入口。
     } else if (m_draggingGroup) {
         drawTopDragDropZone(painter, QString::fromUtf8("解散分组"));
     }
@@ -11219,12 +11237,15 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         if (m_draggingDevice) { // wjy: 如果本次鼠标操作已经进入设备拖拽状态，松开时只输出落点日志。
             QString targetType = QStringLiteral("none"); // wjy: 默认表示没有落到可识别的分组目标。
             QString targetGroup;
+            const bool deleteUngroupedDevices = deviceIndexesAreAllUngrouped(m_draggingDeviceIndexes); // wjy: 只有整个拖拽快照都是根部设备时，顶部危险区域才具备删除含义。
             if (m_deviceGroupExpanded) {
                 const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 拖拽落点按当前可见行识别，和 UI 绘制顺序保持一致。
                 const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 拖拽落点只在当前可见滚动视口内识别。
                 const QRect ghostRect = deviceDragGhostRect(m_deviceDragCurrentPos, size());
                 if (ghostRect.intersects(topDragDropZoneRect())) {
-                    targetType = QStringLiteral("rootBlank"); // wjy: 拖到标题栏下方红色区域时，明确把设备移出分组。
+                    targetType = deleteUngroupedDevices
+                        ? QStringLiteral("delete")
+                        : QStringLiteral("rootBlank"); // wjy: 根部设备拖进顶部区域执行删除；分组设备仍执行原来的移出分组。
                 } else if (ghostRect.intersects(rootDeviceDropZoneRect())) {
                     targetType = QStringLiteral("rootBlank"); // wjy: 移出分组按受限后的拖拽虚影判断，鼠标跑到标题栏上方时仍以可见方框位置为准。
                 } else {
@@ -11289,10 +11310,22 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
             }
 
             QVector<QString> draggedDeviceIds;
-            for (const int deviceIndex : m_draggingDeviceIndexes) {
+            QVector<int> draggedDeviceIndexes = m_draggingDeviceIndexes.values();
+            std::sort(draggedDeviceIndexes.begin(), draggedDeviceIndexes.end()); // wjy: 多选删除按当前显示顺序保存稳定 ID，行为可预测且不依赖 QSet 的无序遍历。
+            for (const int deviceIndex : draggedDeviceIndexes) {
                 if (deviceIndex >= 0 && deviceIndex < g_devices.size()) {
                     draggedDeviceIds.append(g_devices.at(deviceIndex).id); // wjy: 拖拽快照中的展示下标只用于提取稳定 ID，排序变化不会串设备。
                 }
+            }
+            if (targetType == QStringLiteral("delete")) {
+                for (const QString& deviceId : draggedDeviceIds) {
+                    const int currentDeviceIndex = g_deviceCatalog.deviceIndexForId(deviceId); // wjy: 每删除一台后数组下标都会变化，因此逐次通过稳定 ID 重新定位真实设备。
+                    if (currentDeviceIndex >= 0) {
+                        deleteDeviceForIndex(currentDeviceIndex); // wjy: 拖拽删除完整复用右键菜单入口，设备保存、状态缓存和当前选择清理逻辑保持一致。
+                    }
+                }
+                writeDeviceGridStartupLog(QStringLiteral("[wjy-drag] deleted ungrouped devices count=%1")
+                    .arg(draggedDeviceIds.size())); // wjy: 记录顶部拖拽删除数量，便于确认多选操作是否完整执行。
             }
             const bool deviceGroupChanged =
                 (targetType == QStringLiteral("group") && !targetGroupId.isEmpty())

@@ -1,7 +1,11 @@
 #include "uu_codec_factory.h"
 
+#include "d3d11_frame_transformer.h"
+#include "d3d11_native_frame_buffer.h"
 #include "ffmpeg_decoder.h"
+#include "latest_encode_frame_slot.h"
 #include "nvenc_h264_encoder.h"
+#include "stream_capture_diagnostics.h"
 
 #include <api/scoped_refptr.h>
 #include <api/video/resolution.h>
@@ -21,6 +25,9 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -28,7 +35,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 #include <windows.h>
 #include <d3d11.h>
@@ -132,111 +141,270 @@ std::vector<webrtc::SdpVideoFormat> uu_formats()
 
 class NvencHevcEncoder final : public webrtc::VideoEncoder {
 public:
+    ~NvencHevcEncoder() override { Release(); }
+
     int InitEncode(const webrtc::VideoCodec* codec_settings,
                    const webrtc::VideoEncoder::Settings&) override
     {
         if (!codec_settings || codec_settings->width == 0 || codec_settings->height == 0) {
+            lsp::append_stream_capture_diagnostic_log(
+                "encoder",
+                "InitEncode rejected invalid codec settings"); // wjy: WebRTC传入空配置或零尺寸时把参数错误写入被控端采集日志。
             return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
         }
+        lsp::append_stream_capture_diagnostic_log(
+            "encoder",
+            "InitEncode begin size=" + std::to_string(codec_settings->width)
+                + "x" + std::to_string(codec_settings->height)
+                + " start_kbps=" + std::to_string(codec_settings->startBitrate)
+                + " max_fps=" + std::to_string(codec_settings->maxFramerate)); // wjy: 编码器创建入口记录WebRTC协商出的尺寸、码率和帧率。
+        stop_worker();
+        encoder_.shutdown();
+        transformer_.reset();
+        texture_.Reset();
+        argb_.clear();
+        device_.Reset();
+        context_.Reset();
+        size_ = {};
+        encoder_bitrate_kbps_ = 0;
+        encoder_fps_ = 0;
+        frame_id_ = 0; // wjy: InitEncode重建运行资源但保留已注册回调，兼容WebRTC先Register callback再Init的生命周期顺序。
+        tex_w_ = tex_h_ = 0;
         bitrate_kbps_ = std::max(10u, codec_settings->startBitrate ? codec_settings->startBitrate : 120000u);
         fps_ = std::max(1u, codec_settings->maxFramerate ? codec_settings->maxFramerate : 60u);
         target_size_ = {codec_settings->width, codec_settings->height};
         force_keyframe_next_ = true; // wjy: 新编码器会话首帧必须输出IDR和参数集，禁止从无参考帧的P帧开始。
-        return ensure_device() ? WEBRTC_VIDEO_CODEC_OK : WEBRTC_VIDEO_CODEC_ERROR;
+        first_input_enqueued_logged_ = false;
+        first_worker_frame_logged_ = false;
+        first_encoded_frame_logged_ = false; // wjy: 每个InitEncode代际重新记录“入队→工作线程→码流”三道首帧边界。
+        if (!ensure_device(nullptr)) {
+            lsp::append_stream_capture_diagnostic_log(
+                "encoder",
+                "InitEncode failed stage=ensure-device"); // wjy: 无法创建D3D11设备时不再只返回通用编码错误。
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        }
+        if (!start_worker()) {
+            lsp::append_stream_capture_diagnostic_log(
+                "encoder",
+                "InitEncode failed stage=start-worker"); // wjy: 编码线程创建失败单独标记。
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        }
+        lsp::append_stream_capture_diagnostic_log(
+            "encoder",
+            "InitEncode success"); // wjy: 编码设备和最新帧工作线程都准备完成后写入成功边界。
+        return WEBRTC_VIDEO_CODEC_OK;
     }
 
     int32_t RegisterEncodeCompleteCallback(webrtc::EncodedImageCallback* callback) override
     {
+        std::lock_guard lock(callback_mutex_);
         callback_ = callback;
+        lsp::append_stream_capture_diagnostic_log(
+            "encoder",
+            std::string("RegisterEncodeCompleteCallback callback=") + (callback ? "set" : "null")); // wjy: 确认WebRTC是否在首帧前安装编码完成回调。
         return WEBRTC_VIDEO_CODEC_OK;
     }
 
     int32_t Release() override
     {
+        lsp::append_stream_capture_diagnostic_log(
+            "encoder",
+            "Release begin frame_id=" + std::to_string(frame_id_)); // wjy: 编码器退出时记录已成功输出的帧数，判断是否从未产生首帧。
+        stop_worker(); // wjy: 先停止并join最新帧工作线程，再销毁NVENC和D3D资源，杜绝后台访问悬空纹理。
         encoder_.shutdown();
         encoder_bitrate_kbps_ = 0; // wjy: Clear the active NVENC bitrate marker when the encoder session is released.
         encoder_fps_ = 0;
         texture_.Reset();
         argb_.clear();
-        callback_ = nullptr;
+        transformer_.reset();
+        device_.Reset();
+        context_.Reset();
+        {
+            std::lock_guard lock(callback_mutex_);
+            callback_ = nullptr;
+        }
         force_keyframe_next_ = true; // wjy: 下次重新初始化编码器时重新建立完整关键帧边界。
+        frame_id_ = 0;
+        tex_w_ = tex_h_ = 0;
+        first_input_enqueued_logged_ = false;
+        first_worker_frame_logged_ = false;
+        first_encoded_frame_logged_ = false;
+        lsp::append_stream_capture_diagnostic_log(
+            "encoder",
+            "Release end"); // wjy: 工作线程、NVENC和D3D资源全部释放后写入终点。
         return WEBRTC_VIDEO_CODEC_OK;
     }
 
     int32_t Encode(const webrtc::VideoFrame& frame,
                    const std::vector<webrtc::VideoFrameType>* frame_types) override
     {
-        try {
-            return encodeFrame(frame, frame_types); // wjy: 编码线程所有分配/驱动异常在VideoEncoder边界转为错误码，不触发std::terminate。
-        } catch (const std::bad_alloc&) {
-            return WEBRTC_VIDEO_CODEC_ERROR;
-        } catch (const std::exception& exception) {
-            std::cerr << "NVENC encode exception: " << exception.what() << "\n";
-            return WEBRTC_VIDEO_CODEC_ERROR;
-        } catch (...) {
-            return WEBRTC_VIDEO_CODEC_ERROR;
+        {
+            std::lock_guard callback_lock(callback_mutex_);
+            if (!callback_) return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
         }
-    }
-
-private:
-    int32_t encodeFrame(const webrtc::VideoFrame& frame,
-                        const std::vector<webrtc::VideoFrameType>* frame_types)
-    {
-        if (!callback_) return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
-        auto i420 = frame.video_frame_buffer()->ToI420();
-        if (!i420) return WEBRTC_VIDEO_CODEC_ERROR;
-
-        const int width = i420->width();
-        const int height = i420->height();
-        if (width <= 0 || height <= 0) return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
-        if (!ensure_device()) return WEBRTC_VIDEO_CODEC_ERROR;
-        if (!ensure_texture(width, height)) return WEBRTC_VIDEO_CODEC_ERROR;
-        if (encoder_.ready() && should_reconfigure_rate()) {
-            std::string reconfigure_error;
-            if (encoder_.reconfigure(bitrate_kbps_, fps_, &reconfigure_error)) {
-                encoder_bitrate_kbps_ = bitrate_kbps_; // wjy: NVENC会话、纹理注册和bitstream全部保留，只更新实时码率/FPS。
-                encoder_fps_ = fps_;
-            } else {
-                std::cerr << "NVENC live reconfigure skipped: " << reconfigure_error << "\n"; // wjy: 驱动不支持时继续使用旧会话，绝不shutdown造成断流。
-            }
-            last_bitrate_reconfigure_ms_ = GetTickCount64(); // wjy: 成功或失败都短暂冷却，避免每帧重复调用不支持的驱动入口。
-        }
-        if (!encoder_.ready() || size_.width != static_cast<uint32_t>(width) || size_.height != static_cast<uint32_t>(height)) {
-            std::string error;
-            size_ = {static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
-            if (!encoder_.initialize(device_.Get(), size_, bitrate_kbps_, fps_, &error)) {
-                std::cerr << "NVENC init failed: " << error << "\n";
-                return WEBRTC_VIDEO_CODEC_ERROR;
-            }
-            encoder_bitrate_kbps_ = bitrate_kbps_; // wjy: Remember which bitrate the active NVENC session was initialized with.
-            encoder_fps_ = fps_;
-        }
-
-        argb_.resize(static_cast<size_t>(width) * height * 4);
-        const int converted = libyuv::I420ToARGB(
-            i420->DataY(), i420->StrideY(),
-            i420->DataU(), i420->StrideU(),
-            i420->DataV(), i420->StrideV(),
-            argb_.data(), width * 4,
-            width, height);
-        if (converted != 0) return WEBRTC_VIDEO_CODEC_ERROR;
-
-        context_->UpdateSubresource(texture_.Get(), 0, nullptr, argb_.data(), width * 4, 0);
-
-        bool force_keyframe = frame_id_ == 0 || force_keyframe_next_; // wjy: 尺寸变化重建NVENC后不等待WebRTC迟到的关键帧请求。
+        bool force_keyframe = false; // wjy: 首帧和尺寸切换状态只由编码工作线程读取，Encode调用线程仅传递WebRTC关键帧请求，避免数据竞争。
         if (frame_types) {
             force_keyframe = force_keyframe || std::any_of(frame_types->begin(), frame_types->end(), [](webrtc::VideoFrameType type) {
                 return type == webrtc::VideoFrameType::kVideoFrameKey;
             });
         }
 
+        {
+            std::lock_guard lock(worker_mutex_);
+            if (!worker_running_ || worker_stopping_) return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+            if (pending_frames_.push(frame, force_keyframe)) ++queue_drops_; // wjy: 单槽覆盖旧待编码帧，持续过载只降低采样密度，不累积远控操作延迟。
+        }
+        if (!first_input_enqueued_logged_.exchange(true)) {
+            lsp::append_stream_capture_diagnostic_log(
+                "encoder",
+                "first source frame enqueued size="
+                    + std::to_string(frame.video_frame_buffer()->width()) + "x"
+                    + std::to_string(frame.video_frame_buffer()->height())); // wjy: 证明共享VideoTrackSource已经把第一帧交给自定义H265编码器。
+        }
+        worker_cv_.notify_one();
+        return WEBRTC_VIDEO_CODEC_OK;
+    }
+
+private:
+    int32_t encodeFrameSync(const webrtc::VideoFrame& frame, bool force_keyframe_requested)
+    {
+        webrtc::EncodedImageCallback* callback = nullptr;
+        {
+            std::lock_guard lock(callback_mutex_);
+            callback = callback_;
+        }
+        if (!callback) return WEBRTC_VIDEO_CODEC_UNINITIALIZED;
+
+        ComPtr<ID3D11Texture2D> encode_texture;
+        int width = frame.video_frame_buffer()->width();
+        int height = frame.video_frame_buffer()->height();
+        if (width <= 0 || height <= 0) return WEBRTC_VIDEO_CODEC_ERR_PARAMETER;
+
+        uint64_t transform_time_us = 0;
+        bool native_ready = false;
+        auto* native = AsD3D11NativeFrameBuffer(frame.video_frame_buffer().get());
+        if (!first_worker_frame_logged_) {
+            first_worker_frame_logged_ = true;
+            lsp::append_stream_capture_diagnostic_log(
+                "encoder",
+                "worker received first frame size=" + std::to_string(width) + "x" + std::to_string(height)
+                    + " native_d3d11=" + std::to_string(native ? 1 : 0)); // wjy: 工作线程首帧标明是否保持原生D3D11纹理，定位CPU回退或队列未唤醒。
+        }
+        if (native) {
+            std::string transform_error;
+            if (ensure_device(native->device())
+                && transformer_.transform(*native, &encode_texture, &transform_time_us, &transform_error)) {
+                D3D11_TEXTURE2D_DESC desc = {};
+                encode_texture->GetDesc(&desc);
+                width = static_cast<int>(desc.Width);
+                height = static_cast<int>(desc.Height);
+                native_ready = true; // wjy: 原始高质量帧直接使用采集纹理，低分辨率档使用GPU缩放/NV12纹理，均不经过CPU颜色往返。
+            } else if (!transform_error.empty() && frame_id_ % 120 == 0) {
+                std::cerr << "D3D11 native transform fallback: " << transform_error << "\n";
+                lsp::append_stream_capture_diagnostic_log_rate_limited(
+                    "encoder",
+                    "native transform fallback error=" + transform_error,
+                    2000); // wjy: GPU转换失败会回退I420，限频记录原因而不改变兼容路径。
+            }
+        }
+
+        if (!native_ready) {
+            auto i420 = frame.video_frame_buffer()->ToI420();
+            if (!i420) {
+                lsp::append_stream_capture_diagnostic_log_rate_limited(
+                    "encoder",
+                    "ToI420 failed",
+                    1000); // wjy: 原生纹理和软件缓冲都无法转换时显式记录。
+                return WEBRTC_VIDEO_CODEC_ERROR;
+            }
+            width = i420->width();
+            height = i420->height();
+            if (width <= 0 || height <= 0 || !ensure_device(nullptr) || !ensure_texture(width, height)) {
+                lsp::append_stream_capture_diagnostic_log_rate_limited(
+                    "encoder",
+                    "software fallback resource preparation failed size="
+                        + std::to_string(width) + "x" + std::to_string(height),
+                    1000); // wjy: CPU回退资源失败每秒记录一次，不改变返回错误逻辑。
+                return WEBRTC_VIDEO_CODEC_ERROR;
+            }
+
+            argb_.resize(static_cast<size_t>(width) * height * 4);
+            const int converted = libyuv::I420ToARGB(
+                i420->DataY(), i420->StrideY(),
+                i420->DataU(), i420->StrideU(),
+                i420->DataV(), i420->StrideV(),
+                argb_.data(), width * 4,
+                width, height);
+            if (converted != 0) {
+                lsp::append_stream_capture_diagnostic_log_rate_limited(
+                    "encoder",
+                    "I420ToARGB failed code=" + std::to_string(converted),
+                    1000); // wjy: 软件颜色转换失败与NVENC失败分开记录。
+                return WEBRTC_VIDEO_CODEC_ERROR;
+            }
+            context_->UpdateSubresource(texture_.Get(), 0, nullptr, argb_.data(), width * 4, 0);
+            encode_texture = texture_; // wjy: 非原生帧和驱动不支持VideoProcessor时保留既有I420上传回退，不改变软件兼容性。
+        }
+
+        const uint32_t requested_bitrate_kbps = bitrate_kbps_.load();
+        const uint32_t requested_fps = fps_.load();
+        if (encoder_.ready() && should_reconfigure_rate()) {
+            std::string reconfigure_error;
+            if (encoder_.reconfigure(requested_bitrate_kbps, requested_fps, &reconfigure_error)) {
+                encoder_bitrate_kbps_ = requested_bitrate_kbps; // wjy: NVENC会话、纹理注册和bitstream全部保留，只更新实时码率/FPS。
+                encoder_fps_ = requested_fps;
+            } else {
+                std::cerr << "NVENC live reconfigure skipped: " << reconfigure_error << "\n"; // wjy: 驱动不支持时继续使用旧会话，绝不shutdown造成断流。
+                lsp::append_stream_capture_diagnostic_log_rate_limited(
+                    "encoder",
+                    "NVENC reconfigure failed error=" + reconfigure_error,
+                    2000); // wjy: 在线码率更新失败限频记录，现有编码会话继续运行。
+            }
+            last_bitrate_reconfigure_ms_ = GetTickCount64(); // wjy: 成功或失败都短暂冷却，避免每帧重复调用不支持的驱动入口。
+        }
+        if (!encoder_.ready() || size_.width != static_cast<uint32_t>(width) || size_.height != static_cast<uint32_t>(height)) {
+            std::string error;
+            size_ = {static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
+            lsp::append_stream_capture_diagnostic_log(
+                "encoder",
+                "NVENC initialize begin size=" + std::to_string(width) + "x" + std::to_string(height)
+                    + " bitrate_kbps=" + std::to_string(requested_bitrate_kbps)
+                    + " fps=" + std::to_string(requested_fps)
+                    + " native_path=" + std::to_string(native_ready ? 1 : 0)); // wjy: 驱动会话创建前保存全部关键参数和输入路径。
+            if (!encoder_.initialize(device_.Get(), size_, requested_bitrate_kbps, requested_fps, &error)) {
+                std::cerr << "NVENC init failed: " << error << "\n";
+                lsp::append_stream_capture_diagnostic_log(
+                    "encoder",
+                    "NVENC initialize failed error=" + error); // wjy: 真实NVENC错误文本立即落盘，确认是否被ToDesk占用编码会话。
+                return WEBRTC_VIDEO_CODEC_ERROR;
+            }
+            encoder_bitrate_kbps_ = requested_bitrate_kbps; // wjy: Remember which bitrate the active NVENC session was initialized with.
+            encoder_fps_ = requested_fps;
+            lsp::append_stream_capture_diagnostic_log(
+                "encoder",
+                "NVENC initialize success"); // wjy: 驱动编码会话可用后记录成功，后续无首码流只需查看encode阶段。
+        }
+
+        bool force_keyframe = frame_id_ == 0 || force_keyframe_next_ || force_keyframe_requested; // wjy: 首帧、尺寸切换和被覆盖帧继承的关键帧请求统一在工作线程执行。
+
         std::vector<uint8_t> encoded;
         bool keyframe = false;
         std::string error;
-        if (!encoder_.encode(texture_.Get(), frame_id_++, force_keyframe, &encoded, &keyframe, &error)) {
+        const auto nvenc_started = std::chrono::steady_clock::now();
+        const uint32_t encoded_frame_id = frame_id_;
+        if (!encoder_.encode(encode_texture.Get(), encoded_frame_id, force_keyframe, &encoded, &keyframe, &error)) {
+            if (force_keyframe) force_keyframe_next_ = true; // wjy: 驱动失败不能吞掉PLI/IDR请求，下一张最新帧继续承担恢复关键帧。
             std::cerr << "NVENC encode failed: " << error << "\n";
+            lsp::append_stream_capture_diagnostic_log_rate_limited(
+                "encoder",
+                "NVENC encode failed frame_id=" + std::to_string(encoded_frame_id)
+                    + " error=" + error,
+                1000); // wjy: 连续驱动错误按秒记录帧号和原因，保持关键帧重试行为不变。
             return WEBRTC_VIDEO_CODEC_ERROR;
         }
+        ++frame_id_; // wjy: 只有成功取得码流后才推进帧序号，驱动失败重试仍按首帧/关键帧规则恢复。
+        const uint64_t nvenc_time_us = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - nvenc_started).count());
         if (keyframe) {
             force_keyframe_next_ = false; // wjy: 只有NVENC确认实际输出关键帧后才结束尺寸切换交接。
         }
@@ -260,15 +428,140 @@ private:
         image.SetRetransmissionAllowed(true);
         webrtc::CodecSpecificInfo codec_info;
         codec_info.codecType = webrtc::kVideoCodecH265;
-        callback_->OnEncodedImage(image, &codec_info);
+        callback->OnEncodedImage(image, &codec_info);
+        if (!first_encoded_frame_logged_) {
+            first_encoded_frame_logged_ = true;
+            lsp::append_stream_capture_diagnostic_log(
+                "encoder",
+                "first encoded frame delivered bytes=" + std::to_string(encoded.size())
+                    + " keyframe=" + std::to_string(keyframe ? 1 : 0)
+                    + " size=" + std::to_string(width) + "x" + std::to_string(height)); // wjy: 第一份H265码流交给WebRTC的边界与控制端首帧等待直接对应。
+        }
+        ++encoded_since_report_;
+        transform_time_us_since_report_ += transform_time_us;
+        nvenc_time_us_since_report_ += nvenc_time_us;
+        report_encoder_telemetry(); // wjy: 编码完成后聚合GPU转换、NVENC阻塞和队列覆盖数据，直接区分39 FPS瓶颈所在阶段。
         return WEBRTC_VIDEO_CODEC_OK;
+    }
+
+    bool start_worker()
+    {
+        std::lock_guard lock(worker_mutex_);
+        if (worker_running_) return true;
+        worker_stopping_ = false;
+        pending_frames_.clear();
+        queue_drops_ = 0;
+        encoded_since_report_ = 0;
+        transform_time_us_since_report_ = 0;
+        nvenc_time_us_since_report_ = 0;
+        report_started_ = std::chrono::steady_clock::now();
+        try {
+            worker_thread_ = std::thread([this] { worker_loop(); });
+        } catch (const std::exception& exception) {
+            lsp::append_stream_capture_diagnostic_log(
+                "encoder",
+                std::string("worker start exception=") + exception.what()); // wjy: 标准线程创建异常写入诊断文件。
+            return false;
+        } catch (...) {
+            lsp::append_stream_capture_diagnostic_log(
+                "encoder",
+                "worker start unknown exception"); // wjy: 未知线程创建异常也保留失败阶段。
+            return false;
+        }
+        worker_running_ = true;
+        return true;
+    }
+
+    void stop_worker()
+    {
+        {
+            std::lock_guard lock(worker_mutex_);
+            if (!worker_running_) {
+                pending_frames_.clear();
+                return;
+            }
+            worker_stopping_ = true;
+            pending_frames_.clear(); // wjy: Release不等待已经过时的待编码帧，只让当前NVENC调用自然结束后退出。
+        }
+        worker_cv_.notify_all();
+        if (worker_thread_.joinable()) worker_thread_.join();
+        std::lock_guard lock(worker_mutex_);
+        worker_running_ = false;
+        worker_stopping_ = false;
+        pending_frames_.clear();
+    }
+
+    void worker_loop()
+    {
+        for (;;) {
+            std::optional<LatestEncodeFrameSlot<webrtc::VideoFrame>::Item> pending;
+            {
+                std::unique_lock lock(worker_mutex_);
+                worker_cv_.wait(lock, [this] { return worker_stopping_ || !pending_frames_.empty(); });
+                if (worker_stopping_) break;
+                pending = pending_frames_.take(); // wjy: 工作线程一次只取走最新帧，采集/WebRTC线程可立即写入下一帧而不会被NvEncLockBitstream阻塞。
+            }
+
+            try {
+                if (pending) encodeFrameSync(pending->frame, pending->forceKeyframe);
+            } catch (const std::bad_alloc&) {
+                std::cerr << "NVENC worker allocation failed\n";
+                lsp::append_stream_capture_diagnostic_log_rate_limited(
+                    "encoder",
+                    "worker allocation failed",
+                    1000); // wjy: 内存分配失败按秒记录，工作线程仍保持原有继续循环行为。
+            } catch (const std::exception& exception) {
+                std::cerr << "NVENC worker exception: " << exception.what() << "\n";
+                lsp::append_stream_capture_diagnostic_log_rate_limited(
+                    "encoder",
+                    std::string("worker exception=") + exception.what(),
+                    1000); // wjy: 编码线程标准异常限频记录。
+            } catch (...) {
+                std::cerr << "NVENC worker unknown exception\n";
+                lsp::append_stream_capture_diagnostic_log_rate_limited(
+                    "encoder",
+                    "worker unknown exception",
+                    1000); // wjy: 未知异常不再只输出到不可见控制台。
+            }
+        }
+    }
+
+    void report_encoder_telemetry()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - report_started_);
+        if (elapsed < std::chrono::seconds(2)) return;
+        const double seconds = std::max(0.001, elapsed.count() / 1000.0);
+        const double transform_ms = encoded_since_report_ > 0
+            ? static_cast<double>(transform_time_us_since_report_) / encoded_since_report_ / 1000.0
+            : 0.0;
+        const double nvenc_ms = encoded_since_report_ > 0
+            ? static_cast<double>(nvenc_time_us_since_report_) / encoded_since_report_ / 1000.0
+            : 0.0;
+        const uint64_t queue_drops = queue_drops_.exchange(0); // wjy: 同一统计窗口只读取并清零一次，控制台和持久日志共享完全相同的丢帧值。
+        std::cout << "host native encode: output_fps=" << encoded_since_report_ / seconds
+                  << " queue_drop=" << queue_drops
+                  << " gpu_transform_ms=" << transform_ms
+                  << " nvenc_ms=" << nvenc_ms << "\n"; // wjy: 只输出稳定窗口平均值，避免逐帧日志本身制造卡顿和磁盘抖动。
+        std::ostringstream diagnostic;
+        diagnostic << "telemetry output_fps=" << encoded_since_report_ / seconds
+                   << " queue_drop=" << queue_drops
+                   << " gpu_transform_ms=" << transform_ms
+                   << " nvenc_ms=" << nvenc_ms;
+        lsp::append_stream_capture_diagnostic_log(
+            "encoder",
+            diagnostic.str()); // wjy: 两秒聚合编码指标持久化，判断是否卡在队列、GPU转换或同步NVENC调用。
+        report_started_ = now;
+        encoded_since_report_ = 0;
+        transform_time_us_since_report_ = 0;
+        nvenc_time_us_since_report_ = 0;
     }
 
     void SetRates(const RateControlParameters& parameters) override
     {
         const uint32_t bps = parameters.bitrate.get_sum_bps();
-        if (bps > 0) bitrate_kbps_ = std::max(10u, bps / 1000u);
-        if (parameters.framerate_fps > 0.0) fps_ = static_cast<uint32_t>(parameters.framerate_fps + 0.5);
+        if (bps > 0) bitrate_kbps_.store(std::max(10u, bps / 1000u));
+        if (parameters.framerate_fps > 0.0) fps_.store(static_cast<uint32_t>(parameters.framerate_fps + 0.5));
     }
 
     EncoderInfo GetEncoderInfo() const override
@@ -277,7 +570,7 @@ private:
         info.implementation_name = "uu-nvenc-hevc";
         info.is_hardware_accelerated = true;
         info.has_trusted_rate_controller = true;
-        info.supports_native_handle = false;
+        info.supports_native_handle = true; // wjy: 允许WebRTC把D3D11NativeFrameBuffer原样送入自定义H265编码器，跳过默认ToI420映射。
         info.supports_simulcast = false;
         info.scaling_settings = ScalingSettings::kOff;
         return info;
@@ -289,16 +582,38 @@ private:
         if (encoder_bitrate_kbps_ == 0) {
             return false;
         }
-        const uint32_t lower = std::min(encoder_bitrate_kbps_, bitrate_kbps_);
-        const uint32_t upper = std::max(encoder_bitrate_kbps_, bitrate_kbps_);
+        const uint32_t requested_bitrate = bitrate_kbps_.load();
+        const uint32_t requested_fps = fps_.load();
+        const uint32_t lower = std::min(encoder_bitrate_kbps_, requested_bitrate);
+        const uint32_t upper = std::max(encoder_bitrate_kbps_, requested_bitrate);
         const bool changed_enough = (upper - lower) * 100 >= std::max(upper, 1u) * 15; // wjy: Ignore tiny target-rate jitter; only rebuild NVENC for meaningful adaptive bitrate movement.
-        const bool fps_changed = encoder_fps_ != fps_; // wjy: 在线质量协议改变目标FPS时同步更新NVENC帧率字段，不重建编码器。
+        const bool fps_changed = encoder_fps_ != requested_fps; // wjy: 在线质量协议改变目标FPS时同步更新NVENC帧率字段，不重建编码器。
         const bool cooled_down = GetTickCount64() - last_bitrate_reconfigure_ms_ >= 500; // wjy: Keep reconfiguration below roughly twice per second to protect remote-control smoothness.
         return (changed_enough || fps_changed) && cooled_down;
     }
 
-    bool ensure_device()
+    bool ensure_device(ID3D11Device* preferred_device)
     {
+        if (preferred_device) {
+            if (device_.Get() == preferred_device && context_) return true;
+            encoder_.shutdown();
+            transformer_.reset();
+            texture_.Reset();
+            argb_.clear();
+            size_ = {};
+            encoder_bitrate_kbps_ = 0;
+            encoder_fps_ = 0;
+            tex_w_ = tex_h_ = 0;
+            force_keyframe_next_ = true;
+            device_ = preferred_device;
+            device_->GetImmediateContext(&context_); // wjy: 原生采集纹理必须由同一D3D11设备注册给NVENC，设备切换时完整重置编码资源。
+            if (!context_) {
+                lsp::append_stream_capture_diagnostic_log(
+                    "encoder",
+                    "preferred D3D11 device returned null immediate context"); // wjy: 采集设备存在但编码上下文为空时记录驱动异常。
+            }
+            return context_ != nullptr;
+        }
         if (device_ && context_) return true;
         D3D_FEATURE_LEVEL feature_level = {};
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
@@ -306,6 +621,13 @@ private:
                                              D3D11_CREATE_DEVICE_BGRA_SUPPORT,
                                              levels, 2, D3D11_SDK_VERSION,
                                              &device_, &feature_level, &context_);
+        if (FAILED(hr)) {
+            char line[96] = {};
+            std::snprintf(line, sizeof(line), "D3D11CreateDevice failed hr=0x%08lX", static_cast<unsigned long>(hr));
+            lsp::append_stream_capture_diagnostic_log(
+                "encoder",
+                line); // wjy: 软件回退创建编码设备失败时保存HRESULT。
+        }
         return SUCCEEDED(hr);
     }
 
@@ -323,7 +645,20 @@ private:
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         const HRESULT hr = device_->CreateTexture2D(&desc, nullptr, &texture_);
-        if (FAILED(hr)) return false;
+        if (FAILED(hr)) {
+            char line[128] = {};
+            std::snprintf(
+                line,
+                sizeof(line),
+                "CreateTexture2D failed hr=0x%08lX size=%dx%d",
+                static_cast<unsigned long>(hr),
+                width,
+                height);
+            lsp::append_stream_capture_diagnostic_log(
+                "encoder",
+                line); // wjy: CPU回退上传纹理创建失败时保存HRESULT和尺寸。
+            return false;
+        }
         tex_w_ = width;
         tex_h_ = height;
         encoder_.shutdown();
@@ -333,23 +668,39 @@ private:
         return true;
     }
 
+    mutable std::mutex callback_mutex_;
     webrtc::EncodedImageCallback* callback_ = nullptr;
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<ID3D11Texture2D> texture_;
     std::vector<uint8_t> argb_;
+    D3D11FrameTransformer transformer_; // wjy: 原生高质量帧直通，均衡/流畅档位在GPU内裁剪缩放并优先转换NV12。
     lsp::NvencH264Encoder encoder_;
     lsp::Size size_;
     lsp::Size target_size_;
-    uint32_t bitrate_kbps_ = 120000;
+    std::atomic<uint32_t> bitrate_kbps_ = 120000;
     uint32_t encoder_bitrate_kbps_ = 0;
     uint32_t encoder_fps_ = 0;
     uint64_t last_bitrate_reconfigure_ms_ = 0;
-    uint32_t fps_ = 60;
+    std::atomic<uint32_t> fps_ = 60;
     uint32_t frame_id_ = 0;
     bool force_keyframe_next_ = true; // wjy: 记录新会话或尺寸切换后的关键帧交接状态，成功IDR前持续请求。
     int tex_w_ = 0;
     int tex_h_ = 0;
+    std::mutex worker_mutex_;
+    std::condition_variable worker_cv_;
+    LatestEncodeFrameSlot<webrtc::VideoFrame> pending_frames_; // wjy: 单槽队列始终保存尚未编码的最新帧，不允许旧画面排队堆积。
+    std::thread worker_thread_;
+    bool worker_running_ = false;
+    bool worker_stopping_ = false;
+    std::atomic<uint64_t> queue_drops_ = 0;
+    std::chrono::steady_clock::time_point report_started_;
+    uint64_t encoded_since_report_ = 0;
+    uint64_t transform_time_us_since_report_ = 0;
+    uint64_t nvenc_time_us_since_report_ = 0;
+    std::atomic_bool first_input_enqueued_logged_ = false; // wjy: 跨WebRTC调用线程安全记录第一帧进入编码单槽。
+    bool first_worker_frame_logged_ = false; // wjy: 仅编码工作线程访问，标记第一帧是否保持原生D3D11路径。
+    bool first_encoded_frame_logged_ = false; // wjy: 仅编码工作线程访问，标记第一份H265码流已经交给WebRTC。
 };
 
 class HevcD3d11Decoder final : public webrtc::VideoDecoder {

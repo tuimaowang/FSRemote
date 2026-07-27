@@ -1391,6 +1391,19 @@ RemoteDesktopWindow::RemoteDesktopWindow(
     setAttribute(Qt::WA_DeleteOnClose);
     setAttribute(Qt::WA_QuitOnClose, false);
     // =====wjy====
+    setAttribute(Qt::WA_OpaquePaintEvent); // wjy: 本窗口 paintEvent 每次都会用纯黑覆盖整窗，明确声明不透明可阻止 Qt 额外传播或合成父级背景。
+#if defined(Q_OS_WIN)
+    const HWND remoteWindowHandle = reinterpret_cast<HWND>(winId()); // wjy: 顶层远控窗必须先取得稳定HWND，下面的子窗口裁剪样式才能在D3D Presenter创建前生效。
+    if (remoteWindowHandle) {
+        const LONG_PTR currentStyle = ::GetWindowLongPtrW(remoteWindowHandle, GWL_STYLE);
+        ::SetWindowLongPtrW(
+            remoteWindowHandle,
+            GWL_STYLE,
+            currentStyle | WS_CLIPCHILDREN); // wjy: Qt绘制标题栏时裁掉标题栏下的D3D11原生内容层，两个呈现层不会互相覆盖或抢刷新。
+    }
+#endif
+    // ===end====
+    // =====wjy====
     setMinimumSize(100, 100); // wjy: 远控窗口允许缩放到 100x100，但继续阻止窗口缩小到无法操作标题栏和远控画面的尺寸。
     // ===end====
     // =====wjy====
@@ -1665,8 +1678,13 @@ bool RemoteDesktopWindow::nativeEvent(const QByteArray& eventType, void* message
 {
 #if defined(Q_OS_WIN)
     Q_UNUSED(eventType)
-    Q_UNUSED(result)
     const auto* nativeMessage = static_cast<MSG*>(message);
+    // =====wjy====
+    if (nativeMessage && nativeMessage->message == WM_ERASEBKGND) {
+        if (result) *result = 1; // wjy: 父窗口和D3D11内容层都由各自的paint/Present完整覆盖，禁止Windows擦除阶段先改变标题栏颜色。
+        return true; // wjy: 不在擦除消息中绘制整窗，避免标题栏控件在高频resize期间被清空后再重画造成闪烁。
+    }
+    // ===end====
     if (nativeMessage
         && nativeMessage->message == WM_INPUT
         && m_remoteMouseCaptureActive
@@ -2568,14 +2586,19 @@ void RemoteDesktopWindow::applyRemoteClipboardPayload(const QString& encodedBase
 }
 // ===end====
 
+QRect RemoteDesktopWindow::remoteContentRect() const
+{
+    const int barHeight = titleBarHeight();
+    return QRect(0, barHeight, width(), qMax(0, height() - barHeight)); // wjy: 内容层包含视频和等比例黑边，但永远不覆盖自绘标题栏。
+}
+
 QRect RemoteDesktopWindow::remoteImageRect() const
 {
     const QSize remoteSize = remoteFrameSize();
     if (!remoteSize.isValid()) {
         return {};
     }
-    const int barHeight = titleBarHeight();
-    const QRect contentRect(0, barHeight, width(), qMax(0, height() - barHeight));
+    const QRect contentRect = remoteContentRect();
     const QSize scaled = remoteSize.scaled(contentRect.size(), Qt::KeepAspectRatio);
     return QRect(
         contentRect.x() + (contentRect.width() - scaled.width()) / 2,
@@ -2688,12 +2711,12 @@ void RemoteDesktopWindow::updatePerformanceOverlayGeometry()
     if (!m_performanceOverlay) {
         return;
     }
-    const QRect target = remoteImageRect();
+    const QRect target = remoteImageRect(); // wjy: 性能浮层仍锚定真实视频右下角，D3D内容层扩大后不能跟着移到黑边上。
     const bool hasVisibleVideo = m_connectionStatusCode == 50
         && (!m_remoteFrame.isNull() || (m_textureFrameActive && m_remoteTextureSize.isValid()));
     if (!isVisible() || !hasVisibleVideo || target.isEmpty() || m_performanceOverlay->text().isEmpty()
-        || isMinimized() || m_closeInProgress || remoteUpdateActive()) {
-        m_performanceOverlay->hide(); // wjy: 主窗口隐藏、最小化、首帧前、关闭和更新遮罩期间都隐藏独立工具窗，避免浮在其它应用上方。
+        || isMinimized() || m_closeInProgress || remoteUpdateActive() || m_resizingWindow) {
+        m_performanceOverlay->hide(); // wjy: 主窗口隐藏、最小化、首帧前、关闭、更新或交互缩放期间都隐藏独立工具窗，避免原生浮层移动造成额外合成闪烁。
         return;
     }
 
@@ -3401,7 +3424,7 @@ void RemoteDesktopWindow::updateTexturePresenterGeometry()
     if (!m_texturePresenter) {
         return;
     }
-    const QRect target = remoteImageRect();
+    const QRect target = remoteContentRect(); // wjy: 纹理子窗口覆盖完整内容区，视频和黑边由同一个SwapChain一次性合成。
     if (target.isEmpty() || !m_textureFrameActive) {
         m_texturePresenter->hide();
         return;
@@ -3584,7 +3607,7 @@ void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
     const bool textureWasVisible = m_textureFrameActive && m_texturePresenter && m_texturePresenter->isVisible(); // wjy: 软件回退首帧到达时旧D3D画面仍可能覆盖父窗口。
     m_remoteFrame = image;
     m_textureFrameActive = false; // wjy: 先让父窗口绘制新的软件帧，但暂时不隐藏覆盖在上面的最后成功纹理。
-    const QRect contentRect = isFullScreen() ? rect() : QRect(0, titleBarHeight(), width(), height() - titleBarHeight());
+    const QRect contentRect = remoteContentRect(); // wjy: 软件回退与D3D11路径共用完全相同的标题栏下内容边界。
     if (textureWasVisible) {
         repaint(contentRect); // wjy: 同步把BGRA首帧画到D3D子窗口背后，随后隐藏子窗口时不会短暂露出黑色背景。
         m_texturePresenter->hide();
@@ -4424,36 +4447,7 @@ void RemoteDesktopWindow::mouseDoubleClickEvent(QMouseEvent* event)
 
 void RemoteDesktopWindow::mouseMoveEvent(QMouseEvent* event)
 {
-    m_hoveredPos = event->pos();
-    if (!isFullScreen()) {
-        update(QRect(0, 0, width(), titleBarHeight())); // wjy: 普通窗口才需要刷新标题栏。
-    }
-
     // =====wjy====
-    const QString titleButtonTip = !isFullScreen() && m_remoteUpdateAvailable
-            && remoteUpdateButtonRect().contains(event->pos())
-        ? zh("更新目标设备")
-        : (!isFullScreen() && mouseInputModeRect().contains(event->pos())
-                ? remoteMouseBackendToolTip()
-                : (!isFullScreen() && qualityButtonRect().contains(event->pos())
-                        ? remoteQualityStatusSummary()
-                        : (!isFullScreen() && inputSyncRect().contains(event->pos())
-                                ? inputSynchronizationToolTip()
-                                : (!isFullScreen() && clipboardSyncRect().contains(event->pos())
-                                        ? zh("开关剪切板")
-                                        : QString())))); // wjy: 五个本地标题栏入口共用气泡，全屏远端画面不显示或拦截任何本地按钮。
-    if (toolTip() != titleButtonTip) {
-        setToolTip(titleButtonTip); // wjy: 保存当前提示内容，避免鼠标在同一按钮内移动时反复重置气泡。
-        if (!titleButtonTip.isEmpty()) {
-            QToolTip::showText(event->globalPosition().toPoint(), titleButtonTip, this); // wjy: 气泡跟随鼠标显示，明确“更新”操作的是当前窗口绑定设备。
-        } else {
-            QToolTip::hideText(); // wjy: 离开两个标题栏按钮后立即收起气泡，防止提示残留在远控画面上。
-        }
-    } else if (!titleButtonTip.isEmpty() && !QToolTip::isVisible()) {
-        QToolTip::showText(event->globalPosition().toPoint(), titleButtonTip, this); // wjy: 系统自动隐藏气泡后，只要鼠标仍停在按钮上就允许再次显示。
-    }
-    // ===end====
-
     if (m_resizingWindow && (event->buttons() & Qt::LeftButton)) {
         const QPoint delta = event->globalPosition().toPoint() - m_resizeStartGlobal;
         QRect next = m_resizeStartGeometry;
@@ -4484,10 +4478,41 @@ void RemoteDesktopWindow::mouseMoveEvent(QMouseEvent* event)
             }
         }
 
-        setGeometry(next);
+        setGeometry(next); // wjy: 缩放分支最先处理并立即返回，标题栏悬停、提示和按钮区域不会在每个像素移动时重复重画。
         event->accept();
         return;
     }
+    // ===end====
+
+    m_hoveredPos = event->pos();
+    if (!isFullScreen()) {
+        update(QRect(0, 0, width(), titleBarHeight())); // wjy: 普通窗口才需要刷新标题栏。
+    }
+
+    // =====wjy====
+    const QString titleButtonTip = !isFullScreen() && m_remoteUpdateAvailable
+            && remoteUpdateButtonRect().contains(event->pos())
+        ? zh("更新目标设备")
+        : (!isFullScreen() && mouseInputModeRect().contains(event->pos())
+                ? remoteMouseBackendToolTip()
+                : (!isFullScreen() && qualityButtonRect().contains(event->pos())
+                        ? remoteQualityStatusSummary()
+                        : (!isFullScreen() && inputSyncRect().contains(event->pos())
+                                ? inputSynchronizationToolTip()
+                                : (!isFullScreen() && clipboardSyncRect().contains(event->pos())
+                                        ? zh("开关剪切板")
+                                        : QString())))); // wjy: 五个本地标题栏入口共用气泡，全屏远端画面不显示或拦截任何本地按钮。
+    if (toolTip() != titleButtonTip) {
+        setToolTip(titleButtonTip); // wjy: 保存当前提示内容，避免鼠标在同一按钮内移动时反复重置气泡。
+        if (!titleButtonTip.isEmpty()) {
+            QToolTip::showText(event->globalPosition().toPoint(), titleButtonTip, this); // wjy: 气泡跟随鼠标显示，明确“更新”操作的是当前窗口绑定设备。
+        } else {
+            QToolTip::hideText(); // wjy: 离开两个标题栏按钮后立即收起气泡，防止提示残留在远控画面上。
+        }
+    } else if (!titleButtonTip.isEmpty() && !QToolTip::isVisible()) {
+        QToolTip::showText(event->globalPosition().toPoint(), titleButtonTip, this); // wjy: 系统自动隐藏气泡后，只要鼠标仍停在按钮上就允许再次显示。
+    }
+    // ===end====
 
     if (m_draggingWindow && (event->buttons() & Qt::LeftButton)) {
         const QPoint cursorGlobal = event->globalPosition().toPoint();
@@ -4569,6 +4594,7 @@ void RemoteDesktopWindow::mouseReleaseEvent(QMouseEvent* event)
                 }
                 updateWindowMask(); // wjy: 鼠标释放后按最终几何恢复一次圆角Mask，拖拽期间不重复修改窗口区域。
                 updateTexturePresenterGeometry();
+                updatePerformanceOverlayGeometry(); // wjy: 缩放期间隐藏的独立浮层只在最终尺寸提交后恢复一次，避免拖拽时反复移动原生工具窗。
             }
             if (wasDraggingWindow && !snapGeometries.isEmpty()) {
                 const QList<QWidget*> topLevelWindows = QApplication::topLevelWidgets();

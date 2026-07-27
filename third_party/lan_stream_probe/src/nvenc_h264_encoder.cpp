@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <utility>
 #include <windows.h>
 
 namespace lsp {
@@ -14,6 +15,22 @@ uint32_t nvenc_struct_version(uint32_t api_version, uint32_t struct_version, boo
         version |= (1u << 31);
     }
     return version;
+}
+
+NV_ENC_BUFFER_FORMAT nvenc_buffer_format(DXGI_FORMAT format)
+{
+    switch (format) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return NV_ENC_BUFFER_FORMAT_ARGB; // wjy: D3D11 BGRA字节布局对应NVENC的ARGB命名，保持现有色彩顺序。
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return NV_ENC_BUFFER_FORMAT_ABGR;
+    case DXGI_FORMAT_NV12:
+        return NV_ENC_BUFFER_FORMAT_NV12; // wjy: GPU视频处理器可直接输出NV12，上传量和颜色转换成本显著低于四通道纹理。
+    default:
+        return NV_ENC_BUFFER_FORMAT_UNDEFINED;
+    }
 }
 
 } // namespace
@@ -54,7 +71,7 @@ bool NvencH264Encoder::initialize(ID3D11Device* device, Size size, uint32_t bitr
     NV_ENC_PRESET_CONFIG preset = {};
     preset.version = nvenc_struct_version(api_version_, 5, true);
     preset.presetCfg.version = nvenc_struct_version(api_version_, 9, true);
-    if (!check(fn_.nvEncGetEncodePresetConfigEx(encoder_, NV_ENC_CODEC_HEVC_GUID, NV_ENC_PRESET_P5_GUID,
+    if (!check(fn_.nvEncGetEncodePresetConfigEx(encoder_, NV_ENC_CODEC_HEVC_GUID, NV_ENC_PRESET_P3_GUID,
                                                 NV_ENC_TUNING_INFO_LOW_LATENCY, &preset),
                "NvEncGetEncodePresetConfigEx", error)) {
         shutdown();
@@ -91,7 +108,7 @@ bool NvencH264Encoder::initialize(ID3D11Device* device, Size size, uint32_t bitr
     NV_ENC_INITIALIZE_PARAMS init = {};
     init.version = nvenc_struct_version(api_version_, 7, true);
     init.encodeGUID = NV_ENC_CODEC_HEVC_GUID;
-    init.presetGUID = NV_ENC_PRESET_P5_GUID;
+    init.presetGUID = NV_ENC_PRESET_P3_GUID; // wjy: 远控优先低延迟吞吐，P3比P5减少编码计算压力，高码率与AQ继续保障桌面细节。
     init.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
     init.encodeWidth = size.width;
     init.encodeHeight = size.height;
@@ -225,11 +242,15 @@ bool NvencH264Encoder::encode(ID3D11Texture2D* texture, uint32_t frame_id, bool 
 
 void NvencH264Encoder::shutdown()
 {
-    if (encoder_ && registered_) {
-        fn_.nvEncUnregisterResource(encoder_, registered_);
+    if (encoder_) {
+        for (const auto& entry : registered_textures_) {
+            if (entry.registered) fn_.nvEncUnregisterResource(encoder_, entry.registered); // wjy: 会话关闭时一次性注销纹理环全部缓存资源。
+        }
     }
+    registered_textures_.clear();
     registered_ = nullptr;
     registered_texture_ = nullptr;
+    registered_format_ = NV_ENC_BUFFER_FORMAT_UNDEFINED;
     if (encoder_ && bitstream_) {
         fn_.nvEncDestroyBitstreamBuffer(encoder_, bitstream_);
     }
@@ -279,30 +300,41 @@ bool NvencH264Encoder::load_api(std::string* error)
 
 bool NvencH264Encoder::register_texture(ID3D11Texture2D* texture, std::string* error)
 {
-    if (registered_ && registered_texture_ == texture) {
-        return true;
-    }
-    if (registered_) {
-        fn_.nvEncUnregisterResource(encoder_, registered_);
-        registered_ = nullptr;
-        registered_texture_ = nullptr;
+    for (const auto& entry : registered_textures_) {
+        if (entry.texture.Get() == texture) {
+            registered_ = entry.registered;
+            registered_texture_ = texture;
+            registered_format_ = entry.format;
+            return true; // wjy: 捕获环再次轮到同一纹理时直接复用NVENC句柄，消除每帧驱动注册开销。
+        }
     }
 
     D3D11_TEXTURE2D_DESC desc = {};
     texture->GetDesc(&desc);
+    const NV_ENC_BUFFER_FORMAT buffer_format = nvenc_buffer_format(desc.Format);
+    if (buffer_format == NV_ENC_BUFFER_FORMAT_UNDEFINED) {
+        if (error) *error = "unsupported NVENC D3D11 texture format";
+        return false; // wjy: 未知格式交给上层I420兼容回退，禁止NVENC按ARGB误读导致花屏或色偏。
+    }
     NV_ENC_REGISTER_RESOURCE registered = {};
     registered.version = nvenc_struct_version(api_version_, 5);
     registered.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
     registered.width = desc.Width;
     registered.height = desc.Height;
     registered.resourceToRegister = texture;
-    registered.bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
+    registered.bufferFormat = buffer_format;
     registered.bufferUsage = NV_ENC_INPUT_IMAGE;
     if (!check(fn_.nvEncRegisterResource(encoder_, &registered), "NvEncRegisterResource", error)) {
         return false;
     }
     registered_ = registered.registeredResource;
     registered_texture_ = texture;
+    registered_format_ = buffer_format;
+    RegisteredTextureEntry entry;
+    entry.texture = texture;
+    entry.registered = registered_;
+    entry.format = registered_format_;
+    registered_textures_.push_back(std::move(entry)); // wjy: ComPtr持有纹理生命周期，直到NVENC会话统一注销缓存。
     return true;
 }
 
