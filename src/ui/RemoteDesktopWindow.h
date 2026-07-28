@@ -36,7 +36,11 @@ class QWheelEvent;
 
 namespace ui {
 
+struct RemoteTitleBarLayoutSnapshot;
+struct RemoteTitleBarVisualState;
+
 class D3D11FramePresenter;
+class NativeRemoteTitleBarSurface;
 class RemoteViewerLifecycleManager; // wjy: DeviceGrid持有的共享管理器统一限制Viewer初始化并发并等待全部stop任务。
 struct RemoteDesktopViewerCallbackContext; // wjy: 每个原生viewer拥有独立回调上下文和代际，旧会话停止完成前上下文仍保持有效。
 
@@ -80,7 +84,7 @@ public:
     bool isRemoteUpdateActive() const; // wjy: 供设备状态刷新识别“预期更新离线”，避免把正在等待重启的远控窗口当作普通断线关闭。
     void setRemoteUpdateAvailable(bool available); // wjy: 主界面统一探测目标版本后控制标题栏更新按钮，不让远控流线程参与版本检测。
     void setGlobalQualityConfiguration(const stream::RemoteQualityConfiguration& configuration); // wjy: 主窗口全局设置变化时立即更新跟随全局窗口的会话内策略快照。
-    stream::RemoteQualityMode qualityOverrideMode() const; // wjy: 返回当前窗口模式；每次选择都会按设备持久化并在下次打开时恢复。
+    stream::RemoteQualityMode qualityOverrideMode() const; // wjy: 兼容读取历史设备模式；智能协调器不再把它作为活动 UI 的手动覆盖入口。
     RemoteQualityWindowMetrics remoteQualityMetrics(); // wjy: 协调器每秒读取只读原生统计并对累计值求差，不阻塞或修改 WebRTC 会话。
     void applyRemoteQualityDecision(const RemoteQualityDecision& decision); // wjy: 在线下发最新质量档位；相同请求去重，连接建立后自动补发，不停止或重建流。
     void refreshAppliedRemoteQualityStatus(); // wjy: 收到状态码63后从类型化ABI读取Host实际应用值，标题栏不会把请求值冒充结果。
@@ -167,6 +171,10 @@ private:
     // ===end====
     QRect minimizeRect() const;
     QRect closeRect() const;
+    RemoteTitleBarLayoutSnapshot titleBarLayoutSnapshot() const; // wjy: 每次按当前窗口宽度和设备信息覆盖范围生成统一标题栏控件快照。
+    QRect titleBarHoverRectAt(const QPoint& position) const; // wjy: 只返回真正具有悬停视觉的标题栏按钮，空白区移动不再触发整条标题栏重画。
+    void updateTitleBarHover(const QPoint& position); // wjy: 仅当鼠标跨入或跨出按钮热区时刷新相关矩形，远控画面内移动不会持续重画标题栏。
+    void requestTitleBarUpdate(const QRect& region = QRect()); // wjy: 移动或缩放期间延迟标题栏刷新，交互结束后统一提交一次最终状态。
     // =====wjy====
     bool isTitleBarBlankArea(const QPoint& position) const; // wjy: 统一判断标题栏可拖动/可双击区域，排除右侧窗口控制按钮。
     void toggleMaximizedState(); // wjy: 删除最大化图标后仅由标题栏双击调用，统一切换最大化与普通状态。
@@ -177,8 +185,6 @@ private:
     void requestRemoteMouseBackend(RemoteMouseBackend backend);
     void queryRemoteMouseBackend(); // wjy: 每次新 Viewer 收到画面后查询 Host 全局状态，多控制窗口由真实值对齐。
     QString remoteMouseBackendToolTip() const;
-    void showQualityMenu(const QPoint& globalPosition); // wjy: 构建自定义/自动/高质量/均衡/流畅菜单，并保存当前窗口临时选择。
-    void setQualityOverrideMode(stream::RemoteQualityMode mode); // wjy: 修改当前窗口会话内模式，不写AppSettings也不影响其它窗口。
     stream::RemoteQualityMode effectiveQualityMode() const; // wjy: FollowGlobal解析为最新全局模式，局部覆盖则直接返回覆盖值。
     void sendCurrentRemoteQualityDecision(); // wjy: 把内存中的最新决策转换为稳定C ABI结构；连接中只保留最新请求，重连后按新代际补发。
     QString remoteQualityStatusSummary() const; // wjy: 统一生成标题栏气泡和菜单中的请求/实际/降级说明，避免两处反馈不一致。
@@ -216,8 +222,16 @@ private:
     // ===end====
     void updateWindowMask();
     void updateTexturePresenterGeometry();
+    // =====wjy====
+    RemoteTitleBarVisualState titleBarVisualState() const; // wjy: 把窗口可变成员压缩为一次渲染使用的不可变标题栏快照。
+    void updateNativeTitleBarSurface(bool forceRender = false); // wjy: 仅在状态版本、宽度或DPI变化时生成完整新图并原子提交到持久DIB。
+    void updateNativeTitleBarSurfaceGeometry(); // wjy: 同步标题栏子HWND的可见矩形和全屏显隐，不触碰缓存像素所有权。
+    // ===end====
     void showSnapPreviews(const QHash<RemoteDesktopWindow*, QRect>& geometries); // wjy: 拖拽越界重排时同时显示整组窗口的最终虚影。
     void clearSnapPreviews(); // wjy: 拖离、释放、双击或关闭时统一清理整组吸附预览。
+    bool startSystemWindowMove(); // wjy: 标题栏拖动交给Windows/DWM移动现有窗口表面，避免Qt逐像素move导致父窗和D3D子窗分帧合成。
+    void updateSnapPreviewForGeometry(const QRect& proposedGeometry, const QPoint& cursorGlobal); // wjy: 系统移动和手动回退共用同一吸附候选计算。
+    void finishInteractiveWindowOperation(); // wjy: 系统与手动移动/缩放统一恢复浮层、圆角、吸附提交和几何保存。
     // =====wjy====
     bool restoreSavedGeometryForDrag(const QPoint& cursorGlobal, const QPoint& pressedPosition); // wjy: 平铺或最大化窗口开始拖动时恢复 JSON 普通尺寸，并保持鼠标原抓取位置。
     // ===end====
@@ -297,6 +311,9 @@ private:
     bool m_draggingWindow = false;
     // =====wjy====
     bool m_dragRestorePending = false; // wjy: 平铺或最大化标题栏按下后先等待真实移动，单击和双击不会提前恢复窗口尺寸。
+    bool m_systemWindowOperationActive = false; // wjy: Windows正在接管移动/缩放时禁止Qt鼠标路径再次setGeometry。
+    bool m_systemWindowOperationAttempted = false; // wjy: 系统接口失败后本次手势固定走手动回退，不在每个鼠标事件重复调用。
+    bool m_windowPaintingSuspendedForMove = false; // wjy: 标题栏拖动期间冻结父QWidget backing store，原生D3D子窗口仍独立Present。
     QPoint m_dragPressGlobal;
     QPoint m_dragPressPosition; // wjy: 保存按下时的屏幕坐标和窗口内抓取点，超过系统拖拽阈值后用于恢复 JSON 尺寸。
     // ===end====
@@ -356,6 +373,26 @@ private:
     QTimer* m_clipboardPollTimer = nullptr;
     // ===end====
     D3D11FramePresenter* m_texturePresenter = nullptr;
+    std::unique_ptr<NativeRemoteTitleBarSurface> m_nativeTitleBarSurface; // wjy: 独立Win32子窗口持有标题栏DIB，父Qt backing store不再负责可见标题栏像素。
+    quint64 m_titleBarVisualRevision = 1; // wjy: 只有标题栏可见状态变化才递增，远控视频帧不参与该版本。
+    quint64 m_committedTitleBarVisualRevision = 0;
+    QSize m_committedTitleBarLogicalSize; // wjy: 现在保存身份布局签名而不是窗口尺寸，普通缩放不会命中重绘条件。
+    int m_committedTitleBarBarHeight = 0;
+    qreal m_committedTitleBarDevicePixelRatio = 0.0;
+    int nativeTitleBarBandLogicalWidth() const; // wjy: 身份层的固定渲染宽度，按虚拟屏逻辑宽度预留。
+    // =====wjy====
+    quint64 m_committedButtonVisualRevision = 0;
+    int m_committedButtonGroupWidth = 0;
+    quint32 m_committedButtonVisibleSignature = 0;
+    qreal m_committedButtonDevicePixelRatio = 0.0;
+    int m_committedButtonBarHeight = 0; // wjy: 按钮段只在视觉版本、可见集合、组宽度、DPI或栏高变化时重绘，窗口宽度变化本身不触发。
+    void updateNativeTitleBarButtonBand(bool forceRender); // wjy: 渲染并提交按钮段位图，内部按上述维度去重。
+    void updateNativeTitleBarButtonOrigin(); // wjy: 非交互状态下同步按钮段在原生合成缓冲中的位置。
+    QImage m_cachedIdentityBand; // wjy: 与原生表面同一份身份段像素；缩放期间由父窗口直接绘制，不再依赖子HWND参与合成。
+    QImage m_cachedButtonGroup; // wjy: 同上，按钮段位图在缩放期间由父窗口按当前宽度贴到右边缘。
+    int m_cachedButtonGroupLogicalWidth = 0; // wjy: 按钮段逻辑宽度，父窗口据此计算右对齐位置。
+    void paintTitleBarFromCache(QPainter& painter); // wjy: 缩放期间父窗口用缓存位图绘制完整标题栏，只做两次drawImage不重新渲染。
+    // ===end====
 };
 
 } // namespace ui

@@ -275,6 +275,20 @@ if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_VIEWER_STABILITY_TESTS) # wjy: 多窗
         target_compile_options(fsremote_remote_clipboard_codec_tests PRIVATE /utf-8)
     endif()
     add_test(NAME fsremote_remote_clipboard_codec_tests COMMAND fsremote_remote_clipboard_codec_tests)
+    # =====wjy====
+    add_executable(fsremote_remote_titlebar_renderer_tests EXCLUDE_FROM_ALL
+        tests/remote_titlebar_renderer_tests.cpp
+        src/ui/RemoteTitleBarRenderer.cpp
+        src/ui/RemoteTitleBarRenderer.h
+        src/ui/RemoteTitleBarLayout.h
+    ) # wjy: 纯离屏标题栏渲染测试覆盖普通、窄窗口、悬停、按下和DPI物理尺寸，不创建真实远控会话。
+    target_include_directories(fsremote_remote_titlebar_renderer_tests PRIVATE src)
+    target_link_libraries(fsremote_remote_titlebar_renderer_tests PRIVATE Qt6::Gui)
+    if(MSVC)
+        target_compile_options(fsremote_remote_titlebar_renderer_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME fsremote_remote_titlebar_renderer_tests COMMAND fsremote_remote_titlebar_renderer_tests)
+    # ===end====
     # ===end====
 
     # ===end====
@@ -413,6 +427,10 @@ qt_add_executable(FSRemote WIN32
     src/ui/DeviceGrid.h
     src/ui/RemoteDesktopWindow.cpp
     src/ui/RemoteDesktopWindow.h
+    src/ui/NativeRemoteTitleBarSurface.cpp
+    src/ui/NativeRemoteTitleBarSurface.h
+    src/ui/RemoteTitleBarRenderer.cpp
+    src/ui/RemoteTitleBarRenderer.h
     src/ui/RemoteCursorShape.h
     src/ui/RemoteViewerLifecycleManager.cpp
     src/ui/RemoteViewerLifecycleManager.h
@@ -507,7 +525,7 @@ qt_add_executable(FSRemote WIN32
 target_include_directories(FSRemote PRIVATE src include third_party/parsec_vdd)
 target_link_libraries(FSRemote PRIVATE Qt6::Widgets Qt6::Svg Qt6::Network)
 if(WIN32)
-    target_link_libraries(FSRemote PRIVATE wbemuuid ole32 oleaut32 iphlpapi ws2_32 advapi32 shell32 setupapi cfgmgr32 d3d11 dxgi psapi user32 pdh) # wjy: 本机页 GPU 环形占用通过 Windows PDH 性能计数器只读采样。
+    target_link_libraries(FSRemote PRIVATE wbemuuid ole32 oleaut32 iphlpapi ws2_32 advapi32 shell32 setupapi cfgmgr32 d3d11 dxgi psapi user32 gdi32 pdh) # wjy: 原生标题栏持久DIB使用GDI BitBlt，继续显式链接既有Windows系统库集合。
 endif()
 
 if(MSVC)

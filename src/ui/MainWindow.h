@@ -27,7 +27,7 @@ public:
     // =====wjy====
     ~MainWindow() override;
     void showFromTray();
-    void hideToTray(); // wjy: 仅关闭按钮使用；最小化仍保留任务栏按钮。
+    void hideToTray(); // wjy: 兼容现有调用名，实际统一执行系统最小化并保留任务栏按钮。
     void setRemoteControllerOverlayEntries(const QStringList& controllers); // wjy: 目标端主循环同步远控会话详情，驱动右下角提示层显示或隐藏。
     void requestApplicationRestart(); // wjy: 托盘“重启”先创建等待旧进程退出的新实例，再复用统一退出清理流程。
     void requestApplicationExit(); // wjy: 托盘退出和更新退出统一走这里，先注销托盘图标，再有界清理并退出进程。

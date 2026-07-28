@@ -43,7 +43,11 @@ MainWindow::MainWindow(platform::DeviceRealtimeStateService* realtimeStateServic
     setObjectName(QStringLiteral("MainWindow"));
     setWindowTitle(QString::fromUtf8("\xE4\xB8\xB0\xE5\xAE\x9E\xE8\xBF\x9C\xE7\xA8\x8B\xE6\x8E\xA7\xE5\x88\xB6"));
     setWindowIcon(QIcon(QStringLiteral(":/UUGuest/resource/images/titlebar/app_icon.ico")));
-    setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
+    setWindowFlags(Qt::Window
+        | Qt::FramelessWindowHint
+        | Qt::WindowSystemMenuHint
+        | Qt::WindowMinimizeButtonHint); // wjy: 保留自绘无边框标题栏，同时向 Windows 声明系统菜单和最小化能力，让任务栏按钮原生支持显示/最小化切换。
+    setAttribute(Qt::WA_TranslucentBackground); // wjy: 顶层窗口启用 Alpha 背景，DeviceGrid 圆角路径外的四角像素才能真正透出桌面而不是显示矩形底色。
     setMinimumSize(720, 520);
     resize(920, 680);
     writeWindowStartupLog(QStringLiteral("[wjy-window] window basics set"));
@@ -118,19 +122,13 @@ void MainWindow::setupTrayIcon()
             return; // wjy: 右键只负责菜单，不执行打开主窗口逻辑。
         }
         if (reason == QSystemTrayIcon::DoubleClick) {
-            // =====wjy====
-            if (isVisible() && !isMinimized()) {
-                hideToTray(); // wjy: 左键双击时主窗口已正常显示，则隐藏回托盘，实现打开/关闭切换。
-            } else if (m_trayShowAction) {
-                m_trayShowAction->trigger(); // wjy: 左键双击时窗口隐藏或最小化，则复用右键菜单动作恢复主窗口。
-            }
-            // ===end====
-            return;
+            return; // wjy: 双击不再承担独立关闭行为，避免和新的单击切换产生两套状态机。
         }
-        if (reason == QSystemTrayIcon::Trigger
-            || reason == QSystemTrayIcon::MiddleClick) {
-            if (m_trayShowAction) {
-                m_trayShowAction->trigger(); // wjy: 通过“打开主窗口”菜单动作恢复、置前并激活主窗口。
+        if (reason == QSystemTrayIcon::Trigger) {
+            if (!isVisible() || isMinimized()) {
+                showFromTray(); // wjy: 单击已最小化窗口时恢复、置前并激活。
+            } else {
+                showMinimized(); // wjy: 单击正常显示窗口时执行系统最小化，任务栏图标继续保留。
             }
         }
     }); // wjy: activated 使用 lambda，不能依赖 Qt::UniqueConnection；保持普通连接才能确保 Windows 托盘事件进入回调。
@@ -254,13 +252,7 @@ void MainWindow::setRemoteControllerOverlayEntries(const QStringList& controller
 
 void MainWindow::hideToTray()
 {
-    // wjy: 仅标题栏关闭按钮调用——隐藏窗口但保留托盘；任务栏按钮随之消失是 hide 的正常行为。
-    // 最小化请走系统 minimize，保留任务栏状态。
-    if (m_trayIcon && m_trayIcon->isVisible()) {
-        hide();
-        return;
-    }
-    showMinimized();
+    showMinimized(); // wjy: 所有普通收起入口统一使用系统最小化，不再调用 hide 导致任务栏 Logo 消失。
 }
 
 bool MainWindow::event(QEvent* event)
@@ -277,7 +269,7 @@ void MainWindow::closeEvent(QCloseEvent* event)
     // =====wjy====
     if (!m_forceQuit && m_trayIcon && m_trayIcon->isVisible()) {
         event->ignore();
-        hideToTray(); // wjy: 点关闭默认隐藏到托盘；托盘“退出”才真正结束进程。
+        hideToTray(); // wjy: 点关闭默认最小化并同时保留托盘和任务栏图标；托盘“退出”才真正结束进程。
         return;
     }
     // ===end====

@@ -279,6 +279,7 @@ private:
     void saveScriptFileEditor();
     void stopCurrentDeviceScript(); // wjy: Stop the running script on the target device, not only the local SSH process.
     bool stopDeviceScriptForDeviceIndex(int deviceIndex, bool showMessages); // wjy: Stop a running script for one specified device, used by current-device and group-stop actions.
+    void stopDeviceScriptsForIndexes(const QVector<int>& deviceIndexes); // wjy: 单选和多选菜单共用批量停止入口，并只汇总提示一次。
     void stopDeviceGroupScripts(int groupIndex); // wjy: Stop all running scripts in one group.
     QString currentScriptUiDeviceIp() const; // wjy: Return the IP whose script UI should be shown by the current detail page.
     void saveCurrentScriptUiState(); // wjy: Persist the visible script/editor UI into the per-device state cache before switching devices.

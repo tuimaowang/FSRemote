@@ -2959,7 +2959,7 @@ void drawSettingsPage(
         painter.setPen(QColor(QStringLiteral("#040B18")));
         painter.drawText(QRectF(qualityCard.x() + 28, qualityCard.y() + 16, qualityCard.width() - 56, 22),
             Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("远控画质预设"));
+            QString::fromUtf8("智能远控画质"));
 
         QFont detail(textFont);
         detail.setPixelSize(11);
@@ -2967,7 +2967,7 @@ void drawSettingsPage(
         painter.setPen(QColor(QStringLiteral("#687384")));
         painter.drawText(QRectF(qualityCard.x() + 28, qualityCard.y() + 38, qualityCard.width() - 56, 18),
             Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("固定模式不主动降帧；只有自动模式根据性能在60、45、30 FPS间调节。")); // wjy: 页面直接说明唯一自适应入口，避免固定模式再次被复杂策略悄悄降档。
+            QString::fromUtf8("根据当前控制窗口、全屏和后台状态自动切换，不需要手动选择。")); // wjy: 设置页明确展示新的焦点驱动画质策略。
 
         QFont labelFont(textFont);
         labelFont.setPixelSize(12);
@@ -2977,17 +2977,17 @@ void drawSettingsPage(
         painter.drawText(
             QRectF(modeControlRect.x() - 142, modeControlRect.y(), 132, modeControlRect.height()),
             Qt::AlignVCenter | Qt::AlignRight,
-            QString::fromUtf8("全局默认模式"));
+            QString::fromUtf8("当前策略"));
 
         QFont presetFont(textFont);
         presetFont.setPixelSize(12);
         painter.setFont(presetFont);
         const QStringList presetLines = {
-            QString::fromUtf8("高质量    原始分辨率 · 固定请求 60 FPS"),
-            QString::fromUtf8("自动        原始分辨率 · 60 / 45 / 30 FPS 自动调节"),
-            QString::fromUtf8("均衡        1080p · 固定请求 45 FPS"),
-            QString::fromUtf8("流畅        720p · 固定请求 60 FPS"),
-            QString::fromUtf8("最小化    所有模式统一 540p · 15 FPS"),
+            QString::fromUtf8("当前控制窗口    原始分辨率 · 60 FPS"),
+            QString::fromUtf8("全屏窗口            原始分辨率 · 60 FPS"),
+            QString::fromUtf8("其它可见窗口    720p · 60 FPS"),
+            QString::fromUtf8("最小化/隐藏       540p · 15 FPS"),
+            QString::fromUtf8("软件回退            540p · 24 FPS 安全档"),
         };
         for (int index = 0; index < presetLines.size(); ++index) {
             const QRectF lineRect(
@@ -2998,7 +2998,7 @@ void drawSettingsPage(
             painter.setPen(index == presetLines.size() - 1
                     ? QColor(QStringLiteral("#687384"))
                     : QColor(QStringLiteral("#111827")));
-            painter.drawText(lineRect, Qt::AlignVCenter | Qt::AlignLeft, presetLines.at(index)); // wjy: 固定展示四档映射和统一后台档，用户无需推断隐藏的阈值参数。
+            painter.drawText(lineRect, Qt::AlignVCenter | Qt::AlignLeft, presetLines.at(index)); // wjy: 直接展示智能优先级和安全档，用户无需逐窗口操作按钮。
         }
         painter.restore();
         return;
@@ -5551,6 +5551,33 @@ exit 0
 // ===end====
 }
 
+void DeviceGrid::stopDeviceScriptsForIndexes(const QVector<int>& deviceIndexes)
+{
+    QSet<int> visited;
+    int stoppedCount = 0;
+    for (const int deviceIndex : deviceIndexes) {
+        if (deviceIndex < 0 || deviceIndex >= g_devices.size() || visited.contains(deviceIndex)) {
+            continue;
+        }
+        visited.insert(deviceIndex);
+        if (stopDeviceScriptForDeviceIndex(deviceIndex, false)) {
+            ++stoppedCount; // wjy: 仅对确实处于运行态的目标发起停止，未运行设备静默跳过。
+        }
+    }
+    if (stoppedCount <= 0) {
+        QMessageBox messageBox(
+            QMessageBox::Information,
+            QString(),
+            QString::fromUtf8("目标设备中没有正在执行的脚本。"),
+            QMessageBox::NoButton,
+            this);
+        messageBox.addButton(zh("\xE7\x9F\xA5\xE9\x81\x93\xE4\xBA\x86"), QMessageBox::AcceptRole);
+        messageBox.exec(); // wjy: 无论单选还是多选都只显示一次汇总信息，不按设备重复弹窗。
+    } else {
+        update();
+    }
+}
+
 void DeviceGrid::stopDeviceGroupScripts(int groupIndex)
 {
 // =====wjy====
@@ -5783,7 +5810,9 @@ void DeviceGrid::setupSettingsControls()
     // ===end====
 
     // =====wjy====
-    m_remoteQualityConfiguration = platform::AppSettings::remoteQualityConfiguration(); // wjy: 简化设置只读取全局默认模式，旧版复杂参数不再影响四档固定预设。
+    m_remoteQualityConfiguration = platform::AppSettings::remoteQualityConfiguration();
+    m_remoteQualityConfiguration.defaultMode = stream::RemoteQualityMode::Automatic; // wjy: 迁移到智能策略后统一保存自动模式，旧设备手动档不再控制当前 UI。
+    platform::AppSettings::setRemoteQualityConfiguration(m_remoteQualityConfiguration);
     const QString qualityControlStyle = QStringLiteral(
         "QComboBox{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;padding:0 8px;"
         "font-family:'Microsoft YaHei UI';font-size:13px;color:#040B18;}"
@@ -5791,18 +5820,12 @@ void DeviceGrid::setupSettingsControls()
         "QComboBox:disabled{background:#F5F7FA;color:#94A3B8;}"); // wjy: 远控画质页只保留一个默认模式下拉框，避免高级参数继续暗示固定预设可被改写。
 
     m_remoteQualityModeCombo = new QComboBox(this);
-    m_remoteQualityModeCombo->addItem(QString::fromUtf8("自动"), static_cast<int>(stream::RemoteQualityMode::Automatic));
-    m_remoteQualityModeCombo->addItem(QString::fromUtf8("高质量"), static_cast<int>(stream::RemoteQualityMode::HighQualityLocked)); // wjy: 主窗口全局选项与远控标题栏统一显示“高质量”，对应原始分辨率/固定请求60 FPS。
-    m_remoteQualityModeCombo->addItem(QString::fromUtf8("均衡"), static_cast<int>(stream::RemoteQualityMode::Balanced));
-    m_remoteQualityModeCombo->addItem(QString::fromUtf8("流畅"), static_cast<int>(stream::RemoteQualityMode::Smooth)); // wjy: 全局模式不提供FollowGlobal，四项直接对应固定预设或唯一自动策略。
-    m_remoteQualityModeCombo->setCurrentIndex(qMax(0, m_remoteQualityModeCombo->findData(static_cast<int>(m_remoteQualityConfiguration.defaultMode))));
+    m_remoteQualityModeCombo->addItem(QString::fromUtf8("智能切换"), static_cast<int>(stream::RemoteQualityMode::Automatic));
+    m_remoteQualityModeCombo->setCurrentIndex(0);
+    m_remoteQualityModeCombo->setEnabled(false); // wjy: 设置页改为只读策略说明，不再允许全局或单窗口手动覆盖智能画质。
     m_remoteQualityModeCombo->setStyleSheet(qualityControlStyle);
     m_remoteQualityModeCombo->setVisible(false); // wjy: 首次显隐统一交给updateSettingsControls，构造阶段不会闪到常规页上。
 
-    const auto persistRemoteQuality = [this] {
-        saveRemoteQualitySettingsFromControls(); // wjy: 默认模式变化立即保存，并把对应固定预设下发给当前跟随全局的窗口。
-    };
-    connect(m_remoteQualityModeCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, persistRemoteQuality);
     // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after batch add controls create")); // wjy: 批量新增输入框和按钮创建完成。
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before updateSettingsControls in setup")); // wjy: 判断是否崩在首次刷新设置控件显隐状态。
@@ -6291,7 +6314,7 @@ void DeviceGrid::updateSettingsControls()
             m_remoteQualityModeCombo,
             settingsRemoteQualityControlRect(0),
             qualityVisible,
-            qualityVisible,
+            false,
             true); // wjy: 简化页只管理默认模式下拉框，其余预设值作为只读说明绘制，不再创建复杂参数控件。
     }
     // ===end====
@@ -6307,7 +6330,7 @@ void DeviceGrid::saveRemoteQualitySettingsFromControls()
     }
 
     stream::RemoteQualityConfiguration configuration;
-    configuration.defaultMode = static_cast<stream::RemoteQualityMode>(m_remoteQualityModeCombo->currentData().toInt());
+    configuration.defaultMode = stream::RemoteQualityMode::Automatic; // wjy: 智能策略固定为唯一入口，保留配置对象仅兼容现有在线质量管线。
     m_remoteQualityConfiguration = stream::normalizedRemoteQualityConfiguration(configuration); // wjy: 只接受四种可持久化默认模式，其余FPS/分辨率字段恢复代码内置预设。
     platform::AppSettings::setRemoteQualityConfiguration(m_remoteQualityConfiguration);
 
@@ -6357,11 +6380,14 @@ void DeviceGrid::evaluateRemoteQuality()
     }
     try {
         const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
+        RemoteDesktopWindow* activeWindow = topmostRemoteWindow(); // wjy: 最近激活窗口代表用户当前控制目标，切换时立即触发下一轮质量计算。
         std::vector<RemoteQualityWindowMetrics> metrics;
         metrics.reserve(static_cast<std::size_t>(windows.size()));
         for (const QPointer<RemoteDesktopWindow>& window : windows) {
             if (window) {
-                metrics.push_back(window->remoteQualityMetrics()); // wjy: 只在Qt线程读取固定数值快照，不跨线程访问原生WebRTC对象。
+                RemoteQualityWindowMetrics snapshot = window->remoteQualityMetrics();
+                snapshot.active = window.data() == activeWindow;
+                metrics.push_back(snapshot); // wjy: 只在Qt线程附加活动身份，不跨线程访问原生WebRTC对象。
             }
         }
         const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
@@ -7341,6 +7367,8 @@ void DeviceGrid::showDeviceContextMenuForIndexes(
     QMenu menu(this); // wjy: 两种入口复用同一 QMenu，后续顺序、图标或动作调整只需要维护这一处。
     QMenu* scriptMenu = menu.addMenu(QString::fromUtf8("执行脚本"));
     populateCachedScriptFolderMenu(scriptMenu); // wjy: 远控标题栏使用后台加载的树快照，弹出菜单时不访问共享目录。
+    QAction* stopScriptsAction = menu.addAction(QString::fromUtf8("停止脚本")); // wjy: 单设备、多选设备和远控标题栏菜单共用同一个停止入口。
+    menu.addSeparator();
     QMenu* systemMenu = menu.addMenu(menuIcon(QStringLiteral("settings.svg")), QString::fromUtf8("系统设置"));
     QAction* wakeAction = systemMenu->addAction(menuIcon(QStringLiteral("power_on.svg")), batchDeviceMenu ? QString::fromUtf8("批量开机") : QString::fromUtf8("开机"));
     QAction* shutdownAction = systemMenu->addAction(menuIcon(QStringLiteral("shutdown.svg")), batchDeviceMenu ? QString::fromUtf8("批量关机") : QString::fromUtf8("关机"));
@@ -7348,10 +7376,10 @@ void DeviceGrid::showDeviceContextMenuForIndexes(
     QAction* updateAction = systemMenu->addAction(menuIcon(QStringLiteral("update.svg")), batchDeviceMenu ? QString::fromUtf8("批量更新") : QString::fromUtf8("更新"));
     QAction* terminalAction = systemMenu->addAction(menuIcon(QStringLiteral("terminal.svg")), QString::fromUtf8("终端")); // wjy: 系统设置顺序固定为开机、关机、重启、更新、终端。
     // =====wjy====
-    QAction* createGroupAction = nullptr; // wjy: 单设备菜单保持空指针，因此不会出现或误触发批量归组流程。
+    QAction* createGroupAction = nullptr;
     QVector<QAction*> existingGroupActions; // wjy: 按菜单创建时的分组顺序保存动作指针，不能占用脚本动作使用的 data 字段。
-    if (batchDeviceMenu) {
-        QMenu* addGroupMenu = menu.addMenu(QString::fromUtf8("添加分组")); // wjy: 多选菜单在“系统设置”正下方增加悬浮展开的分组子菜单。
+    if (!validTargetIndexes.isEmpty()) {
+        QMenu* addGroupMenu = menu.addMenu(QString::fromUtf8("添加分组")); // wjy: 单设备和多设备都复用同一归组子菜单，目标集合由稳定设备 ID 统一解析。
         createGroupAction = addGroupMenu->addAction(QString::fromUtf8("新建分组")); // wjy: 新建入口固定为子菜单首行，下面才显示当前分组名。
         if (!g_deviceGroupNames.isEmpty()) {
             addGroupMenu->addSeparator(); // wjy: 用分隔线区分创建动作和现有目标组，组名顺序保持侧栏顺序。
@@ -7379,6 +7407,8 @@ void DeviceGrid::showDeviceContextMenuForIndexes(
         }
     // ===end====
     // =====wjy====
+    } else if (selectedAction == stopScriptsAction) {
+        stopDeviceScriptsForIndexes(validTargetIndexes); // wjy: 停止动作一次遍历全部菜单目标，并聚合没有运行脚本时的反馈。
     } else if (selectedAction && selectedAction->data().isValid()) {
         const QString scriptFolderPath = selectedAction->data().toString(); // wjy: 先保存脚本菜单绑定的目录，单设备和多设备必须执行同一个脚本入口。
         if (batchDeviceMenu) {
@@ -8598,6 +8628,7 @@ void DeviceGrid::refreshRealtimeUpdateAvailability()
 void DeviceGrid::rememberRemoteWindowActivation(RemoteDesktopWindow* window)
 {
     m_remoteWindowCoordinator->rememberActivation(window); // wjy: 激活顺序由协调器维护，快捷键不再依赖 DeviceGrid 容器。
+    requestRemoteQualityEvaluation(); // wjy: 用户切换控制窗口后立即把新窗口升为高质量，并把其它普通窗口切为流畅。
 }
 
 RemoteDesktopWindow* DeviceGrid::topmostRemoteWindow() const
@@ -9314,7 +9345,16 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
     painter.setRenderHint(QPainter::Antialiasing);
     painter.setRenderHint(QPainter::SmoothPixmapTransform);
 
-    painter.fillRect(rect(), QColor(QStringLiteral("#F8FAFC")));
+    // =====wjy====
+    painter.setCompositionMode(QPainter::CompositionMode_Source); // wjy: 先直接覆盖上一帧像素，确保圆角外不会残留历史不透明底色。
+    painter.fillRect(rect(), Qt::transparent); // wjy: 将完整客户区清空为透明，四个直角区域不再被任何矩形背景填充。
+    painter.setCompositionMode(QPainter::CompositionMode_SourceOver); // wjy: 清空完成后恢复正常 Alpha 混合，再绘制窗口主体内容。
+    QPainterPath windowShape;
+    windowShape.addRoundedRect(QRectF(rect()), 6, 6); // wjy: 主背景与现有 6px 圆角边框共用同一窗口外形，避免填充和描边轮廓不一致。
+    painter.setClipPath(windowShape); // wjy: 后续标题栏、侧栏和内容背景全部限制在圆角区域内，圆角外像素保持透明。
+    // ===end====
+
+    painter.fillPath(windowShape, QColor(QStringLiteral("#F8FAFC"))); // wjy: 使用圆角路径填充主内容底色，替代原先覆盖四角的整矩形填充。
     painter.fillRect(QRectF(0, 0, width(), kTitleBarHeight), QColor(QStringLiteral("#EEF3F7"))); //标题栏
     painter.fillRect(QRectF(0, kTitleBarHeight, kSidebarWidth, height() - kTitleBarHeight), QColor(QStringLiteral("#EEF3F7"))); // wjy: 详情栏收起时设备栏仍完整保留，不再随 << 消失。
 
