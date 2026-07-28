@@ -10,6 +10,7 @@
 #include <api/stats/rtc_stats_collector_callback.h>
 #include <api/stats/rtc_stats_report.h>
 #include <api/stats/rtcstats_objects.h>
+#include <api/transport/bitrate_settings.h> // wjy: 同时更新 Call 级带宽估计边界，不能只改 RtpSender 后仍被全局默认上限截断。
 #include <api/create_peerconnection_factory.h>
 #include <api/data_channel_interface.h>
 #include <api/field_trials.h>
@@ -382,11 +383,39 @@ void apply_sender_rate(webrtc::RtpSenderInterface* sender, uint32_t min_bitrate_
         encoding.max_framerate = static_cast<int>(fps ? fps : 60);
         encoding.network_priority = webrtc::Priority::kHigh;
     }
+    params.degradation_preference = webrtc::DegradationPreference::MAINTAIN_FRAMERATE_AND_RESOLUTION; // wjy: 分辨率和 FPS 只由远控档位协议决定，禁止 WebRTC 另起一套隐藏降级造成局部模糊或帧率漂移。
     const auto result = sender->SetParameters(params);
     if (!result.ok()) {
         std::cerr << "sender SetParameters failed: " << result.message() << "\n";
     }
 }
+
+// =====wjy====
+bool apply_peer_connection_bitrate(
+    webrtc::PeerConnectionInterface* connection,
+    uint32_t min_bitrate_kbps,
+    uint32_t max_bitrate_kbps,
+    std::string* error)
+{
+    if (!connection) {
+        if (error) *error = "peer connection is unavailable";
+        return false; // wjy: Sender 参数和传输带宽必须成对生效，连接不存在时不能只修改编码器一侧。
+    }
+    const uint32_t safeMinKbps = std::max(1u, std::min(min_bitrate_kbps, max_bitrate_kbps)); // wjy: 保证传输约束始终满足 min <= start <= max。
+    const uint32_t safeMaxKbps = std::max(safeMinKbps, max_bitrate_kbps);
+    const uint32_t safeStartKbps = std::clamp(60000u, safeMinKbps, safeMaxKbps); // wjy: 高质量从 60 Mbps 直接起步；较低档位自动夹到自身上限，避免先冲到高码率再回落。
+    webrtc::BitrateSettings settings;
+    settings.min_bitrate_bps = static_cast<int>(safeMinKbps * 1000u); // wjy: 更新拥塞控制器下限，避免仅设置 RtpEncoding 后仍被旧的 8.1 Mbps Call 上限截断。
+    settings.start_bitrate_bps = static_cast<int>(safeStartKbps * 1000u);
+    settings.max_bitrate_bps = static_cast<int>(safeMaxKbps * 1000u);
+    const auto result = connection->SetBitrate(settings);
+    if (!result.ok()) {
+        if (error) *error = std::string(result.message());
+        return false;
+    }
+    return true;
+}
+// ===end====
 
 } // namespace
 
@@ -512,7 +541,11 @@ bool WebrtcSession::apply_sender_quality(
     if (parameters.encodings.empty()) parameters.encodings.emplace_back();
     const uint32_t safe_fps = std::clamp(target_fps, 1u, 60u);
     const uint32_t safe_max_kbps = std::clamp(max_bitrate_kbps, 256u, 240000u);
-    const uint32_t safe_min_kbps = std::min(safe_max_kbps, std::max(256u, safe_max_kbps / 4)); // wjy: 降码率时同步降低自适应下限，静止桌面不会被旧9Mbps下限顶住。
+    const bool high_quality_priority = priority >= 75; // wjy: 当前活动或全屏高质量窗口使用100优先级，后台流畅窗口保持普通优先级。
+    const uint32_t bitrate_floor_divisor = high_quality_priority ? 2u : 4u; // wjy: 高质量最低保留上限的一半，120 Mbps配置对应60 Mbps，避免WebRTC把原始分辨率压到7 Mbps。
+    const uint32_t safe_min_kbps = std::min(
+        safe_max_kbps,
+        std::max(256u, safe_max_kbps / bitrate_floor_divisor)); // wjy: 非高质量窗口继续使用四分之一自适应下限，后台720p不会无条件占用高码率。
     const webrtc::Priority network_priority = priority >= 75
         ? webrtc::Priority::kHigh
         : (priority >= 40 ? webrtc::Priority::kMedium : webrtc::Priority::kLow); // wjy: 高质量锁定提高发送优先级，但仍服从WebRTC拥塞控制。
@@ -532,10 +565,14 @@ bool WebrtcSession::apply_sender_quality(
             }; // wjy: WebRTC视频适配器在编码前按目标尺寸缩放，多个控制端继续共享同一桌面捕获源。
         }
     }
+    parameters.degradation_preference = webrtc::DegradationPreference::MAINTAIN_FRAMERATE_AND_RESOLUTION; // wjy: 高质量原始/60 和其它固定档位均由控制端显式选择，传输层只调码率，不再隐式改变画面尺寸或采样帧率。
     const auto result = local_video_sender_->SetParameters(parameters);
     if (!result.ok()) {
         if (error) *error = std::string(result.message());
         return false;
+    }
+    if (!apply_peer_connection_bitrate(pc_.get(), safe_min_kbps, safe_max_kbps, error)) {
+        return false; // wjy: 同步解除 Call 级 8.1 Mbps 限制，确保 Sender 请求和拥塞控制器使用同一组档位边界。
     }
     return true;
 }
@@ -741,6 +778,9 @@ bool WebrtcSession::configure_host_media(std::string* error)
         }
     }
     apply_sender_rate(sender.get(), config_.min_bitrate_kbps, config_.target_bitrate_kbps, config_.fps);
+    if (!apply_peer_connection_bitrate(pc_.get(), config_.min_bitrate_kbps, config_.target_bitrate_kbps, error)) {
+        return false; // wjy: 首帧前把默认带宽估计提升到 60 Mbps 起步，质量请求尚未到达时也不会先被 8.1 Mbps 压糊。
+    }
     std::cout << "host media: native WebRTC desktop source enabled; transport recovery is WebRTC-owned\n";
     std::cout << "host media: custom H265 NVENC codec factory is active\n";
     return true;

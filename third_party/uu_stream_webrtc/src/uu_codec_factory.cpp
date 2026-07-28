@@ -346,9 +346,11 @@ private:
             encode_texture = texture_; // wjy: 非原生帧和驱动不支持VideoProcessor时保留既有I420上传回退，不改变软件兼容性。
         }
 
-        const uint32_t requested_bitrate_kbps = bitrate_kbps_.load();
+        // =====wjy====
+        const uint32_t requested_bitrate_kbps = bitrate_kbps_.load(); // wjy: NVENC 严格使用 WebRTC 已分配码率；档位下限现在由 Sender 和 PeerConnection 同层保证，禁止编码器私自超发造成发送队列、丢包和清晰度反复恢复。
         const uint32_t requested_fps = fps_.load();
-        if (encoder_.ready() && should_reconfigure_rate()) {
+        // ===end====
+        if (encoder_.ready() && should_reconfigure_rate(requested_bitrate_kbps, requested_fps)) {
             std::string reconfigure_error;
             if (encoder_.reconfigure(requested_bitrate_kbps, requested_fps, &reconfigure_error)) {
                 encoder_bitrate_kbps_ = requested_bitrate_kbps; // wjy: NVENC会话、纹理注册和bitstream全部保留，只更新实时码率/FPS。
@@ -577,13 +579,11 @@ private:
     }
 
 private:
-    bool should_reconfigure_rate() const
+    bool should_reconfigure_rate(uint32_t requested_bitrate, uint32_t requested_fps) const
     {
         if (encoder_bitrate_kbps_ == 0) {
             return false;
         }
-        const uint32_t requested_bitrate = bitrate_kbps_.load();
-        const uint32_t requested_fps = fps_.load();
         const uint32_t lower = std::min(encoder_bitrate_kbps_, requested_bitrate);
         const uint32_t upper = std::max(encoder_bitrate_kbps_, requested_bitrate);
         const bool changed_enough = (upper - lower) * 100 >= std::max(upper, 1u) * 15; // wjy: Ignore tiny target-rate jitter; only rebuild NVENC for meaningful adaptive bitrate movement.

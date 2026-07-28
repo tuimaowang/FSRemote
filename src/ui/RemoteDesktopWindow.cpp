@@ -2701,10 +2701,6 @@ void RemoteDesktopWindow::updateNativeTitleBarSurfaceGeometry()
         m_nativeTitleBarSurface->setVisible(false); // wjy: 全屏完全移除本地标题栏子HWND，远控内容占用整个客户区。
         return;
     }
-    if (m_resizingWindow) {
-        m_nativeTitleBarSurface->setVisible(false);
-        return; // wjy: 缩放全程保持子表面隐藏，标题栏由父窗口缓存位图绘制；任何其它路径都不得在手势中途把它显示回来。
-    }
     m_nativeTitleBarSurface->setLogicalGeometry(
         QRect(0, 0, width(), titleBarHeight()), devicePixelRatioF()); // wjy: 宽度固定按虚拟屏预留，窗口缩放永远命中内部去重直接返回，不产生SetWindowPos。
     m_nativeTitleBarSurface->setVisible(true);
@@ -2712,32 +2708,6 @@ void RemoteDesktopWindow::updateNativeTitleBarSurfaceGeometry()
 }
 
 // =====wjy====
-void RemoteDesktopWindow::paintTitleBarFromCache(QPainter& painter)
-{
-    const int barHeight = titleBarHeight();
-    if (barHeight <= 0 || width() <= 0) return;
-
-    const QRect barRect(0, 0, width(), barHeight);
-    painter.fillRect(barRect, QColor(QStringLiteral("#E9EEF2"))); // wjy: 位图缺失或尚未生成时至少保证标题栏底色连续，不会露出桌面。
-
-    if (!m_cachedIdentityBand.isNull()) {
-        const qreal dpr = std::max<qreal>(1.0, m_cachedIdentityBand.devicePixelRatio());
-        const int sourceWidth = std::min(
-            m_cachedIdentityBand.width(),
-            static_cast<int>(std::ceil(width() * dpr)));
-        painter.drawImage(
-            barRect,
-            m_cachedIdentityBand,
-            QRect(0, 0, sourceWidth, m_cachedIdentityBand.height())); // wjy: 身份段按虚拟屏宽度渲染，这里只取当前窗口宽度对应的左侧部分。
-    }
-
-    if (!m_cachedButtonGroup.isNull() && m_cachedButtonGroupLogicalWidth > 0) {
-        painter.drawImage(
-            QRect(width() - m_cachedButtonGroupLogicalWidth, 0, m_cachedButtonGroupLogicalWidth, barHeight),
-            m_cachedButtonGroup); // wjy: 按钮段右对齐到当前窗口边缘，缩放中位置立即正确，宽度也不会对不上。
-    }
-}
-
 void RemoteDesktopWindow::updateNativeTitleBarButtonOrigin()
 {
     if (!m_nativeTitleBarSurface || !m_nativeTitleBarSurface->isCreated() || isFullScreen()) return;
@@ -2777,8 +2747,6 @@ void RemoteDesktopWindow::updateNativeTitleBarButtonBand(bool forceRender)
         group.localLayout,
         group.width,
         m_hoveredPos.x() >= 0 ? QPoint(m_hoveredPos.x() - group.left, m_hoveredPos.y()) : QPoint(-1, -1)); // wjy: 悬停位置换算到组局部坐标，命中判断仍由窗口坐标的layout快照负责。
-    m_cachedButtonGroup = image;
-    m_cachedButtonGroupLogicalWidth = group.width; // wjy: 记录逻辑宽度，父窗口自绘时据此右对齐到当前窗口边缘。
     if (!image.isNull() && m_nativeTitleBarSurface->commitButtonGroup(image)) {
         m_committedButtonVisualRevision = m_titleBarVisualRevision;
         m_committedButtonVisibleSignature = group.visibleSignature;
@@ -2821,7 +2789,6 @@ void RemoteDesktopWindow::updateNativeTitleBarSurface(bool forceRender)
     }
 
     const QImage image = RemoteTitleBarRenderer::renderIdentityBand(state, nativeTitleBarBandLogicalWidth());
-    m_cachedIdentityBand = image; // wjy: 缓存与原生表面完全相同的像素，缩放期间父窗口据此自绘，两条路径视觉一致。
     if (!image.isNull() && m_nativeTitleBarSurface->commitIdentityBand(image)) {
         m_committedTitleBarVisualRevision = m_titleBarVisualRevision;
         m_committedTitleBarLogicalSize = identitySignature;
@@ -2887,9 +2854,9 @@ void RemoteDesktopWindow::requestTitleBarUpdate(const QRect& region)
         updateNativeTitleBarSurfaceGeometry();
         return;
     }
-    ++m_titleBarVisualRevision; // wjy: 先记录所有可见状态变化；交互期允许版本累积但不触碰原生窗口或持久DIB。
-    if (m_draggingWindow || m_resizingWindow) {
-        return; // wjy: 会话计时、画质和输入状态在交互期间只排队，松开鼠标后按最终状态一次性重画。
+    ++m_titleBarVisualRevision; // wjy: 先记录所有可见状态变化；系统移动期间延迟提交，交互缩放继续原子替换同一个持久DIB。
+    if (m_draggingWindow) {
+        return; // wjy: 系统移动期间窗口尺寸不变，状态只排队到收尾；交互缩放则继续原子提交到同一个原生标题栏表面。
     }
     updateNativeTitleBarSurface();
 #endif
@@ -4484,10 +4451,6 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     const bool fullScreen = isFullScreen();
 
     painter.fillRect(rect(), QColor(QStringLiteral("#000000")));
-    // =====wjy====
-    if (!fullScreen && m_resizingWindow) {
-        paintTitleBarFromCache(painter); // wjy: 缩放期间原生标题栏子窗口已隐藏，标题栏像素随父窗口backing store一起提交，不存在跨表面合成时序缝隙。
-    }
     const bool nativeTextureVisible = m_textureFrameActive
         && m_texturePresenter
         && m_texturePresenter->isVisible(); // wjy: 绘制阶段只读取原生 D3D 内容层状态，禁止在 paintEvent 内修改子 HWND 几何并触发额外合成。
@@ -4909,12 +4872,9 @@ void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
             }
             // wjy: 缩放期间禁止冻结父QWidget绘制：与移动不同，窗口变大会暴露新的客户区，
             // 关闭绘制会让这块区域保留未定义的backing store内容并被DWM合成出来。
-            if (m_nativeTitleBarSurface && m_nativeTitleBarSurface->isCreated()) {
-                m_nativeTitleBarSurface->setVisible(false); // wjy: 隐藏子HWND后它不再参与父窗口WS_CLIPCHILDREN裁剪，标题栏那一条改由父窗口用缓存位图绘制，消除跨表面合成时序造成的透明缝隙。
-            }
-            update(QRect(0, 0, width(), titleBarHeight())); // wjy: 立即用缓存位图补上标题栏，切换瞬间不出现空白。
+            updateNativeTitleBarSurface(); // wjy: 缩放开始仍由同一个原生DIB子表面持有标题栏像素，不再隐藏HWND或切换到Qt backing store。
             updatePerformanceOverlayGeometry(); // wjy: 开始缩放后立即隐藏独立透明浮层，避免它跟随每个手动几何变化产生额外 HWND 合成。
-            // wjy: 缩放固定走下方 Qt setGeometry 路径；不再进入 Windows 原生尺寸循环，保证父窗口标题栏和 D3D 子内容层按同一轮 Qt 事件提交。
+            // wjy: 缩放固定走下方 Qt setGeometry 路径；标题栏保留原生前台表面，D3D 子内容层继续持有自己的SwapChain。
             // ===end====
             event->accept();
             return;
@@ -5280,10 +5240,10 @@ void RemoteDesktopWindow::resizeEvent(QResizeEvent* event)
     if (!m_resizingWindow) {
         updateWindowMask(); // wjy: 最大化、还原等普通变化立即更新圆角；手动拖拽已在开始时清除Mask并在释放时统一恢复。
     }
-    if (m_resizingWindow) {
-        update(QRect(0, 0, width(), titleBarHeight())); // wjy: 子表面已隐藏，标题栏由父窗口用缓存位图重画；只做两次drawImage，不重新渲染也不触碰任何子HWND。
-    } else {
-        updateNativeTitleBarSurface(); // wjy: 非交互尺寸变化按新状态完整同步两段。
+    updateNativeTitleBarSurface(); // wjy: 所有尺寸变化都只更新同一个原生标题栏表面；缩放时保留旧完整帧并在内存合成缓冲中移动按钮段。
+    if (m_resizingWindow && event && event->oldSize().width() == event->size().width()
+        && m_nativeTitleBarSurface && m_nativeTitleBarSurface->isCreated()) {
+        m_nativeTitleBarSurface->refresh(); // wjy: 纯顶部/底部缩放没有按钮横向位移，仍主动Present一次完整前台缓冲，避免只移动父HWND时等待系统重绘。
     }
     updatePerformanceOverlayGeometry(); // wjy: 窗口缩放、全屏或黑边变化后让本机浮层继续贴住实际画面右下角。
     QWidget::resizeEvent(event);

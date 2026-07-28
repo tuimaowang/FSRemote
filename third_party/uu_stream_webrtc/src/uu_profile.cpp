@@ -30,7 +30,9 @@ std::string_view field_trials()
            "WebRTC-FeedbackLatency/Enabled/"
            "WebRTC-VideoFrameSendingDelay/Enabled/"
            "WebRTC-SendDelay-CountWithFirstPacket/Enabled/"
-           "WebRTC-PcFactoryDefaultBitrates/min:300,start:8100,max:8100/"
+           // =====wjy====
+           "WebRTC-PcFactoryDefaultBitrates/min:300,start:60000,max:240000/" // wjy: 旧配置把整个 PeerConnection 的发送上限锁在 8.1 Mbps，高质量后续即使请求 120 Mbps 也无法突破；默认改为 60 Mbps 起步、240 Mbps 硬上限，具体档位再通过 SetBitrate 收紧。
+           // ===end====
            "WebRTC-ProbingScreenshareBwe/1.6,6,85,95,-60,3/"
            "WebRTC-VideoRateControl/probe_max_allocation:true/"
            "WebRTC-BweRapidRecoveryExperiment/Enabled/"

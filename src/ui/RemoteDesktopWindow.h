@@ -387,11 +387,7 @@ private:
     qreal m_committedButtonDevicePixelRatio = 0.0;
     int m_committedButtonBarHeight = 0; // wjy: 按钮段只在视觉版本、可见集合、组宽度、DPI或栏高变化时重绘，窗口宽度变化本身不触发。
     void updateNativeTitleBarButtonBand(bool forceRender); // wjy: 渲染并提交按钮段位图，内部按上述维度去重。
-    void updateNativeTitleBarButtonOrigin(); // wjy: 非交互状态下同步按钮段在原生合成缓冲中的位置。
-    QImage m_cachedIdentityBand; // wjy: 与原生表面同一份身份段像素；缩放期间由父窗口直接绘制，不再依赖子HWND参与合成。
-    QImage m_cachedButtonGroup; // wjy: 同上，按钮段位图在缩放期间由父窗口按当前宽度贴到右边缘。
-    int m_cachedButtonGroupLogicalWidth = 0; // wjy: 按钮段逻辑宽度，父窗口据此计算右对齐位置。
-    void paintTitleBarFromCache(QPainter& painter); // wjy: 缩放期间父窗口用缓存位图绘制完整标题栏，只做两次drawImage不重新渲染。
+    void updateNativeTitleBarButtonOrigin(); // wjy: 在原生合成缓冲内同步按钮段位置；交互缩放期间不切换标题栏表面所有者。
     // ===end====
 };
 

@@ -71,7 +71,7 @@ bool NvencH264Encoder::initialize(ID3D11Device* device, Size size, uint32_t bitr
     NV_ENC_PRESET_CONFIG preset = {};
     preset.version = nvenc_struct_version(api_version_, 5, true);
     preset.presetCfg.version = nvenc_struct_version(api_version_, 9, true);
-    if (!check(fn_.nvEncGetEncodePresetConfigEx(encoder_, NV_ENC_CODEC_HEVC_GUID, NV_ENC_PRESET_P3_GUID,
+    if (!check(fn_.nvEncGetEncodePresetConfigEx(encoder_, NV_ENC_CODEC_HEVC_GUID, NV_ENC_PRESET_P3_GUID, // wjy: 恢复低延迟P3预设，避免原始分辨率60 FPS下因P5编码耗时增加而产生输出节奏波动。
                                                 NV_ENC_TUNING_INFO_LOW_LATENCY, &preset),
                "NvEncGetEncodePresetConfigEx", error)) {
         shutdown();
@@ -84,11 +84,11 @@ bool NvencH264Encoder::initialize(ID3D11Device* device, Size size, uint32_t bitr
     config.profileGUID = NV_ENC_HEVC_PROFILE_MAIN_GUID;
     config.gopLength = safe_fps * 5;
     config.frameIntervalP = 1;
-    config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
+    config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR; // wjy: 恢复稳定版本的低延迟 CBR，避免 VBR 在周期关键帧和静止桌面之间反复回收预算，表现为先糊后清晰。
     config.rcParams.averageBitRate = bitrate;
     // =====wjy====
-    config.rcParams.maxBitRate = bitrate + bitrate / 4; // wjy: 复杂运动帧允许最多25%受控峰值，减少雪地、树枝和文字边缘瞬时糊化；WebRTC发送上限仍是最终硬边界。
-    config.rcParams.vbvBufferSize = std::max<uint32_t>(config.rcParams.maxBitRate * 2 / safe_fps, 1); // wjy: 使用约两帧峰值缓冲吸收画面复杂度突变，不引入B帧重排或长lookahead延迟。
+    config.rcParams.maxBitRate = bitrate; // wjy: CBR 的平均值和峰值保持一致，编码输出不再短时超过 WebRTC 已分配带宽。
+    config.rcParams.vbvBufferSize = std::max<uint32_t>(bitrate * 6 / safe_fps, 1); // wjy: 保留约六帧 VBV 吸收关键帧复杂度，但不允许 VBR 长周期压低后续桌面细节。
     config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
     config.rcParams.enableAQ = 1;
     config.rcParams.enableTemporalAQ = 1; // wjy: 时间AQ把码率优先分配给连续帧中的运动与高频细节，提升高质量模式下视频和滚动画面观感。
@@ -108,7 +108,7 @@ bool NvencH264Encoder::initialize(ID3D11Device* device, Size size, uint32_t bitr
     NV_ENC_INITIALIZE_PARAMS init = {};
     init.version = nvenc_struct_version(api_version_, 7, true);
     init.encodeGUID = NV_ENC_CODEC_HEVC_GUID;
-    init.presetGUID = NV_ENC_PRESET_P3_GUID; // wjy: 远控优先低延迟吞吐，P3比P5减少编码计算压力，高码率与AQ继续保障桌面细节。
+    init.presetGUID = NV_ENC_PRESET_P3_GUID; // wjy: 初始化参数与预设查询统一恢复P3；清晰度继续由提高后的码率下限、AQ和关键帧缓冲保障。
     init.tuningInfo = NV_ENC_TUNING_INFO_LOW_LATENCY;
     init.encodeWidth = size.width;
     init.encodeHeight = size.height;
@@ -152,8 +152,9 @@ bool NvencH264Encoder::reconfigure(uint32_t bitrate_kbps, uint32_t fps, std::str
     nextConfig.gopLength = safeFps * 5;
     nextConfig.rcParams.averageBitRate = bitrate;
     // =====wjy====
-    nextConfig.rcParams.maxBitRate = bitrate + bitrate / 4; // wjy: 在线切换画质后同步保留25%复杂帧峰值，参数变化不重建编码器也不强制IDR。
-    nextConfig.rcParams.vbvBufferSize = std::max<uint32_t>(nextConfig.rcParams.maxBitRate * 2 / safeFps, 1); // wjy: FPS变化时重新按两帧峰值计算VBV，避免低FPS档缓冲时长意外扩大。
+    nextConfig.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR; // wjy: 在线调档继续使用 CBR，不让驱动从旧配置继承 VBR 后再次出现糊清波动。
+    nextConfig.rcParams.maxBitRate = bitrate; // wjy: 重新配置后的编码峰值与 WebRTC 新分配码率完全一致。
+    nextConfig.rcParams.vbvBufferSize = std::max<uint32_t>(bitrate * 6 / safeFps, 1); // wjy: FPS变化后按六帧重新计算缓冲时长，关键帧仍有稳定预算。
     // ===end====
     nextConfig.rcParams.vbvInitialDelay = nextConfig.rcParams.vbvBufferSize;
     nextConfig.encodeCodecConfig.hevcConfig.idrPeriod = nextConfig.gopLength;

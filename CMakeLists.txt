@@ -525,7 +525,7 @@ qt_add_executable(FSRemote WIN32
 target_include_directories(FSRemote PRIVATE src include third_party/parsec_vdd)
 target_link_libraries(FSRemote PRIVATE Qt6::Widgets Qt6::Svg Qt6::Network)
 if(WIN32)
-    target_link_libraries(FSRemote PRIVATE wbemuuid ole32 oleaut32 iphlpapi ws2_32 advapi32 shell32 setupapi cfgmgr32 d3d11 dxgi psapi user32 gdi32 pdh) # wjy: 原生标题栏持久DIB使用GDI BitBlt，继续显式链接既有Windows系统库集合。
+    target_link_libraries(FSRemote PRIVATE wbemuuid ole32 oleaut32 iphlpapi ws2_32 advapi32 shell32 setupapi cfgmgr32 d3d11 dxgi psapi user32 gdi32 pdh) # wjy: 远控视频与原生标题栏都使用D3D11/DXGI前台缓冲；GDI继续作为标题栏设备失败回退。
 endif()
 
 if(MSVC)
