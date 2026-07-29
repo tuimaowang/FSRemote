@@ -64,7 +64,7 @@ FsRemoteIdentityCallbacks g_identity_callbacks = {};
 struct HostRuntimeConfig {
     uint32_t requested_max_sessions = 3; // wjy: 用户明确要求全新设备无需注册表即可启用三路会话，因此 DLL 无配置入口默认请求 3。
     uint32_t effective_max_sessions = 3; // wjy: 无配置或旧入口直接采用三路有效上限，复制 Release 目录到其他设备即可生效。
-    uint32_t max_aggregate_video_kbps = 120000; // wjy: 首阶段把总预算直接用于唯一 WebRTC 发送端。
+    uint32_t max_aggregate_video_kbps = 80000; // wjy: 默认把高质量原始分辨率的单会话发送上限设为80Mbps。
     uint32_t handshake_timeout_ms = 5000; // wjy: 后续认证状态机直接复用该超时配置。
     uint32_t ownership_policy = FSREMOTE_OWNERSHIP_SHARED; // wjy: 默认授予全部已认证 control 会话协同输入权限，无需目标设备额外配置。
 };

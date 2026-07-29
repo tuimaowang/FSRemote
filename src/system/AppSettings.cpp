@@ -207,7 +207,7 @@ void AppSettings::setRemoteHostMaxSessions(int sessions)
 
 int AppSettings::remoteHostAggregateVideoKbps()
 {
-    return qBound(9000, settings().value(QStringLiteral("remoteHostAggregateVideoKbps"), 120000).toInt(), 240000); // wjy: 总预算默认沿用当前单流上限，允许后续按实测结果调整。
+    return qBound(9000, settings().value(QStringLiteral("remoteHostAggregateVideoKbps"), 80000).toInt(), 240000); // wjy: 总预算默认沿用当前高质量单流上限，允许后续按实测结果调整。
 }
 
 void AppSettings::setRemoteHostAggregateVideoKbps(int kbps)

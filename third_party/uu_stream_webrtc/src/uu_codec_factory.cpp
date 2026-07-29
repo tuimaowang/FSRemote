@@ -170,7 +170,7 @@ public:
         encoder_fps_ = 0;
         frame_id_ = 0; // wjy: InitEncode重建运行资源但保留已注册回调，兼容WebRTC先Register callback再Init的生命周期顺序。
         tex_w_ = tex_h_ = 0;
-        bitrate_kbps_ = std::max(10u, codec_settings->startBitrate ? codec_settings->startBitrate : 120000u);
+        bitrate_kbps_ = std::max(10u, codec_settings->startBitrate ? codec_settings->startBitrate : 80000u);
         fps_ = std::max(1u, codec_settings->maxFramerate ? codec_settings->maxFramerate : 60u);
         target_size_ = {codec_settings->width, codec_settings->height};
         force_keyframe_next_ = true; // wjy: 新编码器会话首帧必须输出IDR和参数集，禁止从无参考帧的P帧开始。
@@ -678,7 +678,7 @@ private:
     lsp::NvencH264Encoder encoder_;
     lsp::Size size_;
     lsp::Size target_size_;
-    std::atomic<uint32_t> bitrate_kbps_ = 120000;
+    std::atomic<uint32_t> bitrate_kbps_ = 80000;
     uint32_t encoder_bitrate_kbps_ = 0;
     uint32_t encoder_fps_ = 0;
     uint64_t last_bitrate_reconfigure_ms_ = 0;

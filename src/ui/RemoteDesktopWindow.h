@@ -27,7 +27,6 @@ class QCloseEvent;
 class QFocusEvent;
 class QKeyEvent;
 class QKeySequence;
-class QLabel;
 class QMouseEvent;
 class QPaintEvent;
 class QResizeEvent;
@@ -181,14 +180,12 @@ private:
     void toggleMaximizedState(); // wjy: 删除最大化图标后仅由标题栏双击调用，统一切换最大化与普通状态。
     void toggleClipboardSync();
     void toggleInputSynchronization(); // wjy: 标题栏一次点击根据关闭、主控、跟随三态执行开启、关闭或主控切换。
-    QString inputSynchronizationToolTip() const;
     void toggleRemoteMouseBackend(); // wjy: 兼容沿用现有协议入口，根据 Host 确认状态同时切换键盘和鼠标注入后端。
     void requestRemoteMouseBackend(RemoteMouseBackend backend);
     void queryRemoteMouseBackend(); // wjy: 每次新 Viewer 收到画面后查询 Host 全局状态，多控制窗口由真实值对齐。
-    QString remoteMouseBackendToolTip() const;
     stream::RemoteQualityMode effectiveQualityMode() const; // wjy: FollowGlobal解析为最新全局模式，局部覆盖则直接返回覆盖值。
     void sendCurrentRemoteQualityDecision(); // wjy: 把内存中的最新决策转换为稳定C ABI结构；连接中只保留最新请求，重连后按新代际补发。
-    QString remoteQualityStatusSummary() const; // wjy: 统一生成标题栏气泡和菜单中的请求/实际/降级说明，避免两处反馈不一致。
+    QString remoteQualityStatusSummary() const; // wjy: 统一生成诊断中的请求/实际/降级说明，避免状态文案分叉。
     bool remoteQualityIsDegraded() const; // wjy: 判断当前是否处于最小化、自动降级、Host限制或高质量硬边界保护状态。
     // ===end====
     QRect remoteContentRect() const; // wjy: D3D11 Presenter覆盖标题栏下的完整内容区，真实远端矩形仍由remoteImageRect单独计算。
@@ -225,7 +222,7 @@ private:
     void updateTexturePresenterGeometry();
     RemoteWindowLayoutSnapshot compositorLayoutSnapshot() const; // wjy: 从当前顶层窗口一次性生成物理输出、内容和输入映射快照。
     void commitCompositorLayout(); // wjy: 统一把父窗口几何提交给新合成器，避免各表面各自推导尺寸。
-    void presentCompositorOverlay(); // wjy: 将标题栏、性能信息和连接遮罩合成为一张预乘Alpha图层提交到DComp。
+    void presentCompositorOverlay(); // wjy: 将标题栏和连接遮罩合成为一张预乘Alpha图层提交到DComp。
     void beginResizeDebugTrace(); // wjy: 开始一次尺寸手势的内存追踪，不在高频事件期间写磁盘。
     void appendResizeDebugTrace(const QString& stage); // wjy: 记录父窗口、D3D子窗口和Present状态的同一时序节点。
     void flushResizeDebugTrace(); // wjy: 松手后一次性把本次追踪写入data/remote_resize_trace.log，避免日志改变拖拽时序。
@@ -240,7 +237,7 @@ private:
     bool startSystemWindowMove(); // wjy: 标题栏拖动交给Windows/DWM移动现有窗口表面，避免Qt逐像素move导致父窗和D3D子窗分帧合成。
     bool startSystemWindowResize(); // wjy: 边缘缩放优先交给Windows原生尺寸循环，使顶层窗口和原生子表面的合成节奏由DWM统一管理。
     void updateSnapPreviewForGeometry(const QRect& proposedGeometry, const QPoint& cursorGlobal); // wjy: 系统移动和手动回退共用同一吸附候选计算。
-    void finishInteractiveWindowOperation(); // wjy: 系统与手动移动/缩放统一恢复浮层、圆角、吸附提交和几何保存。
+    void finishInteractiveWindowOperation(); // wjy: 系统与手动移动/缩放统一恢复圆角、吸附提交和几何保存。
     // =====wjy====
     bool restoreSavedGeometryForDrag(const QPoint& cursorGlobal, const QPoint& pressedPosition); // wjy: 平铺或最大化窗口开始拖动时恢复 JSON 普通尺寸，并保持鼠标原抓取位置。
     // ===end====
@@ -249,13 +246,10 @@ private:
     void discardPendingTextureFrame(); // wjy: 取消单槽帧时完成keyed mutex消费者交接，避免解码纹理槽永久占用。
     void invalidateViewerCallbacks(); // wjy: 关闭或重连前统一递增代际并清空待呈现帧，让全部旧异步结果立即失效。
     void saveWindowGeometry();
-    void updateFrameStats(const QImage& image); // wjy: Update the bottom-right stream stats overlay from each received remote frame.
+    void updateFrameStats(const QImage& image); // wjy: Update the in-memory stream stats used by the title bar.
     void updatePresentedFrameStats(qint64 bgraBytes); // wjy: BGRA和共享纹理成功呈现统一计入真实接收FPS，零拷贝纹理不增加RAW带宽。
     void updateFrameColorStats(const QImage& image); // wjy: Update right-bottom RGB diagnostics for pure-black webpage tests.
     // =====wjy====
-    void updatePerformanceOverlay(); // wjy: 每秒把实际FPS、码率和接收压力快照更新到本机浮层，不参与远端编码或策略计算。
-    void updatePerformanceOverlayGeometry(); // wjy: 浮层固定吸附实际画面右下角，并在D3D11原生子窗口之上恢复正确层级。
-    void raisePerformanceOverlay(); // wjy: 仅在D3D Presenter真正从隐藏切到显示时恢复一次层级，禁止逐帧交换原生子窗口Z序。
     // ===end====
     void sampleFrameColorRegion(const QImage& image, const QRect& region, int* minValue, int* avgValue, int* maxValue) const; // wjy: Sample RGB values cheaply without scanning every pixel.
     QString m_deviceName;
@@ -342,19 +336,14 @@ private:
     qint64 m_lastResizePixelProbeMs = -1000;
     quint64 m_resizeVisibleSampleCount = 0;
     QElapsedTimer m_sessionClock;
-    QElapsedTimer m_frameStatsClock; // wjy: Measures one-second windows for the remote desktop stats overlay.
+    QElapsedTimer m_frameStatsClock; // wjy: Measures one-second windows for the remote desktop title-bar statistics.
     int m_frameStatsCount = 0; // wjy: 统计当前窗口真正成功进入显示路径的BGRA或共享纹理帧数。
     quint64 m_totalPresentedFrames = 0; // wjy: 单调累计成功 Present 数，与单槽拒绝计数求差得到本地呈现压力而非网络结果。
     qint64 m_frameStatsBytes = 0; // wjy: Accumulates decoded BGRA bytes for raw-throughput diagnostics.
-    double m_receiveFps = 0.0; // wjy: Last calculated UI-side received FPS shown in the overlay.
+    double m_receiveFps = 0.0; // wjy: Last calculated UI-side received FPS shown in the title bar.
     double m_rawBgraMbps = 0.0; // wjy: Last calculated decoded BGRA throughput, separate from compressed network bitrate.
     double m_encodedMbps = 0.0; // wjy: Last calculated compressed video bitrate reported by the decoder from encoded frame bytes.
     // =====wjy====
-    RemotePerformanceSignals m_latestPerformanceSignals; // wjy: 保存最近一次WebRTC累计统计差值，仅供本机一秒刷新浮层读取。
-    double m_latestPresenterDropRatio = 0.0; // wjy: 没有解码丢帧时仍可用本地呈现丢帧解释显示压力。
-    QLabel* m_performanceOverlay = nullptr; // wjy: 原生鼠标穿透子控件覆盖D3D11与BGRA路径，固定显示在远控画面右下角。
-    QString m_performanceOverlayText; // wjy: 缓存上一秒六行文本，相同内容不触发QLabel重绘和原生窗口更新。
-    QString m_performanceOverlayAccent; // wjy: 缓存状态边框颜色，只有健康/压力级别改变时才重新应用样式。
     // ===end====
     int m_rgbMin = 0; // wjy: Whole-frame minimum sampled RGB value.
     int m_rgbAvg = 0; // wjy: Whole-frame average sampled RGB value.
@@ -368,7 +357,7 @@ private:
     Qt::CursorShape m_remoteCursorShape = Qt::ArrowCursor; // wjy: 缓存最近一次远端桌面光标，退出相对鼠标模式后无需等待下一条状态即可恢复。
     RemoteMouseBackend m_remoteMouseBackend = RemoteMouseBackend::System;
     RemoteMouseBackend m_pendingRemoteMouseBackend = RemoteMouseBackend::System;
-    bool m_remoteMouseBackendKnown = false; // wjy: 新连接未收到 Host 回应前显示安全默认值，但气泡明确标注“等待确认”。
+    bool m_remoteMouseBackendKnown = false; // wjy: 新连接未收到 Host 回应前显示安全默认值，按钮状态会标记等待确认。
     bool m_remoteMouseBackendPending = false;
     bool m_remoteMouseBackendFallback = false;
     bool m_mouseBackendButtonPressed = false;

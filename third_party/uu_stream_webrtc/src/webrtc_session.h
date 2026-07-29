@@ -26,7 +26,7 @@ enum class SessionRole {
 struct SessionConfig {
     SessionRole role = SessionRole::Host;
     uint32_t min_bitrate_kbps = 9000; // wjy: Keep the compressed video target above 20 Mbps so static desktop frames do not collapse into low-quality refreshes.
-    uint32_t target_bitrate_kbps = 120000; // wjy: Treat this value as the adaptive bitrate ceiling, currently 120 Mbps for high-quality remote-control testing.
+    uint32_t target_bitrate_kbps = 80000; // wjy: Treat this value as the adaptive bitrate ceiling, currently 80 Mbps for high-quality remote-control testing.
     uint32_t fps = 60;
     // =====wjy====
     webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> host_video_source; // wjy: host 会话只消费 manager 管理的共享帧源，不再创建或停止桌面捕获器。
