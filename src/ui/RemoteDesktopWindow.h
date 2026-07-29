@@ -165,7 +165,6 @@ private:
     // =====wjy====
     QRect remoteUpdateButtonRect() const; // wjy: 更新按钮位于剪切板按钮左侧，对应用户标出的标题栏空白区域。
     QRect mouseInputModeRect() const; // wjy: 兼容保留既有函数名；该标题栏开关现在统一切换系统/驱动键鼠后端。
-    QRect qualityButtonRect() const; // wjy: 单窗口画质按钮位于剪切板左侧，菜单设置只影响当前远控窗口。
     QRect clipboardSyncRect() const;
     QRect inputSyncRect() const; // wjy: 键鼠同步按钮固定在剪切板按钮左侧，并作为标题栏本地点击区排除远端输入。
     // ===end====

@@ -1127,6 +1127,7 @@ QFileInfo scriptEntryFile(const QString& folderPath)
         QStringLiteral("*.ps1"),
         QStringLiteral("*.py"),
         QStringLiteral("*.exe"),
+        QStringLiteral("*.whl"),
     }; // wjy: 优先使用批处理/PowerShell 作为入口，其次 Python，最后才直接运行 exe。
 
     const QDir dir(folderPath);

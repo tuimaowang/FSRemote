@@ -1664,6 +1664,9 @@ RemoteDesktopWindow::RemoteDesktopWindow(
             pollRemoteUpdateStatus(); // wjy: 准备和安装阶段轮询目标端，重新连接阶段由流回调确认画面恢复。
         }
         update(isFullScreen() ? rect() : QRect(0, titleBarHeight(), width(), height() - titleBarHeight()));
+        if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
+            presentCompositorOverlay(); // wjy: 更新动画和状态文本直接刷新唯一DComp叠加层，父窗口不再产生第二套延迟画面。
+        }
     });
 
     // ===end====
@@ -2139,6 +2142,9 @@ void RemoteDesktopWindow::beginRemoteUpdateWait()
     }
     pollRemoteUpdateStatus(); // wjy: accepted 后立即查询准备状态，目标端失败时不用等待超时。
     update();
+    if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
+        presentCompositorOverlay(); // wjy: 更新受理后立即用更新卡片替换连接提示，不等待下一次250ms定时器。
+    }
 }
 
 void RemoteDesktopWindow::pollRemoteUpdateStatus()
@@ -2204,6 +2210,9 @@ void RemoteDesktopWindow::pollRemoteUpdateStatus()
                 break;
             }
             window->update();
+            if (window->m_texturePresenter && window->m_texturePresenter->usesCompositorSurface()) {
+                window->presentCompositorOverlay(); // wjy: 查询线程返回的新阶段同步进入DComp，失败后即使定时器停止也能显示最终错误卡片。
+            }
         }, Qt::QueuedConnection);
     };
     if (!m_lifecycleManager || !m_lifecycleManager->submitLifecycleTask(probeTask)) {
@@ -2328,6 +2337,9 @@ void RemoteDesktopWindow::startViewerAfterUpdate()
         m_nextRemoteUpdateProbeAtMs = 0; // wjy: 流句柄创建失败时回到状态查询，不关闭远控窗口。
     }
     update();
+    if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
+        presentCompositorOverlay(); // wjy: 重连阶段切换后立即更新标题栏和中央卡片，清除旧连接状态快照。
+    }
 }
 
 void RemoteDesktopWindow::finishRemoteUpdateWait()
@@ -2353,6 +2365,9 @@ void RemoteDesktopWindow::finishRemoteUpdateWait()
         m_inputBroadcastCoordinator->notifyEligibilityChanged(this); // wjy: 更新完成后恢复资格；若同步仍由其它窗口主控，本窗口从下一事件起自动重新跟随。
     }
     update();
+    if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
+        presentCompositorOverlay(); // wjy: 首帧确认更新结束时立即移除更新卡片，恢复标题栏实时状态。
+    }
 }
 // ===end====
 
@@ -2599,7 +2614,7 @@ RemoteTitleBarVisualState RemoteDesktopWindow::titleBarVisualState() const
         .arg(elapsedSeconds / 3600, 2, 10, QLatin1Char('0'))
         .arg((elapsedSeconds / 60) % 60, 2, 10, QLatin1Char('0'))
         .arg(elapsedSeconds % 60, 2, 10, QLatin1Char('0')); // wjy: 会话计时在状态快照阶段格式化，原生绘制器不读取窗口时钟。
-    if (m_connectionStatusCode == FSREMOTE_STATUS_RECEIVING_VIDEO) {
+    if (m_connectionStatusCode == FSREMOTE_STATUS_RECEIVING_VIDEO && !remoteUpdateActive()) {
         const QString fpsText = m_receiveFps > 0.0
             ? QString::number(qRound(m_receiveFps))
             : QStringLiteral("--");
@@ -2638,38 +2653,7 @@ RemoteTitleBarVisualState RemoteDesktopWindow::titleBarVisualState() const
         state.mouseBackendText += QLatin1Char('?');
     }
 
-    state.qualityAccent = QColor(QStringLiteral("#3A7BFC"));
-    const stream::RemoteQualityMode displayedQualityMode = m_hasRemoteQualityDecision
-        ? m_remoteQualityDecision.effectiveMode
-        : stream::RemoteQualityMode::Automatic;
-    switch (displayedQualityMode) {
-    case stream::RemoteQualityMode::FollowGlobal:
-        state.qualityText = QString::fromUtf8("自定义");
-        break;
-    case stream::RemoteQualityMode::Automatic:
-        state.qualityText = QString::fromUtf8("自动");
-        break;
-    case stream::RemoteQualityMode::HighQualityLocked:
-        state.qualityText = QString::fromUtf8("高质");
-        state.qualityAccent = QColor(QStringLiteral("#D97706"));
-        break;
-    case stream::RemoteQualityMode::Balanced:
-        state.qualityText = QString::fromUtf8("均衡");
-        state.qualityAccent = QColor(QStringLiteral("#0F766E"));
-        break;
-    case stream::RemoteQualityMode::Smooth:
-        state.qualityText = QString::fromUtf8("流畅");
-        state.qualityAccent = QColor(QStringLiteral("#7C3AED"));
-        break;
-    }
-    if (m_hasRemoteQualityDecision && m_remoteQualityDecision.minimized) {
-        state.qualityText = QString::fromUtf8("后台");
-        state.qualityAccent = QColor(QStringLiteral("#64748B"));
-    } else if (remoteQualityIsDegraded()) {
-        state.qualityText += QString::fromUtf8("↓");
-    }
-    if (m_qualityProtocolUnavailable) state.qualityText += QLatin1Char('!');
-
+    // wjy: 标题栏快照不再携带画质胶囊状态，避免把只读策略信息误认为手动操作入口。
     state.inputSyncText = QString::fromUtf8("同步");
     state.inputSyncAccent = QColor(QStringLiteral("#98A2B3"));
     state.inputSyncBackground = QColor(QStringLiteral("#F2F4F7"));
@@ -2845,7 +2829,7 @@ void RemoteDesktopWindow::presentCompositorOverlay()
     if (!m_textureFrameActive && !m_remoteFrame.isNull()) {
         painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
         painter.drawImage(remoteImageRect(), m_remoteFrame); // wjy: 软件BGRA回退也进入同一DComp叠加SwapChain，不再依赖父backing store作为最终像素所有者。
-    } else if (!m_textureFrameActive && m_remoteFrame.isNull()) {
+    } else if (!m_textureFrameActive && m_remoteFrame.isNull() && !remoteUpdateActive()) {
         const QRect contentRect(0, isFullScreen() ? 0 : titleBarHeight(), width(),
             qMax(0, height() - (isFullScreen() ? 0 : titleBarHeight())));
         QFont titleFont(QStringLiteral("Microsoft YaHei UI"));
@@ -2853,17 +2837,20 @@ void RemoteDesktopWindow::presentCompositorOverlay()
         titleFont.setWeight(QFont::DemiBold);
         painter.setFont(titleFont);
         painter.setPen(QColor(QStringLiteral("#FFFFFF")));
-        painter.drawText(contentRect.adjusted(0, -34, 0, 0),
-            Qt::AlignCenter, zh("正在连接 %1").arg(m_deviceName));
+        painter.drawText(
+            QRectF(contentRect.left(), contentRect.center().y() - 34, contentRect.width(), 26),
+            Qt::AlignCenter,
+            zh("正在连接 %1").arg(m_deviceName)); // wjy: DComp连接主标题使用固定中央文本行，与期望界面和Qt回退路径保持完全一致。
         QFont statusFont(QStringLiteral("Microsoft YaHei UI"));
         statusFont.setPixelSize(13);
         painter.setFont(statusFont);
         painter.setPen(m_connectionStatusCode == 90
                 ? QColor(QStringLiteral("#FFB4B4"))
                 : QColor(QStringLiteral("#B8C0CC")));
-        painter.drawText(contentRect.adjusted(60, 0, -60, 48),
+        painter.drawText(
+            QRectF(contentRect.left() + 60, contentRect.center().y(), contentRect.width() - 120, 48),
             Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap,
-            m_connectionStatus);
+            m_connectionStatus); // wjy: 副标题从中央主标题下方开始绘制，禁止再次使用内容区顶部导致文字跑到标题栏下方。
     }
 
     if (!isFullScreen()) {
@@ -2878,22 +2865,55 @@ void RemoteDesktopWindow::presentCompositorOverlay()
     if (remoteUpdateActive()) {
         const QRect contentRect(0, isFullScreen() ? 0 : titleBarHeight(), width(),
             qMax(0, height() - (isFullScreen() ? 0 : titleBarHeight())));
-        painter.fillRect(contentRect, QColor(3, 10, 22, 196));
-        QFont titleFont(QStringLiteral("Microsoft YaHei UI"));
-        titleFont.setPixelSize(17);
-        titleFont.setWeight(QFont::DemiBold);
-        painter.setFont(titleFont);
+        painter.fillRect(contentRect, QColor(3, 10, 22, 196)); // wjy: DComp路径完整接管更新遮罩，父QWidget不再叠加第二套连接或更新文字。
+
+        const int cardWidth = qMin(380, qMax(240, contentRect.width() - 48));
+        const int cardHeight = 136;
+        const QRect card(
+            contentRect.center().x() - cardWidth / 2,
+            contentRect.center().y() - cardHeight / 2,
+            cardWidth,
+            cardHeight);
+        painter.setPen(QPen(QColor(255, 255, 255, 28), 1));
+        painter.setBrush(QColor(17, 27, 45, 238));
+        painter.drawRoundedRect(QRectF(card), 12, 12); // wjy: 更新卡片与旧Qt回退路径保持同一尺寸和配色，切换显示所有权时不会跳变。
+
+        const QRect spinnerRect(card.center().x() - 15, card.top() + 20, 30, 30);
+        if (m_remoteUpdateState == RemoteUpdateState::Failed) {
+            painter.setPen(QPen(QColor(QStringLiteral("#FF7A7A")), 3));
+            painter.setBrush(Qt::NoBrush);
+            painter.drawEllipse(spinnerRect);
+            painter.drawLine(spinnerRect.center().x(), spinnerRect.top() + 7,
+                spinnerRect.center().x(), spinnerRect.bottom() - 9);
+            painter.drawPoint(spinnerRect.center().x(), spinnerRect.bottom() - 5);
+        } else {
+            painter.setPen(QPen(QColor(255, 255, 255, 48), 4, Qt::SolidLine, Qt::RoundCap));
+            painter.setBrush(Qt::NoBrush);
+            painter.drawEllipse(spinnerRect);
+            painter.setPen(QPen(QColor(QStringLiteral("#3A9BFF")), 4, Qt::SolidLine, Qt::RoundCap));
+            const int startAngle = (90 - m_remoteUpdateSpinnerStep * 30) * 16;
+            painter.drawArc(spinnerRect, startAngle, -210 * 16); // wjy: 合成层按同一250ms状态步进刷新圆环，DComp模式不再显示静止的更新文字。
+        }
+
+        QFont updateTitleFont(QStringLiteral("Microsoft YaHei UI"));
+        updateTitleFont.setPixelSize(17);
+        updateTitleFont.setWeight(QFont::DemiBold);
+        painter.setFont(updateTitleFont);
         painter.setPen(QColor(QStringLiteral("#F4F8FF")));
-        painter.drawText(contentRect, Qt::AlignCenter, remoteUpdateTitle());
-        QFont detailFont(QStringLiteral("Microsoft YaHei UI"));
-        detailFont.setPixelSize(12);
-        painter.setFont(detailFont);
-        painter.setPen(QColor(QStringLiteral("#AEBBCD")));
-        painter.drawText(contentRect.adjusted(24, 34, -24, -24),
-            Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap,
-            remoteUpdateDetail());
+        painter.drawText(QRect(card.left() + 20, card.top() + 58, card.width() - 40, 26),
+            Qt::AlignCenter, remoteUpdateTitle());
+
+        QFont updateDetailFont(QStringLiteral("Microsoft YaHei UI"));
+        updateDetailFont.setPixelSize(12);
+        painter.setFont(updateDetailFont);
+        painter.setPen(m_remoteUpdateState == RemoteUpdateState::Failed
+                ? QColor(QStringLiteral("#FFB4B4"))
+                : QColor(QStringLiteral("#AEBBCD")));
+        painter.drawText(QRect(card.left() + 26, card.top() + 91, card.width() - 52, 34),
+            Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap, remoteUpdateDetail());
     }
     painter.end();
+    overlay.setDevicePixelRatio(dpr); // wjy: 标记叠加图实际物理像素对应的顶层窗口DPR，供DComp按正确比例铺满整个客户区。
     m_texturePresenter->presentCompositorOverlay(overlay);
     sampleVisibleCompositorRegion(); // wjy: 叠加层提交后按需采样真实屏幕像素，和本次resize状态绑定。
 }
@@ -2920,7 +2940,7 @@ QRect RemoteDesktopWindow::titleBarHoverRectAt(const QPoint& position) const
         return {};
     }
     const RemoteTitleBarLayoutSnapshot layout = titleBarLayoutSnapshot();
-    for (const QRect& control : {layout.update, layout.mouseBackend, layout.qualityStatus,
+    for (const QRect& control : {layout.update, layout.mouseBackend,
              layout.inputSync, layout.clipboard, layout.minimize, layout.close}) {
         if (!control.isEmpty() && control.contains(position)) {
             return control; // wjy: 只把实际可见按钮视为悬停区域，设备文字和标题栏空白区移动不会产生绘制请求。
@@ -2982,11 +3002,6 @@ QRect RemoteDesktopWindow::remoteUpdateButtonRect() const
 QRect RemoteDesktopWindow::mouseInputModeRect() const
 {
     return titleBarLayoutSnapshot().mouseBackend;
-}
-
-QRect RemoteDesktopWindow::qualityButtonRect() const
-{
-    return titleBarLayoutSnapshot().qualityStatus;
 }
 
 QRect RemoteDesktopWindow::clipboardSyncRect() const
@@ -4463,6 +4478,9 @@ void RemoteDesktopWindow::startViewerConnection()
     m_viewerStartQueued = true; // wjy: 先标记排队，管理器若立即授予名额会在受控入口同步改成active。
     m_connectionStatusCode = 5;
     m_connectionStatus = QString::fromUtf8("等待远控初始化资源"); // wjy: 第5个及后续窗口先显示等待状态，窗口本身已创建且可移动/关闭。
+    if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
+        presentCompositorOverlay(); // wjy: 排队状态也要同步到DComp叠加层，不能只刷新被其覆盖的Qt父窗口。
+    }
     update();
     if (!m_lifecycleManager->requestViewerStart(this)) {
         m_viewerStartQueued = false;
@@ -4580,6 +4598,9 @@ void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
             m_inputBroadcastCoordinator->notifyEligibilityChanged(this); // wjy: 更新遮罩分支提前返回前仍通知协调器移除不可输入目标。
         }
         update(isFullScreen() ? rect() : QRect(0, titleBarHeight(), width(), height() - titleBarHeight()));
+        if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
+            presentCompositorOverlay(); // wjy: 更新期断线只刷新更新卡片，不让旧“正在连接”文字重新进入DComp快照。
+        }
         return; // wjy: 更新遮罩接管连接文字，不显示“连接失败/已断开”。
     }
     // ===end====
@@ -4590,6 +4611,9 @@ void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
         m_inputBroadcastCoordinator->notifyEligibilityChanged(this); // wjy: 断线/失败会关闭主控或移除跟随端，连接成功后则从后续事件开始动态加入。
     }
     update(isFullScreen() ? rect() : QRect(0, titleBarHeight(), width(), height() - titleBarHeight())); // wjy: 连接状态在全屏覆盖整窗。
+    if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
+        presentCompositorOverlay(); // wjy: 合成路径的连接文字由DComp叠加层独占，状态变化后立即提交新快照，避免旧提示残留。
+    }
     if (should_query_mouse_backend) queryRemoteMouseBackend(); // wjy: 先提交 code=50 再发送 query，sendInputMessage 的连接资格门禁此时已经满足。
 }
 
@@ -4609,6 +4633,9 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     const bool nativeTextureVisible = m_textureFrameActive
         && m_texturePresenter
         && m_texturePresenter->hasVisiblePresentation(); // wjy: 统一确认旧D3D子表面或DComp视频视觉是否在前台，缩放期间据此保留父backing store的上一帧。
+    const bool compositorOverlayOwnsLocalUi = m_texturePresenter
+        && m_texturePresenter->usesCompositorSurface()
+        && m_texturePresenter->hasCompositorOverlay(); // wjy: DComp叠加层建立后独占标题栏、连接提示和更新卡片，父QWidget不再重复绘制本地UI。
     const bool preserveNativeContentDuringResize = m_resizingWindow && nativeTextureVisible;
 
     if (m_resizingWindow) {
@@ -4627,7 +4654,7 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
         painter.setRenderHint(QPainter::SmoothPixmapTransform, false); // wjy: Prefer low-latency full-screen remote drawing over expensive smooth scaling.
         painter.drawImage(target, m_remoteFrame);
         // wjy: 旧的RAW/RGB调试面板保持关闭，BGRA和D3D11路径共用同一组内存统计。
-    } else if (!nativeTextureVisible) {
+    } else if (!nativeTextureVisible && !compositorOverlayOwnsLocalUi) {
         const int barHeight = fullScreen ? 0 : titleBarHeight();
         const QRect contentRect(0, barHeight, width(), qMax(0, height() - barHeight));
         QFont titleFont(QStringLiteral("Microsoft YaHei UI"));
@@ -4652,7 +4679,7 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     }
     // ===end====
     // =====wjy====
-    if (remoteUpdateActive()) {
+    if (remoteUpdateActive() && !compositorOverlayOwnsLocalUi) {
         const int contentTop = fullScreen ? 0 : titleBarHeight();
         const QRect contentRect(0, contentTop, width(), qMax(0, height() - contentTop));
         painter.fillRect(contentRect, QColor(3, 10, 22, 196)); // wjy: 保留窗口和最后画面位置，用半透明遮罩明确当前不可操作。
@@ -4732,7 +4759,7 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     constexpr int elapsedTextWidth = 70;
     constexpr int elapsedGap = 14;
     int titleTextRight = width() - 6;
-    for (const QRect& control : {titleLayout.update, titleLayout.mouseBackend, titleLayout.qualityStatus,
+    for (const QRect& control : {titleLayout.update, titleLayout.mouseBackend,
              titleLayout.inputSync, titleLayout.clipboard, titleLayout.minimize, titleLayout.close}) {
         if (!control.isEmpty()) titleTextRight = qMin(titleTextRight, control.left());
     } // wjy: 标题辅助文字只让位给当前真正可见的最左侧控件，隐藏控件不会继续占用空白。
@@ -4812,56 +4839,6 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
         mouseModeText += QLatin1Char('?');
     }
     painter.drawText(mouseModeRect, Qt::AlignCenter, mouseModeText); // wjy: pending、回退和旧版本未确认分别使用省略号、感叹号和问号，避免把请求值冒充生效值。
-    }
-    // ===end====
-
-    // =====wjy====
-    const QRect qualityRect = titleLayout.qualityStatus;
-    if (!qualityRect.isEmpty()) {
-    const bool qualityHovered = qualityRect.contains(m_hoveredPos);
-    QString qualityText;
-    QColor qualityAccent(QStringLiteral("#3A7BFC"));
-    const stream::RemoteQualityMode displayedQualityMode = m_hasRemoteQualityDecision
-        ? m_remoteQualityDecision.effectiveMode
-        : stream::RemoteQualityMode::Automatic; // wjy: 画质胶囊只显示智能策略的实际决策，不再显示已停用的手动覆盖值。
-    switch (displayedQualityMode) {
-    case stream::RemoteQualityMode::FollowGlobal:
-        qualityText = QString::fromUtf8("自定义"); // wjy: 标题栏与菜单统一使用“自定义”文案。
-        break;
-    case stream::RemoteQualityMode::Automatic:
-        qualityText = QString::fromUtf8("自动");
-        break;
-    case stream::RemoteQualityMode::HighQualityLocked:
-        qualityText = QString::fromUtf8("高质");
-        qualityAccent = QColor(QStringLiteral("#D97706")); // wjy: 高质量使用暖色持久提示，和普通自动模式明显区分。
-        break;
-    case stream::RemoteQualityMode::Balanced:
-        qualityText = QString::fromUtf8("均衡");
-        qualityAccent = QColor(QStringLiteral("#0F766E"));
-        break;
-    case stream::RemoteQualityMode::Smooth:
-        qualityText = QString::fromUtf8("流畅");
-        qualityAccent = QColor(QStringLiteral("#7C3AED"));
-        break;
-    }
-    if (m_hasRemoteQualityDecision && m_remoteQualityDecision.minimized) {
-        qualityText = QString::fromUtf8("后台"); // wjy: 最小化或隐藏安全档优先于活动窗口高质量状态。
-        qualityAccent = QColor(QStringLiteral("#64748B"));
-    } else if (remoteQualityIsDegraded()) {
-        qualityText += QString::fromUtf8("↓"); // wjy: 向下标记表示后台/软件回退、自动降档或Host实际限制；固定模式本身不会因接收压力改变请求。
-    }
-    if (m_qualityProtocolUnavailable) {
-        qualityText += QLatin1Char('!'); // wjy: 旧Host/旧DLL不支持在线调节时以非致命感叹号提示，流不会中断。
-    }
-    painter.setPen(QPen(qualityAccent, 1));
-    painter.setBrush(qualityHovered ? qualityAccent.lighter(185) : qualityAccent.lighter(205));
-    painter.drawRoundedRect(QRectF(qualityRect), 4, 4);
-    QFont qualityFont(QStringLiteral("Microsoft YaHei UI"));
-    qualityFont.setPixelSize(11);
-    qualityFont.setWeight(QFont::DemiBold);
-    painter.setFont(qualityFont);
-    painter.setPen(qualityAccent.darker(115));
-    painter.drawText(qualityRect, Qt::AlignCenter, qualityText); // wjy: 只读胶囊持续展示高质、流畅或后台状态，不再提供手动切换入口。
     }
     // ===end====
 
