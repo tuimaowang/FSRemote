@@ -2898,6 +2898,16 @@ void RemoteDesktopWindow::presentCompositorOverlay()
     QPainter painter(&overlay);
     painter.setRenderHint(QPainter::Antialiasing, true);
     painter.scale(dpr, dpr);
+    const QRect contentRect = remoteContentRect();
+    const QRect imageRect = remoteImageRect();
+    if (!contentRect.isEmpty()) {
+        painter.fillRect(contentRect, Qt::black); // wjy: 黑边按当前窗口内容区域重新生成，不再依赖旧硬件SwapChain中的黑色像素。
+        if (imageRect.isValid()) {
+            painter.setCompositionMode(QPainter::CompositionMode_Clear);
+            painter.fillRect(imageRect, Qt::transparent); // wjy: 清出当前真实视频区域，让DComp视频视觉只覆盖内容，不被叠加层黑底遮挡。
+            painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+        }
+    }
 
     if (!m_textureFrameActive && !m_remoteFrame.isNull()) {
         painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
