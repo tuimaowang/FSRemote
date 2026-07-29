@@ -20,6 +20,7 @@
 #include "ui/LatestTextureFrameSlot.h" // wjy: 远控纹理跨线程交接改为可单测的单槽最新帧模型，禁止每帧都堆积Qt任务。
 #include "ui/RemoteQualityCoordinator.h"
 #include "ui/RemoteInputBroadcastCoordinator.h"
+#include "ui/RemoteWindowCompositor.h" // wjy: 统一记录输出几何、缩放状态和回退状态，旧可见路径仍由开关控制。
 
 class QEvent;
 class QCloseEvent;
@@ -222,6 +223,13 @@ private:
     // ===end====
     void updateWindowMask();
     void updateTexturePresenterGeometry();
+    RemoteWindowLayoutSnapshot compositorLayoutSnapshot() const; // wjy: 从当前顶层窗口一次性生成物理输出、内容和输入映射快照。
+    void commitCompositorLayout(); // wjy: 统一把父窗口几何提交给新合成器，避免各表面各自推导尺寸。
+    void presentCompositorOverlay(); // wjy: 将标题栏、性能信息和连接遮罩合成为一张预乘Alpha图层提交到DComp。
+    void beginResizeDebugTrace(); // wjy: 开始一次尺寸手势的内存追踪，不在高频事件期间写磁盘。
+    void appendResizeDebugTrace(const QString& stage); // wjy: 记录父窗口、D3D子窗口和Present状态的同一时序节点。
+    void flushResizeDebugTrace(); // wjy: 松手后一次性把本次追踪写入data/remote_resize_trace.log，避免日志改变拖拽时序。
+    void sampleVisibleCompositorRegion(); // wjy: 可选地从屏幕实际可见像素采样黑色比例，区分DComp空帧与普通WM_SIZE事件。
     // =====wjy====
     RemoteTitleBarVisualState titleBarVisualState() const; // wjy: 把窗口可变成员压缩为一次渲染使用的不可变标题栏快照。
     void updateNativeTitleBarSurface(bool forceRender = false); // wjy: 仅在状态版本、宽度或DPI变化时生成完整新图并原子提交到持久DIB。
@@ -230,6 +238,7 @@ private:
     void showSnapPreviews(const QHash<RemoteDesktopWindow*, QRect>& geometries); // wjy: 拖拽越界重排时同时显示整组窗口的最终虚影。
     void clearSnapPreviews(); // wjy: 拖离、释放、双击或关闭时统一清理整组吸附预览。
     bool startSystemWindowMove(); // wjy: 标题栏拖动交给Windows/DWM移动现有窗口表面，避免Qt逐像素move导致父窗和D3D子窗分帧合成。
+    bool startSystemWindowResize(); // wjy: 边缘缩放优先交给Windows原生尺寸循环，使顶层窗口和原生子表面的合成节奏由DWM统一管理。
     void updateSnapPreviewForGeometry(const QRect& proposedGeometry, const QPoint& cursorGlobal); // wjy: 系统移动和手动回退共用同一吸附候选计算。
     void finishInteractiveWindowOperation(); // wjy: 系统与手动移动/缩放统一恢复浮层、圆角、吸附提交和几何保存。
     // =====wjy====
@@ -326,6 +335,12 @@ private:
     // ===end====
     QPoint m_resizeStartGlobal;
     QRect m_resizeStartGeometry;
+    QElapsedTimer m_resizeDebugClock; // wjy: 记录缩放手势内的单调毫秒时间，不依赖系统时间回拨。
+    quint64 m_resizeDebugTraceId = 0; // wjy: 每次边缘缩放递增，便于把多次手势从同一个诊断文件中分开。
+    QVector<QString> m_resizeDebugTrace; // wjy: 只保留当前手势前256条事件，避免诊断本身制造无界内存或磁盘压力。
+    bool m_resizePixelProbeEnabled = false; // wjy: 仅通过FSREMOTE_RESIZE_PIXEL_PROBE=1开启实际屏幕采样，正常运行不做截图。
+    qint64 m_lastResizePixelProbeMs = -1000;
+    quint64 m_resizeVisibleSampleCount = 0;
     QElapsedTimer m_sessionClock;
     QElapsedTimer m_frameStatsClock; // wjy: Measures one-second windows for the remote desktop stats overlay.
     int m_frameStatsCount = 0; // wjy: 统计当前窗口真正成功进入显示路径的BGRA或共享纹理帧数。
@@ -373,6 +388,7 @@ private:
     QTimer* m_clipboardPollTimer = nullptr;
     // ===end====
     D3D11FramePresenter* m_texturePresenter = nullptr;
+    std::unique_ptr<RemoteWindowCompositor> m_unifiedCompositor; // wjy: 新路径默认关闭，启用后先接管状态/布局，再逐层迁移可见表面。
     std::unique_ptr<NativeRemoteTitleBarSurface> m_nativeTitleBarSurface; // wjy: 独立Win32子窗口持有标题栏DIB，父Qt backing store不再负责可见标题栏像素。
     quint64 m_titleBarVisualRevision = 1; // wjy: 只有标题栏可见状态变化才递增，远控视频帧不参与该版本。
     quint64 m_committedTitleBarVisualRevision = 0;

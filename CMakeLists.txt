@@ -195,6 +195,18 @@ if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_VIEWER_STABILITY_TESTS) # wjy: 多窗
     endif()
     add_test(NAME fsremote_latest_texture_frame_slot_tests COMMAND fsremote_latest_texture_frame_slot_tests) # wjy: CTest通过断言确认上千帧输入仍只有一个pending和一个调度权。
 
+    add_executable(fsremote_remote_window_compositor_tests EXCLUDE_FROM_ALL
+        tests/remote_window_compositor_tests.cpp
+        src/ui/RemoteWindowCompositor.cpp
+        src/ui/RemoteWindowCompositor.h
+    ) # wjy: 纯状态/几何回归不启动 WebRTC 或显卡，覆盖移动、边缘缩放、DPI、软件回退和设备恢复状态机。
+    target_include_directories(fsremote_remote_window_compositor_tests PRIVATE src)
+    target_link_libraries(fsremote_remote_window_compositor_tests PRIVATE Qt6::Core)
+    if(MSVC)
+        target_compile_options(fsremote_remote_window_compositor_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME fsremote_remote_window_compositor_tests COMMAND fsremote_remote_window_compositor_tests)
+
     add_executable(fsremote_remote_quality_policy_tests EXCLUDE_FROM_ALL
         tests/remote_quality_policy_tests.cpp
         src/stream/RemoteQualityPolicy.h
@@ -442,6 +454,8 @@ qt_add_executable(FSRemote WIN32
     # ===end====
     src/ui/D3D11FramePresenter.cpp
     src/ui/D3D11FramePresenter.h
+    src/ui/RemoteWindowCompositor.cpp
+    src/ui/RemoteWindowCompositor.h
     src/stream/StreamRuntime.cpp
     src/stream/StreamRuntime.h
     src/stream/RemoteQualityPolicy.h
@@ -525,6 +539,7 @@ qt_add_executable(FSRemote WIN32
 target_include_directories(FSRemote PRIVATE src include third_party/parsec_vdd)
 target_link_libraries(FSRemote PRIVATE Qt6::Widgets Qt6::Svg Qt6::Network)
 if(WIN32)
+    target_link_libraries(FSRemote PRIVATE dcomp) # wjy: DirectComposition顶层目标显式链接，旧D3D子窗口路径仍可回退。
     target_link_libraries(FSRemote PRIVATE wbemuuid ole32 oleaut32 iphlpapi ws2_32 advapi32 shell32 setupapi cfgmgr32 d3d11 dxgi psapi user32 gdi32 pdh) # wjy: 远控视频与原生标题栏都使用D3D11/DXGI前台缓冲；GDI继续作为标题栏设备失败回退。
 endif()
 

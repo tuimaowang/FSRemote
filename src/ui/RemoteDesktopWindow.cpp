@@ -1569,6 +1569,18 @@ RemoteDesktopWindow::RemoteDesktopWindow(
         setGeometry(initialGeometry);
         // ===end====
     }
+    // =====wjy====
+    m_unifiedCompositor = std::make_unique<RemoteWindowCompositor>(); // wjy: 运行时开关只决定是否启用新状态/布局路径，不修改流协议或用户保存的设备设置。
+    const QByteArray pixelProbe = qgetenv("FSREMOTE_RESIZE_PIXEL_PROBE").trimmed().toLower();
+    m_resizePixelProbeEnabled = pixelProbe == "1"
+        || pixelProbe == "true"
+        || pixelProbe == "yes"
+        || pixelProbe == "on"; // wjy: 采样开关独立于合成路径，便于旧路径与新路径做同屏对照。
+    appendViewerDebugLog(QStringLiteral("remote compositor path=%1 enabled=%2")
+        .arg(RemoteWindowCompositorConfig::activePathId())
+        .arg(m_unifiedCompositor->isEnabled() ? 1 : 0)); // wjy: 日志明确当前窗口使用旧多表面还是新保留式合成路径。
+    commitCompositorLayout(); // wjy: 在首个子表面创建前提交初始几何，后续标题栏、输入和DPI都复用同一快照。
+    // ===end====
     setWindowTitle(m_deviceName);
     setMouseTracking(true);
     setFocusPolicy(Qt::StrongFocus);
@@ -1594,6 +1606,14 @@ RemoteDesktopWindow::RemoteDesktopWindow(
     connect(m_framePresentTimer, &QTimer::timeout, this, &RemoteDesktopWindow::flushPendingRemoteFrame);
     m_framePresentTimer->start(); // wjy: Fixed latest-frame presentation prevents full-screen repaint pressure from building visible latency.
     m_texturePresenter = new D3D11FramePresenter(this);
+    if (m_unifiedCompositor && m_unifiedCompositor->isEnabled()) {
+        m_texturePresenter->setCompositorHostWindow(
+            reinterpret_cast<void*>(winId()),
+            true); // wjy: 新路径的SwapChain绑定顶层窗口DComp目标，Presenter子控件保持隐藏，不再生成第二个可见视频表面。
+        if (m_nativeTitleBarSurface && m_nativeTitleBarSurface->isCreated()) {
+            m_nativeTitleBarSurface->setVisible(false); // wjy: DComp叠加层尚未首帧前也先隐藏旧标题栏，避免初始化阶段双重合成。
+        }
+    }
     // =====wjy====
 #if !FSREMOTE_LEGACY_PARENT_TITLE_BAR
     m_nativeTitleBarSurface = std::make_unique<NativeRemoteTitleBarSurface>();
@@ -1808,6 +1828,7 @@ bool RemoteDesktopWindow::event(QEvent* event)
     }
     if (titleBarScaleChanged) {
         ++m_titleBarVisualRevision;
+        commitCompositorLayout(); // wjy: DPI 切换与标题栏重建共享同一物理像素快照，输入区域不会继续使用旧缩放比例。
         updateNativeTitleBarSurface(true);
     }
     if (performanceOverlayAnchorChanged) {
@@ -1823,6 +1844,9 @@ bool RemoteDesktopWindow::nativeEvent(const QByteArray& eventType, void* message
     const auto* nativeMessage = static_cast<MSG*>(message);
     // =====wjy====
     if (nativeMessage && nativeMessage->message == WM_ERASEBKGND) {
+        if (m_resizingWindow) {
+            appendResizeDebugTrace(QStringLiteral("parent.native.WM_ERASEBKGND")); // wjy: 记录Windows擦除消息是否在尺寸手势中先于D3D子窗口补帧到达。
+        }
         if (result) *result = 1; // wjy: 父窗口和D3D11内容层都由各自的paint/Present完整覆盖，禁止Windows擦除阶段先改变标题栏颜色。
         return true; // wjy: 不在擦除消息中绘制整窗，避免标题栏控件在高频resize期间被清空后再重画造成闪烁。
     }
@@ -2071,7 +2095,20 @@ QString RemoteDesktopWindow::remoteResourceDiagnosticSummary()
     QString quality = remoteQualityStatusSummary();
     quality.replace(QLatin1Char('\n'), QStringLiteral(" | "));
     const long d3dReason = m_texturePresenter ? m_texturePresenter->lastDeviceRemovalReason() : 0;
-    return QStringLiteral("host=%1 connected=%2 generation=%3 status=%4 bgra_pending=%5 texture_pending=%6 drain=%7 dropped=%8 fallback=%9 d3d=0x%10 fps=%11 encoded_mbps=%12 quality={%13}")
+    const QString compositor = m_unifiedCompositor
+        ? QStringLiteral("%1/state=%2/layout_rev=%3/output=%4x%5 source=%6x%7 frame=%8 presented=%9 fallbacks=%10")
+            .arg(RemoteWindowCompositorConfig::activePathId())
+            .arg(static_cast<int>(m_unifiedCompositor->state()))
+            .arg(static_cast<qulonglong>(m_unifiedCompositor->layout().revision))
+            .arg(m_unifiedCompositor->layout().outputSize.width())
+            .arg(m_unifiedCompositor->layout().outputSize.height())
+            .arg(m_unifiedCompositor->layout().sourceSize.width())
+            .arg(m_unifiedCompositor->layout().sourceSize.height())
+            .arg(static_cast<qulonglong>(m_unifiedCompositor->lastFrameId()))
+            .arg(static_cast<qulonglong>(m_unifiedCompositor->presentedFrameCount()))
+            .arg(static_cast<qulonglong>(m_unifiedCompositor->fallbackCount()))
+        : QStringLiteral("none");
+    return QStringLiteral("host=%1 connected=%2 generation=%3 status=%4 bgra_pending=%5 texture_pending=%6 drain=%7 dropped=%8 fallback=%9 d3d=0x%10 fps=%11 encoded_mbps=%12 compositor=%13 quality={%14}")
         .arg(m_hostIp)
         .arg(m_viewerHandle ? 1 : 0)
         .arg(m_viewerGeneration.load(std::memory_order_acquire))
@@ -2084,6 +2121,7 @@ QString RemoteDesktopWindow::remoteResourceDiagnosticSummary()
         .arg(static_cast<qulonglong>(static_cast<unsigned long>(d3dReason)), 0, 16)
         .arg(m_receiveFps, 0, 'f', 1)
         .arg(m_encodedMbps, 0, 'f', 2)
+        .arg(compositor)
         .arg(quality); // wjy: 单行快照便于20窗口soak后按host检索，不保留任何帧内容或敏感剪贴板数据。
 }
 // ===end====
@@ -2163,7 +2201,7 @@ void RemoteDesktopWindow::beginRemoteUpdateWait()
     ++m_remoteUpdateGeneration;
     m_textureFrameActive = false;
     if (m_texturePresenter) {
-        m_texturePresenter->hide(); // wjy: D3D 子窗口位于父窗口之上，更新时隐藏才能看见中央遮罩。
+        m_texturePresenter->setPresentationVisible(false); // wjy: 旧路径隐藏子HWND，新路径把DComp视频视觉透明化，中央遮罩不会被视频盖住。
     }
     if (m_performanceOverlay) {
         m_performanceOverlay->hide(); // wjy: 更新等待期间隐藏最后一秒的旧指标，避免把停止的视频误显示为实时状态。
@@ -2457,6 +2495,26 @@ bool RemoteDesktopWindow::startSystemWindowMove()
     return m_systemWindowOperationActive;
 }
 
+bool RemoteDesktopWindow::startSystemWindowResize()
+{
+    if (m_systemWindowOperationAttempted) {
+        return m_systemWindowOperationActive; // wjy: 同一手势只请求一次系统缩放；失败后稳定走现有手动回退，禁止鼠标移动时反复重试。
+    }
+    m_systemWindowOperationAttempted = true;
+
+    Qt::Edges nativeEdges = {}; // wjy: QFlags的默认构造不依赖未初始化栈内存，先明确从无边缘开始再逐项加入方向。
+    if (m_resizeEdges & ResizeLeft) nativeEdges |= Qt::LeftEdge; // wjy: 把现有四方向位掩码逐项映射到QWindow原生缩放边缘。
+    if (m_resizeEdges & ResizeRight) nativeEdges |= Qt::RightEdge;
+    if (m_resizeEdges & ResizeTop) nativeEdges |= Qt::TopEdge;
+    if (m_resizeEdges & ResizeBottom) nativeEdges |= Qt::BottomEdge;
+
+    QWindow* nativeWindow = windowHandle();
+    m_systemWindowOperationActive = nativeWindow
+        && nativeEdges != Qt::Edges()
+        && nativeWindow->startSystemResize(nativeEdges); // wjy: 成功后Windows接管鼠标捕获与窗口尺寸循环，Qt不再逐事件调用顶层setGeometry。
+    return m_systemWindowOperationActive;
+}
+
 void RemoteDesktopWindow::updateSnapPreviewForGeometry(
     const QRect& proposedGeometry,
     const QPoint& cursorGlobal)
@@ -2493,11 +2551,17 @@ void RemoteDesktopWindow::finishInteractiveWindowOperation()
     m_systemWindowOperationAttempted = false;
 
     if (wasResizingWindow) {
+        appendResizeDebugTrace(QStringLiteral("gesture.finish.begin")); // wjy: 在释放状态清理前记录最后一次父/子窗口和SwapChain快照。
         if (m_texturePresenter) {
-            m_texturePresenter->setInteractiveResize(false); // wjy: 结束节流实时缩放，下一张帧若仍有最终尺寸差异会立即精确提交。
+            m_texturePresenter->setInteractiveResize(false); // wjy: 松手后仅按最终客户区调整一次SwapChain，并立即用拖拽期间缓存的最新帧补画。
         }
         updateWindowMask(); // wjy: 系统缩放结束后仅按最终尺寸恢复一次圆角Region。
         updateTexturePresenterGeometry();
+        if (m_unifiedCompositor && m_unifiedCompositor->isEnabled()) {
+            m_unifiedCompositor->finalizeResize(compositorLayoutSnapshot()); // wjy: 最终几何、DPI和输入区域提交后才退出交互缩放状态。
+        }
+        appendResizeDebugTrace(QStringLiteral("gesture.finish.after_final_geometry")); // wjy: 确认最终尺寸调整和补帧完成后再写出整手势日志。
+        flushResizeDebugTrace();
     }
 
     if (wasDraggingWindow && !snapGeometries.isEmpty()) {
@@ -2697,6 +2761,13 @@ RemoteTitleBarVisualState RemoteDesktopWindow::titleBarVisualState() const
 void RemoteDesktopWindow::updateNativeTitleBarSurfaceGeometry()
 {
     if (!m_nativeTitleBarSurface || !m_nativeTitleBarSurface->isCreated()) return;
+    if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
+        presentCompositorOverlay();
+        if (m_texturePresenter->hasCompositorOverlay()) {
+            m_nativeTitleBarSurface->setVisible(false); // wjy: 叠加SwapChain可用时旧原生表面始终保持隐藏。
+            return;
+        }
+    }
     if (isFullScreen()) {
         m_nativeTitleBarSurface->setVisible(false); // wjy: 全屏完全移除本地标题栏子HWND，远控内容占用整个客户区。
         return;
@@ -2760,6 +2831,15 @@ void RemoteDesktopWindow::updateNativeTitleBarButtonBand(bool forceRender)
 
 void RemoteDesktopWindow::updateNativeTitleBarSurface(bool forceRender)
 {
+    if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
+        presentCompositorOverlay();
+        if (m_texturePresenter->hasCompositorOverlay()) {
+            if (m_nativeTitleBarSurface && m_nativeTitleBarSurface->isCreated()) {
+                m_nativeTitleBarSurface->setVisible(false); // wjy: 叠加SwapChain就绪后才隐藏旧DIB HWND，避免初始化失败时标题栏消失。
+            }
+            return;
+        }
+    }
     if (!m_nativeTitleBarSurface || !m_nativeTitleBarSurface->isCreated()) return;
     if (m_draggingWindow) {
         return; // wjy: 移动手势不改变任何标题栏尺寸，完全冻结两层即可。
@@ -2797,6 +2877,111 @@ void RemoteDesktopWindow::updateNativeTitleBarSurface(bool forceRender)
     }
     updateNativeTitleBarSurfaceGeometry(); // wjy: 首帧先完成DIB提交再显示子窗口，普通更新则保持旧前台表面直到新帧复制完成。
     updateNativeTitleBarButtonBand(forceRender);
+}
+
+void RemoteDesktopWindow::presentCompositorOverlay()
+{
+    if (!m_texturePresenter
+        || !m_texturePresenter->usesCompositorSurface()
+        || width() <= 0
+        || height() <= 0) {
+        return;
+    }
+
+    const qreal dpr = std::max<qreal>(1.0, devicePixelRatioF());
+    const QSize physicalSize(
+        qMax(1, qRound(width() * dpr)),
+        qMax(1, qRound(height() * dpr)));
+    QImage overlay(physicalSize, QImage::Format_ARGB32_Premultiplied);
+    overlay.fill(Qt::transparent);
+
+    QPainter painter(&overlay);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.scale(dpr, dpr);
+
+    if (!m_textureFrameActive && !m_remoteFrame.isNull()) {
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+        painter.drawImage(remoteImageRect(), m_remoteFrame); // wjy: 软件BGRA回退也进入同一DComp叠加SwapChain，不再依赖父backing store作为最终像素所有者。
+    } else if (!m_textureFrameActive && m_remoteFrame.isNull()) {
+        const QRect contentRect(0, isFullScreen() ? 0 : titleBarHeight(), width(),
+            qMax(0, height() - (isFullScreen() ? 0 : titleBarHeight())));
+        QFont titleFont(QStringLiteral("Microsoft YaHei UI"));
+        titleFont.setPixelSize(18);
+        titleFont.setWeight(QFont::DemiBold);
+        painter.setFont(titleFont);
+        painter.setPen(QColor(QStringLiteral("#FFFFFF")));
+        painter.drawText(contentRect.adjusted(0, -34, 0, 0),
+            Qt::AlignCenter, zh("正在连接 %1").arg(m_deviceName));
+        QFont statusFont(QStringLiteral("Microsoft YaHei UI"));
+        statusFont.setPixelSize(13);
+        painter.setFont(statusFont);
+        painter.setPen(m_connectionStatusCode == 90
+                ? QColor(QStringLiteral("#FFB4B4"))
+                : QColor(QStringLiteral("#B8C0CC")));
+        painter.drawText(contentRect.adjusted(60, 0, -60, 48),
+            Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap,
+            m_connectionStatus);
+    }
+
+    if (!isFullScreen()) {
+        RemoteTitleBarVisualState titleState = titleBarVisualState();
+        titleState.devicePixelRatio = 1.0;
+        const QImage titleBar = RemoteTitleBarRenderer::render(titleState);
+        if (!titleBar.isNull()) {
+            painter.drawImage(QRect(0, 0, width(), titleBarHeight()), titleBar);
+        }
+    }
+
+    if (!m_performanceOverlayText.isEmpty()
+        && !isMinimized()
+        && !remoteUpdateActive()
+        && !m_draggingWindow
+        && !m_resizingWindow) {
+        const QRect videoRect = remoteImageRect();
+        const QSize panelSize(132, 132);
+        const QRect panel(
+            qMax(videoRect.left(), videoRect.right() - panelSize.width() - 12 + 1),
+            qMax(videoRect.top(), videoRect.bottom() - panelSize.height() - 12 + 1),
+            panelSize.width(),
+            panelSize.height());
+        QColor accent(m_performanceOverlayAccent);
+        if (!accent.isValid()) accent = QColor(QStringLiteral("#38BDF8"));
+        accent.setAlpha(150);
+        painter.setPen(QPen(accent, 1.0));
+        painter.setBrush(QColor(8, 15, 25, 56));
+        painter.drawRoundedRect(QRectF(panel).adjusted(0.5, 0.5, -0.5, -0.5), 6.0, 6.0);
+        const QRect textRect = panel.adjusted(10, 10, -10, -10);
+        QFont font(QStringLiteral("Microsoft YaHei UI"));
+        font.setPixelSize(12);
+        font.setWeight(QFont::DemiBold);
+        painter.setFont(font);
+        painter.setPen(QColor(0, 0, 0, 180));
+        painter.drawText(textRect.translated(1, 1), Qt::AlignLeft | Qt::AlignTop, m_performanceOverlayText);
+        painter.setPen(QColor(QStringLiteral("#F8FAFC")));
+        painter.drawText(textRect, Qt::AlignLeft | Qt::AlignTop, m_performanceOverlayText);
+    }
+
+    if (remoteUpdateActive()) {
+        const QRect contentRect(0, isFullScreen() ? 0 : titleBarHeight(), width(),
+            qMax(0, height() - (isFullScreen() ? 0 : titleBarHeight())));
+        painter.fillRect(contentRect, QColor(3, 10, 22, 196));
+        QFont titleFont(QStringLiteral("Microsoft YaHei UI"));
+        titleFont.setPixelSize(17);
+        titleFont.setWeight(QFont::DemiBold);
+        painter.setFont(titleFont);
+        painter.setPen(QColor(QStringLiteral("#F4F8FF")));
+        painter.drawText(contentRect, Qt::AlignCenter, remoteUpdateTitle());
+        QFont detailFont(QStringLiteral("Microsoft YaHei UI"));
+        detailFont.setPixelSize(12);
+        painter.setFont(detailFont);
+        painter.setPen(QColor(QStringLiteral("#AEBBCD")));
+        painter.drawText(contentRect.adjusted(24, 34, -24, -24),
+            Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap,
+            remoteUpdateDetail());
+    }
+    painter.end();
+    m_texturePresenter->presentCompositorOverlay(overlay);
+    sampleVisibleCompositorRegion(); // wjy: 叠加层提交后按需采样真实屏幕像素，和本次resize状态绑定。
 }
 
 // =====wjy====
@@ -2843,6 +3028,18 @@ void RemoteDesktopWindow::updateTitleBarHover(const QPoint& position)
 
 void RemoteDesktopWindow::requestTitleBarUpdate(const QRect& region)
 {
+#if !FSREMOTE_LEGACY_PARENT_TITLE_BAR
+    if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
+        Q_UNUSED(region)
+        ++m_titleBarVisualRevision;
+        if (!m_draggingWindow) {
+            presentCompositorOverlay(); // wjy: DComp路径只重新提交统一Alpha层，标题栏状态变化不会再触发独立HWND重绘。
+        }
+        if (m_texturePresenter->hasCompositorOverlay()) {
+            return;
+        }
+    }
+#endif
 #if FSREMOTE_LEGACY_PARENT_TITLE_BAR
     if (isFullScreen() || m_draggingWindow || m_resizingWindow) return;
     const QRect titleRect(0, 0, width(), titleBarHeight());
@@ -3181,6 +3378,13 @@ void RemoteDesktopWindow::updatePerformanceOverlayGeometry()
     if (!m_performanceOverlay) {
         return;
     }
+    if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
+        presentCompositorOverlay();
+        if (m_texturePresenter->hasCompositorOverlay()) {
+            m_performanceOverlay->hide(); // wjy: DComp叠加层就绪后旧透明工具窗保持隐藏，创建失败则继续使用旧浮层回退。
+            return;
+        }
+    }
     const QRect target = remoteImageRect(); // wjy: 性能浮层仍锚定真实视频右下角，D3D内容层扩大后不能跟着移到黑边上。
     const bool hasVisibleVideo = m_connectionStatusCode == 50
         && (!m_remoteFrame.isNull() || (m_textureFrameActive && m_remoteTextureSize.isValid()));
@@ -3231,6 +3435,18 @@ QSize RemoteDesktopWindow::remoteFrameSize() const
 
 bool RemoteDesktopWindow::normalizedRemotePoint(const QPoint& position, int* x, int* y) const
 {
+    if (m_unifiedCompositor && m_unifiedCompositor->isEnabled()
+        && m_unifiedCompositor->layout().isValid()
+        && m_unifiedCompositor->layout().devicePixelRatio > 0.0) {
+        const RemoteWindowLayoutSnapshot& snapshot = m_unifiedCompositor->layout();
+        const qreal dpr = snapshot.devicePixelRatio;
+        const QRect logicalInput(
+            qRound(snapshot.inputRect.left() / dpr),
+            qRound(snapshot.inputRect.top() / dpr),
+            qRound(snapshot.inputRect.width() / dpr),
+            qRound(snapshot.inputRect.height() / dpr));
+        return normalizedRemoteInputPoint(logicalInput, position, x, y); // wjy: 新路径输入命中使用已提交快照反推逻辑矩形，避免拖拽中读取旧子HWND几何。
+    }
     return normalizedRemoteInputPoint(remoteImageRect(), position, x, y); // wjy: 远端画面内换算与黑边拒绝由独立函数统一，普通绘制和 D3D 转发得到完全相同结果。
 }
 
@@ -3903,19 +4119,208 @@ void RemoteDesktopWindow::updateWindowMask()
     setMask(QRegion(path.toFillPolygon().toPolygon()));
 }
 
+RemoteWindowLayoutSnapshot RemoteDesktopWindow::compositorLayoutSnapshot() const
+{
+    RemoteWindowLayoutSnapshot snapshot;
+    const qreal dpr = qMax<qreal>(1.0, devicePixelRatioF());
+    const auto scaleRect = [dpr](const QRect& logical) {
+        return QRect(
+            qRound(logical.left() * dpr),
+            qRound(logical.top() * dpr),
+            qRound(logical.width() * dpr),
+            qRound(logical.height() * dpr));
+    };
+    const QRect logicalContent = remoteContentRect();
+    const QRect logicalImage = remoteImageRect();
+    snapshot.physicalOutputRect = QRect(0, 0, qRound(width() * dpr), qRound(height() * dpr));
+    snapshot.titleBarRect = isFullScreen()
+        ? QRect()
+        : scaleRect(QRect(0, 0, width(), titleBarHeight()));
+    snapshot.contentRect = scaleRect(logicalContent);
+    snapshot.inputRect = scaleRect(logicalImage.isValid() ? logicalImage : logicalContent);
+    snapshot.outputSize = snapshot.contentRect.size();
+    snapshot.sourceSize = m_remoteTextureSize.isValid()
+        ? m_remoteTextureSize
+        : m_remoteFrame.size();
+    snapshot.devicePixelRatio = dpr;
+    return snapshot;
+}
+
+void RemoteDesktopWindow::commitCompositorLayout()
+{
+    if (!m_unifiedCompositor || !m_unifiedCompositor->isEnabled()) {
+        return;
+    }
+    const RemoteWindowLayoutSnapshot snapshot = compositorLayoutSnapshot();
+    if (m_resizingWindow) {
+        m_unifiedCompositor->updateInteractiveGeometry(snapshot);
+    } else {
+        m_unifiedCompositor->commitLayout(snapshot);
+    }
+}
+
 void RemoteDesktopWindow::updateTexturePresenterGeometry()
 {
     if (!m_texturePresenter) {
         return;
     }
+    commitCompositorLayout(); // wjy: D3D 子表面和新合成器同时读取同一份几何快照，迁移期先不改变旧显示路径。
     const QRect target = remoteContentRect(); // wjy: 纹理子窗口覆盖完整内容区，视频和黑边由同一个SwapChain一次性合成。
+    if (m_texturePresenter->usesCompositorSurface()) {
+        m_texturePresenter->setCompositorOutputRect(
+            compositorLayoutSnapshot().contentRect); // wjy: DirectComposition使用物理像素快照，避免高DPI下把Qt逻辑尺寸当成SwapChain尺寸。
+        m_texturePresenter->hide(); // wjy: 隐藏Presenter控件本身，避免DComp视频与Qt子窗口形成重叠可见表面。
+        return;
+    }
     if (target.isEmpty() || !m_textureFrameActive) {
         m_texturePresenter->hide();
         return;
     }
     if (m_texturePresenter->geometry() != target) {
-        m_texturePresenter->setGeometry(target);
+        m_texturePresenter->setGeometry(target); // wjy: 几何始终由Qt维护，原生WM_WINDOWPOSCHANGING阶段再注入SWP_NOREDRAW，避免Qt记录与实际HWND尺寸脱节。
     }
+}
+
+void RemoteDesktopWindow::beginResizeDebugTrace()
+{
+    ++m_resizeDebugTraceId; // wjy: 每次按下边缘都建立独立编号，连续测试可以在同一个日志文件中逐手势对照。
+    m_resizeDebugClock.restart();
+    m_lastResizePixelProbeMs = -1000;
+    m_resizeVisibleSampleCount = 0;
+    m_resizeDebugTrace.clear();
+    m_resizeDebugTrace.reserve(256);
+    appendResizeDebugTrace(QStringLiteral("gesture.begin")); // wjy: 首条记录固定标记手势起点，后续所有父/子窗口事件共享同一时间基准。
+}
+
+void RemoteDesktopWindow::appendResizeDebugTrace(const QString& stage)
+{
+    if (!m_resizeDebugClock.isValid() || m_resizeDebugTrace.size() >= 256) {
+        return; // wjy: 诊断只保留有限内存样本，满载后不再分配，避免日志改变高频缩放时序。
+    }
+
+    const QRect parentGeometry = geometry();
+    const QRect childGeometry = m_texturePresenter ? m_texturePresenter->geometry() : QRect();
+    int parentClientWidth = width();
+    int parentClientHeight = height();
+#if defined(Q_OS_WIN)
+    RECT parentClientRect = {};
+    if (::GetClientRect(reinterpret_cast<HWND>(winId()), &parentClientRect)) {
+        parentClientWidth = parentClientRect.right - parentClientRect.left;
+        parentClientHeight = parentClientRect.bottom - parentClientRect.top;
+    }
+#endif
+    const QString presenter = m_texturePresenter
+        ? m_texturePresenter->resizeDebugSnapshot()
+        : QStringLiteral("d3d{presenter=null}");
+    m_resizeDebugTrace.append(QStringLiteral(
+        "t=%1 stage=%2 parent=%3,%4 %5x%6 client=%7x%8 child=%9,%10 %11x%12 resizing=%13 texture_active=%14 visible=%15 %16")
+        .arg(m_resizeDebugClock.elapsed())
+        .arg(stage)
+        .arg(parentGeometry.x())
+        .arg(parentGeometry.y())
+        .arg(parentGeometry.width())
+        .arg(parentGeometry.height())
+        .arg(parentClientWidth)
+        .arg(parentClientHeight)
+        .arg(childGeometry.x())
+        .arg(childGeometry.y())
+        .arg(childGeometry.width())
+        .arg(childGeometry.height())
+        .arg(m_resizingWindow ? 1 : 0)
+        .arg(m_textureFrameActive ? 1 : 0)
+        .arg(m_texturePresenter && m_texturePresenter->hasVisiblePresentation() ? 1 : 0)
+        .arg(presenter)); // wjy: 同一行绑定父几何、子几何、显隐、纹理状态和D3D快照，直接判断哪一层先进入空档。
+}
+
+void RemoteDesktopWindow::flushResizeDebugTrace()
+{
+    if (!m_resizeDebugClock.isValid() || m_resizeDebugTrace.isEmpty()) {
+        return;
+    }
+
+    const QString dataDir = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("data"));
+    QDir().mkpath(dataDir);
+    QFile file(QDir(dataDir).filePath(QStringLiteral("remote_resize_trace.log")));
+    if (file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+        QTextStream stream(&file);
+        stream << QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz"))
+               << QStringLiteral(" host=") << m_hostIp
+               << QStringLiteral(" trace=") << m_resizeDebugTraceId
+               << Qt::endl;
+        for (const QString& line : m_resizeDebugTrace) {
+            stream << line << Qt::endl;
+        }
+        stream << QStringLiteral("-- end trace --") << Qt::endl;
+    }
+    m_resizeDebugTrace.clear();
+    m_resizeDebugClock.invalidate(); // wjy: 写完后关闭当前手势时钟，下一次拖拽重新建立独立时间轴。
+}
+
+void RemoteDesktopWindow::sampleVisibleCompositorRegion()
+{
+    if (!m_resizePixelProbeEnabled
+        || !m_resizingWindow
+        || !m_resizeDebugClock.isValid()
+        || !m_unifiedCompositor
+        || !m_unifiedCompositor->isEnabled()) {
+        return;
+    }
+    const qint64 elapsedMs = m_resizeDebugClock.elapsed();
+    if (elapsedMs - m_lastResizePixelProbeMs < 100) {
+        return; // wjy: 截图采样限频，避免诊断本身抢占拖拽和Present线程。
+    }
+    QScreen* screen = windowHandle() ? windowHandle()->screen() : nullptr;
+    if (!screen) {
+        screen = QGuiApplication::screenAt(frameGeometry().center());
+    }
+    if (!screen) {
+        return;
+    }
+    const QRect globalRect = frameGeometry();
+    const QPixmap screenshot = screen->grabWindow(
+        0,
+        globalRect.left(),
+        globalRect.top(),
+        globalRect.width(),
+        globalRect.height());
+    const QImage image = screenshot.toImage().convertToFormat(QImage::Format_RGB32);
+    if (image.isNull() || image.width() <= 0 || image.height() <= 0) {
+        return;
+    }
+
+    const int step = qMax(1, qMax(image.width(), image.height()) / 160);
+    quint64 sampleCount = 0;
+    quint64 blackCount = 0;
+    quint64 luminanceSum = 0;
+    for (int y = 0; y < image.height(); y += step) {
+        for (int x = 0; x < image.width(); x += step) {
+            const QColor color = image.pixelColor(x, y);
+            const int luminance = (color.red() * 30 + color.green() * 59 + color.blue() * 11) / 100;
+            ++sampleCount;
+            luminanceSum += static_cast<quint64>(luminance);
+            if (luminance <= 4) {
+                ++blackCount;
+            }
+        }
+    }
+    if (sampleCount == 0) {
+        return;
+    }
+    m_lastResizePixelProbeMs = elapsedMs;
+    ++m_resizeVisibleSampleCount;
+    const double blackRatio = static_cast<double>(blackCount) / static_cast<double>(sampleCount);
+    const double averageLuminance = static_cast<double>(luminanceSum) / static_cast<double>(sampleCount);
+    appendResizeDebugTrace(QStringLiteral(
+        "visible.sample index=%1 size=%2x%3 samples=%4 black_ratio=%5 avg_luma=%6 state=%7 layout_rev=%8 frame=%9")
+        .arg(static_cast<qulonglong>(m_resizeVisibleSampleCount))
+        .arg(image.width())
+        .arg(image.height())
+        .arg(static_cast<qulonglong>(sampleCount))
+        .arg(blackRatio, 0, 'f', 4)
+        .arg(averageLuminance, 0, 'f', 1)
+        .arg(static_cast<int>(m_unifiedCompositor->state()))
+        .arg(static_cast<qulonglong>(m_unifiedCompositor->layout().revision))
+        .arg(static_cast<qulonglong>(m_unifiedCompositor->lastFrameId()))); // wjy: 采样结果与同一时刻状态/布局/帧号关联，日志不再只记录WM_SIZE事件。
 }
 
 void RemoteDesktopWindow::enqueueRemoteFrame(QImage image, quint64 viewerGeneration)
@@ -3987,6 +4392,13 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
             texturePresented = false; // wjy: D3D11共享设备创建中的分配异常也转换为本窗口软件回退，不允许异常逃出Qt队列任务。
         }
         if (!texturePresented) {
+            if (m_unifiedCompositor && m_unifiedCompositor->isEnabled()) {
+                if (m_texturePresenter->lastFailureWasDeviceLost()) {
+                    m_unifiedCompositor->enterDeviceRecovery(); // wjy: 设备级失败进入恢复态，统一表面后续必须保留最后有效帧或软件帧。
+                } else {
+                    m_unifiedCompositor->enterHardwareFallback(); // wjy: 普通共享纹理失败只标记硬件回退，不立即清空当前可见布局。
+                }
+            }
             ++m_textureFailureCount;
             appendViewerDebugLog(QStringLiteral("D3D11 presenter failed host=%1 reason=0x%2 retry=%3")
                 .arg(m_hostIp)
@@ -3998,8 +4410,10 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
                 && m_textureFailureCount < kTextureFailuresBeforeSoftwareFallback; // wjy: 普通单帧句柄竞争不触发黑屏或昂贵BGRA回退，直接等待下一张最新纹理。
             if (keepLastFrame) {
                 m_textureFrameActive = true;
-                if (!m_texturePresenter->isVisible()) {
-                    m_texturePresenter->show();
+                if (m_texturePresenter->usesCompositorSurface()) {
+                    m_texturePresenter->setPresentationVisible(true); // wjy: DComp路径恢复视频视觉透明度，不显示备用子控件。
+                } else if (!m_texturePresenter->isVisible()) {
+                    m_texturePresenter->setPresentationVisible(true);
                     m_texturePresenter->raise(); // wjy: 只有旧SwapChain此前被隐藏时才恢复层级，连续失败帧不重复操作原生窗口Z序。
                     raisePerformanceOverlay(); // wjy: Presenter真实恢复显示后一次性把本机指标放回最上层。
                 }
@@ -4008,7 +4422,7 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
                 m_softwareFallbackActive = true;
                 m_textureFrameActive = canContinueDisplayingTexture; // wjy: BGRA首帧到达前仅保留仍有效的旧D3D画面，设备已移除时立即回到安全背景。
                 if (!canContinueDisplayingTexture) {
-                    m_texturePresenter->hide();
+                    m_texturePresenter->setPresentationVisible(false);
                 }
                 discardPendingTextureFrame(); // wjy: 软件回退取消排队纹理时同步归还keyed mutex槽位。
                 const int retryDelayMs = qMin(10000, 1000 * (1 << qMin(m_textureFailureCount - 1, 3)));
@@ -4020,8 +4434,14 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
             }
         } else {
             updatePresentedFrameStats(0); // wjy: 共享纹理成功Present后计入FPS；零拷贝路径不虚构BGRA内存吞吐。
+            if (m_unifiedCompositor && m_unifiedCompositor->isEnabled()) {
+                m_unifiedCompositor->markHardwareFrame(frame->frameId, QSize(frame->width, frame->height)); // wjy: 只有真正Present成功的共享纹理才推进统一合成器帧号。
+            }
             m_remoteTextureSize = QSize(frame->width, frame->height); // wjy: 只有新纹理真正成功Present后才提交远端尺寸，失败帧不能污染缩放比例。
             m_remoteFrame = QImage(); // wjy: 成功切换到新纹理后才释放软件上一帧，整个提交过程不会提前露出黑色背景。
+            if (m_texturePresenter->usesCompositorSurface()) {
+                presentCompositorOverlay(); // wjy: 硬件恢复前先清掉叠加SwapChain里的旧BGRA帧，再提升视频视觉，避免软件画面残留覆盖新硬件帧。
+            }
             m_encodedMbps = qMax(0.0, frame->encodedMbps); // wjy: 码率统计只跟随真正成功显示的新帧。
             const bool recoveredFromSoftwareFallback = m_softwareFallbackActive; // wjy: 普通单帧失败恢复不触发全局画质重算，只有真正退出BGRA保活才通知协调器。
             const bool connectionTitleChanged = m_connectionStatusCode != 50
@@ -4037,8 +4457,10 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
             m_connectionStatusCode = 50;
             m_connectionStatus = QString::fromUtf8("画面已接收");
             if (!m_remoteMouseBackendKnown && !m_remoteMouseBackendPending) queryRemoteMouseBackend(); // wjy: 纹理首帧若先于状态回调到达，也会在输入资格建立后立即同步 Host 全局后端。
-            if (!m_texturePresenter->isVisible()) {
-                m_texturePresenter->show();
+            if (m_texturePresenter->usesCompositorSurface()) {
+                m_texturePresenter->setPresentationVisible(true); // wjy: DComp首帧提交后只恢复视频视觉，不再把子控件带回可见层。
+            } else if (!m_texturePresenter->isVisible()) {
+                m_texturePresenter->setPresentationVisible(true);
                 m_texturePresenter->raise(); // wjy: 首帧或BGRA回切D3D时才提升Presenter，正常60 FPS Present不再逐帧改变Z序。
                 raisePerformanceOverlay(); // wjy: Presenter层级变化完成后只恢复一次浮层，消除两个原生子窗口交替闪烁。
             }
@@ -4091,15 +4513,20 @@ void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
     // ===end====
     updateFrameStats(image); // wjy: Count received UI frames before repainting so the overlay reflects the latest decoded BGRA flow.
     // =====wjy====
-    const bool textureWasVisible = m_textureFrameActive && m_texturePresenter && m_texturePresenter->isVisible(); // wjy: 软件回退首帧到达时旧D3D画面仍可能覆盖父窗口。
+    const bool textureWasVisible = m_textureFrameActive
+        && m_texturePresenter
+        && m_texturePresenter->hasVisiblePresentation(); // wjy: 软件回退首帧到达时同时识别旧子HWND或DComp视觉树是否仍覆盖内容区。
     m_remoteFrame = image;
     m_textureFrameActive = false; // wjy: 先让父窗口绘制新的软件帧，但暂时不隐藏覆盖在上面的最后成功纹理。
     const QRect contentRect = remoteContentRect(); // wjy: 软件回退与D3D11路径共用完全相同的标题栏下内容边界。
-    if (textureWasVisible) {
+    if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
+        presentCompositorOverlay(); // wjy: 先把BGRA帧提交到同一个DComp叠加SwapChain，再隐藏硬件视觉，避免硬件到软件切换露出黑色中间帧。
+        m_texturePresenter->setPresentationVisible(false);
+    } else if (textureWasVisible) {
         repaint(contentRect); // wjy: 同步把BGRA首帧画到D3D子窗口背后，随后隐藏子窗口时不会短暂露出黑色背景。
-        m_texturePresenter->hide();
+        m_texturePresenter->setPresentationVisible(false);
     } else if (m_texturePresenter) {
-        m_texturePresenter->hide();
+        m_texturePresenter->setPresentationVisible(false);
     }
     // ===end====
     m_connectionStatusCode = 50;
@@ -4122,6 +4549,9 @@ void RemoteDesktopWindow::updateFrameStats(const QImage& image)
     }
     updateFrameColorStats(image); // wjy: Keep RGB diagnostics visible while testing pure-black remote pages.
     updatePresentedFrameStats(static_cast<qint64>(image.sizeInBytes())); // wjy: 软件帧携带真实BGRA字节数，同时和共享纹理共用同一FPS时间窗。
+    if (m_unifiedCompositor && m_unifiedCompositor->isEnabled()) {
+        m_unifiedCompositor->markSoftwareFrame(m_totalPresentedFrames, image.size()); // wjy: BGRA回退沿用同一布局和帧计数，避免硬件/软件路径各自维护可见状态。
+    }
 }
 
 void RemoteDesktopWindow::updatePresentedFrameStats(qint64 bgraBytes)
@@ -4449,11 +4879,22 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     const bool fullScreen = isFullScreen();
-
-    painter.fillRect(rect(), QColor(QStringLiteral("#000000")));
     const bool nativeTextureVisible = m_textureFrameActive
         && m_texturePresenter
-        && m_texturePresenter->isVisible(); // wjy: 绘制阶段只读取原生 D3D 内容层状态，禁止在 paintEvent 内修改子 HWND 几何并触发额外合成。
+        && m_texturePresenter->hasVisiblePresentation(); // wjy: 统一确认旧D3D子表面或DComp视频视觉是否在前台，缩放期间据此保留父backing store的上一帧。
+    const bool preserveNativeContentDuringResize = m_resizingWindow && nativeTextureVisible;
+
+    if (m_resizingWindow) {
+        appendResizeDebugTrace(preserveNativeContentDuringResize
+                ? QStringLiteral("parent.paint.skip_black_fill")
+                : QStringLiteral("parent.paint.before_black_fill")); // wjy: 记录缩放期间是否跳过整窗清黑，避免原生D3D子窗口合成空档时暴露黑帧。
+    }
+    if (!preserveNativeContentDuringResize) {
+        painter.fillRect(rect(), QColor(QStringLiteral("#000000"))); // wjy: 非原生远控内容或非缩放状态仍完整填黑，保持连接提示和软件帧的原有背景行为。
+    }
+    if (m_resizingWindow && !preserveNativeContentDuringResize) {
+        appendResizeDebugTrace(QStringLiteral("parent.paint.after_black_fill")); // wjy: 仅在实际清黑后记录，下一轮日志可直接确认黑底是否被跳过。
+    }
     if (!nativeTextureVisible && !m_remoteFrame.isNull()) {
         const QRect target = remoteImageRect();
         painter.setRenderHint(QPainter::SmoothPixmapTransform, false); // wjy: Prefer low-latency full-screen remote drawing over expensive smooth scaling.
@@ -4866,15 +5307,23 @@ void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
             m_systemWindowOperationAttempted = false;
             m_resizeStartGlobal = event->globalPosition().toPoint();
             m_resizeStartGeometry = frameGeometry(); // wjy: 固定记录本次手势起始几何，后续每个鼠标移动都从同一基准计算，避免增量误差造成边缘抖动。
+            beginResizeDebugTrace(); // wjy: 从鼠标按下开始记录本次尺寸手势的父/子窗口时序。
             clearMask(); // wjy: 交互缩放开始时一次性移除圆角区域，拖拽期间使用完整矩形窗口避免每个像素尺寸都重建系统Region。
+            if (m_unifiedCompositor && m_unifiedCompositor->isEnabled()) {
+                m_unifiedCompositor->beginInteractiveResize(compositorLayoutSnapshot()); // wjy: 锁定最后有效帧和本地层缓存，后续中间几何不销毁可见表面。
+            }
             if (m_texturePresenter) {
-                m_texturePresenter->setInteractiveResize(true); // wjy: 开启节流实时缩放，拖动期间继续按受控频率呈现最新远控帧。
+                m_texturePresenter->setInteractiveResize(true); // wjy: 拖动期间冻结BackBuffer尺寸但保持子HWND和网络新帧实时更新，避免逐像素ResizeBuffers造成闪烁。
             }
             // wjy: 缩放期间禁止冻结父QWidget绘制：与移动不同，窗口变大会暴露新的客户区，
             // 关闭绘制会让这块区域保留未定义的backing store内容并被DWM合成出来。
             updateNativeTitleBarSurface(); // wjy: 缩放开始仍由同一个原生DIB子表面持有标题栏像素，不再隐藏HWND或切换到Qt backing store。
             updatePerformanceOverlayGeometry(); // wjy: 开始缩放后立即隐藏独立透明浮层，避免它跟随每个手动几何变化产生额外 HWND 合成。
-            // wjy: 缩放固定走下方 Qt setGeometry 路径；标题栏保留原生前台表面，D3D 子内容层继续持有自己的SwapChain。
+            const bool nativeResizeStarted = startSystemWindowResize();
+            appendResizeDebugTrace(nativeResizeStarted
+                    ? QStringLiteral("resize.start_system.success")
+                    : QStringLiteral("resize.start_system.fallback")); // wjy: 记录原生缩放是否真正接管，避免把手动回退误判成DWM路径。
+            // wjy: 原生缩放成功时由DWM驱动尺寸事件；失败时标题栏和D3D内容层继续沿用现有手动回退路径。
             // ===end====
             event->accept();
             return;
@@ -4978,7 +5427,11 @@ void RemoteDesktopWindow::mouseMoveEvent(QMouseEvent* event)
             }
         }
 
+        appendResizeDebugTrace(QStringLiteral("manual.resize.before_setGeometry target=%1x%2")
+            .arg(next.width())
+            .arg(next.height())); // wjy: 在父窗口提交前记录目标尺寸，和后续parent.resize/child.resize顺序对照。
         setGeometry(next); // wjy: 手动缩放只提交几何；标题栏显示由独立上一帧快照维持，D3D 子窗口继续呈现内容和黑边。
+        appendResizeDebugTrace(QStringLiteral("manual.resize.after_setGeometry")); // wjy: 记录Qt setGeometry返回后的即时父子窗口状态。
         event->accept();
         return;
     }
@@ -5237,15 +5690,27 @@ void RemoteDesktopWindow::focusOutEvent(QFocusEvent* event)
 
 void RemoteDesktopWindow::resizeEvent(QResizeEvent* event)
 {
+    if (m_resizingWindow) {
+        appendResizeDebugTrace(QStringLiteral("parent.resize.begin old=%1x%2 new=%3x%4")
+            .arg(event ? event->oldSize().width() : -1)
+            .arg(event ? event->oldSize().height() : -1)
+            .arg(event ? event->size().width() : -1)
+            .arg(event ? event->size().height() : -1)); // wjy: 记录父QWidget收到的真实尺寸事件及其前后尺寸。
+    }
     if (!m_resizingWindow) {
         updateWindowMask(); // wjy: 最大化、还原等普通变化立即更新圆角；手动拖拽已在开始时清除Mask并在释放时统一恢复。
     }
+    updateTexturePresenterGeometry(); // wjy: 父窗口每次尺寸变化仍同步D3D子HWND；拖拽期间只由DWM缩放稳定BackBuffer，松手后再一次性调整最终缓冲尺寸。
+    commitCompositorLayout(); // wjy: 父窗口尺寸变化先提交统一快照，标题栏、性能层和远端输入以后都从这里读取。
     updateNativeTitleBarSurface(); // wjy: 所有尺寸变化都只更新同一个原生标题栏表面；缩放时保留旧完整帧并在内存合成缓冲中移动按钮段。
     if (m_resizingWindow && event && event->oldSize().width() == event->size().width()
         && m_nativeTitleBarSurface && m_nativeTitleBarSurface->isCreated()) {
         m_nativeTitleBarSurface->refresh(); // wjy: 纯顶部/底部缩放没有按钮横向位移，仍主动Present一次完整前台缓冲，避免只移动父HWND时等待系统重绘。
     }
     updatePerformanceOverlayGeometry(); // wjy: 窗口缩放、全屏或黑边变化后让本机浮层继续贴住实际画面右下角。
+    if (m_resizingWindow) {
+        appendResizeDebugTrace(QStringLiteral("parent.resize.after_children")); // wjy: 子窗口几何、标题栏和浮层同步后记录一次，定位父子表面是否出现尺寸滞后。
+    }
     QWidget::resizeEvent(event);
 }
 
