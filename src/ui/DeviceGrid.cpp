@@ -34,6 +34,7 @@
 #include <QClipboard>
 #include <QComboBox>
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QCursor>
 #include <QDateTime>
 #include <QDebug>
@@ -1017,6 +1018,64 @@ private:
 };
 
 // =====wjy====
+constexpr int kScriptTreeNodeTypeRole = Qt::UserRole + 1;
+constexpr int kScriptTreeFolderNode = 0;
+constexpr int kScriptTreeFileNode = 1;
+
+QStringList supportedScriptSuffixes()
+{
+    return {
+        QStringLiteral("bat"),
+        QStringLiteral("cmd"),
+        QStringLiteral("ps1"),
+        QStringLiteral("py"),
+        QStringLiteral("exe"),
+    }; // wjy: 右键和脚本树只展示真正能够被远端包装器执行的入口后缀，whl 等依赖包仍作为目录内容复制。
+}
+
+bool isSupportedScriptSuffix(const QString& suffix)
+{
+    return supportedScriptSuffixes().contains(suffix.trimmed().toLower()); // wjy: 所有入口校验统一走同一份后缀白名单，避免菜单和执行器出现两套标准。
+}
+
+QFileInfoList scriptEntryFiles(const QString& folderPath)
+{
+    QDir dir(folderPath);
+    QStringList filters;
+    for (const QString& suffix : supportedScriptSuffixes()) {
+        filters.append(QStringLiteral("*.%1").arg(suffix)); // wjy: 目录快照只收集可执行入口文件，配置和依赖文件不占用菜单动作。
+    }
+    return dir.entryInfoList(
+        filters,
+        QDir::Files,
+        QDir::Name | QDir::IgnoreCase); // wjy: 同一目录中的多个入口按名称稳定排序，菜单显示顺序和后台预检保持一致。
+}
+
+QString scriptWorkspaceName(const QString& sourceFolderPath, const QString& entryScriptHash)
+{
+    const QDir scriptRoot(QString::fromUtf8(kRemoteScriptFolderPath));
+    const QString relativeFolder = QDir::fromNativeSeparators(
+        scriptRoot.relativeFilePath(QDir::cleanPath(sourceFolderPath)))
+        .trimmed()
+        .toLower();
+    const QByteArray folderDigest = QCryptographicHash::hash(
+        relativeFolder.toUtf8(),
+        QCryptographicHash::Sha256)
+        .toHex()
+        .left(10); // wjy: 用共享根目录下的相对文件夹路径生成稳定短哈希，避免不同目录中的同名脚本共用 work 缓存。
+    QString baseName = QFileInfo(QDir::cleanPath(sourceFolderPath)).fileName().trimmed();
+    if (baseName.isEmpty()) {
+        baseName = QStringLiteral("script"); // wjy: 根目录或异常 UNC 路径没有文件夹名时仍提供合法、可定位的工作区前缀。
+    }
+    baseName.replace(QRegularExpression(QStringLiteral("[\\\\/:*?\"<>|]")), QStringLiteral("_"));
+    const QString normalizedEntryHash = entryScriptHash.trimmed().toLower();
+    return baseName
+        + QStringLiteral("__")
+        + QString::fromLatin1(folderDigest)
+        + QStringLiteral("__")
+        + normalizedEntryHash; // wjy: 目录路径 Hash 和入口内容 Hash 同时编码进 work 名称，任一 Hash 变化都会自然落到新工作区。
+}
+
 QFileInfoList scriptChildDirectories(const QString& folderPath)
 {
     QDir dir(folderPath);
@@ -1038,6 +1097,16 @@ QJsonArray scriptFolderTreeChildrenSnapshot(const QString& folderPath, int depth
         QJsonObject child;
         child.insert(QStringLiteral("name"), childInfo.fileName());
         child.insert(QStringLiteral("path"), childInfo.absoluteFilePath());
+        child.insert(QStringLiteral("type"), QStringLiteral("folder")); // wjy: 明确区分目录节点和入口文件节点，菜单不再把目录名误当成脚本动作。
+        QJsonArray scripts;
+        for (const QFileInfo& scriptInfo : scriptEntryFiles(childInfo.absoluteFilePath())) {
+            QJsonObject script;
+            script.insert(QStringLiteral("name"), scriptInfo.fileName());
+            script.insert(QStringLiteral("path"), scriptInfo.absoluteFilePath());
+            script.insert(QStringLiteral("type"), QStringLiteral("file")); // wjy: 入口动作绑定具体文件路径，用户选择哪个文件就执行哪个文件。
+            scripts.append(script);
+        }
+        child.insert(QStringLiteral("scripts"), scripts); // wjy: 一个目录可同时展示多个 bat/cmd/ps1/py/exe 入口。
         child.insert(QStringLiteral("children"),
             scriptFolderTreeChildrenSnapshot(childInfo.absoluteFilePath(), depth + 1)); // wjy: 后台递归生成纯数据快照，禁止在线程中创建 Qt 控件。
         children.append(child);
@@ -1059,6 +1128,15 @@ QJsonObject loadScriptFolderTreeSnapshot(const QString& rootPath)
     }
 
     snapshot.insert(QStringLiteral("available"), true);
+    QJsonArray scripts;
+    for (const QFileInfo& scriptInfo : scriptEntryFiles(rootPath)) {
+        QJsonObject script;
+        script.insert(QStringLiteral("name"), scriptInfo.fileName());
+        script.insert(QStringLiteral("path"), scriptInfo.absoluteFilePath());
+        script.insert(QStringLiteral("type"), QStringLiteral("file")); // wjy: 根共享目录下的入口文件也纳入统一菜单/树节点模型。
+        scripts.append(script);
+    }
+    snapshot.insert(QStringLiteral("scripts"), scripts);
     snapshot.insert(QStringLiteral("children"), scriptFolderTreeChildrenSnapshot(rootPath, 0));
     return snapshot;
 }
@@ -1119,28 +1197,51 @@ QString readScriptOutputFileTail(const QString& filePath, qint64 maxBytes = 256 
     return QString::fromUtf8(file.readAll());
 }
 
-QFileInfo scriptEntryFile(const QString& folderPath)
+QFileInfo scriptEntryFileForSelection(const QString& entryPath)
 {
-    const QStringList priorityExtensions = {
-        QStringLiteral("*.bat"),
-        QStringLiteral("*.cmd"),
-        QStringLiteral("*.ps1"),
-        QStringLiteral("*.py"),
-        QStringLiteral("*.exe"),
-        QStringLiteral("*.whl"),
-    }; // wjy: 优先使用批处理/PowerShell 作为入口，其次 Python，最后才直接运行 exe。
-
-    const QDir dir(folderPath);
-    for (const QString& pattern : priorityExtensions) {
-        const QFileInfoList files = dir.entryInfoList(
-            QStringList{pattern},
-            QDir::Files,
-            QDir::Name | QDir::IgnoreCase);
-        if (!files.isEmpty()) {
-            return files.first(); // wjy: 同类脚本多个时先取名称排序后的第一个，后续可再扩展为脚本选择菜单。
-        }
+    const QFileInfo entryScript(QDir::cleanPath(entryPath));
+    if (!entryScript.exists()
+        || !entryScript.isFile()
+        || !isSupportedScriptSuffix(entryScript.suffix())) {
+        return {}; // wjy: 菜单已经明确选择入口文件，预检只验证该文件仍存在且后缀受支持，不再按优先级猜测其它文件。
     }
-    return {};
+    return entryScript; // wjy: 返回用户点选的精确入口，避免同一目录多个脚本时执行错文件。
+}
+
+QString scriptEntryContentHash(const QFileInfo& scriptFile, QString* errorMessage = nullptr)
+{
+    if (errorMessage) {
+        errorMessage->clear();
+    }
+    QFile file(scriptFile.absoluteFilePath());
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (errorMessage) {
+            *errorMessage = QString::fromUtf8("无法读取入口脚本：%1").arg(file.errorString());
+        }
+        return {};
+    }
+
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    while (!file.atEnd()) {
+        const QByteArray chunk = file.read(1024 * 1024);
+        if (chunk.isEmpty()) {
+            if (!file.atEnd()) {
+                if (errorMessage) {
+                    *errorMessage = QString::fromUtf8("读取入口脚本失败：%1").arg(file.errorString());
+                }
+                return {};
+            }
+            break;
+        }
+        hash.addData(chunk); // wjy: 分块计算 SHA-256，避免大脚本或可执行入口一次性占满后台线程内存。
+    }
+    if (file.error() != QFile::NoError) {
+        if (errorMessage) {
+            *errorMessage = QString::fromUtf8("读取入口脚本失败：%1").arg(file.errorString());
+        }
+        return {};
+    }
+    return QString::fromLatin1(hash.result().toHex()); // wjy: 返回完整内容 Hash，脚本版本变化时生成新的 work 目录。
 }
 
 QString scriptRunCommandForFile(const QFileInfo& scriptFile)
@@ -4989,6 +5090,7 @@ void DeviceGrid::applyScriptFolderTreeSnapshot(const QJsonObject& snapshot)
     const QString rootName = snapshot.value(QStringLiteral("name")).toString(QString::fromUtf8("远程脚本文件"));
     QTreeWidgetItem* rootItem = new QTreeWidgetItem(m_scriptFolderTree, QStringList(rootName));
     rootItem->setData(0, Qt::UserRole, rootPath);
+    rootItem->setData(0, kScriptTreeNodeTypeRole, kScriptTreeFolderNode); // wjy: 根节点明确标记为目录，不能被当成可执行入口。
     rootItem->setToolTip(0, rootPath);
     rootItem->setExpanded(true);
 
@@ -5000,8 +5102,24 @@ void DeviceGrid::applyScriptFolderTreeSnapshot(const QJsonObject& snapshot)
         return; // wjy: 后台失败只更新占位文字，主线程不会再次验证共享路径。
     }
 
+    std::function<void(QTreeWidgetItem*, const QJsonArray&)> appendScripts;
+    appendScripts = [](QTreeWidgetItem* parentItem, const QJsonArray& scripts) {
+        for (const QJsonValue& scriptValue : scripts) {
+            const QJsonObject script = scriptValue.toObject();
+            const QString scriptName = script.value(QStringLiteral("name")).toString();
+            const QString scriptPath = script.value(QStringLiteral("path")).toString();
+            if (scriptName.isEmpty() || scriptPath.isEmpty()) {
+                continue;
+            }
+            QTreeWidgetItem* scriptItem = new QTreeWidgetItem(parentItem, QStringList(scriptName));
+            scriptItem->setData(0, Qt::UserRole, scriptPath);
+            scriptItem->setData(0, kScriptTreeNodeTypeRole, kScriptTreeFileNode); // wjy: 树节点绑定具体入口文件，后续点击直接执行该文件所在目录的副本。
+            scriptItem->setToolTip(0, scriptPath);
+        }
+    };
+
     std::function<void(QTreeWidgetItem*, const QJsonArray&)> appendChildren;
-    appendChildren = [&appendChildren](QTreeWidgetItem* parentItem, const QJsonArray& children) {
+    appendChildren = [&appendChildren, &appendScripts](QTreeWidgetItem* parentItem, const QJsonArray& children) {
         for (const QJsonValue& childValue : children) {
             const QJsonObject child = childValue.toObject();
             const QString childName = child.value(QStringLiteral("name")).toString();
@@ -5011,13 +5129,19 @@ void DeviceGrid::applyScriptFolderTreeSnapshot(const QJsonObject& snapshot)
             }
             QTreeWidgetItem* childItem = new QTreeWidgetItem(parentItem, QStringList(childName));
             childItem->setData(0, Qt::UserRole, childPath);
+            childItem->setData(0, kScriptTreeNodeTypeRole,
+                child.value(QStringLiteral("type")).toString() == QStringLiteral("file")
+                    ? kScriptTreeFileNode
+                    : kScriptTreeFolderNode); // wjy: 快照中的目录/文件类型直接传递到 UI，菜单和树选中规则共用这一标记。
             childItem->setToolTip(0, childPath);
+            appendScripts(childItem, child.value(QStringLiteral("scripts")).toArray());
             appendChildren(childItem, child.value(QStringLiteral("children")).toArray()); // wjy: UI 只消费纯 JSON 数据，不执行 QFileInfo/QDir 查询。
         }
     };
+    appendScripts(rootItem, snapshot.value(QStringLiteral("scripts")).toArray());
     appendChildren(rootItem, snapshot.value(QStringLiteral("children")).toArray());
     if (rootItem->childCount() == 0) {
-        QTreeWidgetItem* emptyItem = new QTreeWidgetItem(rootItem, QStringList(QString::fromUtf8("无子文件夹")));
+        QTreeWidgetItem* emptyItem = new QTreeWidgetItem(rootItem, QStringList(QString::fromUtf8("无可执行脚本或子文件夹")));
         emptyItem->setDisabled(true);
     }
     m_scriptFolderTreeLoaded = true;
@@ -5043,25 +5167,31 @@ void DeviceGrid::populateCachedScriptFolderMenu(QMenu* menu) const
     }
 
     QTreeWidgetItem* rootItem = m_scriptFolderTree->topLevelItem(0);
-    std::function<void(QMenu*, QTreeWidgetItem*)> appendMenuItem;
+    std::function<bool(QMenu*, QTreeWidgetItem*)> appendMenuItem;
     appendMenuItem = [&appendMenuItem](QMenu* targetMenu, QTreeWidgetItem* item) {
         if (!targetMenu || !item) {
-            return;
+            return false;
         }
         if (!(item->flags() & Qt::ItemIsEnabled)) {
             QAction* placeholderAction = targetMenu->addAction(item->text(0));
             placeholderAction->setEnabled(false);
-            return;
+            return true;
         }
-        if (item->childCount() == 0) {
-            QAction* scriptFolderAction = targetMenu->addAction(item->text(0));
-            scriptFolderAction->setData(item->data(0, Qt::UserRole)); // wjy: 叶子动作直接复用后台快照路径，创建菜单时零网络访问。
-            return;
+        if (item->data(0, kScriptTreeNodeTypeRole).toInt() == kScriptTreeFileNode) {
+            QAction* scriptFileAction = targetMenu->addAction(item->text(0));
+            scriptFileAction->setData(item->data(0, Qt::UserRole)); // wjy: 菜单动作绑定用户点选的具体入口文件，不再把目录名当作隐式入口。
+            return true;
         }
         QMenu* childMenu = targetMenu->addMenu(item->text(0));
         for (int childIndex = 0; childIndex < item->childCount(); ++childIndex) {
             appendMenuItem(childMenu, item->child(childIndex));
         }
+        if (childMenu->actions().isEmpty()) {
+            targetMenu->removeAction(childMenu->menuAction());
+            delete childMenu; // wjy: 没有可执行入口的目录不生成空子菜单，避免用户点击后才得到无意义的目录动作。
+            return false;
+        }
+        return true;
     };
     for (int childIndex = 0; childIndex < rootItem->childCount(); ++childIndex) {
         appendMenuItem(menu, rootItem->child(childIndex));
@@ -5076,16 +5206,20 @@ void DeviceGrid::selectScriptFolderTreeItem(QTreeWidgetItem* item)
         return;
     }
 
-    const QString scriptFolderPath = item->data(0, Qt::UserRole).toString().trimmed();
-    if (scriptFolderPath.isEmpty()) {
+    if (item->data(0, kScriptTreeNodeTypeRole).toInt() != kScriptTreeFileNode) {
+        return; // wjy: 文件夹节点只负责展开目录，只有用户明确点击入口文件时才更新执行目标。
+    }
+
+    const QString scriptEntryPath = item->data(0, Qt::UserRole).toString().trimmed();
+    if (scriptEntryPath.isEmpty()) {
         return;
     }
 
-    m_lastScriptFolderPath = QDir::cleanPath(scriptFolderPath); // wjy: 点击后台快照节点时直接采用已验证路径，不在 UI 线程重新调用 isDir。
-    const QString folderName = item->text(0).trimmed();
-    m_scriptOutputTitle = folderName.trimmed().isEmpty()
+    m_lastScriptEntryPath = QDir::cleanPath(scriptEntryPath); // wjy: 保存具体入口文件路径，执行时由其父目录作为复制范围。
+    const QString entryName = item->text(0).trimmed();
+    m_scriptOutputTitle = entryName.trimmed().isEmpty()
         ? QString::fromUtf8("脚本日志")
-        : QString::fromUtf8("已选择: %1").arg(folderName);
+        : QString::fromUtf8("已选择: %1").arg(entryName); // wjy: 日志标题显示用户实际选择的文件，多个入口同目录时不会再产生歧义。
     saveCurrentScriptUiState();
     update(scriptTerminalPanelRect().toAlignedRect().adjusted(-2, -2, 2, 2));
 // ===end====
@@ -5098,8 +5232,8 @@ void DeviceGrid::syncScriptFolderTreeSelection()
         return;
     }
 
-    const QString selectedPath = QDir::cleanPath(m_lastScriptFolderPath); // wjy: 仅做字符串规范化，选择同步不查询共享目录元数据。
-    if (m_lastScriptFolderPath.trimmed().isEmpty()) {
+    const QString selectedPath = QDir::cleanPath(m_lastScriptEntryPath); // wjy: 仅做字符串规范化，选择同步不查询共享目录元数据。
+    if (m_lastScriptEntryPath.trimmed().isEmpty()) {
         QSignalBlocker blocker(m_scriptFolderTree);
         m_scriptFolderTree->clearSelection();
         m_scriptFolderTree->setCurrentItem(nullptr);
@@ -7511,14 +7645,14 @@ void DeviceGrid::showDeviceContextMenuForIndexes(
     } else if (selectedAction == stopScriptsAction) {
         stopDeviceScriptsForIndexes(validTargetIndexes); // wjy: 停止动作一次遍历全部菜单目标，并聚合没有运行脚本时的反馈。
     } else if (selectedAction && selectedAction->data().isValid()) {
-        const QString scriptFolderPath = selectedAction->data().toString(); // wjy: 先保存脚本菜单绑定的目录，单设备和多设备必须执行同一个脚本入口。
+        const QString scriptEntryPath = selectedAction->data().toString(); // wjy: 保存菜单绑定的具体入口文件，单设备和多设备必须执行同一个用户选择。
         if (batchDeviceMenu) {
             batchExecuteDeviceScriptFolder(
                 validTargetIndexes,
-                scriptFolderPath,
+                scriptEntryPath,
                 QString::fromUtf8("选中的设备中没有可执行设备。")); // wjy: 多选时传入完整有效目标集合，不能再只使用触发右键菜单的 deviceIndex。
         } else {
-            executeDeviceScriptFolder(deviceIndex, scriptFolderPath, true); // wjy: 单设备及远控标题栏菜单保留原来的详细失败提示。
+            executeDeviceScriptFolder(deviceIndex, scriptEntryPath, true); // wjy: 单设备及远控标题栏菜单保留原来的详细失败提示。
         }
     // ===end====
     } else if (selectedAction == wakeAction) {
@@ -7769,14 +7903,14 @@ void DeviceGrid::openCurrentDeviceTerminal()
     openTerminalForDeviceIndex(m_selectedDeviceIndex, true);
 }
 
-void DeviceGrid::executeCurrentDeviceScriptFolder(const QString& scriptFolderPath)
+void DeviceGrid::executeCurrentDeviceScriptFolder(const QString& scriptEntryPath)
 {
 // =====wjy====
-    executeDeviceScriptFolder(m_selectedDeviceIndex, scriptFolderPath, true); // wjy: 设备右键和终端执行按钮仍然按当前详情设备执行脚本。
+    executeDeviceScriptFolder(m_selectedDeviceIndex, scriptEntryPath, true); // wjy: 当前设备执行用户明确选择的入口文件，父目录由执行函数负责复制。
 // ===end====
 }
 
-bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scriptFolderPath, bool showMessages)
+bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scriptEntryPath, bool showMessages)
 {
 // =====wjy====
     if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
@@ -7788,7 +7922,7 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
     const QString preflightIdentity = device.id.trimmed().isEmpty() ? targetIp : device.id.trimmed();
     const QString preflightKey = preflightIdentity
         + QLatin1Char('\x1f')
-        + QDir::fromNativeSeparators(scriptFolderPath).trimmed().toLower(); // wjy: 稳定设备身份和规范脚本路径共同组成预检查键，不同脚本仍可独立安排。
+        + QDir::fromNativeSeparators(scriptEntryPath).trimmed().toLower(); // wjy: 稳定设备身份和具体入口路径共同组成预检查键，同目录不同脚本可独立安排。
     const ScriptUiState existingState = m_scriptUiStateStore.state(targetIp);
     if (existingState.outputRunning && existingState.localLaunchInProgress) {
         m_scriptLaunchPreflightResults.remove(preflightKey); // wjy: 另一轮预检查返回前脚本已经启动时清理旧结果，未来重试必须重新确认远端状态。
@@ -7813,13 +7947,23 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
         const QString deviceId = device.id;
         QPointer<DeviceGrid> self(this);
         try {
-            runBackgroundTask([self, deviceId, targetIp, scriptFolderPath, preflightKey, showMessages] {
+            runBackgroundTask([self, deviceId, targetIp, scriptEntryPath, preflightKey, showMessages] {
                 ScriptLaunchPreflightResult preflight;
-                const QFileInfo entryScript = scriptEntryFile(scriptFolderPath); // wjy: 可能触碰 UNC 的脚本目录枚举和 exists 全部在可取消后台线程执行。
+                const QFileInfo entryScript = scriptEntryFileForSelection(scriptEntryPath); // wjy: 后台只验证用户点选的具体入口，避免同目录多个文件时重新猜入口。
                 preflight.entryAvailable = entryScript.exists()
                     && !scriptRunCommandForFile(entryScript).trimmed().isEmpty();
                 if (preflight.entryAvailable) {
                     preflight.entryScriptPath = entryScript.absoluteFilePath();
+                    QString hashError;
+                    preflight.entryScriptHash = scriptEntryContentHash(entryScript, &hashError); // wjy: 在后台线程计算入口脚本内容 Hash，脚本版本变化会落到新的本地工作区。
+                    if (preflight.entryScriptHash.isEmpty()) {
+                        preflight.entryAvailable = false;
+                        preflight.errorMessage = hashError.isEmpty()
+                            ? QString::fromUtf8("无法计算入口脚本 Hash。")
+                            : hashError;
+                    }
+                }
+                if (preflight.entryAvailable) {
                     preflight.remoteStatus = platform::DeviceStatusService::query(targetIp); // wjy: 一次后台 49101 查询同时取得终端用户和权威脚本状态。
                     const platform::RemoteScriptRuntimeInfo& runtime = preflight.remoteStatus.scriptRuntime;
                     const bool statusAlreadyBlocksLaunch = runtime.supported
@@ -7851,7 +7995,7 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
                 if (!self) {
                     return;
                 }
-                QMetaObject::invokeMethod(self, [self, deviceId, targetIp, scriptFolderPath, preflightKey, showMessages, preflight] {
+                QMetaObject::invokeMethod(self, [self, deviceId, targetIp, scriptEntryPath, preflightKey, showMessages, preflight] {
                     if (!self) {
                         return;
                     }
@@ -7867,7 +8011,7 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
                         return; // wjy: 设备已被删除时直接丢弃网络结果，不创建无归属脚本状态。
                     }
                     grid->m_scriptLaunchPreflightResults.insert(preflightKey, preflight);
-                    grid->executeDeviceScriptFolder(currentDeviceIndex, scriptFolderPath, showMessages); // wjy: 原脚本状态机仍只在主线程运行，本次递归会一次性消费后台结果而不会再次发网络请求。
+                    grid->executeDeviceScriptFolder(currentDeviceIndex, scriptEntryPath, showMessages); // wjy: 原脚本状态机仍只在主线程运行，本次递归只消费已完成的具体入口预检。
                 }, Qt::QueuedConnection);
             });
         } catch (...) {
@@ -7884,7 +8028,12 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
     const QFileInfo entryScript(preflight.entryScriptPath);
     if (!preflight.entryAvailable) {
         if (showMessages) {
-            QMessageBox::information(this, QString(), QString::fromUtf8("无可用脚本"));
+            QMessageBox::information(
+                this,
+                QString(),
+                preflight.errorMessage.isEmpty()
+                    ? QString::fromUtf8("无可用脚本")
+                    : preflight.errorMessage); // wjy: Hash 读取失败等预检错误直接反馈具体原因，不伪装成脚本不存在。
         }
         return false; // wjy: 后台确认没有受支持入口后不创建 work，也不发任何 SSH 执行命令。
     }
@@ -7953,10 +8102,10 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
         return false; // wjy: 脚本执行复用远程终端密钥授权，目标设备未准备好时提前提示。
     }
 
-    const QString sourcePath = QDir::toNativeSeparators(QFileInfo(scriptFolderPath).absoluteFilePath());
+    const QString sourcePath = QDir::toNativeSeparators(entryScript.absolutePath());
     const QString targetName = deviceDisplayName(device);
     const QString scriptName = entryScript.fileName();
-    const QString scriptWorkName = entryScript.completeBaseName();
+    const QString scriptWorkName = scriptWorkspaceName(sourcePath, preflight.entryScriptHash); // wjy: 目录路径 Hash 和入口脚本内容 Hash 同时决定工作区，任一变化都会创建新副本。
     const QString runId = QUuid::createUuid().toString(QUuid::WithoutBraces); // wjy: 每次执行生成唯一 ID，远端完成/停止只能清理属于本次运行的活动清单。
     const bool targetIsCurrent = currentScriptUiDeviceIp() == targetIp;
     ScriptUiState state;
@@ -7978,7 +8127,7 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
     state.outputTitle = QString::fromUtf8("%1 - %2").arg(targetName, scriptName);
     state.outputText = QString::fromUtf8("$ 执行脚本 %1\n目标设备: %2\n状态: 正在复制并执行...\n")
         .arg(scriptName, targetName); // wjy: 点击脚本后立即显示右侧终端面板，让用户知道远端任务已经开始。
-    state.lastScriptFolderPath = scriptFolderPath;
+    state.lastScriptEntryPath = entryScript.absoluteFilePath(); // wjy: 保存精确入口文件路径，切换设备或再次点击执行时仍使用同一个文件。
     state.editorVisible = true;
     state.editorLoading = true;
     state.editorSaving = false;
@@ -7994,7 +8143,7 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
     update(deviceListViewportRect(m_deviceGroupExpanded)); // wjy: 脚本启动后立刻刷新设备列表，单台和分组批量执行都能马上显示运行图标。
     if (targetIsCurrent) {
         m_deviceDetailTab = DeviceDetailTab::ScriptLog;
-        m_lastScriptFolderPath = state.lastScriptFolderPath;
+        m_lastScriptEntryPath = state.lastScriptEntryPath;
         m_scriptOutputVisible = state.outputVisible;
         m_scriptOutputRunning = state.outputRunning;
         m_scriptOutputFailed = state.outputFailed;
@@ -8042,10 +8191,9 @@ $workRoot = Join-Path $fsremoteDir 'work'
 New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
 $scriptWorkName = '%4'
 $work = Join-Path $workRoot $scriptWorkName
-$workAlreadyExists = Test-Path -LiteralPath $work
-if (-not $workAlreadyExists) {
+$source = '%1'
+if (-not (Test-Path -LiteralPath $work)) {
     New-Item -ItemType Directory -Force -Path $work | Out-Null
-    $source = '%1'
     $log = Join-Path $work 'fsremote_robocopy.log'
     & robocopy $source $work /E /R:1 /W:1 /NFL /NDL /NJH /NJS "/LOG:$log" | Out-Null
     $copyExit = $LASTEXITCODE
@@ -8055,8 +8203,9 @@ if (-not $workAlreadyExists) {
         }
         exit $copyExit
     }
+    Write-Output ('FSRemote created script workspace: ' + $work) # wjy: 两个 Hash 首次组合出新工作区时才复制共享目录，配置副本从此在本地 work 中独立保存。
 } else {
-    Write-Output ('FSRemote reuse existing work folder: ' + $work)
+    Write-Output ('FSRemote reused script workspace: ' + $work) # wjy: 目录路径 Hash 和入口脚本内容 Hash 均未变化时复用旧副本，避免覆盖本地修改过的 control.txt。
 }
 Set-Location -LiteralPath $work
 $entry = Join-Path $work '%2'
@@ -8245,10 +8394,10 @@ exit $scriptExit
 // =====wjy====
 void DeviceGrid::batchExecuteDeviceScriptFolder(
     const QVector<int>& deviceIndexes,
-    const QString& scriptFolderPath,
+    const QString& scriptEntryPath,
     const QString& noExecutableMessage)
 {
-    const QString validationPath = QDir::fromNativeSeparators(scriptFolderPath).trimmed().toLower();
+    const QString validationPath = QDir::fromNativeSeparators(scriptEntryPath).trimmed().toLower();
     if (validationPath.isEmpty() || m_pendingScriptBatchValidationPaths.contains(validationPath)) {
         return; // wjy: 空路径或同一共享目录已经在验证时不重复创建批量后台任务。
     }
@@ -8262,14 +8411,14 @@ void DeviceGrid::batchExecuteDeviceScriptFolder(
     m_pendingScriptBatchValidationPaths.insert(validationPath);
     QPointer<DeviceGrid> self(this);
     try {
-        runBackgroundTask([self, targetDeviceIds, scriptFolderPath, noExecutableMessage, validationPath] {
-            const QFileInfo entryScript = scriptEntryFile(scriptFolderPath);
+        runBackgroundTask([self, targetDeviceIds, scriptEntryPath, noExecutableMessage, validationPath] {
+            const QFileInfo entryScript = scriptEntryFileForSelection(scriptEntryPath); // wjy: 批量入口预检只确认用户点选的文件，不再从目录中自动挑选其它脚本。
             const bool entryAvailable = entryScript.exists()
                 && !scriptRunCommandForFile(entryScript).trimmed().isEmpty(); // wjy: 批量入口的唯一共享目录预检在后台执行，网盘无响应不会卡住菜单。
             if (!self) {
                 return;
             }
-            QMetaObject::invokeMethod(self, [self, targetDeviceIds, scriptFolderPath, noExecutableMessage, validationPath, entryAvailable] {
+            QMetaObject::invokeMethod(self, [self, targetDeviceIds, scriptEntryPath, noExecutableMessage, validationPath, entryAvailable] {
                 if (!self) {
                     return;
                 }
@@ -8284,7 +8433,7 @@ void DeviceGrid::batchExecuteDeviceScriptFolder(
                 for (const QString& deviceId : targetDeviceIds) {
                     const int currentIndex = g_deviceCatalog.deviceIndexForId(deviceId);
                     if (currentIndex >= 0
-                        && grid->executeDeviceScriptFolder(currentIndex, scriptFolderPath, false)) {
+                        && grid->executeDeviceScriptFolder(currentIndex, scriptEntryPath, false)) {
                         ++scheduledCount; // wjy: 每个目标再执行自己的后台状态和授权预检查，脚本运行状态仍按设备 IP 完全隔离。
                     }
                 }
@@ -8302,7 +8451,7 @@ void DeviceGrid::batchExecuteDeviceScriptFolder(
 }
 // ===end====
 
-void DeviceGrid::executeDeviceGroupScriptFolder(int groupIndex, const QString& scriptFolderPath)
+void DeviceGrid::executeDeviceGroupScriptFolder(int groupIndex, const QString& scriptEntryPath)
 {
 // =====wjy====
     if (groupIndex < 0 || groupIndex >= g_deviceGroupNames.size()) {
@@ -8310,7 +8459,7 @@ void DeviceGrid::executeDeviceGroupScriptFolder(int groupIndex, const QString& s
     }
     batchExecuteDeviceScriptFolder(
         deviceIndexesForGroup(groupIndex),
-        scriptFolderPath,
+        scriptEntryPath,
         QString::fromUtf8("分组内没有可执行设备。")); // wjy: 分组入口也按稳定分组 ID 取得设备，并复用与多选设备完全相同的批量执行逻辑。
 // ===end====
 }
@@ -9858,7 +10007,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             m_scriptOutputRunning,
             m_scriptOutputFailed,
             m_scriptOutputScrollOffset,
-            !m_lastScriptFolderPath.trimmed().isEmpty() && !m_scriptOutputRunning); // wjy: Script output lives in the right-side blank area after the device detail card is painted.
+            !m_lastScriptEntryPath.trimmed().isEmpty() && !m_scriptOutputRunning); // wjy: 只有存在具体入口文件且当前未运行时显示执行按钮。
     }
         painter.restore();
     }
@@ -10457,8 +10606,8 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
             || scriptTerminalStopButtonRect().contains(event->position()))) {
         if (scriptTerminalStopButtonRect().contains(event->position())) {
             stopCurrentDeviceScript(); // wjy: 停止时先要求目标设备 taskkill 脚本进程树，再让本地 SSH 执行会话退出。
-        } else if (!m_scriptOutputRunning && !m_lastScriptFolderPath.trimmed().isEmpty()) {
-            executeCurrentDeviceScriptFolder(m_lastScriptFolderPath);
+        } else if (!m_scriptOutputRunning && !m_lastScriptEntryPath.trimmed().isEmpty()) {
+            executeCurrentDeviceScriptFolder(m_lastScriptEntryPath);
         }
         event->accept();
         return;

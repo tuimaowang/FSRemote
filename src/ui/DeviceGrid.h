@@ -100,6 +100,7 @@ private:
     struct ScriptLaunchPreflightResult {
         bool entryAvailable = false; // wjy: 后台已经确认脚本目录存在受支持入口，主线程不再对 UNC 路径调用 exists。
         QString entryScriptPath; // wjy: 保存后台解析出的实际入口文件，后续运行命令和编辑器继续使用同一文件。
+        QString entryScriptHash; // wjy: 保存入口脚本内容 SHA-256，工作区 Hash 变化时创建新副本而不覆盖旧配置。
         platform::DeviceStatusInfo remoteStatus; // wjy: 一次状态查询同时携带终端用户和权威脚本运行态，避免重复连接 49101。
         bool authorizationSucceeded = false; // wjy: 公钥已成功登记到目标端后才允许进入原脚本启动状态机。
         QString errorMessage; // wjy: 后台脚本入口、状态或授权失败的详细原因只在主线程显示。
@@ -166,9 +167,9 @@ private:
     void openCurrentDeviceTerminal();
     bool openTerminalForDeviceIndex(int deviceIndex, bool showMessages);
     bool scheduleOpenTerminals(const QVector<int>& deviceIndexes, bool showMessages); // wjy: 终端用户名查询、密钥授权和进程启动统一在一个后台批次完成。
-    void executeCurrentDeviceScriptFolder(const QString& scriptFolderPath); // wjy: Copy one shared script folder to remote work directory and run its entry script.
-    bool executeDeviceScriptFolder(int deviceIndex, const QString& scriptFolderPath, bool showMessages); // wjy: Run one shared script folder on a specified device without forcing the current selection.
-    void executeDeviceGroupScriptFolder(int groupIndex, const QString& scriptFolderPath); // wjy: Run one selected script folder for every device in a group.
+    void executeCurrentDeviceScriptFolder(const QString& scriptEntryPath); // wjy: Copy the selected entry file's parent folder and run that exact entry on the current device.
+    bool executeDeviceScriptFolder(int deviceIndex, const QString& scriptEntryPath, bool showMessages); // wjy: Run the selected entry file's parent folder on one specified device.
+    void executeDeviceGroupScriptFolder(int groupIndex, const QString& scriptEntryPath); // wjy: Run one selected entry file for every device in a group.
     void openRemoteDesktopWindow();
     void openRemoteDesktopWindowForDevice(int deviceIndex); // wjy: 首次窗口的位置由 RemoteDesktopWindow 统一按当前屏幕居中，不再由设备列表附加偏移。
     void launchSelectedRemoteDesktopWindows();
@@ -292,7 +293,7 @@ private:
     void batchShutdownDevices(const QVector<int>& deviceIndexes);
     void batchRestartDevices(const QVector<int>& deviceIndexes);
     // =====wjy====
-    void batchExecuteDeviceScriptFolder(const QVector<int>& deviceIndexes, const QString& scriptFolderPath, const QString& noExecutableMessage); // wjy: 多选设备和分组脚本共用统一批量入口，一次校验脚本后再逐台启动。
+    void batchExecuteDeviceScriptFolder(const QVector<int>& deviceIndexes, const QString& scriptEntryPath, const QString& noExecutableMessage); // wjy: 多选设备和分组脚本共用统一批量入口，先校验用户点选的入口再逐台启动。
     void batchUpdateDevices(const QVector<int>& deviceIndexes); // wjy: 多选设备或分组菜单统一复用单设备更新请求逻辑。
     // ===end====
     void batchOpenDeviceTerminals(const QVector<int>& deviceIndexes);
@@ -310,7 +311,7 @@ private:
     QString m_currentDeviceName;
     ScriptUiStateStore m_scriptUiStateStore; // wjy: 每设备脚本状态由独立仓储唯一持有，DeviceGrid 只投影当前设备页面。
     // =====wjy====
-    QSet<QString> m_pendingScriptLaunchKeys; // wjy: 按设备稳定 ID 和脚本目录组合去重，预检查期间连续点击不会重复访问网盘或目标端口。
+    QSet<QString> m_pendingScriptLaunchKeys; // wjy: 按设备稳定 ID 和具体入口路径组合去重，预检查期间连续点击不会重复访问网盘或目标端口。
     QSet<QString> m_pendingScriptBatchValidationPaths; // wjy: 分组或多选脚本先后台验证一次共享入口，同一路径验证期间不重复创建整批任务。
     QHash<QString, ScriptLaunchPreflightResult> m_scriptLaunchPreflightResults; // wjy: 后台结果暂存到主线程后由原执行函数一次性消费，保持后续脚本状态逻辑不变。
     // ===end====
