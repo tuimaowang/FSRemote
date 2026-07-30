@@ -2127,17 +2127,34 @@ QString localSystemMemoryText(quint64 bytes)
     return QStringLiteral("%1 GB").arg(bytes / (1024.0 * 1024.0 * 1024.0), 0, 'f', 1);
 }
 
+int localSystemDiskUsagePercent(const platform::LocalDiskInfo& disk)
+{
+    if (disk.totalBytes == 0) {
+        return -1; // wjy: 单个盘符容量查询失败时保留未知状态，不把空容量误画成 0%。
+    }
+    const quint64 usedBytes = qMin(disk.usedBytes, disk.totalBytes); // wjy: 显示层再次限制已用容量，防止刷新期间容量变化产生超过总量的文本。
+    return qBound(0, qRound(usedBytes * 100.0 / disk.totalBytes), 100); // wjy: 每个盘符独立计算 0-100 百分比，容量条和告警颜色共用同一结果。
+}
+
 QString localSystemDiskUsageText(const platform::LocalDiskInfo& disk)
 {
     if (disk.totalBytes == 0) {
-        return QStringLiteral("--"); // wjy: 单个盘符容量查询失败时只显示占位，不影响其它盘符和资源圆环。
+        return QStringLiteral("--");
     }
-    const quint64 usedBytes = qMin(disk.usedBytes, disk.totalBytes); // wjy: 显示层再次限制已用容量，防止刷新期间容量变化产生超过总量的文本。
-    const int usagePercent = qBound(0, qRound(usedBytes * 100.0 / disk.totalBytes), 100); // wjy: 每个盘符独立计算 0-100 百分比，不再复用系统盘结果。
-    return QString::fromUtf8("已用 %1 / %2 GB · %3%")
-        .arg(usedBytes / (1024.0 * 1024.0 * 1024.0), 0, 'f', 1)
-        .arg(disk.totalBytes / (1024.0 * 1024.0 * 1024.0), 0, 'f', 1)
-        .arg(usagePercent); // wjy: 同一行同时给出已用、总量和百分比，用户无需在多个字段间换算。
+    const quint64 usedBytes = qMin(disk.usedBytes, disk.totalBytes);
+    return QString::fromUtf8("已用 %1 / %2")
+        .arg(localSystemMemoryText(usedBytes))
+        .arg(localSystemMemoryText(disk.totalBytes)); // wjy: 顶部文字只保留已用和总量，百分比由右侧容量条直观表达。
+}
+
+QString localSystemDiskAvailableText(const platform::LocalDiskInfo& disk)
+{
+    if (disk.totalBytes == 0) {
+        return QStringLiteral("--");
+    }
+    const quint64 usedBytes = qMin(disk.usedBytes, disk.totalBytes);
+    return QString::fromUtf8("可用 %1")
+        .arg(localSystemMemoryText(disk.totalBytes - usedBytes)); // wjy: 可用容量直接由同一盘符总量减已用量得到，和容量条保持一致。
 }
 
 QColor localUsageColor(qreal usagePercent)
@@ -2157,79 +2174,93 @@ QColor localUsageColor(qreal usagePercent)
 void drawLocalSystemInfoPage(
     QPainter& painter,
     const platform::LocalSystemInfo& info,
+    const platform::LocalMemoryUsage& memoryUsage,
     qreal cpuUsagePercent,
     qreal gpuUsagePercent,
     qreal memoryUsagePercent,
     const QFont& textFont)
 {
     const QRect panel = scriptFileEditorRect(); // wjy: 本机页复用脚本/配置内容区域，缩放和底部安全边界保持完全一致。
-    const int diskItemCount = qMax(1, info.disks.size()); // wjy: 没有取得盘符时仍保留一项占位；正常情况下数量完全来自数据层枚举结果。
-    const int diskRowCount = diskItemCount; // wjy: 每个枚举到的盘符固定占用一整行，C、D、E 等按顺序向下换行，不再因窗口较宽排列到同一行。
-    constexpr int diskRowHeight = 26; // wjy: 每行固定 26px，使多盘符增加高度时仍保持紧凑且文字垂直居中。
-    const int diskAreaHeight = diskRowCount * diskRowHeight; // wjy: 磁盘区域高度由实际盘符行数计算，C、D、E 等新增盘符都会得到独立显示位置。
-    const QRect usageCard(panel.x(), panel.y(), panel.width(), 96 + diskAreaHeight); // wjy: 资源卡在固定三枚圆环下方按磁盘行数增长，不再为单个 C 盘写死 118px 高度。
-    const int infoTop = usageCard.bottom() + 12;
-    const QRect infoCard(panel.x(), infoTop, panel.width(), qMax(220, panel.bottom() - infoTop));
+    const QRect resourceCard = panel; // wjy: CPU、GPU、内存和磁盘共享完整内容区，只绘制一个外层卡片。
+    painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
+    painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
+    painter.drawRoundedRect(
+        QRectF(resourceCard).adjusted(0.5, 0.5, -0.5, -0.5),
+        5,
+        5); // wjy: 统一白底和细边框取代原来的资源卡加系统信息卡，不再产生上下两个视觉块。
 
-    const auto drawCard = [&painter](const QRect& card) {
-        painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
-        painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
-        painter.drawRoundedRect(QRectF(card).adjusted(0.5, 0.5, -0.5, -0.5), 5, 5); // wjy: 信息卡使用配置页同样的白底和细边框，避免本机页脱离现有视觉系统。
-    };
+    const QRect content = resourceCard.adjusted(18, 12, -18, -12);
+    constexpr int cpuRowHeight = 78;
+    constexpr int gpuRowHeight = 78;
+    constexpr int memoryRowHeight = 112; // wjy: 内存行额外容纳已用容量、内存条组合、插槽和类型速率四层信息。
+    constexpr int resourceGap = 6;
+    const QRect cpuRow(content.x(), content.y(), content.width(), cpuRowHeight);
+    const QRect gpuRow(content.x(), cpuRow.bottom() + 1 + resourceGap, content.width(), gpuRowHeight);
+    const QRect memoryRow(content.x(), gpuRow.bottom() + 1 + resourceGap, content.width(), memoryRowHeight);
 
-    drawCard(usageCard);
-    drawCard(infoCard);
-
-    QFont titleFont(textFont);
-    titleFont.setPixelSize(15);
-    titleFont.setBold(true);
-    const QRect metricsArea = usageCard.adjusted(16, 10, -16, -(diskAreaHeight + 14)); // wjy: 上部三类资源保持固定视觉高度，底部空间全部交给动态盘符列表。
-    const int metricGap = 12;
-    const int metricWidth = qMax(1, (metricsArea.width() - metricGap * 2) / 3);
-    const QRect cpuMetric(metricsArea.x(), metricsArea.y(), metricWidth, metricsArea.height());
-    const QRect gpuMetric(cpuMetric.right() + 1 + metricGap, metricsArea.y(), metricWidth, metricsArea.height());
-    const int memoryMetricX = gpuMetric.right() + 1 + metricGap;
-    const QRect memoryMetric(memoryMetricX, metricsArea.y(), qMax(1, metricsArea.right() - memoryMetricX + 1), metricsArea.height()); // wjy: 最后一列吸收整数除法余数，三个区域始终填满可用宽度。
-
-    painter.save();
-    painter.setPen(QPen(QColor(QStringLiteral("#EEF2F7")), 1));
-    const int firstSeparatorX = cpuMetric.right() + metricGap / 2;
-    const int secondSeparatorX = gpuMetric.right() + metricGap / 2;
-    painter.drawLine(firstSeparatorX, metricsArea.y() + 6, firstSeparatorX, metricsArea.bottom() - 6);
-    painter.drawLine(secondSeparatorX, metricsArea.y() + 6, secondSeparatorX, metricsArea.bottom() - 6); // wjy: 使用浅分隔线表达三列关系，不把用户截图中的红色标注框画进正式界面。
-    painter.restore();
-
-    const auto drawUsageMetric = [&](const QRect& metricRect,
-                                     const QString& label,
-                                     const QString& detail,
-                                     qreal usagePercent) {
-        const int ringSize = qBound(44, metricRect.height() - 8, 54);
+    const auto drawUsageRow = [&](const QRect& rowRect,
+                                  const QString& label,
+                                  const QString& primaryText,
+                                  const QStringList& secondaryTexts,
+                                  qreal usagePercent) {
+        constexpr int labelWidth = 54;
+        const int ringSize = qBound(48, rowRect.height() - 18, 62);
         const QRect ringRect(
-            metricRect.right() - ringSize - 2,
-            metricRect.y() + (metricRect.height() - ringSize) / 2,
+            rowRect.x() + labelWidth,
+            rowRect.y() + (rowRect.height() - ringSize) / 2,
             ringSize,
-            ringSize); // wjy: 每列圆环右对齐，左侧保留标签和摘要，布局对应用户给出的三块示意。
+            ringSize); // wjy: 标签在最左、圆环在中间、硬件摘要在右侧，严格对应用户确认的纵向草图结构。
         const QRect textRect(
-            metricRect.x() + 2,
-            metricRect.y() + 7,
-            qMax(34, ringRect.x() - metricRect.x() - 8),
-            metricRect.height() - 14);
+            ringRect.right() + 18,
+            rowRect.y() + 7,
+            qMax(30, rowRect.right() - ringRect.right() - 18),
+            rowRect.height() - 14);
 
         QFont labelFont(textFont);
-        labelFont.setPixelSize(11);
+        labelFont.setPixelSize(13);
+        labelFont.setBold(true);
         painter.setFont(labelFont);
-        painter.setPen(QColor(QStringLiteral("#687384")));
-        painter.drawText(textRect.adjusted(0, 0, 0, -28), Qt::AlignLeft | Qt::AlignVCenter, label);
+        painter.setPen(QColor(QStringLiteral("#3A7BFC")));
+        painter.drawText(
+            QRect(rowRect.x(), rowRect.y(), labelWidth - 8, rowRect.height()),
+            Qt::AlignLeft | Qt::AlignVCenter,
+            label); // wjy: 三类资源标签使用统一主色，左侧不再堆叠额外本机身份信息。
 
-        QFont detailFont(textFont);
-        detailFont.setPixelSize(15);
-        detailFont.setBold(true);
-        painter.setFont(detailFont);
+        QFont primaryFont(textFont);
+        primaryFont.setPixelSize(13);
+        primaryFont.setBold(true);
+        painter.setFont(primaryFont);
         painter.setPen(QColor(QStringLiteral("#111827")));
         painter.drawText(
-            textRect.adjusted(0, 20, 0, 0),
+            QRect(textRect.x(), textRect.y(), textRect.width(), 20),
             Qt::AlignLeft | Qt::AlignVCenter,
-            QFontMetrics(detailFont).elidedText(detail, Qt::ElideRight, textRect.width())); // wjy: 每列摘要在窄窗口下独立省略，不会挤进圆环。
+            QFontMetrics(primaryFont).elidedText(
+                localSystemInfoDisplayValue(primaryText),
+                Qt::ElideRight,
+                textRect.width())); // wjy: 型号或已用容量作为每行第一视觉层级，过长时只在自身区域省略。
+
+        QFont secondaryFont(textFont);
+        secondaryFont.setPixelSize(11);
+        painter.setFont(secondaryFont);
+        painter.setPen(QColor(QStringLiteral("#687384")));
+        constexpr int secondaryLineHeight = 19;
+        for (int index = 0; index < secondaryTexts.size(); ++index) {
+            const QRect lineRect(
+                textRect.x(),
+                textRect.y() + 22 + index * secondaryLineHeight,
+                textRect.width(),
+                secondaryLineHeight);
+            if (lineRect.bottom() > textRect.bottom()) {
+                break;
+            }
+            painter.drawText(
+                lineRect,
+                Qt::AlignLeft | Qt::AlignVCenter,
+                QFontMetrics(secondaryFont).elidedText(
+                    localSystemInfoDisplayValue(secondaryTexts.at(index)),
+                    Qt::ElideRight,
+                    lineRect.width())); // wjy: CPU/GPU/内存细节按独立行裁切，关键数字不会跨入圆环或卡片边界。
+        }
 
         painter.save();
         painter.setRenderHint(QPainter::Antialiasing);
@@ -2258,35 +2289,108 @@ void drawLocalSystemInfoPage(
         painter.drawText(ringRect, Qt::AlignCenter, percentText);
     };
 
-    const QString cpuDetail = info.logicalProcessorCount > 0
-        ? QString::fromUtf8("%1线程").arg(info.logicalProcessorCount)
-        : QStringLiteral("--");
-    const QString gpuDetail = gpuUsagePercent < 0
-        ? QString::fromUtf8("采样中")
-        : QString::fromUtf8("实时占用");
-    drawUsageMetric(cpuMetric, QStringLiteral("CPU"), cpuDetail, cpuUsagePercent);
-    drawUsageMetric(gpuMetric, QStringLiteral("GPU"), gpuDetail, gpuUsagePercent);
-    drawUsageMetric(memoryMetric, QString::fromUtf8("内存"), localSystemMemoryText(info.totalPhysicalMemoryBytes), memoryUsagePercent); // wjy: 顶部按 CPU、GPU、内存固定顺序绘制，三列位置不会随采样结果变化。
+    const QString cpuSecondary = info.logicalProcessorCount > 0
+        ? QString::fromUtf8("%1 逻辑处理器 · %2")
+              .arg(info.logicalProcessorCount)
+              .arg(localSystemInfoDisplayValue(info.cpuArchitecture))
+        : localSystemInfoDisplayValue(info.cpuArchitecture);
+    drawUsageRow(
+        cpuRow,
+        QStringLiteral("CPU"),
+        info.cpuModel,
+        {cpuSecondary},
+        cpuUsagePercent);
 
-    const QRect diskArea = usageCard.adjusted(
-        18,
-        usageCard.height() - diskAreaHeight - 8,
-        -18,
-        -8); // wjy: 磁盘列表固定从资源圆环下方开始，区域高度与上面计算的实际行数严格一致。
+    const QString gpuMemoryText = info.gpu.dedicatedVideoMemoryBytes > 0
+        ? QString::fromUtf8("专用显存 %1").arg(localSystemMemoryText(info.gpu.dedicatedVideoMemoryBytes))
+        : QString::fromUtf8("专用显存 --");
+    drawUsageRow(
+        gpuRow,
+        QStringLiteral("GPU"),
+        info.gpu.name,
+        {gpuMemoryText},
+        gpuUsagePercent);
+
+    const quint64 sampledTotalMemory = memoryUsage.totalBytes > 0
+        ? memoryUsage.totalBytes
+        : info.totalPhysicalMemoryBytes; // wjy: 首次动态采样失败时回退到静态总容量，内存行仍有可用信息。
+    const QString memoryPrimary = memoryUsage.totalBytes > 0
+        ? QString::fromUtf8("已用 %1 / %2")
+              .arg(localSystemMemoryText(memoryUsage.usedBytes))
+              .arg(localSystemMemoryText(memoryUsage.totalBytes))
+        : QString::fromUtf8("总容量 %1").arg(localSystemMemoryText(sampledTotalMemory));
+    const int installedModuleCount = info.memoryModules.size();
+    const QString slotText = installedModuleCount > 0
+        ? (info.totalMemorySlotCount > 0
+                ? QString::fromUtf8("已使用 %1 / %2 个插槽")
+                      .arg(installedModuleCount)
+                      .arg(info.totalMemorySlotCount)
+                : QString::fromUtf8("已安装 %1 条内存").arg(installedModuleCount))
+        : QString::fromUtf8("内存条信息 --");
+    const QString specificationText = QStringLiteral("%1 · %2")
+        .arg(platform::LocalSystemInfoService::memoryTypeSummary(info.memoryModules))
+        .arg(platform::LocalSystemInfoService::memorySpeedSummary(info.memoryModules));
+    QStringList memoryDetails{
+        platform::LocalSystemInfoService::memoryCapacityComposition(info.memoryModules),
+        slotText,
+        specificationText,
+    };
+    if (memoryUsage.totalBytes > 0) {
+        const QString availableMemoryText = memoryUsage.availableBytes > 0
+            ? localSystemMemoryText(memoryUsage.availableBytes)
+            : QStringLiteral("0.0 GB"); // wjy: 已成功采样且可用容量为零时显示真实 0，而不是把它误判成未知占位。
+        memoryDetails.prepend(
+            QString::fromUtf8("可用 %1").arg(availableMemoryText)); // wjy: 可用容量来自同一次 GlobalMemoryStatusEx 快照，不通过整数百分比反推。
+    }
+    drawUsageRow(
+        memoryRow,
+        QString::fromUtf8("内存"),
+        memoryPrimary,
+        memoryDetails,
+        memoryUsagePercent);
+
     painter.save();
     painter.setPen(QPen(QColor(QStringLiteral("#EEF2F7")), 1));
-    for (int row = 1; row < diskRowCount; ++row) {
+    painter.drawLine(content.left(), cpuRow.bottom() + resourceGap / 2, content.right(), cpuRow.bottom() + resourceGap / 2);
+    painter.drawLine(content.left(), gpuRow.bottom() + resourceGap / 2, content.right(), gpuRow.bottom() + resourceGap / 2);
+    painter.drawLine(content.left(), memoryRow.bottom() + resourceGap, content.right(), memoryRow.bottom() + resourceGap); // wjy: 浅分隔线只组织同一卡片内部内容，不再形成独立子卡片。
+    painter.restore();
+
+    const int diskItemCount = qMax(1, info.disks.size());
+    const int diskHeaderY = memoryRow.bottom() + resourceGap + 1;
+    const QRect diskHeaderRect(content.x(), diskHeaderY, content.width(), 30);
+    QFont diskHeaderFont(textFont);
+    diskHeaderFont.setPixelSize(13);
+    diskHeaderFont.setBold(true);
+    painter.setFont(diskHeaderFont);
+    painter.setPen(QColor(QStringLiteral("#111827")));
+    painter.drawText(diskHeaderRect, Qt::AlignLeft | Qt::AlignVCenter, QString::fromUtf8("磁盘"));
+
+    const int diskRowsTop = diskHeaderRect.bottom() + 1;
+    const int availableDiskHeight = qMax(42, content.bottom() - diskRowsTop + 1);
+    const int diskRowHeight = qBound(
+        42,
+        availableDiskHeight / diskItemCount,
+        58); // wjy: 常见盘符使用接近资源管理器的两行高度，盘符增多时在同一卡片内自动压缩。
+    const QRect diskArea(
+        content.x(),
+        diskRowsTop,
+        content.width(),
+        diskRowHeight * diskItemCount);
+
+    painter.save();
+    painter.setPen(QPen(QColor(QStringLiteral("#EEF2F7")), 1));
+    for (int row = 1; row < diskItemCount; ++row) {
         const int separatorY = diskArea.y() + row * diskRowHeight;
-        painter.drawLine(diskArea.left(), separatorY, diskArea.right(), separatorY); // wjy: 多行盘符使用浅色横线分隔，容量文字较长时仍能明确对应当前行。
+        painter.drawLine(diskArea.left(), separatorY, diskArea.right(), separatorY);
     }
     painter.restore();
 
     QFont diskLabelFont(textFont);
-    diskLabelFont.setPixelSize(11);
+    diskLabelFont.setPixelSize(12);
     diskLabelFont.setBold(true);
     QFont diskValueFont(textFont);
     diskValueFont.setPixelSize(11);
-    diskValueFont.setBold(true);
     for (int index = 0; index < diskItemCount; ++index) {
         const QRect cellRect(
             diskArea.x(),
@@ -2298,8 +2402,28 @@ void drawLocalSystemInfoPage(
         const QString diskLabel = hasDisk
             ? localSystemInfoDisplayValue(disk.rootPath)
             : QString::fromUtf8("磁盘"); // wjy: 每个真实盘符独立作为标签；枚举为空时只显示一行“磁盘 --”占位。
-        const QRect labelRect = cellRect.adjusted(2, 0, -cellRect.width() + 44, 0);
-        const QRect valueRect = cellRect.adjusted(48, 0, -2, 0);
+        const QRect labelRect(cellRect.x() + 2, cellRect.y(), 48, cellRect.height());
+        const QRect diskContentRect(
+            labelRect.right() + 8,
+            cellRect.y() + 4,
+            qMax(20, cellRect.right() - labelRect.right() - 10),
+            cellRect.height() - 8);
+        const QRect usageTextRect(
+            diskContentRect.x(),
+            diskContentRect.y(),
+            diskContentRect.width(),
+            18);
+        const int availableTextWidth = qMin(112, qMax(72, diskContentRect.width() / 3));
+        const QRect availableTextRect(
+            diskContentRect.right() - availableTextWidth + 1,
+            diskContentRect.bottom() - 18,
+            availableTextWidth,
+            18);
+        const QRect barRect(
+            diskContentRect.x(),
+            diskContentRect.bottom() - 12,
+            qMax(18, availableTextRect.x() - diskContentRect.x() - 12),
+            8);
 
         painter.setFont(diskLabelFont);
         painter.setPen(QColor(QStringLiteral("#687384")));
@@ -2310,68 +2434,41 @@ void drawLocalSystemInfoPage(
         painter.setFont(diskValueFont);
         painter.setPen(QColor(QStringLiteral("#111827")));
         painter.drawText(
-            valueRect,
-            Qt::AlignVCenter | Qt::AlignRight,
+            usageTextRect,
+            Qt::AlignVCenter | Qt::AlignLeft,
             QFontMetrics(diskValueFont).elidedText(
                 hasDisk ? localSystemDiskUsageText(disk) : QStringLiteral("--"),
                 Qt::ElideRight,
-                valueRect.width())); // wjy: 每个盘符分别在独立行显示已用、总量和百分比，盘符数量完全跟随本机枚举结果。
-    }
-    const QStringList labels{
-        QString::fromUtf8("电脑名称"),
-        QString::fromUtf8("操作系统"),
-        QString::fromUtf8("CPU 型号"),
-        QString::fromUtf8("CPU 架构"),
-        QString::fromUtf8("逻辑处理器"),
-        QString::fromUtf8("物理内存"),
-        QStringLiteral("IPv4"),
-        QStringLiteral("MAC"),
-        QString::fromUtf8("子网掩码"),
-        QString::fromUtf8("默认网关"),
-    };
-    const QStringList values{
-        localSystemInfoDisplayValue(info.network.name),
-        localSystemInfoDisplayValue(info.operatingSystem),
-        localSystemInfoDisplayValue(info.cpuModel),
-        localSystemInfoDisplayValue(info.cpuArchitecture),
-        info.logicalProcessorCount > 0 ? QString::number(info.logicalProcessorCount) : QStringLiteral("--"),
-        localSystemMemoryText(info.totalPhysicalMemoryBytes),
-        localSystemInfoDisplayValue(info.network.ip),
-        localSystemInfoDisplayValue(info.network.mac),
-        localSystemInfoDisplayValue(info.network.subnetMask),
-        localSystemInfoDisplayValue(info.network.gateway),
-    };
-
-    painter.setFont(titleFont);
-    painter.setPen(QColor(QStringLiteral("#040B18")));
-    painter.drawText(infoCard.adjusted(18, 12, -18, -infoCard.height() + 42), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("本机系统信息"));
-
-    const int columnGap = 18;
-    const int fieldGap = 6;
-    const int fieldWidth = qMax(120, (infoCard.width() - 36 - columnGap) / 2);
-    const int fieldHeight = 38; // wjy: 五行信息在最小窗口高度下仍完整落入详情安全边界，不被底部折叠区域裁掉。
-    QFont labelFont(textFont);
-    labelFont.setPixelSize(11);
-    QFont valueFont(textFont);
-    valueFont.setPixelSize(13);
-    for (int index = 0; index < labels.size(); ++index) {
-        const int column = index % 2;
-        const int row = index / 2;
-        const QRect field(
-            infoCard.x() + 18 + column * (fieldWidth + columnGap),
-            infoCard.y() + 44 + row * (fieldHeight + fieldGap),
-            fieldWidth,
-            fieldHeight);
-        painter.setPen(Qt::NoPen);
-        painter.setBrush(QColor(QStringLiteral("#F8FAFC")));
-        painter.drawRoundedRect(QRectF(field), 4, 4);
-        painter.setFont(labelFont);
+                usageTextRect.width()));
         painter.setPen(QColor(QStringLiteral("#687384")));
-        painter.drawText(field.adjusted(10, 3, -10, -20), Qt::AlignVCenter | Qt::AlignLeft, labels.at(index));
-        painter.setFont(valueFont);
-        painter.setPen(QColor(QStringLiteral("#111827")));
-        const QString value = QFontMetrics(valueFont).elidedText(values.at(index), Qt::ElideRight, field.width() - 20);
-        painter.drawText(field.adjusted(10, 17, -10, -3), Qt::AlignVCenter | Qt::AlignLeft, value);
+        painter.drawText(
+            availableTextRect,
+            Qt::AlignVCenter | Qt::AlignRight,
+            QFontMetrics(diskValueFont).elidedText(
+                hasDisk ? localSystemDiskAvailableText(disk) : QStringLiteral("--"),
+                Qt::ElideLeft,
+                availableTextRect.width())); // wjy: 可用容量固定贴右，容量条在左侧保留足够长度模拟文件资源管理器。
+
+        painter.save();
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(QStringLiteral("#EEF2F7")));
+        painter.drawRoundedRect(QRectF(barRect), 4, 4);
+        const int usagePercent = hasDisk ? localSystemDiskUsagePercent(disk) : -1;
+        if (usagePercent >= 0) {
+            const int filledWidth = qBound(
+                0,
+                qRound(barRect.width() * usagePercent / 100.0),
+                barRect.width());
+            if (filledWidth > 0) {
+                painter.setBrush(localUsageColor(usagePercent));
+                painter.drawRoundedRect(
+                    QRectF(barRect.x(), barRect.y(), filledWidth, barRect.height()),
+                    4,
+                    4); // wjy: 已用比例填充容量条，60% 和 85% 阈值沿用资源圆环的橙色与红色提醒。
+            }
+        }
+        painter.restore();
     }
 }
 // ===end====
@@ -3489,20 +3586,22 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
             m_localGpuUsageSampler.reset(); // wjy: GPU 查询句柄跟随页面可见性释放，隐藏期间不持续采集性能计数器。
             m_localCpuUsagePercent = -1.0;
             m_localGpuUsagePercent = -1.0;
-            m_localMemoryUsagePercent = -1.0; // wjy: 清除三类显示值，下次进入先重新建立各自采样状态。
+            m_localMemoryUsagePercent = -1.0;
+            m_localMemoryUsage = {}; // wjy: 清除动态内存容量快照，下次进入不会短暂显示上一次页面的已用和可用值。
             return;
         }
         const int sampledCpuPercent = m_localCpuUsageSampler.samplePercent(); // wjy: 一次定时回调连续读取三类只读资源快照。
         const int sampledGpuPercent = m_localGpuUsageSampler.samplePercent();
-        const int sampledMemoryPercent = m_localMemoryUsageSampler.samplePercent();
+        const platform::LocalMemoryUsage sampledMemory = m_localMemoryUsageSampler.sample(); // wjy: 百分比和容量从同一份系统快照取得，内存文字不会与圆环来自不同时间点。
         if (sampledCpuPercent >= 0) {
             animateLocalUsageTo(m_localCpuUsageAnimation, m_localCpuUsagePercent, sampledCpuPercent);
         }
         if (sampledGpuPercent >= 0) {
             animateLocalUsageTo(m_localGpuUsageAnimation, m_localGpuUsagePercent, sampledGpuPercent);
         }
-        if (sampledMemoryPercent >= 0) {
-            animateLocalUsageTo(m_localMemoryUsageAnimation, m_localMemoryUsagePercent, sampledMemoryPercent); // wjy: 三类有效样本分别从当前画面平滑过渡，不会互相重置。
+        if (sampledMemory.percent >= 0) {
+            m_localMemoryUsage = sampledMemory; // wjy: 先提交最新容量，再让圆环平滑过渡；每次重绘看到的容量始终是最新完整快照。
+            animateLocalUsageTo(m_localMemoryUsageAnimation, m_localMemoryUsagePercent, sampledMemory.percent); // wjy: 三类有效样本分别从当前画面平滑过渡，不会互相重置。
         }
     });
     QTimer::singleShot(0, this, [this] {
@@ -3890,7 +3989,8 @@ void DeviceGrid::prepareForApplicationExit()
         m_localGpuUsageSampler.reset(); // wjy: 同步清除 CPU 时间基线并关闭 GPU PDH 查询句柄。
         m_localCpuUsagePercent = -1.0;
         m_localGpuUsagePercent = -1.0;
-        m_localMemoryUsagePercent = -1.0; // wjy: 三类显示值全部恢复未采样哨兵，重复进入退出准备时状态一致。
+        m_localMemoryUsagePercent = -1.0;
+        m_localMemoryUsage = {}; // wjy: 退出准备同时丢弃已用/可用容量，销毁期间不会再绘制陈旧内存数据。
     }
     if (m_localCpuUsageAnimation) {
         m_localCpuUsageAnimation->stop();
@@ -9672,6 +9772,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
         drawLocalSystemInfoPage(
             painter,
             m_localSystemInfo,
+            m_localMemoryUsage,
             m_localCpuUsagePercent,
             m_localGpuUsagePercent,
             m_localMemoryUsagePercent,
@@ -9857,9 +9958,12 @@ void DeviceGrid::refreshLocalSystemInfoTab()
     m_localCpuUsagePercent = m_localCpuUsageSampler.samplePercent(); // wjy: CPU 首次采样只建立累计时间基线。
     m_localGpuUsagePercent = m_localGpuUsageSampler.samplePercent(); // wjy: GPU 首次采集创建通配符查询并建立性能计数器基线。
     m_localMemoryUsagePercent = -1.0;
-    const int memoryPercent = m_localMemoryUsageSampler.samplePercent();
-    if (memoryPercent >= 0) {
-        animateLocalUsageTo(m_localMemoryUsageAnimation, m_localMemoryUsagePercent, memoryPercent); // wjy: 内存无需双样本，进入页面后立即从零平滑显示当前负载。
+    m_localMemoryUsage = m_localMemoryUsageSampler.sample(); // wjy: 首次进入立即取得已用、总量、可用容量和负载百分比。
+    if (m_localMemoryUsage.percent >= 0) {
+        animateLocalUsageTo(
+            m_localMemoryUsageAnimation,
+            m_localMemoryUsagePercent,
+            m_localMemoryUsage.percent); // wjy: 内存无需双样本，进入页面后立即从零平滑显示当前负载。
     }
 }
 
@@ -9923,7 +10027,8 @@ void DeviceGrid::updateLocalSystemMonitorState()
         m_localGpuUsageSampler.reset(); // wjy: 离开页面立即丢弃 CPU 基线并关闭 GPU 查询，隐藏期间不继续消耗资源。
         m_localCpuUsagePercent = -1.0;
         m_localGpuUsagePercent = -1.0;
-        m_localMemoryUsagePercent = -1.0; // wjy: 重新进入时三枚圆环都不会短暂显示旧负载。
+        m_localMemoryUsagePercent = -1.0;
+        m_localMemoryUsage = {}; // wjy: 离开本机页同步清除容量快照，重新进入后等待新的同一时刻采样。
     }
 }
 

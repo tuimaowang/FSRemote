@@ -335,10 +335,11 @@ private:
     QLineEdit* m_deviceGroupNameEdit = nullptr; // wjy: Group rename editor.
     QLineEdit* m_deviceListNameEdit = nullptr; // wjy: Device rename editor shown directly on the left list row.
     DeviceSearchPanel* m_deviceSearchPanel = nullptr; // wjy: 主界面右侧查找页的唯一控件实例，生命周期由 DeviceGrid 父子关系管理。
-    platform::LocalSystemInfo m_localSystemInfo; // wjy: 本机详情页展示的静态系统和网络快照，不写回设备目录。
+    platform::LocalSystemInfo m_localSystemInfo; // wjy: 本机详情页只保存 CPU、GPU、内存和磁盘硬件快照，不再包含身份或网络字段。
     platform::CpuUsageSampler m_localCpuUsageSampler; // wjy: 保存相邻 GetSystemTimes 样本，只在本机页可见期间推进基线。
     platform::GpuUsageSampler m_localGpuUsageSampler; // wjy: 持有 Windows GPU Engine 性能计数器查询，只在本机页可见期间采样。
     platform::MemoryUsageSampler m_localMemoryUsageSampler; // wjy: 每秒只读当前物理内存负载，不保存跨页面基线。
+    platform::LocalMemoryUsage m_localMemoryUsage; // wjy: 保存最新同一时刻的已用、总量和可用容量，页面重绘不再次调用系统 API。
     QTimer* m_localSystemInfoTimer = nullptr; // wjy: 本机页 CPU、GPU、内存占用共用一秒刷新定时器，离开页面后停止。
     QVariantAnimation* m_localCpuUsageAnimation = nullptr; // wjy: CPU 圆环在相邻样本间平滑扫动。
     QVariantAnimation* m_localGpuUsageAnimation = nullptr; // wjy: GPU 圆环独立缓动，不与 CPU 新样本互相抢占动画状态。
