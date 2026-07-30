@@ -282,6 +282,7 @@ private:
     FsRemoteStreamHandle m_viewerHandle = nullptr;
     std::shared_ptr<RemoteDesktopViewerCallbackContext> m_viewerCallbackContext; // wjy: stop返回前持续持有原生回调user指针，避免异步销毁期间访问已经释放的上下文。
     std::atomic<quint64> m_viewerGeneration = 0; // wjy: viewer每次创建、停止或关闭都推进代际，跨线程回调只读取这一原子值。
+    std::atomic<quint64> m_staleTextureFrameDrops = 0; // wjy: 独立统计旧Viewer代际迟到纹理，诊断时不再与Presenter背压、网络丢包混合。
     bool m_closeInProgress = false;
     // =====wjy====
     RemoteUpdateState m_remoteUpdateState = RemoteUpdateState::None;
@@ -337,7 +338,7 @@ private:
     QElapsedTimer m_sessionClock;
     QElapsedTimer m_frameStatsClock; // wjy: Measures one-second windows for the remote desktop title-bar statistics.
     int m_frameStatsCount = 0; // wjy: 统计当前窗口真正成功进入显示路径的BGRA或共享纹理帧数。
-    quint64 m_totalPresentedFrames = 0; // wjy: 单调累计成功 Present 数，与单槽拒绝计数求差得到本地呈现压力而非网络结果。
+    quint64 m_totalPresentedFrames = 0; // wjy: 单调累计成功Present数，与单槽旧pending替换计数求差得到本地呈现压力而非网络结果。
     qint64 m_frameStatsBytes = 0; // wjy: Accumulates decoded BGRA bytes for raw-throughput diagnostics.
     double m_receiveFps = 0.0; // wjy: Last calculated UI-side received FPS shown in the title bar.
     double m_rawBgraMbps = 0.0; // wjy: Last calculated decoded BGRA throughput, separate from compressed network bitrate.

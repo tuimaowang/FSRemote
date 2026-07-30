@@ -795,17 +795,61 @@ private:
         lsp::DecodedFrame decoded;
         std::string error;
         // append_viewer_log("decoder ffmpeg decode begin size=" + std::to_string(data.size())); // wjy: per-frame decode log disabled for smoother multi-view streaming.
-        if (!decoder_.decode(data, &decoded, &error)) {
+        const lsp::DecodeResult decodeResult = decoder_.decode(data, &decoded, &error);
+        if (decodeResult.status == lsp::DecodeStatus::NeedMoreInput) {
+            return WEBRTC_VIDEO_CODEC_OK; // wjy: FFmpeg低延迟路径暂未产出画面属于正常节奏，保持解码实例和参考链。
+        }
+        if (decodeResult.status == lsp::DecodeStatus::OutputTextureBusy) {
+            ++output_texture_busy_drops_; // wjy: Presenter未及时归还三槽时只丢显示输出，不把背压计入真实解码错误。
+            consecutive_corrupt_decode_errors_ = 0; // wjy: 共享纹理繁忙发生在码流成功解码之后，证明参考链健康并清除旧损坏连续计数。
+            waiting_for_keyframe_ = false; // wjy: 当前压缩帧已经成功进入FFmpeg参考链；即使没有可写显示纹理，也不能继续等待或请求关键帧。
+            if (output_texture_busy_drops_ <= 3 || output_texture_busy_drops_ % 120 == 0) {
+                std::cout << "uu-d3d11va-hevc output texture busy drops=" << output_texture_busy_drops_ << "\n";
+            }
+            return WEBRTC_VIDEO_CODEC_OK; // wjy: 不reset、不进入等待关键帧、不请求PLI，也不触发软件回退。
+        }
+        if (decodeResult.status == lsp::DecodeStatus::DeviceLost) {
+            ++decode_errors_;
+            decoder_.reset(); // wjy: 先释放当前Viewer持有的FFmpeg/D3D11VA对象，其他远控窗口的独立解码器不受影响。
+            decoder_ready_ = false;
+            staging_.Reset();
+            staging_w_ = 0;
+            staging_h_ = 0;
+            staging_format_ = DXGI_FORMAT_UNKNOWN;
+            context_.Reset();
+            device_.Reset(); // wjy: 丢弃已失效的外层D3D设备，下一次Decode由ensure_device为本Viewer创建新设备代际。
+            consecutive_corrupt_decode_errors_ = 0;
+            waiting_for_keyframe_ = true;
+            last_keyframe_request_ms_ = GetTickCount64();
+            append_viewer_log("decoder device lost; rebuild current viewer device"); // wjy: 设备恢复与码流损坏分开记录，不把单窗口GPU故障扩散到整个进程。
+            return WEBRTC_VIDEO_CODEC_ERROR;
+        }
+        if (!decodeResult.producedFrame()) {
+            ++decode_errors_;
+            if (decodeResult.status == lsp::DecodeStatus::CorruptBitstream) {
+                ++consecutive_corrupt_decode_errors_; // wjy: 偶发损坏只丢当前输出；连续损坏才说明参考链需要关键帧恢复。
+                if (consecutive_corrupt_decode_errors_ < kCorruptDecodeErrorsBeforeReset) {
+                    if (consecutive_corrupt_decode_errors_ == 1) {
+                        append_viewer_log("decoder corrupt frame dropped without reset"); // wjy: 只记录连续段首帧，避免损坏期间逐帧磁盘输出。
+                    }
+                    return WEBRTC_VIDEO_CODEC_OK;
+                }
+            } else {
+                consecutive_corrupt_decode_errors_ = 0; // wjy: 致命资源或契约错误不参与码流损坏阈值，立即进入现有恢复路径。
+            }
             decoder_.reset();
             decoder_ready_ = false;
             waiting_for_keyframe_ = true;
             last_keyframe_request_ms_ = GetTickCount64();
-            if (++decode_errors_ <= 3 || decode_errors_ % 30 == 0) {
-                std::cerr << "uu-d3d11va-hevc decode failed; reset and request keyframe: " << error << "\n";
+            if (decode_errors_ <= 3 || decode_errors_ % 30 == 0) {
+                std::cerr << "uu-d3d11va-hevc decode failed status=" << static_cast<int>(decodeResult.status)
+                          << "; reset and request keyframe: " << error << "\n";
             }
-            append_viewer_log("decoder ffmpeg decode failed error=" + error); // wjy: compressed frame decode returned an error.
+            append_viewer_log("decoder ffmpeg decode failed status="
+                + std::to_string(static_cast<int>(decodeResult.status)) + " error=" + error); // wjy: 真实码流、设备或致命错误保留类别，显示背压不会进入这里。
             return WEBRTC_VIDEO_CODEC_ERROR;
         }
+        consecutive_corrupt_decode_errors_ = 0; // wjy: 任意成功解码帧都结束损坏连续段，后续偶发错误重新从零计数。
         // =====wjy====
         struct SharedTextureReleaseGuard {
             lsp::H264Decoder* decoder = nullptr;
@@ -1057,6 +1101,9 @@ private:
     uint64_t decode_calls_ = 0;
     uint64_t decoded_frames_ = 0;
     uint64_t decode_errors_ = 0;
+    uint64_t output_texture_busy_drops_ = 0; // wjy: 独立记录共享输出槽繁忙丢帧，不能与码流损坏或网络丢包合并。
+    static constexpr uint32_t kCorruptDecodeErrorsBeforeReset = 3; // wjy: 连续三次明确码流损坏才重置并请求关键帧，避免单包抖动造成恢复风暴。
+    uint32_t consecutive_corrupt_decode_errors_ = 0;
     uint64_t last_keyframe_request_ms_ = 0;
     uint64_t encoded_stats_start_ms_ = 0;
     uint64_t encoded_stats_bytes_ = 0;

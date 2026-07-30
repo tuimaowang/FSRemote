@@ -690,14 +690,17 @@ private:
             }
 
             lsp::DecodedFrame decoded;
-            if (decoder.decode(*encoded, &decoded, &error)) {
+            const lsp::DecodeResult decodeResult = decoder.decode(*encoded, &decoded, &error);
+            if (decodeResult.producedFrame()) {
                 auto frame = std::make_shared<lsp::DecodedFrame>(std::move(decoded));
                 std::lock_guard lock(mutex_);
                 latest_frame_ = std::move(frame);
                 stats_.frame_id = frame_id;
                 ++stats_.frames;
                 last_error_.clear();
-            } else if (!error.empty()) {
+            } else if (decodeResult.status != lsp::DecodeStatus::NeedMoreInput
+                && decodeResult.status != lsp::DecodeStatus::OutputTextureBusy
+                && !error.empty()) {
                 {
                     std::lock_guard lock(encoded_mutex_);
                     encoded_queue_.clear();

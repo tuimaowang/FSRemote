@@ -1389,10 +1389,10 @@ int FSREMOTE_STREAM_CALL onRemoteTextureFrame(void* user, int width, int height,
     try {
         auto* context = static_cast<RemoteDesktopViewerCallbackContext*>(user); // wjy: 每个纹理回调携带固定代际，旧连接即使仍在解码也只能写入自己的上下文。
         RemoteDesktopWindow* window = context ? context->window.data() : nullptr;
-        if (!window || !window->acceptsViewerGeneration(context->generation) || width <= 0 || height <= 0 || !sharedHandle) {
+        if (!window || !context || width <= 0 || height <= 0 || !sharedHandle) {
             return 0;
         }
-        return window->enqueueRemoteTextureFrame(width, height, sharedHandle, frameId, encodedMbps, context->generation); // wjy: 原样返回三态结果，受控丢帧不能触发BGRA回读。
+        return window->enqueueRemoteTextureFrame(width, height, sharedHandle, frameId, encodedMbps, context->generation); // wjy: 代际判断交给窗口统一计数；旧Viewer返回受控丢帧，不能触发无意义BGRA回读。
     } catch (...) {
         return 0;
     } // wjy: Qt投递或单槽更新异常只让该帧走软件回退，不得越过原生解码回调边界。
@@ -1919,7 +1919,7 @@ RemoteQualityWindowMetrics RemoteDesktopWindow::remoteQualityMetrics()
         metrics.performance = m_performanceSignalSampler.sample(counters); // wjy: 只有第二份单调快照开始产生有效压力，重连和旧 DLL 都不会虚假降档。
     }
 
-    const quint64 totalDrops = m_pendingTextureFrames.droppedFrameCount();
+    const quint64 totalDrops = m_pendingTextureFrames.replacedFrameCount(); // wjy: 本地Presenter压力只统计被最新帧替换的旧pending，不再统计被拒绝的新画面。
     const qint64 nowMs = m_sessionClock.isValid() ? m_sessionClock.elapsed() : 0;
     if (m_lastPresenterSampleMs > 0 && nowMs > m_lastPresenterSampleMs
         && m_totalPresentedFrames >= m_lastPresenterSampleFrames
@@ -2033,7 +2033,7 @@ QString RemoteDesktopWindow::remoteResourceDiagnosticSummary()
             .arg(static_cast<qulonglong>(m_unifiedCompositor->presentedFrameCount()))
             .arg(static_cast<qulonglong>(m_unifiedCompositor->fallbackCount()))
         : QStringLiteral("none");
-    return QStringLiteral("host=%1 connected=%2 generation=%3 status=%4 bgra_pending=%5 texture_pending=%6 drain=%7 dropped=%8 fallback=%9 d3d=0x%10 fps=%11 encoded_mbps=%12 compositor=%13 quality={%14}")
+    return QStringLiteral("host=%1 connected=%2 generation=%3 status=%4 bgra_pending=%5 texture_pending=%6 drain=%7 presenter_pending_replace=%8 fallback=%9 d3d=0x%10 fps=%11 encoded_mbps=%12 compositor=%13 quality={%14} stale_generation_drop=%15")
         .arg(m_hostIp)
         .arg(m_viewerHandle ? 1 : 0)
         .arg(m_viewerGeneration.load(std::memory_order_acquire))
@@ -2041,13 +2041,14 @@ QString RemoteDesktopWindow::remoteResourceDiagnosticSummary()
         .arg(pendingBgra ? 1 : 0)
         .arg(m_pendingTextureFrames.pendingCount())
         .arg(m_pendingTextureFrames.drainScheduled() ? 1 : 0)
-        .arg(m_pendingTextureFrames.droppedFrameCount())
+        .arg(m_pendingTextureFrames.replacedFrameCount())
         .arg(m_softwareFallbackActive ? 1 : 0)
         .arg(static_cast<qulonglong>(static_cast<unsigned long>(d3dReason)), 0, 16)
         .arg(m_receiveFps, 0, 'f', 1)
         .arg(m_encodedMbps, 0, 'f', 2)
         .arg(compositor)
-        .arg(quality); // wjy: 单行快照便于20窗口soak后按host检索，不保留任何帧内容或敏感剪贴板数据。
+        .arg(quality)
+        .arg(m_staleTextureFrameDrops.load(std::memory_order_relaxed)); // wjy: 单行快照便于20窗口soak后按host检索，迟到旧纹理与Presenter替换分开归因。
 }
 // ===end====
 
@@ -4078,23 +4079,29 @@ void RemoteDesktopWindow::enqueueRemoteFrame(QImage image, quint64 viewerGenerat
 
 int RemoteDesktopWindow::enqueueRemoteTextureFrame(int width, int height, void* sharedHandle, quint64 frameId, double encodedMbps, quint64 viewerGeneration)
 {
-    if (!acceptsViewerGeneration(viewerGeneration) || m_texturePresentFailed.load() || width <= 0 || height <= 0 || !sharedHandle) {
+    if (!acceptsViewerGeneration(viewerGeneration)) {
+        m_staleTextureFrameDrops.fetch_add(1, std::memory_order_relaxed); // wjy: 重连或关闭后的旧解码回调只记代际丢帧，不进入新Viewer队列。
+        return FSREMOTE_TEXTURE_FRAME_DROPPED; // wjy: 让解码端立即归还生产者key并跳过BGRA回读，旧画面绝不进入新会话Presenter。
+    }
+    if (m_texturePresentFailed.load() || width <= 0 || height <= 0 || !sharedHandle) {
         return FSREMOTE_TEXTURE_FRAME_FALLBACK;
     }
 
     // =====wjy====
-    const TextureFramePushResult pushResult = m_pendingTextureFrames.push({
+    TextureFramePushResult pushResult = m_pendingTextureFrames.push({
         width,
         height,
         sharedHandle,
         frameId,
         encodedMbps,
         viewerGeneration,
-    }); // wjy: keyed mutex帧只在单槽空闲时接管；已有pending时拒绝新帧并让生产端立即归还纹理。
-    if (pushResult == TextureFramePushResult::DroppedWhilePending) {
-        return FSREMOTE_TEXTURE_FRAME_DROPPED; // wjy: 不排队、不做BGRA回读，保持一个pending和一个执行中帧的硬上限。
+    }); // wjy: 单槽始终接管最新纹理；若淘汰旧pending，push结果会把旧描述符交还给本函数处理。
+    if (pushResult.replacedPending.has_value()
+        && m_texturePresenter
+        && pushResult.replacedPending->sharedHandle) {
+        m_texturePresenter->discardSharedTexture(pushResult.replacedPending->sharedHandle); // wjy: 旧pending已经持有消费者key，替换后立即Acquire key 1并Release key 0，所有权恰好归还一次。
     }
-    if (pushResult == TextureFramePushResult::AcceptedAndScheduleDrain
+    if (pushResult.disposition == TextureFramePushDisposition::AcceptedAndScheduleDrain
         && !QMetaObject::invokeMethod(this, &RemoteDesktopWindow::drainPendingRemoteTextureFrame, Qt::QueuedConnection)) {
         m_pendingTextureFrames.cancelScheduledDrain(); // wjy: Qt对象拒绝投递时释放唯一调度权，让原生解码器立即回退到安全BGRA路径。
         return FSREMOTE_TEXTURE_FRAME_FALLBACK;
@@ -4178,11 +4185,12 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
             }
             m_remoteTextureSize = QSize(frame->width, frame->height); // wjy: 只有新纹理真正成功Present后才提交远端尺寸，失败帧不能污染缩放比例。
             m_remoteFrame = QImage(); // wjy: 成功切换到新纹理后才释放软件上一帧，整个提交过程不会提前露出黑色背景。
-            if (m_texturePresenter->usesCompositorSurface()) {
-                presentCompositorOverlay(); // wjy: 硬件恢复前先清掉叠加SwapChain里的旧BGRA帧，再提升视频视觉，避免软件画面残留覆盖新硬件帧。
-            }
             m_encodedMbps = qMax(0.0, frame->encodedMbps); // wjy: 码率统计只跟随真正成功显示的新帧。
             const bool recoveredFromSoftwareFallback = m_softwareFallbackActive; // wjy: 普通单帧失败恢复不触发全局画质重算，只有真正退出BGRA保活才通知协调器。
+            if (m_texturePresenter->usesCompositorSurface()
+                && (!hadSuccessfulTexture || recoveredFromSoftwareFallback)) {
+                presentCompositorOverlay(); // wjy: 仅首个硬件帧或软件转硬件时清理旧BGRA/连接内容；正常视频帧只Present视频SwapChain，不再逐帧重建整窗Overlay。
+            }
             const bool connectionTitleChanged = m_connectionStatusCode != 50
                 || m_connectionStatus != QString::fromUtf8("画面已接收"); // wjy: 正常视频帧不改变标题栏状态，只有首帧或重连恢复需要重画一次。
             if (m_textureFailureCount > 0) {

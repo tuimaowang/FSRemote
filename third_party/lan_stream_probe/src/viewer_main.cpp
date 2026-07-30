@@ -509,7 +509,8 @@ void decode_thread()
 
         std::string error;
         lsp::DecodedFrame decoded;
-        if (decoder.decode(*encoded, &decoded, &error)) {
+        const lsp::DecodeResult decodeResult = decoder.decode(*encoded, &decoded, &error);
+        if (decodeResult.producedFrame()) {
             auto frame = std::make_shared<lsp::DecodedFrame>(std::move(decoded));
             std::lock_guard lock(g_mutex);
             g_shared.frame = std::move(frame);
@@ -517,7 +518,9 @@ void decode_thread()
             g_shared.frame_id = frame_id;
             ++g_shared.decoded_frames;
             g_shared.last_error.clear();
-        } else if (!error.empty()) {
+        } else if (decodeResult.status != lsp::DecodeStatus::NeedMoreInput
+            && decodeResult.status != lsp::DecodeStatus::OutputTextureBusy
+            && !error.empty()) {
             {
                 std::lock_guard encoded_lock(g_encoded_mutex);
                 g_encoded_queue.clear();

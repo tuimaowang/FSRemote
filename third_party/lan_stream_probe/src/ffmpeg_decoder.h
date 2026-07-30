@@ -28,20 +28,46 @@ struct DecodedFrame {
     bool shared_texture_locked = false; // wjy: 只有生产端成功AcquireSync的帧才允许执行一次ReleaseSync，避免异常路径重复释放。
 };
 
+// =====wjy====
+enum class DecodeStatus {
+    Success, // wjy: 已完成码流解码并生成一张可交付画面。
+    NeedMoreInput, // wjy: FFmpeg暂未输出画面，属于正常低延迟解码节奏，不得重置参考链。
+    OutputTextureBusy, // wjy: 码流已被解码，但共享输出槽暂时都由Presenter持有，只丢弃本次显示输出。
+    CorruptBitstream, // wjy: FFmpeg明确报告当前压缩数据损坏，上层可进入受控关键帧恢复。
+    DeviceLost, // wjy: D3D11设备被移除、重置或挂起，应交给Viewer设备恢复路径处理。
+    FatalError, // wjy: 初始化、资源创建或不满足解码契约的不可继续错误。
+};
+
+struct DecodeResult {
+    DecodeStatus status = DecodeStatus::FatalError;
+
+    bool producedFrame() const
+    {
+        return status == DecodeStatus::Success; // wjy: 兼容现有if判断，同时保留上层读取精确失败类别的能力。
+    }
+
+    explicit operator bool() const
+    {
+        return producedFrame();
+    }
+};
+// ===end====
+
 class H264Decoder {
 public:
     ~H264Decoder();
     bool initialize_d3d11(ID3D11Device* device, ID3D11DeviceContext* context, std::string* error);
-    bool decode(const std::vector<uint8_t>& h264, DecodedFrame* frame, std::string* error);
+    DecodeResult decode(const std::vector<uint8_t>& h264, DecodedFrame* frame, std::string* error); // wjy: 返回结构化状态，显示背压不再伪装成码流错误。
     void release_shared_texture(DecodedFrame* frame, bool consumerAccepted); // wjy: GPU接管时交给消费者key，回退或主动丢帧时直接归还生产者key。
     void reset();
 
 private:
     bool ensure(std::string* error);
-    bool receive(DecodedFrame* frame, std::string* error);
-    bool convert_d3d11_frame(DecodedFrame* decoded, std::string* error);
+    DecodeResult receive(DecodedFrame* frame, std::string* error);
+    DecodeResult convert_d3d11_frame(DecodedFrame* decoded, std::string* error);
     bool ensure_video_processor(int width, int height, std::string* error);
-    int acquire_output_texture(std::string* error); // wjy: 从三槽池选择当前可写纹理，禁止覆盖Presenter尚未释放的资源。
+    int acquire_output_texture(DecodeStatus* status, std::string* error); // wjy: 无可写槽返回OutputTextureBusy，真实同步或设备错误保留独立类别。
+    DecodeStatus current_device_failure_status() const; // wjy: 资源调用失败后检查D3D11设备代际，区分DeviceLost与普通致命错误。
     void retire_output_textures(); // wjy: 分辨率切换时保留仍可能排队的旧共享纹理，使裸句柄在Qt消费前继续有效。
     void collect_retired_output_textures(); // wjy: 仅当旧纹理全部回到生产者key后释放整组资源，限制质量切换期间的GPU占用。
     void shutdown();

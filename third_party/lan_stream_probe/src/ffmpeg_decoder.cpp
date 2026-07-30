@@ -34,6 +34,21 @@ std::string fferr(const char* call, int ret)
     return std::string(call) + " failed: " + std::to_string(ret);
 }
 
+DecodeStatus decode_status_from_averror(int error)
+{
+    return error == AVERROR_INVALIDDATA
+        ? DecodeStatus::CorruptBitstream
+        : DecodeStatus::FatalError; // wjy: 仅FFmpeg明确标记的无效码流归为损坏，内存/参数等错误不得触发码流恢复风暴。
+}
+
+bool is_device_lost_hresult(HRESULT result)
+{
+    return result == DXGI_ERROR_DEVICE_REMOVED
+        || result == DXGI_ERROR_DEVICE_RESET
+        || result == DXGI_ERROR_DEVICE_HUNG
+        || result == DXGI_ERROR_DRIVER_INTERNAL_ERROR; // wjy: 这些HRESULT表示当前D3D设备代际不可继续使用。
+}
+
 } // namespace
 
 H264Decoder::~H264Decoder()
@@ -62,10 +77,21 @@ bool H264Decoder::initialize_d3d11(ID3D11Device* device, ID3D11DeviceContext* co
     return ensure(error);
 }
 
-bool H264Decoder::decode(const std::vector<uint8_t>& h264, DecodedFrame* frame, std::string* error)
+DecodeResult H264Decoder::decode(const std::vector<uint8_t>& h264, DecodedFrame* frame, std::string* error)
 {
-    if (h264.empty() || !ensure(error)) {
-        return false;
+    if (error) {
+        error->clear(); // wjy: NeedMoreInput和OutputTextureBusy不能携带上一帧遗留错误，避免上层误判解码链已损坏。
+    }
+    if (!frame) {
+        if (error) *error = "decoded frame output is null";
+        return {DecodeStatus::FatalError};
+    }
+    if (h264.empty()) {
+        if (error) *error = "encoded frame is empty";
+        return {DecodeStatus::CorruptBitstream};
+    }
+    if (!ensure(error)) {
+        return {current_device_failure_status()};
     }
     av_packet_unref(packet_);
     packet_->data = const_cast<uint8_t*>(h264.data());
@@ -76,7 +102,10 @@ bool H264Decoder::decode(const std::vector<uint8_t>& h264, DecodedFrame* frame, 
     }
     if (sent < 0) {
         if (error) *error = fferr("avcodec_send_packet", sent);
-        return false;
+        const DecodeStatus deviceStatus = current_device_failure_status();
+        return {deviceStatus == DecodeStatus::DeviceLost
+            ? deviceStatus
+            : decode_status_from_averror(sent)}; // wjy: FFmpeg外部错误发生时优先检查底层D3D设备，避免把Device Removed误记为码流损坏。
     }
     return receive(frame, error);
 }
@@ -177,37 +206,40 @@ bool H264Decoder::ensure(std::string* error)
     return true;
 }
 
-bool H264Decoder::receive(DecodedFrame* decoded, std::string* error)
+DecodeResult H264Decoder::receive(DecodedFrame* decoded, std::string* error)
 {
     const int ret = avcodec_receive_frame(codec_, frame_);
     if (ret == AVERROR(EAGAIN)) {
-        return false;
+        return {DecodeStatus::NeedMoreInput}; // wjy: 解码器正常等待后续压缩数据，不重置、不请求关键帧。
     }
     if (ret < 0) {
         if (error) *error = fferr("avcodec_receive_frame", ret);
-        return false;
+        const DecodeStatus deviceStatus = current_device_failure_status();
+        return {deviceStatus == DecodeStatus::DeviceLost
+            ? deviceStatus
+            : decode_status_from_averror(ret)}; // wjy: 硬解码接收失败可能由设备代际失效引起，必须先进入当前Viewer设备恢复。
     }
 
     if (frame_->format != AV_PIX_FMT_D3D11) {
         if (error) *error = "decoder did not return a D3D11 frame";
         av_frame_unref(frame_);
-        return false;
+        return {DecodeStatus::FatalError};
     }
-    const bool ok = convert_d3d11_frame(decoded, error);
+    const DecodeResult result = convert_d3d11_frame(decoded, error);
     av_frame_unref(frame_);
-    return ok;
+    return result;
 }
 
-bool H264Decoder::convert_d3d11_frame(DecodedFrame* decoded, std::string* error)
+DecodeResult H264Decoder::convert_d3d11_frame(DecodedFrame* decoded, std::string* error)
 {
     auto* texture = reinterpret_cast<ID3D11Texture2D*>(frame_->data[0]);
     const UINT array_slice = static_cast<UINT>(reinterpret_cast<intptr_t>(frame_->data[1]));
     if (!texture) {
         if (error) *error = "D3D11 decoded texture is null";
-        return false;
+        return {DecodeStatus::FatalError};
     }
     if (!ensure_video_processor(frame_->width, frame_->height, error)) {
-        return false;
+        return {current_device_failure_status()};
     }
 
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorInputView> input_view;
@@ -218,7 +250,7 @@ bool H264Decoder::convert_d3d11_frame(DecodedFrame* decoded, std::string* error)
     HRESULT hr = video_device_->CreateVideoProcessorInputView(texture, processor_enum_.Get(), &input_desc, &input_view);
     if (FAILED(hr)) {
         if (error) *error = "CreateVideoProcessorInputView failed: 0x" + std::to_string(static_cast<unsigned long>(hr));
-        return false;
+        return {is_device_lost_hresult(hr) ? DecodeStatus::DeviceLost : current_device_failure_status()};
     }
 
     Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> output_view;
@@ -226,16 +258,17 @@ bool H264Decoder::convert_d3d11_frame(DecodedFrame* decoded, std::string* error)
     output_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
     output_desc.Texture2D.MipSlice = 0;
     // =====wjy====
-    const int write_index = acquire_output_texture(error); // wjy: keyed mutex保证不会覆盖Qt仍在显示或排队的纹理。
+    DecodeStatus acquireStatus = DecodeStatus::FatalError;
+    const int write_index = acquire_output_texture(&acquireStatus, error); // wjy: keyed mutex保证不会覆盖Qt仍在显示或排队的纹理。
     if (write_index < 0) {
-        return false; // wjy: 三槽均不可写属于异常同步状态，拒绝制造未同步黑帧。
+        return {acquireStatus}; // wjy: 三槽正常繁忙只丢本次显示输出，不破坏已经完成的H265参考链。
     }
     // ===end====
     hr = video_device_->CreateVideoProcessorOutputView(output_textures_[write_index].Get(), processor_enum_.Get(), &output_desc, &output_view);
     if (FAILED(hr)) {
         output_keyed_mutexes_[write_index]->ReleaseSync(kSharedTextureProducerKey); // wjy: 创建输出视图失败时立即归还生产者key。
         if (error) *error = "CreateVideoProcessorOutputView failed: 0x" + std::to_string(static_cast<unsigned long>(hr));
-        return false;
+        return {is_device_lost_hresult(hr) ? DecodeStatus::DeviceLost : current_device_failure_status()};
     }
 
     RECT rect = {0, 0, frame_->width, frame_->height};
@@ -262,7 +295,7 @@ bool H264Decoder::convert_d3d11_frame(DecodedFrame* decoded, std::string* error)
     if (FAILED(hr)) {
         output_keyed_mutexes_[write_index]->ReleaseSync(kSharedTextureProducerKey); // wjy: Blt失败没有可交付帧，保持槽位仍归生产端。
         if (error) *error = "VideoProcessorBlt failed: 0x" + std::to_string(static_cast<unsigned long>(hr));
-        return false;
+        return {is_device_lost_hresult(hr) ? DecodeStatus::DeviceLost : current_device_failure_status()};
     }
     context_->Flush(); // wjy: 跨D3D11设备共享纹理前立即提交生产端Blt，避免控制端读到尚未执行完成的新纹理初始黑色内容。
 
@@ -273,7 +306,7 @@ bool H264Decoder::convert_d3d11_frame(DecodedFrame* decoded, std::string* error)
     decoded->shared_handle = output_shared_handles_[output_index_];
     decoded->shared_texture_index = output_index_; // wjy: 上层根据纹理回调结果决定交给消费者key还是直接归还生产者key。
     decoded->shared_texture_locked = true; // wjy: 回调返回前生产端持续持有该槽，消费者只能在正式交接后读取。
-    return true;
+    return {DecodeStatus::Success};
 }
 
 // =====wjy====
@@ -295,8 +328,11 @@ void H264Decoder::release_shared_texture(DecodedFrame* frame, bool consumerAccep
     frame->shared_texture_index = -1;
 }
 
-int H264Decoder::acquire_output_texture(std::string* error)
+int H264Decoder::acquire_output_texture(DecodeStatus* status, std::string* error)
 {
+    if (status) {
+        *status = DecodeStatus::OutputTextureBusy; // wjy: 所有槽仅WAIT_TIMEOUT时属于正常显示背压。
+    }
     collect_retired_output_textures(); // wjy: 每帧回收已经被控制端释放的旧分辨率纹理组。
     for (int offset = 1; offset <= kOutputTextureCount; ++offset) {
         const int candidate = (output_index_ + offset + kOutputTextureCount) % kOutputTextureCount;
@@ -307,14 +343,30 @@ int H264Decoder::acquire_output_texture(std::string* error)
         if (hr == S_OK || hr == WAIT_ABANDONED) {
             return candidate; // wjy: 非阻塞选择空闲槽，解码线程不等待Qt释放某一张固定纹理。
         }
-        if (hr != WAIT_TIMEOUT && FAILED(hr) && error) {
-            *error = "AcquireSync(BGRA output) failed: 0x" + std::to_string(static_cast<unsigned long>(hr));
+        if (hr != WAIT_TIMEOUT && FAILED(hr)) {
+            if (error) *error = "AcquireSync(BGRA output) failed: 0x" + std::to_string(static_cast<unsigned long>(hr));
+            if (status) {
+                *status = is_device_lost_hresult(hr)
+                    ? DecodeStatus::DeviceLost
+                    : current_device_failure_status(); // wjy: keyed mutex API自身失败不能伪装成普通槽位繁忙。
+            }
         }
     }
     if (error && error->empty()) {
         *error = "no writable keyed shared texture";
     }
     return -1;
+}
+
+DecodeStatus H264Decoder::current_device_failure_status() const
+{
+    if (!device_) {
+        return DecodeStatus::FatalError;
+    }
+    const HRESULT removalReason = device_->GetDeviceRemovedReason();
+    return FAILED(removalReason) || is_device_lost_hresult(removalReason)
+        ? DecodeStatus::DeviceLost
+        : DecodeStatus::FatalError; // wjy: 设备仍健康时保留资源/契约错误类别，避免无意义地重建设备。
 }
 
 void H264Decoder::retire_output_textures()
