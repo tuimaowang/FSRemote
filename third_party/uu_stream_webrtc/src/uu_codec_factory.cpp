@@ -17,6 +17,7 @@
 #include <api/video_codecs/builtin_video_decoder_factory.h>
 #include <api/video_codecs/builtin_video_encoder_factory.h>
 #include <api/video_codecs/sdp_video_format.h>
+#include <common_video/include/video_frame_buffer_pool.h>
 #include <libyuv/convert.h>
 #include <libyuv/convert_from.h>
 #include <modules/video_coding/include/video_codec_interface.h>
@@ -763,8 +764,8 @@ private:
             append_viewer_log("decoder ensure_device failed in Decode"); // wjy: D3D11 device could not be created/reused.
             return WEBRTC_VIDEO_CODEC_ERROR;
         }
-        std::vector<uint8_t> data(input_image.data(), input_image.data() + input_image.size());
-        const bool encoded_keyframe = input_image.IsKey() || hevc_has_random_access_frame(data.data(), data.size());
+        const bool encoded_keyframe = input_image.IsKey()
+            || hevc_has_random_access_frame(input_image.data(), input_image.size());
         if (waiting_for_keyframe_ && !encoded_keyframe) {
             const uint64_t now = GetTickCount64();
             if (now - last_keyframe_request_ms_ >= 50) {
@@ -794,8 +795,9 @@ private:
 
         lsp::DecodedFrame decoded;
         std::string error;
-        // append_viewer_log("decoder ffmpeg decode begin size=" + std::to_string(data.size())); // wjy: per-frame decode log disabled for smoother multi-view streaming.
-        const lsp::DecodeResult decodeResult = decoder_.decode(data, &decoded, &error);
+        // append_viewer_log("decoder ffmpeg decode begin size=" + std::to_string(input_image.size())); // wjy: per-frame decode log disabled for smoother multi-view streaming.
+        const lsp::DecodeResult decodeResult = decoder_.decode(
+            input_image.data(), input_image.size(), &decoded, &error); // wjy: 压缩包直接交给解码器，由其统一复用并补齐padding。
         if (decodeResult.status == lsp::DecodeStatus::NeedMoreInput) {
             return WEBRTC_VIDEO_CODEC_OK; // wjy: FFmpeg低延迟路径暂未产出画面属于正常节奏，保持解码实例和参考链。
         }
@@ -882,8 +884,7 @@ private:
             return WEBRTC_VIDEO_CODEC_ERROR;
         }
 
-        auto buffer = webrtc::I420Buffer::Create(static_cast<int>(decoded.size.width),
-                                                 static_cast<int>(decoded.size.height));
+        webrtc::scoped_refptr<webrtc::I420Buffer> buffer; // wjy: 纹理直显路径不申请整张I420，只有软件回退时才分配。
         int texture_result = DecodedTextureFallback; // wjy: 使用编解码公共库内部三态，避免底层目标反向依赖上层FsRemoteStreamApi头文件。
         if (texture_callback_ && decoded.shared_handle) {
             texture_result = texture_callback_(
@@ -895,23 +896,41 @@ private:
         }
 
         if (texture_result != DecodedTextureFallback) {
-            sharedTextureGuard.release(texture_result == DecodedTextureAccepted); // wjy: 丢弃帧直接回到生产者key，不锁死共享纹理槽。
-            const int width = static_cast<int>(decoded.size.width);
-            const int height = static_cast<int>(decoded.size.height);
-            for (int y = 0; y < height; ++y) {
-                std::memset(buffer->MutableDataY() + y * buffer->StrideY(), 16, static_cast<size_t>(width));
+            // =====wjy====
+            // GPU纹理已经交给Presenter或被受控丢弃；不再构造无效黑色I420，也不再重复触发WebRTC软件帧回调。
+            sharedTextureGuard.release(texture_result == DecodedTextureAccepted); // wjy: 按接管结果完成一次且仅一次key交接。
+            waiting_for_keyframe_ = false; // wjy: 当前压缩帧已经成功解码，继续使用后续参考帧。
+            ++decoded_frames_; // wjy: 统计GPU直显路径帧数，避免与软件回退统计混淆。
+            if (decoded_frames_ == 1 || decoded_frames_ % 120 == 0) {
+                std::cout << "uu-d3d11va-hevc texture frames=" << decoded_frames_
+                          << " size=" << decoded.size.width << "x" << decoded.size.height << "\n";
             }
-            for (int y = 0; y < (height + 1) / 2; ++y) {
-                std::memset(buffer->MutableDataU() + y * buffer->StrideU(), 128, static_cast<size_t>((width + 1) / 2));
-                std::memset(buffer->MutableDataV() + y * buffer->StrideV(), 128, static_cast<size_t>((width + 1) / 2));
-            }
+            return WEBRTC_VIDEO_CODEC_OK;
+            // ===end====
         } else {
-            std::vector<uint8_t> bgra;
-            if (!decoded.bgra.empty()) {
-                bgra = decoded.bgra;
-            } else if (!copy_srv_to_bgra(decoded.srv.Get(), decoded.size.width, decoded.size.height, &bgra)) {
+            // =====wjy====
+            // 仅软件回退路径申请与真实分辨率相同的I420缓冲，GPU直显路径不会触发这段分配。
+            buffer = i420_fallback_pool_.CreateI420Buffer(
+                static_cast<int>(decoded.size.width),
+                static_cast<int>(decoded.size.height)); // wjy: 复用有界I420缓冲，只有回退帧被释放后才归还池槽。
+            if (!buffer) {
+                sharedTextureGuard.release(false); // wjy: 内存不足时也必须归还生产者key。
+                append_viewer_log("decoder I420 allocation failed");
+                return WEBRTC_VIDEO_CODEC_ERROR;
+            }
+            // ===end====
+            const std::vector<uint8_t>* bgra = &decoded.bgra;
+            if (bgra->empty()) {
+                if (!copy_srv_to_bgra(decoded.srv.Get(), decoded.size.width, decoded.size.height, &bgra_fallback_buffer_)) {
+                    std::cerr << "decoder copy_srv_to_bgra failed\n";
+                    append_viewer_log("decoder copy_srv_to_bgra failed"); // wjy: texture readback failed before Qt callback.
+                    return WEBRTC_VIDEO_CODEC_ERROR;
+                }
+                bgra = &bgra_fallback_buffer_; // wjy: 仅在真实回退时复用解码器自有缓冲，回调同步消费后即可覆盖下一帧。
+            }
+            if (bgra->empty()) {
                 std::cerr << "decoder copy_srv_to_bgra failed\n";
-                append_viewer_log("decoder copy_srv_to_bgra failed"); // wjy: texture readback failed before Qt callback.
+                append_viewer_log("decoder BGRA buffer empty");
                 return WEBRTC_VIDEO_CODEC_ERROR;
             }
             sharedTextureGuard.release(false); // wjy: GPU到CPU回读完成后归还纹理，Qt复制与I420转换不再占用共享槽。
@@ -924,7 +943,7 @@ private:
                 }
                 if (hook) {
                     // append_viewer_log("decoder bgra hook call"); // wjy: per-frame app-callback log disabled.
-                    hook(static_cast<int>(decoded.size.width), static_cast<int>(decoded.size.height), bgra.data(), bgra.size(), encoded_mbps_);
+                    hook(static_cast<int>(decoded.size.width), static_cast<int>(decoded.size.height), bgra->data(), bgra->size(), encoded_mbps_);
                     // append_viewer_log("decoder bgra hook returned"); // wjy: per-frame app-callback log disabled.
                 } else {
                     // append_viewer_log("decoder bgra hook missing"); // wjy: per-frame missing-hook log disabled.
@@ -932,7 +951,7 @@ private:
             }
 
             const int converted = libyuv::ARGBToI420(
-                bgra.data(), static_cast<int>(decoded.size.width) * 4,
+                bgra->data(), static_cast<int>(decoded.size.width) * 4,
                 buffer->MutableDataY(), buffer->StrideY(),
                 buffer->MutableDataU(), buffer->StrideU(),
                 buffer->MutableDataV(), buffer->StrideV(),
@@ -1095,6 +1114,8 @@ private:
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<ID3D11Texture2D> staging_;
+    webrtc::VideoFrameBufferPool i420_fallback_pool_{false, 3}; // wjy: 软件回退最多保留三个I420缓冲，引用归还后复用，避免无界分配。
+    std::vector<uint8_t> bgra_fallback_buffer_; // wjy: 软件回退回调同步消费，复用单个BGRA缓冲避免每帧分配。
     lsp::H264Decoder decoder_;
     bool decoder_ready_ = false;
     bool waiting_for_keyframe_ = true;

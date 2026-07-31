@@ -1,6 +1,7 @@
 #include "ffmpeg_decoder.h"
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <utility>
 
@@ -79,6 +80,11 @@ bool H264Decoder::initialize_d3d11(ID3D11Device* device, ID3D11DeviceContext* co
 
 DecodeResult H264Decoder::decode(const std::vector<uint8_t>& h264, DecodedFrame* frame, std::string* error)
 {
+    return decode(h264.data(), h264.size(), frame, error); // wjy: 旧vector调用者复用新的内部padding路径，保持外部接口不变。
+}
+
+DecodeResult H264Decoder::decode(const uint8_t* h264, std::size_t h264Size, DecodedFrame* frame, std::string* error)
+{
     if (error) {
         error->clear(); // wjy: NeedMoreInput和OutputTextureBusy不能携带上一帧遗留错误，避免上层误判解码链已损坏。
     }
@@ -86,7 +92,7 @@ DecodeResult H264Decoder::decode(const std::vector<uint8_t>& h264, DecodedFrame*
         if (error) *error = "decoded frame output is null";
         return {DecodeStatus::FatalError};
     }
-    if (h264.empty()) {
+    if (!h264 || h264Size == 0) {
         if (error) *error = "encoded frame is empty";
         return {DecodeStatus::CorruptBitstream};
     }
@@ -94,8 +100,15 @@ DecodeResult H264Decoder::decode(const std::vector<uint8_t>& h264, DecodedFrame*
         return {current_device_failure_status()};
     }
     av_packet_unref(packet_);
-    packet_->data = const_cast<uint8_t*>(h264.data());
-    packet_->size = static_cast<int>(h264.size());
+    // =====wjy====
+    // FFmpeg可能读取压缩包末尾的padding字节；输入内存由解码器统一复用并始终补零，避免越界读取。
+    constexpr std::size_t kPacketPadding = AV_INPUT_BUFFER_PADDING_SIZE;
+    packet_input_buffer_.resize(h264Size + kPacketPadding);
+    std::memcpy(packet_input_buffer_.data(), h264, h264Size);
+    std::memset(packet_input_buffer_.data() + h264Size, 0, kPacketPadding);
+    packet_->data = packet_input_buffer_.data();
+    packet_->size = static_cast<int>(h264Size);
+    // ===end====
     const int sent = avcodec_send_packet(codec_, packet_);
     if (sent == AVERROR(EAGAIN)) {
         return receive(frame, error);

@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -57,6 +58,7 @@ class H264Decoder {
 public:
     ~H264Decoder();
     bool initialize_d3d11(ID3D11Device* device, ID3D11DeviceContext* context, std::string* error);
+    DecodeResult decode(const uint8_t* h264, std::size_t h264Size, DecodedFrame* frame, std::string* error); // wjy: 直接接收压缩包并在解码器内部补齐FFmpeg padding，避免上层重复复制。
     DecodeResult decode(const std::vector<uint8_t>& h264, DecodedFrame* frame, std::string* error); // wjy: 返回结构化状态，显示背压不再伪装成码流错误。
     void release_shared_texture(DecodedFrame* frame, bool consumerAccepted); // wjy: GPU接管时交给消费者key，回退或主动丢帧时直接归还生产者key。
     void reset();
@@ -98,6 +100,7 @@ private:
     AVCodecContext* codec_ = nullptr;
     AVFrame* frame_ = nullptr;
     AVPacket* packet_ = nullptr;
+    std::vector<uint8_t> packet_input_buffer_; // wjy: 复用带padding的FFmpeg输入内存，避免每个压缩包重新分配。
     AVBufferRef* hw_device_ = nullptr;
     SwsContext* sws_ = nullptr;
     int sws_width_ = 0;
