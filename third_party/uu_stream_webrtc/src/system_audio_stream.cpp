@@ -621,17 +621,128 @@ public:
     }
 
 private:
+    // =====wjy====
+    uintptr_t connectInterruptibly(const std::string& host_ip, uint16_t port, std::string* error)
+    {
+        if (!ensure_wsa()) {
+            if (error) *error = "WSAStartup failed";
+            return 0;
+        }
+        SOCKET connectingSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (connectingSocket == INVALID_SOCKET) {
+            if (error) *error = "audio socket failed";
+            return 0;
+        }
+
+        uintptr_t expectedSocket = 0;
+        if (!socket_.compare_exchange_strong(
+                expectedSocket, static_cast<uintptr_t>(connectingSocket), std::memory_order_acq_rel)) {
+            ::closesocket(connectingSocket);
+            if (error) *error = "audio socket already active";
+            return 0; // wjy: 单播放器任意时刻只允许一个连接中或已连接socket，焦点抖动不会并行拨号。
+        }
+
+        auto closeIfStillOwned = [this, connectingSocket] {
+            uintptr_t owned = static_cast<uintptr_t>(connectingSocket);
+            if (socket_.compare_exchange_strong(owned, 0, std::memory_order_acq_rel)) {
+                ::shutdown(connectingSocket, SD_BOTH);
+                ::closesocket(connectingSocket); // wjy: 仅创建线程仍拥有句柄时关闭，stop已交换走的句柄绝不二次关闭。
+            }
+        };
+
+        sockaddr_in addr = {};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        if (::inet_pton(AF_INET, host_ip.c_str(), &addr.sin_addr) != 1) {
+            if (error) *error = "invalid audio host";
+            closeIfStillOwned();
+            return 0;
+        }
+
+        u_long nonBlocking = 1;
+        if (::ioctlsocket(connectingSocket, FIONBIO, &nonBlocking) == SOCKET_ERROR) {
+            if (error) *error = "audio nonblocking setup failed";
+            closeIfStillOwned();
+            return 0;
+        }
+
+        const int connectResult = ::connect(
+            connectingSocket, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+        if (connectResult == SOCKET_ERROR) {
+            const int connectError = ::WSAGetLastError();
+            if (connectError != WSAEWOULDBLOCK
+                && connectError != WSAEINPROGRESS
+                && connectError != WSAEINVAL) {
+                if (error) *error = "audio connect failed";
+                closeIfStillOwned();
+                return 0;
+            }
+
+            bool connected = false;
+            while (running_.load(std::memory_order_acquire)
+                && socket_.load(std::memory_order_acquire) == static_cast<uintptr_t>(connectingSocket)) {
+                fd_set writeSet;
+                fd_set errorSet;
+                FD_ZERO(&writeSet);
+                FD_ZERO(&errorSet);
+                FD_SET(connectingSocket, &writeSet);
+                FD_SET(connectingSocket, &errorSet);
+                timeval timeout = {};
+                timeout.tv_usec = 100000; // wjy: 每100ms重新观察停止标志，焦点离开不会等待系统默认TCP超时。
+                const int selected = ::select(0, nullptr, &writeSet, &errorSet, &timeout);
+                if (selected == SOCKET_ERROR) {
+                    break; // wjy: stop从另一线程关闭连接中socket时select立即失败并退出。
+                }
+                if (selected == 0) {
+                    continue;
+                }
+                int socketError = 0;
+                int socketErrorSize = sizeof(socketError);
+                if (::getsockopt(
+                        connectingSocket,
+                        SOL_SOCKET,
+                        SO_ERROR,
+                        reinterpret_cast<char*>(&socketError),
+                        &socketErrorSize) == 0
+                    && socketError == 0
+                    && FD_ISSET(connectingSocket, &writeSet)) {
+                    connected = true;
+                }
+                break;
+            }
+            if (!connected) {
+                if (error && running_.load(std::memory_order_acquire)) *error = "audio connect failed";
+                closeIfStillOwned();
+                return 0;
+            }
+        }
+
+        if (!running_.load(std::memory_order_acquire)
+            || socket_.load(std::memory_order_acquire) != static_cast<uintptr_t>(connectingSocket)) {
+            closeIfStillOwned();
+            return 0; // wjy: 连接成功瞬间若焦点已离开，禁止把已被stop取消的socket重新交给播放循环。
+        }
+        u_long blocking = 0;
+        if (::ioctlsocket(connectingSocket, FIONBIO, &blocking) == SOCKET_ERROR) {
+            if (error) *error = "audio blocking restore failed";
+            closeIfStillOwned();
+            return 0;
+        }
+        return static_cast<uintptr_t>(connectingSocket);
+    }
+    // ===end====
+
     void run(const std::string& host_ip, uint16_t port)
     {
         while (running_) {
             uintptr_t socket = 0;
             while (running_ && !socket) {
                 std::string error;
-                socket = uu::connect_tcp(host_ip, port, &error);
+                socket = connectInterruptibly(host_ip, port, &error); // wjy: 连接中句柄立即登记到socket_，stop可从焦点线程取消而不会等待系统TCP超时。
                 if (socket || !running_) {
                     break;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                std::this_thread::sleep_for(std::chrono::milliseconds(50)); // wjy: 连接失败重试间隔压到50ms，焦点离开时stop等待不会被旧200ms睡眠放大。
             }
             if (!socket || !running_) {
                 if (socket) {
@@ -639,8 +750,6 @@ private:
                 }
                 return;
             }
-            socket_ = socket;
-
             WasapiPlayer player;
             std::string player_error;
             if (player.start(&player_error)) {

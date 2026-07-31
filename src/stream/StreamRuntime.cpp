@@ -94,6 +94,7 @@ StreamRuntime::StreamRuntime()
     m_stop = reinterpret_cast<StopFn>(library->resolve("fsremote_stream_stop"));
     m_sendInput = reinterpret_cast<SendInputFn>(library->resolve("fsremote_stream_send_input"));
     m_setViewerQuality = reinterpret_cast<SetViewerQualityFn>(library->resolve("fsremote_stream_set_viewer_quality")); // wjy: 可选导出支持无重连画质更新，旧DLL继续使用原始流。
+    m_setViewerAudioEnabled = reinterpret_cast<SetViewerAudioEnabledFn>(library->resolve("fsremote_stream_set_viewer_audio_enabled")); // wjy: 新DLL支持焦点切换时在线启停音频，旧DLL不影响视频兼容路径。
     m_getViewerQualityStatus = reinterpret_cast<GetViewerQualityStatusFn>(library->resolve("fsremote_stream_get_viewer_quality_status"));
     m_getViewerPerformanceStats = reinterpret_cast<GetViewerPerformanceStatsFn>(library->resolve("fsremote_stream_get_viewer_performance_stats")); // wjy: 性能统计导出保持可选，避免新 UI 强制依赖旧 DLL 不具备的能力。
     m_isBusy = reinterpret_cast<IsBusyFn>(library->resolve("fsremote_stream_is_busy"));
@@ -213,6 +214,12 @@ bool StreamRuntime::sendInput(FsRemoteStreamHandle handle, const QByteArray& mes
 bool StreamRuntime::setViewerQuality(FsRemoteStreamHandle handle, const FsRemoteViewerQualityConfig& config)
 {
     return m_setViewerQuality && handle && m_setViewerQuality(handle, &config) != 0; // wjy: DLL同步复制配置，调用返回后栈上结构即可释放。
+}
+
+bool StreamRuntime::setViewerAudioEnabled(FsRemoteStreamHandle handle, bool enabled)
+{
+    return m_setViewerAudioEnabled && handle
+        && m_setViewerAudioEnabled(handle, enabled ? 1 : 0) != 0; // wjy: 同步保存最新意图；准入尚未完成时由Viewer内部延后应用。
 }
 
 bool StreamRuntime::viewerQualityStatus(FsRemoteStreamHandle handle, FsRemoteViewerQualityStatus* status) const

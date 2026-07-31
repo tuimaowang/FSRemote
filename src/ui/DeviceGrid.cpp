@@ -6615,14 +6615,15 @@ void DeviceGrid::evaluateRemoteQuality()
     }
     try {
         const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
-        RemoteDesktopWindow* activeWindow = topmostRemoteWindow(); // wjy: 最近激活窗口代表用户当前控制目标，切换时立即触发下一轮质量计算。
+        auto* activeWindow = qobject_cast<RemoteDesktopWindow*>(QApplication::activeWindow()); // wjy: 使用Qt当前真实活动顶层窗口；切到主界面或其它应用后不再沿用“最近激活”远控窗口。
         std::vector<RemoteQualityWindowMetrics> metrics;
         metrics.reserve(static_cast<std::size_t>(windows.size()));
         for (const QPointer<RemoteDesktopWindow>& window : windows) {
             if (window) {
                 RemoteQualityWindowMetrics snapshot = window->remoteQualityMetrics();
-                snapshot.active = window.data() == activeWindow;
-                metrics.push_back(snapshot); // wjy: 只在Qt线程附加活动身份，不跨线程访问原生WebRTC对象。
+                snapshot.active = snapshot.visible && !snapshot.minimized
+                    && (window.data() == activeWindow || window->isActiveWindow()); // wjy: 只让真实可见焦点窗口成为音频/最高性能所有者，原生子窗口焦点由isActiveWindow兜底识别。
+                metrics.push_back(snapshot); // wjy: 只在Qt线程附加真实焦点身份，不跨线程访问原生WebRTC对象。
             }
         }
         const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
@@ -6631,9 +6632,21 @@ void DeviceGrid::evaluateRemoteQuality()
             metrics,
             nowMs);
         for (const RemoteQualityDecision& decision : decisions) {
+            if (decision.audioEnabled) {
+                continue; // wjy: 先关闭所有非所有者音频，再启动新所有者，焦点切换过程中也不出现双音频重叠窗口。
+            }
             auto* window = reinterpret_cast<RemoteDesktopWindow*>(decision.windowId);
             if (window && windows.contains(QPointer<RemoteDesktopWindow>(window))) {
                 window->applyRemoteQualityDecision(decision); // wjy: 每个窗口内部按Viewer代际去重并在线发送，未连接窗口仅缓存最后决策。
+            }
+        }
+        for (const RemoteQualityDecision& decision : decisions) {
+            if (!decision.audioEnabled) {
+                continue;
+            }
+            auto* window = reinterpret_cast<RemoteDesktopWindow*>(decision.windowId);
+            if (window && windows.contains(QPointer<RemoteDesktopWindow>(window))) {
+                window->applyRemoteQualityDecision(decision); // wjy: 全部旧播放器停止后才启用唯一焦点窗口，严格维持全局单音频所有权。
             }
         }
         if (!windows.isEmpty()

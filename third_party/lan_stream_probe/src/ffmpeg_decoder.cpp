@@ -353,8 +353,13 @@ int H264Decoder::acquire_output_texture(DecodeStatus* status, std::string* error
             continue;
         }
         const HRESULT hr = output_keyed_mutexes_[candidate]->AcquireSync(kSharedTextureProducerKey, 0);
-        if (hr == S_OK || hr == WAIT_ABANDONED) {
+        if (hr == S_OK) {
             return candidate; // wjy: 非阻塞选择空闲槽，解码线程不等待Qt释放某一张固定纹理。
+        }
+        if (hr == WAIT_ABANDONED) {
+            if (error) *error = "AcquireSync(BGRA output) abandoned";
+            if (status) *status = DecodeStatus::DeviceLost;
+            return -1; // wjy: abandoned所有权不可信，立即让当前Viewer重建解码设备，绝不继续写入或ReleaseSync该槽。
         }
         if (hr != WAIT_TIMEOUT && FAILED(hr)) {
             if (error) *error = "AcquireSync(BGRA output) failed: 0x" + std::to_string(static_cast<unsigned long>(hr));
@@ -404,20 +409,24 @@ void H264Decoder::collect_retired_output_textures()
 {
     for (auto iterator = retired_output_textures_.begin(); iterator != retired_output_textures_.end();) {
         bool allReleased = true;
+        bool abandoned = false;
         for (const auto& keyedMutex : iterator->keyed_mutexes) {
             if (!keyedMutex) {
                 continue;
             }
             const HRESULT hr = keyedMutex->AcquireSync(kSharedTextureProducerKey, 0);
-            if (hr == S_OK || hr == WAIT_ABANDONED) {
+            if (hr == S_OK) {
                 keyedMutex->ReleaseSync(kSharedTextureProducerKey); // wjy: 探测后保持生产者key不变，确认该槽没有待消费帧。
+            } else if (hr == WAIT_ABANDONED) {
+                abandoned = true;
+                break; // wjy: 旧资源组出现abandoned后直接退役销毁，不再伪造ReleaseSync或重新放入生产池。
             } else {
                 allReleased = false;
                 break;
             }
         }
-        if (allReleased) {
-            iterator = retired_output_textures_.erase(iterator); // wjy: 全部槽归还后才销毁旧纹理和共享句柄。
+        if (allReleased || abandoned) {
+            iterator = retired_output_textures_.erase(iterator); // wjy: 正常全部归还或检测到不可复用的abandoned时销毁整组旧纹理和共享句柄。
         } else {
             ++iterator;
         }

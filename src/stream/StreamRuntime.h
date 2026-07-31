@@ -65,6 +65,7 @@ public:
     void stop(FsRemoteStreamHandle handle);
     bool sendInput(FsRemoteStreamHandle handle, const QByteArray& message);
     bool setViewerQuality(FsRemoteStreamHandle handle, const FsRemoteViewerQualityConfig& config); // wjy: 新DLL在线发送质量请求，旧DLL缺失导出时返回false但不停止当前流。
+    bool setViewerAudioEnabled(FsRemoteStreamHandle handle, bool enabled); // wjy: 可选在线音频导出缺失时返回false，画面和控制继续保持连接。
     bool viewerQualityStatus(FsRemoteStreamHandle handle, FsRemoteViewerQualityStatus* status) const; // wjy: 读取Host实际应用结果供标题栏反馈。
     bool viewerPerformanceStats(FsRemoteStreamHandle handle, FsRemoteViewerPerformanceStats* stats) const; // wjy: 可选读取接收端性能累计量；旧 DLL 无导出时返回 false 且绝不把低 FPS 猜成压力。
     bool isBusy(FsRemoteStreamHandle handle) const;
@@ -101,6 +102,7 @@ private:
     using StopFn = void(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
     using SendInputFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, const char*);
     using SetViewerQualityFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, const FsRemoteViewerQualityConfig*);
+    using SetViewerAudioEnabledFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, int);
     using GetViewerQualityStatusFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, FsRemoteViewerQualityStatus*);
     using GetViewerPerformanceStatsFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, FsRemoteViewerPerformanceStats*);
     using IsBusyFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
@@ -122,6 +124,7 @@ private:
     StopFn m_stop = nullptr;
     SendInputFn m_sendInput = nullptr;
     SetViewerQualityFn m_setViewerQuality = nullptr;
+    SetViewerAudioEnabledFn m_setViewerAudioEnabled = nullptr;
     GetViewerQualityStatusFn m_getViewerQualityStatus = nullptr;
     GetViewerPerformanceStatsFn m_getViewerPerformanceStats = nullptr;
     IsBusyFn m_isBusy = nullptr;

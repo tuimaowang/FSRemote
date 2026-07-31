@@ -227,9 +227,6 @@ std::string cursor_lock_probe_text()
 // =====wjy====
 void append_viewer_log(const std::string& line)
 {
-    (void)line;
-    return; // wjy: disable native viewer diagnostics completely while testing stream smoothness.
-
     SYSTEMTIME time = {}; // wjy: capture wall-clock time so the last line can be matched with the crash moment.
     ::GetLocalTime(&time);
     char prefix[96] = {};
@@ -2214,6 +2211,7 @@ public:
 
     virtual bool sendInput(const char*) { return false; }
     virtual bool setViewerQuality(const FsRemoteViewerQualityConfig*) { return false; } // wjy: 只有Viewer覆盖在线质量更新，Host或旧句柄安全返回false。
+    virtual bool setViewerAudioEnabled(bool) { return false; } // wjy: Host句柄不拥有本地播放器，错误类型安全返回false。
     virtual bool viewerQualityStatus(FsRemoteViewerQualityStatus*) const { return false; } // wjy: 非Viewer句柄没有应用状态。
     virtual bool viewerPerformanceStats(FsRemoteViewerPerformanceStats*) const { return false; } // wjy: Host 句柄不提供接收端统计，错误句柄安全返回 false。
     virtual bool isBusy() const { return false; }
@@ -2960,6 +2958,11 @@ public:
                 append_viewer_log("viewer worker unknown exception");
                 report_status(status_callback_, user_, FSREMOTE_STATUS_ERROR, "Viewer runtime failure");
             }
+            {
+                std::lock_guard lock(audio_mutex_);
+                audio_capability_available_ = false;
+                stopAudioPlayerLocked(); // wjy: run任意正常返回或异常出口都关闭音频，单路视频失败不会留下后台播放器持续重连。
+            }
         });
     }
 
@@ -2967,10 +2970,11 @@ public:
     {
         // =====wjy====
         stop(); // wjy: close sockets and join the worker before viewer members can be freed.
-        // ===end====
-        if (audio_player_) {
-            audio_player_->stop();
+        {
+            std::lock_guard lock(audio_mutex_); // wjy: worker退出后再串行停止播放器，避免与准入完成时的延后启动并发。
+            stopAudioPlayerLocked();
         }
+        // ===end====
     }
 
     bool sendInput(const char* message) override
@@ -3014,6 +3018,13 @@ public:
         return true;
     }
 
+    bool setViewerAudioEnabled(bool enabled) override
+    {
+        audio_enabled_requested_.store(enabled, std::memory_order_release); // wjy: UI焦点线程只发布最新意图，不积压多次焦点切换任务。
+        std::lock_guard lock(audio_mutex_);
+        return applyRequestedAudioStateLocked(); // wjy: 播放器start/stop严格串行，连接准入前只缓存状态不创建线程。
+    }
+
     bool viewerQualityStatus(FsRemoteViewerQualityStatus* status) const override
     {
         if (!status || status->struct_size < sizeof(FsRemoteViewerQualityStatus) || status->version != 1) {
@@ -3040,6 +3051,42 @@ public:
 
 private:
     // =====wjy====
+    bool applyRequestedAudioStateLocked()
+    {
+        if (!audio_capability_available_) {
+            return true; // wjy: 准入结果尚未确认audio能力时接受请求并延迟应用，视频初始化不受影响。
+        }
+        if (!audio_enabled_requested_.load(std::memory_order_acquire)) {
+            stopAudioPlayerLocked();
+            return true;
+        }
+        if (audio_playing_) {
+            return true; // wjy: 相同焦点状态重复下发时不创建第二条音频线程或第二个socket。
+        }
+        if (!audio_player_) {
+            audio_player_ = std::make_unique<uu::ViewerAudioPlayer>(); // wjy: 只有真正成为音频所有者后才分配播放器对象。
+        }
+        std::string audio_error;
+        if (!audio_player_->start(host_ip_, 49105, &audio_error)) {
+            set_error(audio_error.empty() ? "viewer audio start failed" : audio_error);
+            append_viewer_log("viewer audio start failed error=" + audio_error);
+            return false; // wjy: 音频失败只返回给可选ABI，现有视频和控制会话继续运行。
+        }
+        audio_playing_ = true;
+        append_viewer_log("viewer audio enabled host=" + host_ip_); // wjy: 只记录状态跃迁，不按音频包写日志。
+        return true;
+    }
+
+    void stopAudioPlayerLocked()
+    {
+        if (!audio_player_ || !audio_playing_) {
+            return;
+        }
+        audio_player_->stop(); // wjy: 关闭socket后join唯一音频线程，返回时后台设备不再播放本Viewer声音。
+        audio_playing_ = false;
+        append_viewer_log("viewer audio disabled host=" + host_ip_); // wjy: 焦点离开只产生一条低频状态日志。
+    }
+
     void requestPerformanceStats()
     {
         const uint64_t now = ::GetTickCount64();
@@ -3225,10 +3272,11 @@ private:
             + " ownership=" + admission_.ownership); // wjy: ViewerInstance 持久保存并记录服务端确认的身份、能力、版本与权限结果。
         // ===end====
         if (has_capability(admission_.capabilities, "audio")) {
-            std::string audio_error;
-            audio_player_ = std::make_unique<uu::ViewerAudioPlayer>();
-            audio_player_->start(host_ip_, 49105, &audio_error); // wjy: 只有准入结果包含 audio 能力时才创建音频订阅者。
-            append_viewer_log("viewer audio start error=" + audio_error); // wjy: record audio startup because it runs parallel to video.
+            std::lock_guard lock(audio_mutex_);
+            audio_capability_available_ = true; // wjy: Host确认能力后只应用此前缓存的最新焦点意图，默认不抢占后台音频。
+            if (!applyRequestedAudioStateLocked()) {
+                append_viewer_log("viewer deferred audio state apply failed"); // wjy: 音频失败保留诊断但不阻断后续WebRTC视频初始化。
+            }
         }
         report_status(status_callback_, user_, FSREMOTE_STATUS_INITIALIZING_WEBRTC, "Initializing WebRTC");
         uu::NativeWebrtcRuntime runtime;
@@ -3387,6 +3435,11 @@ private:
             std::lock_guard lock(session_mutex_);
             active_session_ = nullptr;
         }
+        {
+            std::lock_guard lock(audio_mutex_);
+            audio_capability_available_ = false; // wjy: 信令会话结束后禁止迟到焦点请求重新启动独立音频连接。
+            stopAudioPlayerLocked();
+        }
         const bool loopWasRunning = running_.exchange(false); // wjy: 信令循环自然结束后锁存终态，避免随后PeerConnection析构触发ICE closed重复通知。
         if (loopWasRunning) {
             report_status(status_callback_, user_, 80, "Remote connection closed");
@@ -3414,6 +3467,10 @@ private:
     std::shared_ptr<PerformanceState> performance_state_ = std::make_shared<PerformanceState>(); // wjy: 统计回调与 Viewer 生命周期解耦，停止时无需等待 UI 读取者。
     std::atomic_uint64_t last_performance_stats_request_ms_ = 0; // wjy: 两条解码回调共用无锁限频时间戳。
     uint64_t last_stats_status_ms_ = 0;
+    std::atomic_bool audio_enabled_requested_ = false; // wjy: 新Viewer默认静音，协调器明确授予真实焦点后才允许启动本地播放。
+    std::mutex audio_mutex_; // wjy: UI焦点切换、Viewer准入和析构三条路径共享同一播放器所有权门禁。
+    bool audio_capability_available_ = false;
+    bool audio_playing_ = false;
     std::unique_ptr<uu::ViewerAudioPlayer> audio_player_;
 };
 
@@ -3577,6 +3634,14 @@ int FSREMOTE_STREAM_CALL fsremote_stream_set_viewer_quality(
 {
     if (!handle || !config) return 0;
     return static_cast<StreamInstance*>(handle)->setViewerQuality(config) ? 1 : 0; // wjy: Viewer同步复制最新配置，Host或错误句柄安全拒绝且不影响现有流。
+}
+
+int FSREMOTE_STREAM_CALL fsremote_stream_set_viewer_audio_enabled(
+    FsRemoteStreamHandle handle,
+    int enabled)
+{
+    if (!handle) return 0;
+    return static_cast<StreamInstance*>(handle)->setViewerAudioEnabled(enabled != 0) ? 1 : 0; // wjy: 只切换本地Viewer播放器，远端视频、输入和认证会话保持连续。
 }
 
 int FSREMOTE_STREAM_CALL fsremote_stream_get_viewer_quality_status(

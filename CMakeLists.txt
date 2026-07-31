@@ -229,6 +229,16 @@ if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_VIEWER_STABILITY_TESTS) # wjy: 多窗
     endif()
     add_test(NAME fsremote_remote_quality_coordinator_tests COMMAND fsremote_remote_quality_coordinator_tests)
 
+    add_executable(fsremote_viewer_audio_stop_tests EXCLUDE_FROM_ALL
+        tests/viewer_audio_player_stop_tests.cpp
+    ) # wjy: 使用不可达测试地址验证音频仍在连接阶段时stop也能快速返回，不需要真实远端或音频设备。
+    target_link_libraries(fsremote_viewer_audio_stop_tests PRIVATE uu_stream_common)
+    if(MSVC)
+        set_property(TARGET fsremote_viewer_audio_stop_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded") # wjy: 与原生公共静态库保持/MT一致，避免测试链接时混用CRT。
+        target_compile_options(fsremote_viewer_audio_stop_tests PRIVATE /utf-8)
+    endif()
+    add_test(NAME fsremote_viewer_audio_stop_tests COMMAND fsremote_viewer_audio_stop_tests)
+
     # =====wjy====
     add_executable(fsremote_remote_input_broadcast_tests EXCLUDE_FROM_ALL
         tests/remote_input_broadcast_coordinator_tests.cpp

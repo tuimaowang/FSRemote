@@ -192,6 +192,7 @@ private:
     void queryRemoteMouseBackend(); // wjy: 每次新 Viewer 收到画面后查询 Host 全局状态，多控制窗口由真实值对齐。
     stream::RemoteQualityMode effectiveQualityMode() const; // wjy: FollowGlobal解析为最新全局模式，局部覆盖则直接返回覆盖值。
     void sendCurrentRemoteQualityDecision(); // wjy: 把内存中的最新决策转换为稳定C ABI结构；连接中只保留最新请求，重连后按新代际补发。
+    void sendCurrentViewerAudioDecision(); // wjy: 按Viewer代际和布尔状态去重在线音频切换，连接前只保留协调器最新决策。
     QString remoteQualityStatusSummary() const; // wjy: 统一生成诊断中的请求/实际/降级说明，避免状态文案分叉。
     bool remoteQualityIsDegraded() const; // wjy: 判断当前是否处于最小化、自动降级、Host限制或高质量硬边界保护状态。
     // ===end====
@@ -286,6 +287,9 @@ private:
     FsRemoteViewerQualityConfig m_lastSentQualityConfig = {}; // wjy: 记录最后一次成功交给DLL的配置，用于1秒协调循环去重，避免控制通道重复刷屏。
     bool m_hasLastSentQualityConfig = false;
     quint64 m_lastQualityViewerGeneration = 0; // wjy: 相同配置在新Viewer代际仍需补发，不能被旧连接的去重状态吞掉。
+    bool m_lastSentViewerAudioEnabled = false; // wjy: 记录当前代际最后一次交给DLL的音频所有权状态，避免每秒重复start/stop。
+    bool m_hasLastSentViewerAudioState = false;
+    quint64 m_lastAudioViewerGeneration = 0; // wjy: 新Viewer即使仍是焦点也必须重新补发音频意图，旧句柄状态不能复用。
     quint64 m_nextQualityRequestId = 0; // wjy: 每个窗口单调递增请求号，迟到确认无法覆盖后续模式选择。
     FsRemoteViewerQualityStatus m_appliedQualityStatus = {}; // wjy: Host确认的实际宽高、FPS和码率快照，仅在匹配当前请求时展示。
     bool m_hasAppliedQualityStatus = false;

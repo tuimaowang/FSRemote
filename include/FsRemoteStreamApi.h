@@ -185,6 +185,7 @@ void FSREMOTE_STREAM_CALL fsremote_stream_stop(FsRemoteStreamHandle handle);
 int FSREMOTE_STREAM_CALL fsremote_stream_send_input(FsRemoteStreamHandle handle, const char* message);
 // =====wjy====
 int FSREMOTE_STREAM_CALL fsremote_stream_set_viewer_quality(FsRemoteStreamHandle handle, const FsRemoteViewerQualityConfig* config);
+int FSREMOTE_STREAM_CALL fsremote_stream_set_viewer_audio_enabled(FsRemoteStreamHandle handle, int enabled); // wjy: 在线启停当前Viewer本地音频播放器，不重连视频、控制或认证会话。
 int FSREMOTE_STREAM_CALL fsremote_stream_get_viewer_quality_status(FsRemoteStreamHandle handle, FsRemoteViewerQualityStatus* status);
 int FSREMOTE_STREAM_CALL fsremote_stream_get_viewer_performance_stats(FsRemoteStreamHandle handle, FsRemoteViewerPerformanceStats* stats);
 // ===end====

@@ -22,6 +22,7 @@
 #include <QDir>
 #include <QEvent>
 #include <QFile>
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <QKeyEvent>
 #include <QKeySequence>
@@ -161,6 +162,7 @@ QString remoteQualityReasonText(RemoteQualityDegradationReason reason)
     switch (reason) {
     case RemoteQualityDegradationReason::None: return QString::fromUtf8("正常");
     case RemoteQualityDegradationReason::ModePreference: return QString::fromUtf8("模式预设");
+    case RemoteQualityDegradationReason::Background: return QString::fromUtf8("后台低性能保活");
     case RemoteQualityDegradationReason::Minimized: return QString::fromUtf8("最小化保活");
     case RemoteQualityDegradationReason::PipelinePressure: return QString::fromUtf8("接收管线持续压力");
     case RemoteQualityDegradationReason::SeverePipelinePressure: return QString::fromUtf8("接收管线严重压力");
@@ -189,7 +191,11 @@ bool sameQualityDecision(const RemoteQualityDecision& left, const RemoteQualityD
         && left.maxBitrateKbps == right.maxBitrateKbps
         && left.priority == right.priority
         && left.reason == right.reason
-        && left.minimized == right.minimized;
+        && left.active == right.active
+        && left.fullScreen == right.fullScreen
+        && left.minimized == right.minimized
+        && left.softwareFallback == right.softwareFallback
+        && left.audioEnabled == right.audioEnabled; // wjy: 焦点和音频所有权变化必须作为真实决策变化处理，不能被相同画质参数去重。
 }
 // ===end====
 
@@ -974,18 +980,32 @@ QRect normalizedSavedWindowGeometry(const QRect& geometry, const QSize& minimumS
 // =====wjy====
 void appendViewerDebugLog(const QString& line)
 {
-    Q_UNUSED(line)
-    return; // wjy: disable Qt-side viewer diagnostics completely while tuning remote desktop performance.
-
-    const QString dataDir = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("data")); // wjy: keep Qt-side frame logs beside the native stream DLL logs.
-    QDir().mkpath(dataDir); // wjy: make the data directory if this is the first stream log in a fresh build folder.
-    QFile file(QDir(dataDir).filePath(QStringLiteral("stream_viewer_debug.log"))); // wjy: use the same file as the native WebRTC diagnostics.
+    static QMutex logMutex;
+    static bool sizeChecked = false;
+    QMutexLocker locker(&logMutex); // wjy: 状态回调线程和Qt线程串行写完整行，避免多窗口诊断互相穿插。
+    const QString dataDir = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("data"));
+    QDir().mkpath(dataDir); // wjy: 发布目录首次运行时自动创建data文件夹，日志不再落到临时目录。
+    const QString logPath = QDir(dataDir).filePath(QStringLiteral("remote_viewer_state.log"));
+    if (!sizeChecked) {
+        sizeChecked = true;
+        if (QFileInfo(logPath).size() > 4 * 1024 * 1024) {
+            QFile oversized(logPath);
+            oversized.open(QIODevice::WriteOnly | QIODevice::Truncate); // wjy: 每进程最多检查一次，历史文件超过4MB时截断，长期多设备运行不会无限增长。
+        }
+    }
+    QFile file(logPath);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
         return; // wjy: logging must never block or crash the remote desktop UI.
     }
     QTextStream stream(&file);
     stream << QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz"))
-           << QStringLiteral(" qt ")
+           << QStringLiteral(" qt tid=")
+#if defined(Q_OS_WIN)
+           << static_cast<qulonglong>(::GetCurrentThreadId())
+#else
+           << 0
+#endif
+           << QLatin1Char(' ')
            << line
            << Qt::endl; // wjy: Qt::endl flushes each line so a crash leaves the latest checkpoint.
 }
@@ -1761,7 +1781,9 @@ bool RemoteDesktopWindow::event(QEvent* event)
     const bool qualityVisibilityChanged = event
         && (event->type() == QEvent::WindowStateChange
             || event->type() == QEvent::Show
-            || event->type() == QEvent::Hide); // wjy: 最小化/恢复/显示/隐藏都会改变资源优先级，必须立即通知协调器。
+            || event->type() == QEvent::Hide
+            || event->type() == QEvent::WindowActivate
+            || event->type() == QEvent::WindowDeactivate); // wjy: 焦点进入/离开也会切换唯一音频与前后台画质，必须立即通知协调器。
     const bool titleBarScaleChanged = event
         && event->type() == QEvent::DevicePixelRatioChange; // wjy: 跨不同DPI显示器后必须按新物理像素尺寸重建标题栏DIB，逻辑命中矩形保持不变。
     if (event && event->type() == QEvent::WindowActivate) {
@@ -1777,7 +1799,7 @@ bool RemoteDesktopWindow::event(QEvent* event)
         update(); // wjy: 状态改变后重绘，确保旧标题栏不会残留在全屏画面顶部。
     }
     if (qualityVisibilityChanged && !m_closeInProgress) {
-        emit remoteQualityInputsChanged(); // wjy: 最小化无需等待1秒定时器，下一轮Qt事件即下发后台FPS和分辨率。
+        emit remoteQualityInputsChanged(); // wjy: 显隐、最小化和焦点变化都在下一轮Qt事件切换画质与音频，不等待1秒轮询。
     }
     if (titleBarScaleChanged) {
         ++m_titleBarVisualRevision;
@@ -1907,7 +1929,7 @@ RemoteQualityWindowMetrics RemoteDesktopWindow::remoteQualityMetrics()
     metrics.effectiveMode = effectiveQualityMode();
     metrics.visible = isVisible() && !m_closeInProgress;
     metrics.minimized = isMinimized();
-    metrics.fullScreen = isFullScreen(); // wjy: 全屏窗口即使不是最近激活窗口也必须由智能策略保持高质量。
+    metrics.fullScreen = isFullScreen(); // wjy: 可见全屏窗口即使暂时失焦也保持高性能，但音频仍由协调器只授予真实焦点窗口。
     metrics.softwareFallback = m_softwareFallbackActive; // wjy: 重试开放期间也保持BGRA回退硬上限，必须等纹理实际成功后才恢复。
     const QSize sourceSize = remoteFrameSize().isValid() ? remoteFrameSize() : QSize(1920, 1080);
     metrics.sourceWidth = sourceSize.width();
@@ -1940,7 +1962,7 @@ RemoteQualityWindowMetrics RemoteDesktopWindow::remoteQualityMetrics()
         metrics.performance = m_performanceSignalSampler.sample(counters); // wjy: 只有第二份单调快照开始产生有效压力，重连和旧 DLL 都不会虚假降档。
     }
 
-    const quint64 totalDrops = m_pendingTextureFrames.replacedFrameCount(); // wjy: 本地Presenter压力只统计被最新帧替换的旧pending，不再统计被拒绝的新画面。
+    const quint64 totalDrops = m_pendingTextureFrames.replacedFrameCount(); // wjy: 本地Presenter压力统计单槽占用时由生产端直接回收的新纹理，不再跨线程替换旧pending。
     const qint64 nowMs = m_sessionClock.isValid() ? m_sessionClock.elapsed() : 0;
     if (m_lastPresenterSampleMs > 0 && nowMs > m_lastPresenterSampleMs
         && m_totalPresentedFrames >= m_lastPresenterSampleFrames
@@ -1968,7 +1990,19 @@ void RemoteDesktopWindow::applyRemoteQualityDecision(const RemoteQualityDecision
     m_remoteQualityDecision = decision; // wjy: 无论Viewer是否已创建都保存最新值，连接成功后只补发这一份。
     m_hasRemoteQualityDecision = true;
     sendCurrentRemoteQualityDecision();
-    if (feedbackChanged) requestTitleBarUpdate(); // wjy: 仅画质原因或档位变化时刷新标题栏，1秒协调循环不会制造无意义重绘。
+    sendCurrentViewerAudioDecision(); // wjy: 画质和音频共用同一焦点决策，但音频通过独立可选ABI在线切换。
+    if (feedbackChanged) {
+        appendViewerDebugLog(QStringLiteral("quality role host=%1 active=%2 fullscreen=%3 background=%4 audio=%5 resolution=%6 fps=%7 priority=%8")
+            .arg(m_hostIp)
+            .arg(decision.active ? 1 : 0)
+            .arg(decision.fullScreen ? 1 : 0)
+            .arg(!decision.active && !decision.fullScreen ? 1 : 0)
+            .arg(decision.audioEnabled ? 1 : 0)
+            .arg(static_cast<int>(decision.resolution))
+            .arg(decision.targetFps)
+            .arg(decision.priority)); // wjy: 只在角色/档位状态变化时写data日志，不按每秒评估或每帧重复输出。
+        requestTitleBarUpdate();
+    }
 }
 
 void RemoteDesktopWindow::sendCurrentRemoteQualityDecision()
@@ -2010,6 +2044,30 @@ void RemoteDesktopWindow::sendCurrentRemoteQualityDecision()
     m_lastQualityViewerGeneration = currentGeneration; // wjy: 新连接代际即使参数相同也会重新发送，旧Host确认不能代替新会话。
     m_qualityRequestPending = true;
     m_qualityProtocolUnavailable = false;
+}
+
+void RemoteDesktopWindow::sendCurrentViewerAudioDecision()
+{
+    if (!m_hasRemoteQualityDecision || !m_viewerHandle || m_closeInProgress) {
+        return;
+    }
+    const bool enabled = m_remoteQualityDecision.audioEnabled;
+    const quint64 currentGeneration = m_viewerGeneration.load(std::memory_order_acquire);
+    if (m_hasLastSentViewerAudioState
+        && m_lastAudioViewerGeneration == currentGeneration
+        && m_lastSentViewerAudioEnabled == enabled) {
+        return; // wjy: 同一代际相同布尔状态不重复调用音频线程启停接口。
+    }
+
+    const bool supported = stream::StreamRuntime::instance().setViewerAudioEnabled(m_viewerHandle, enabled);
+    m_lastSentViewerAudioEnabled = enabled;
+    m_hasLastSentViewerAudioState = true;
+    m_lastAudioViewerGeneration = currentGeneration; // wjy: 即使旧DLL缺失导出也锁存本次结果，避免一秒轮询持续尝试；新代际会重新探测。
+    appendViewerDebugLog(QStringLiteral("audio owner host=%1 enabled=%2 api_supported=%3 generation=%4")
+        .arg(m_hostIp)
+        .arg(enabled ? 1 : 0)
+        .arg(supported ? 1 : 0)
+        .arg(currentGeneration)); // wjy: 焦点音频所有权每次真实变化只记录一条data诊断。
 }
 
 void RemoteDesktopWindow::refreshAppliedRemoteQualityStatus()
@@ -3157,7 +3215,8 @@ bool RemoteDesktopWindow::remoteQualityIsDegraded() const
     if (!m_hasRemoteQualityDecision) {
         return false;
     }
-    if (m_remoteQualityDecision.reason == RemoteQualityDegradationReason::Minimized
+    if (m_remoteQualityDecision.reason == RemoteQualityDegradationReason::Background
+        || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::Minimized
         || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::PipelinePressure
         || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::SeverePipelinePressure
         || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::SoftwareFallback
@@ -4127,11 +4186,9 @@ int RemoteDesktopWindow::enqueueRemoteTextureFrame(int width, int height, void* 
         frameId,
         encodedMbps,
         viewerGeneration,
-    }); // wjy: 单槽始终接管最新纹理；若淘汰旧pending，push结果会把旧描述符交还给本函数处理。
-    if (pushResult.replacedPending.has_value()
-        && m_texturePresenter
-        && pushResult.replacedPending->sharedHandle) {
-        m_texturePresenter->discardSharedTexture(pushResult.replacedPending->sharedHandle); // wjy: 旧pending已经持有消费者key，替换后立即Acquire key 1并Release key 0，所有权恰好归还一次。
+    }); // wjy: 单槽为空才接管纹理；槽已占用时保留旧pending并让生产端回收本次新帧。
+    if (pushResult.disposition == TextureFramePushDisposition::DroppedBecausePending) {
+        return FSREMOTE_TEXTURE_FRAME_DROPPED; // wjy: 解码回调线程不再调用Qt Presenter，生产端在自己的D3D设备上直接ReleaseSync回key 0。
     }
     if (pushResult.disposition == TextureFramePushDisposition::AcceptedAndScheduleDrain
         && !QMetaObject::invokeMethod(this, &RemoteDesktopWindow::drainPendingRemoteTextureFrame, Qt::QueuedConnection)) {
@@ -4448,6 +4505,8 @@ void RemoteDesktopWindow::invalidateViewerCallbacks()
 {
     m_viewerGeneration.fetch_add(1, std::memory_order_acq_rel); // wjy: 先推进代际，原生线程从这一刻起无法再把旧帧或旧断线状态提交到窗口。
     m_lastQualityViewerGeneration = 0; // wjy: 下一次Viewer即使使用相同档位也必须重新补发，旧代际去重状态立即失效。
+    m_lastAudioViewerGeneration = 0;
+    m_hasLastSentViewerAudioState = false; // wjy: 停止或重连后必须向新Viewer重新下发当前唯一音频所有权。
     m_qualityRequestPending = false;
     m_hasAppliedQualityStatus = false;
     m_qualityProtocolUnavailable = false; // wjy: 重连后重新探测新Host能力，不能沿用上一连接的“不支持”结论。
@@ -4741,6 +4800,7 @@ void RemoteDesktopWindow::startViewerConnectionWithAdmission()
             releaseViewerStartupAdmission(); // wjy: 创建失败不继续占用初始化预算，下一台设备可以立即补位。
         } else {
             sendCurrentRemoteQualityDecision(); // wjy: 窗口排队初始化期间若全局/局部策略已变化，只向新Viewer补发最终最新值。
+            sendCurrentViewerAudioDecision(); // wjy: Viewer默认静音，创建成功后立即按当前真实焦点补发唯一音频状态。
         }
     } else {
         setConnectionStatus(90, QString::fromUtf8("设备 IP 为空"));
