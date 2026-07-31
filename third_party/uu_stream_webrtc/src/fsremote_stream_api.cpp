@@ -3288,6 +3288,45 @@ private:
             std::lock_guard lock(session_mutex_);
             active_session_ = &session;
         }
+        // =====wjy====
+        session.set_connection_state_callback([this](webrtc::PeerConnectionInterface::IceConnectionState state) {
+            if (state == webrtc::PeerConnectionInterface::kIceConnectionDisconnected) {
+                if (!running_ || ice_disconnected_.exchange(true)) {
+                    return; // wjy: 同一次断网只上报一次，重复Disconnected不重启Qt侧三秒计时器。
+                }
+                append_viewer_log("viewer ICE temporarily disconnected");
+                report_status(
+                    status_callback_, user_, FSREMOTE_STATUS_NETWORK_UNSTABLE, "ICE temporarily disconnected"); // wjy: 保留PeerConnection和信令socket，让WebRTC先尝试使用现有会话自恢复。
+                return;
+            }
+            if (state == webrtc::PeerConnectionInterface::kIceConnectionConnected
+                || state == webrtc::PeerConnectionInterface::kIceConnectionCompleted) {
+                if (ice_disconnected_.exchange(false) && running_) {
+                    append_viewer_log("viewer ICE connectivity restored; waiting video");
+                    report_status(
+                        status_callback_, user_, FSREMOTE_STATUS_NETWORK_RECOVERING, ""); // wjy: ICE恢复不等于画面恢复，Qt使用统一中文状态并保留警告直到真正呈现新帧。
+                }
+                return;
+            }
+            if (state != webrtc::PeerConnectionInterface::kIceConnectionFailed
+                && state != webrtc::PeerConnectionInterface::kIceConnectionClosed) {
+                return; // wjy: new/checking等中间状态不改变现有网络恢复流程。
+            }
+            ice_disconnected_.store(false);
+            bool expectedRunning = true;
+            if (!running_.compare_exchange_strong(expectedRunning, false)) {
+                return; // wjy: 手动关闭或更早的ICE终态已经接管清理时，不重复通知和关闭socket。
+            }
+            append_viewer_log(
+                "viewer ICE ended state=" + std::to_string(static_cast<int>(state)));
+            report_status(
+                status_callback_, user_, FSREMOTE_STATUS_REMOTE_CLOSED, "Remote network connection lost"); // wjy: recv循环会因running=false跳过尾部通知，因此在ICE线程明确投递一次断线状态。
+            const uintptr_t current = socket_.exchange(0);
+            if (current) {
+                uu::close_socket(current); // wjy: shutdown+closesocket解除recv_message阻塞，唤醒Viewer worker退出。
+            }
+        });
+        // ===end====
         session.set_signal_callback([socket](const std::string& kind, const std::string& body) {
             append_viewer_log("viewer send signaling kind=" + kind + " body_size=" + std::to_string(body.size())); // wjy: show local offer/answer/candidate egress.
             uu::send_message(socket, kind + "\n" + body);
@@ -3340,11 +3379,16 @@ private:
             handle_message(session, message);
         }
         append_viewer_log("viewer recv loop end running=" + std::to_string(running_.load())); // wjy: distinguish clean remote close from native crash.
+        const uintptr_t remainingSocket = socket_.exchange(0);
+        if (remainingSocket) {
+            uu::close_socket(remainingSocket); // wjy: 远端正常关闭或recv失败后立即清除句柄，析构时不会重复关闭已经结束的连接。
+        }
         {
             std::lock_guard lock(session_mutex_);
             active_session_ = nullptr;
         }
-        if (running_) {
+        const bool loopWasRunning = running_.exchange(false); // wjy: 信令循环自然结束后锁存终态，避免随后PeerConnection析构触发ICE closed重复通知。
+        if (loopWasRunning) {
             report_status(status_callback_, user_, 80, "Remote connection closed");
         }
         append_viewer_log("viewer worker end"); // wjy: proves the thread exited cleanly.
@@ -3358,6 +3402,7 @@ private:
     void* user_ = nullptr;
     SessionAdmission admission_; // wjy: 准入结果生命周期覆盖整个 ViewerInstance，供后续音频令牌、控制权和状态处理复用。
     std::atomic_bool control_allowed_ = false; // wjy: 原子权限位跨 UI 与 viewer worker 线程读取，避免直接并发访问 admission_ 字符串。
+    std::atomic_bool ice_disconnected_ = false; // wjy: 去重同一轮ICE断开/恢复通知，避免网络线程高频回调反复重置UI计时器。
     std::mutex session_mutex_;
     uu::WebrtcSession* active_session_ = nullptr;
     mutable std::mutex quality_mutex_;

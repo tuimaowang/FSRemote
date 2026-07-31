@@ -148,6 +148,14 @@ private:
     void startViewerConnectionWithAdmission(); // wjy: 仅在共享管理器授予名额后真正调用原生startViewer。
     void releaseViewerStartupAdmission(); // wjy: 连接成功、失败或stop完成时幂等释放初始化名额。
     // =====wjy====
+    void beginNetworkRecoveryGracePeriod(); // wjy: ICE短时断开先保留旧会话三秒，等待WebRTC自行恢复。
+    void beginNetworkReconnect(); // wjy: 确认会话失效后停止旧Viewer，并在stop完成后进入无限退避重试。
+    void scheduleNetworkReconnect(); // wjy: 以1/2/4/8/10秒退避安排下一次连接，达到10秒后不限制重试次数。
+    void attemptNetworkReconnect(); // wjy: 单次重试仍通过共享初始化管理器，不能绕过多窗口并发上限。
+    void finishNetworkReconnect(); // wjy: 只有成功呈现新帧才恢复输入、清除警告并重置退避。
+    void cancelNetworkReconnect(); // wjy: 关闭窗口、程序退出或远程更新接管时终止所有后续重试。
+    // ===end====
+    // =====wjy====
     void pollRemoteUpdateStatus();
     void stopViewerConnectionAsync(bool deleteAfterStop);
     void finishViewerStop(const QString& errorMessage); // wjy: 原生stop无论成功或异常都回到Qt线程统一释放初始化名额并决定删除/重连。
@@ -255,6 +263,14 @@ private:
     QString m_hostIp;
     QString m_connectionStatus;
     int m_connectionStatusCode = 0;
+    bool m_hasReceivedVideoInCurrentViewer = false; // wjy: 区分建立远控后的网络中断与首次连接失败，避免标题栏误报。
+    bool m_networkWarningVisible = false; // wjy: 只保存静态“网络不佳”可见状态，不跟随每帧或计时器闪动。
+    // =====wjy====
+    QTimer* m_networkReconnectTimer = nullptr;
+    bool m_networkReconnectActive = false; // wjy: 一旦正常远控因网络中断进入恢复流程，窗口保持到用户主动关闭并无限重试。
+    bool m_networkRecoveryGraceActive = false; // wjy: true表示当前3秒计时器用于等待旧ICE会话自恢复，false表示用于退避重建。
+    int m_networkReconnectAttempt = 0; // wjy: 保存0到5的退避档位，第五档后固定10秒且不停止累计恢复流程。
+    // ===end====
     QImage m_remoteFrame;
     QSize m_remoteTextureSize;
     QMutex m_pendingFrameMutex; // wjy: Protects latest-frame handoff from the decoder thread to the Qt UI thread.

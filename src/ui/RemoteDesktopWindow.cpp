@@ -1642,6 +1642,24 @@ RemoteDesktopWindow::RemoteDesktopWindow(
     m_sessionTimer->start();
 
     // =====wjy====
+    m_networkReconnectTimer = new QTimer(this);
+    m_networkReconnectTimer->setSingleShot(true); // wjy: 同一个单次定时器分时承担3秒自恢复等待和后续退避重连，不创建常驻轮询线程。
+    connect(m_networkReconnectTimer, &QTimer::timeout, this, [this] {
+        if (!m_networkReconnectActive || m_closeInProgress || m_applicationExitInProgress
+            || remoteUpdateActive()) {
+            cancelNetworkReconnect();
+            return;
+        }
+        if (m_networkRecoveryGraceActive) {
+            m_networkRecoveryGraceActive = false;
+            beginNetworkReconnect(); // wjy: 三秒内没有成功呈现新帧，旧会话视为不可用并进入安全stop流程。
+            return;
+        }
+        attemptNetworkReconnect(); // wjy: 退避到期后只尝试一次，失败状态回调会再次安排下一档。
+    });
+    // ===end====
+
+    // =====wjy====
     m_remoteUpdateTimer = new QTimer(this);
     m_remoteUpdateTimer->setInterval(250); // wjy: 250ms 只推进遮罩动画，网络状态查询限制为约每秒一次。
     connect(m_remoteUpdateTimer, &QTimer::timeout, this, [this] {
@@ -1692,6 +1710,9 @@ RemoteDesktopWindow::~RemoteDesktopWindow()
     // ===end====
     if (m_remoteUpdateTimer) {
         m_remoteUpdateTimer->stop(); // wjy: 窗口析构后停止更新状态轮询和遮罩动画。
+    }
+    if (m_networkReconnectTimer) {
+        m_networkReconnectTimer->stop(); // wjy: QObject子对象析构前先取消待执行重试，避免析构期间再次申请Viewer。
     }
     invalidateViewerCallbacks(); // wjy: 析构开始即作废活动代际并丢弃尚未呈现的BGRA/纹理，旧原生回调无法再访问Presenter。
     // =====wjy====
@@ -2104,6 +2125,7 @@ void RemoteDesktopWindow::beginRemoteUpdateWait()
         return;
     }
 
+    cancelNetworkReconnect(); // wjy: 远程更新拥有独立重连状态机，开始更新前必须取消普通断网无限重试。
     setRemoteMouseCaptureActive(false); // wjy: 切换状态前先向旧连接释放鼠标和按键，防止目标端残留输入状态。
     releaseForwardedKeys();
     m_waitingShortcutRelease = false;
@@ -2249,6 +2271,8 @@ void RemoteDesktopWindow::stopViewerConnectionAsync(bool deleteAfterStop)
             deleteLater();
         } else if (m_remoteUpdateReconnectRequested) {
             startViewerAfterUpdate();
+        } else if (m_networkReconnectActive) {
+            scheduleNetworkReconnect(); // wjy: 同步创建失败没有原生对象可清理，直接进入下一档退避且继续无限等待。
         }
         // ===end====
         return;
@@ -2309,6 +2333,8 @@ void RemoteDesktopWindow::finishViewerStop(const QString& errorMessage)
     }
     if (m_remoteUpdateReconnectRequested) {
         startViewerAfterUpdate(); // wjy: stop返回后再申请新的初始化名额，旧回调和新会话不会重叠。
+    } else if (m_networkReconnectActive) {
+        scheduleNetworkReconnect(); // wjy: 只有旧Viewer析构和工作线程join完成后才允许启动新代际。
     }
     // ===end====
 }
@@ -2608,6 +2634,7 @@ RemoteTitleBarVisualState RemoteDesktopWindow::titleBarVisualState() const
     state.deviceName = m_deviceName;
     state.hostIp = m_hostIp;
     state.connectionStatus = m_connectionStatus;
+    state.networkWarningText = m_networkWarningVisible ? zh("网络不佳") : QString(); // wjy: 原生DIB和DComp完整标题栏都从同一快照取得静态网络提示。
     state.updateAvailable = m_remoteUpdateAvailable; // wjy: 即使当前视觉由layout.update表示，快照仍完整记录标题栏更新入口来源状态，便于后续渲染演进不回读窗口。
 
     const qint64 elapsedSeconds = m_sessionClock.elapsed() / 1000;
@@ -3247,8 +3274,9 @@ void RemoteDesktopWindow::saveWindowGeometry()
 
 bool RemoteDesktopWindow::sendInputMessage(const QByteArray& message)
 {
-    if (remoteUpdateActive()) {
-        return false; // wjy: 更新遮罩期间统一阻断鼠标、键盘和剪贴板消息，避免发送到正在退出或刚重启的目标进程。
+    if (remoteUpdateActive() || !m_viewerHandle
+        || !RemoteConnectionState::acceptsRemoteInput(m_connectionStatusCode)) {
+        return false; // wjy: 更新、断网、退避重连或没有有效Viewer时统一丢弃输入，不向失效句柄积压键鼠和剪贴板消息。
     }
     const bool shouldLog = shouldLogInputMessage(message);
     const bool ok = stream::StreamRuntime::instance().sendInput(m_viewerHandle, message);
@@ -3308,8 +3336,9 @@ void RemoteDesktopWindow::toggleInputSynchronization()
 
 void RemoteDesktopWindow::setRemoteMouseCaptureActive(bool active)
 {
-    if (active && remoteUpdateActive()) {
-        return; // wjy: 更新过程中忽略旧流迟到的 relative mouse 状态，保持本机鼠标可见可操作。
+    if (active && (remoteUpdateActive() || !m_viewerHandle
+        || !RemoteConnectionState::acceptsRemoteInput(m_connectionStatusCode))) {
+        return; // wjy: 更新或断网重连期间忽略旧流迟到的relative状态，防止本机鼠标再次被隐藏或锁定。
     }
     if (m_remoteMouseCaptureActive == active) {
         if (active) {
@@ -3618,7 +3647,9 @@ void RemoteDesktopWindow::setKeyboardForwardingActive(bool active)
 #if defined(Q_OS_WIN)
     if (m_waitingShortcutRelease && !m_closeInProgress) {
         installKeyboardHook(this); // wjy: 等待组合键松开时保留 hook，但 hook 只记录 keyup，不转发远端。
-    } else if (active && !m_closeInProgress && !remoteUpdateActive() && isActiveWindow()) {
+    } else if (active && !m_closeInProgress && !remoteUpdateActive() && isActiveWindow()
+        && m_viewerHandle
+        && RemoteConnectionState::acceptsRemoteInput(m_connectionStatusCode)) {
         installKeyboardHook(this);
     } else {
         uninstallKeyboardHook(this);
@@ -3732,6 +3763,7 @@ void RemoteDesktopWindow::shutdownForApplicationExit()
     m_applicationExitInProgress = true; // wjy: 窗口删除权交给DeviceGrid，异步stop完成时不得通过deleteLater改变批量退出顺序。
     m_remoteUpdateState = RemoteUpdateState::None;
     m_remoteUpdateReconnectRequested = false;
+    cancelNetworkReconnect(); // wjy: 应用退出后禁止任何退避定时器重新申请Viewer。
     if (m_remoteUpdateTimer) {
         m_remoteUpdateTimer->stop(); // wjy: 控制端自身退出时终止远端更新轮询，不再尝试恢复窗口。
     }
@@ -4192,7 +4224,8 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
                 presentCompositorOverlay(); // wjy: 仅首个硬件帧或软件转硬件时清理旧BGRA/连接内容；正常视频帧只Present视频SwapChain，不再逐帧重建整窗Overlay。
             }
             const bool connectionTitleChanged = m_connectionStatusCode != 50
-                || m_connectionStatus != QString::fromUtf8("画面已接收"); // wjy: 正常视频帧不改变标题栏状态，只有首帧或重连恢复需要重画一次。
+                || m_connectionStatus != QString::fromUtf8("画面已接收")
+                || m_networkWarningVisible; // wjy: 恢复首帧必须同时清除静态网络提示，后续正常视频帧不重复重画。
             if (m_textureFailureCount > 0) {
                 m_textureFailureCount = 0;
                 m_softwareFallbackActive = false;
@@ -4203,6 +4236,12 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
             }
             m_connectionStatusCode = 50;
             m_connectionStatus = QString::fromUtf8("画面已接收");
+            m_hasReceivedVideoInCurrentViewer = true;
+            if (m_networkReconnectActive) {
+                finishNetworkReconnect(); // wjy: 共享纹理已成功Present，至此才确认网络、解码和DComp整条路径恢复。
+            } else {
+                m_networkWarningVisible = false;
+            }
             if (!m_remoteMouseBackendKnown && !m_remoteMouseBackendPending) queryRemoteMouseBackend(); // wjy: 纹理首帧若先于状态回调到达，也会在输入资格建立后立即同步 Host 全局后端。
             if (m_texturePresenter->usesCompositorSurface()) {
                 m_texturePresenter->setPresentationVisible(true); // wjy: DComp首帧提交后只恢复视频视觉，不再把子控件带回可见层。
@@ -4258,6 +4297,9 @@ void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
     // appendViewerDebugLog(QStringLiteral("setRemoteFrame enter size=%1x%2").arg(image.width()).arg(image.height())); // wjy: per-frame UI log disabled for smoother rendering.
     // ===end====
     updateFrameStats(image); // wjy: Count received UI frames before repainting so the title bar reflects the latest decoded BGRA flow.
+    const bool connectionTitleChanged = m_connectionStatusCode != FSREMOTE_STATUS_RECEIVING_VIDEO
+        || m_connectionStatus != QString::fromUtf8("画面已接收")
+        || m_networkWarningVisible; // wjy: 软件帧恢复与共享纹理恢复遵循同一标题栏清理条件。
     // =====wjy====
     const bool textureWasVisible = m_textureFrameActive
         && m_texturePresenter
@@ -4277,12 +4319,21 @@ void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
     // ===end====
     m_connectionStatusCode = 50;
     m_connectionStatus = QString::fromUtf8("画面已接收");
+    m_hasReceivedVideoInCurrentViewer = true;
+    if (m_networkReconnectActive) {
+        finishNetworkReconnect(); // wjy: 软件帧真实进入显示路径后结束无限重连，行为与共享纹理路径一致。
+    } else {
+        m_networkWarningVisible = false;
+    }
     if (!m_remoteMouseBackendKnown && !m_remoteMouseBackendPending) queryRemoteMouseBackend(); // wjy: BGRA 首帧与纹理路径使用相同查询门禁，事件先后顺序不同也只发送一次。
     if (m_remoteUpdateState == RemoteUpdateState::Reconnecting) {
         finishRemoteUpdateWait(); // wjy: 软件帧路径同样以首帧到达作为恢复正常远控的唯一完成点。
     }
     if (!textureWasVisible) {
         update(contentRect); // wjy: 普通软件帧继续异步刷新；只有D3D→BGRA交接首帧使用一次同步重绘。
+    }
+    if (connectionTitleChanged) {
+        requestTitleBarUpdate(); // wjy: 恢复时立即从标题栏移除“网络不佳”，不等待下一次一秒计时刷新。
     }
     // appendViewerDebugLog(QStringLiteral("setRemoteFrame update requested")); // wjy: per-frame repaint log disabled to avoid disk IO on every frame.
 }
@@ -4468,6 +4519,136 @@ bool RemoteDesktopWindow::handleLocalShortcutKey(int virtualKey, Qt::KeyboardMod
     return false;
 }
 
+// =====wjy====
+void RemoteDesktopWindow::beginNetworkRecoveryGracePeriod()
+{
+    if (m_closeInProgress || m_applicationExitInProgress || remoteUpdateActive()
+        || m_hostIp.trimmed().isEmpty()
+        || (!m_hasReceivedVideoInCurrentViewer && !m_networkReconnectActive)) {
+        return; // wjy: 只为已经正常出画或已经处于恢复流程的窗口无限等待，首次配置/鉴权错误仍保留明确失败结果。
+    }
+
+    m_networkReconnectActive = true;
+    m_networkRecoveryGraceActive = true;
+    m_networkWarningVisible = true;
+    if (m_networkReconnectTimer) {
+        m_networkReconnectTimer->start(3000); // wjy: Disconnected或ICE刚恢复都等待最多三秒真实画面，短时抖动不销毁昂贵会话。
+    }
+    requestTitleBarUpdate();
+}
+
+void RemoteDesktopWindow::beginNetworkReconnect()
+{
+    if (m_closeInProgress || m_applicationExitInProgress || remoteUpdateActive()
+        || m_hostIp.trimmed().isEmpty()
+        || (m_lifecycleManager && m_lifecycleManager->isApplicationShuttingDown())) {
+        cancelNetworkReconnect();
+        return;
+    }
+
+    m_networkReconnectActive = true;
+    m_networkRecoveryGraceActive = false;
+    m_networkWarningVisible = true;
+    if (m_networkReconnectTimer) m_networkReconnectTimer->stop();
+    if (m_viewerHandle || m_viewerStopInProgress || m_viewerStartQueued || m_viewerStartAdmissionActive) {
+        stopViewerConnectionAsync(false); // wjy: 旧Viewer及其回调上下文必须完全销毁，finishViewerStop之后才能安排新代际。
+        return;
+    }
+    scheduleNetworkReconnect();
+}
+
+void RemoteDesktopWindow::scheduleNetworkReconnect()
+{
+    if (!m_networkReconnectActive || m_closeInProgress || m_applicationExitInProgress
+        || remoteUpdateActive() || m_hostIp.trimmed().isEmpty()
+        || (m_lifecycleManager && m_lifecycleManager->isApplicationShuttingDown())) {
+        cancelNetworkReconnect();
+        return;
+    }
+    if (m_networkReconnectTimer && m_networkReconnectTimer->isActive()
+        && !m_networkRecoveryGraceActive) {
+        return; // wjy: stop异常状态回调和finishViewerStop可能连续请求调度，同一轮只保留一个退避定时器且不重复增加次数。
+    }
+
+    static constexpr int kRetryDelaysMs[] = {1000, 2000, 4000, 8000, 10000};
+    const int delayIndex = qMin(m_networkReconnectAttempt, 4);
+    const int delayMs = kRetryDelaysMs[delayIndex];
+    m_networkReconnectAttempt = qMin(m_networkReconnectAttempt + 1, 5); // wjy: 只保存当前退避档位；第五档后固定10秒无限重试，长期运行不会发生整数溢出。
+    m_networkRecoveryGraceActive = false;
+    m_networkWarningVisible = true;
+    m_connectionStatusCode = FSREMOTE_STATUS_NETWORK_RECOVERING;
+    m_connectionStatus = QString::fromUtf8("网络不佳，%1 秒后自动重连").arg(delayMs / 1000);
+    if (m_networkReconnectTimer) {
+        m_networkReconnectTimer->start(delayMs);
+    }
+    appendViewerDebugLog(QStringLiteral("network reconnect scheduled host=%1 attempt=%2 delay_ms=%3")
+        .arg(m_hostIp)
+        .arg(m_networkReconnectAttempt)
+        .arg(delayMs)); // wjy: 低频记录每轮退避，现场日志可确认程序仍在无限等待而不是卡死。
+    update(isFullScreen() ? rect() : QRect(0, titleBarHeight(), width(), height() - titleBarHeight()));
+    requestTitleBarUpdate();
+}
+
+void RemoteDesktopWindow::attemptNetworkReconnect()
+{
+    if (!m_networkReconnectActive || m_closeInProgress || m_applicationExitInProgress
+        || remoteUpdateActive() || m_hostIp.trimmed().isEmpty()
+        || (m_lifecycleManager && m_lifecycleManager->isApplicationShuttingDown())) {
+        cancelNetworkReconnect();
+        return;
+    }
+    if (m_viewerHandle || m_viewerStopInProgress || m_viewerStartQueued || m_viewerStartAdmissionActive) {
+        beginNetworkReconnect();
+        return; // wjy: 极端迟到状态下先收敛旧生命周期，禁止同一个窗口并行创建两个Viewer。
+    }
+
+    m_connectionStatusCode = FSREMOTE_STATUS_NETWORK_RECOVERING;
+    m_connectionStatus = QString::fromUtf8("网络不佳，正在重新连接");
+    appendViewerDebugLog(QStringLiteral("network reconnect attempt host=%1 attempt=%2")
+        .arg(m_hostIp)
+        .arg(m_networkReconnectAttempt));
+    update(isFullScreen() ? rect() : QRect(0, titleBarHeight(), width(), height() - titleBarHeight()));
+    requestTitleBarUpdate();
+    startViewerConnection(); // wjy: 继续复用四路初始化准入队列，多窗口同时恢复时不会瞬间压满CPU和网络线程。
+}
+
+void RemoteDesktopWindow::finishNetworkReconnect()
+{
+    if (!m_networkReconnectActive && !m_networkWarningVisible) {
+        return;
+    }
+    if (m_networkReconnectTimer) m_networkReconnectTimer->stop();
+    m_networkReconnectActive = false;
+    m_networkRecoveryGraceActive = false;
+    m_networkReconnectAttempt = 0;
+    m_networkWarningVisible = false;
+    if (m_clipboardSyncEnabled && m_clipboardPollTimer) {
+        m_clipboardPollTimer->start();
+    }
+    if (isActiveWindow()) {
+        setKeyboardForwardingActive(true); // wjy: 第一帧已经成功显示后才重新安装键盘hook，等待期间不会向失效句柄发送输入。
+    }
+    if (m_inputBroadcastCoordinator) {
+        m_inputBroadcastCoordinator->notifyEligibilityChanged(this);
+    }
+    appendViewerDebugLog(QStringLiteral("network reconnect recovered host=%1").arg(m_hostIp));
+    requestTitleBarUpdate();
+}
+
+void RemoteDesktopWindow::cancelNetworkReconnect()
+{
+    if (m_networkReconnectTimer) m_networkReconnectTimer->stop();
+    const bool warningChanged = m_networkWarningVisible;
+    m_networkReconnectActive = false;
+    m_networkRecoveryGraceActive = false;
+    m_networkReconnectAttempt = 0;
+    m_networkWarningVisible = false;
+    if (warningChanged && !m_closeInProgress && !m_applicationExitInProgress) {
+        requestTitleBarUpdate();
+    }
+}
+// ===end====
+
 void RemoteDesktopWindow::startViewerConnection()
 {
     // =====wjy====
@@ -4504,6 +4685,13 @@ void RemoteDesktopWindow::startViewerConnectionWithAdmission()
     // =====wjy====
     m_viewerStartQueued = false;
     m_viewerStartAdmissionActive = true; // wjy: 从此刻到连接成功/失败/stop完成期间占用一个初始化预算。
+    m_hasReceivedVideoInCurrentViewer = false; // wjy: 新Viewer独立判断是否曾正常出画，首次连接错误不能继承旧会话的网络警告依据。
+    if (!m_networkReconnectActive) {
+        m_networkWarningVisible = false; // wjy: 普通首次连接清理历史提示；无限重连中的新代际必须继续显示“网络不佳”。
+    } else if (m_networkReconnectTimer) {
+        m_networkRecoveryGraceActive = true;
+        m_networkReconnectTimer->start(15000); // wjy: 重试Viewer取得初始化名额后最多等待15秒首帧，半连接状态不会永久卡在“正在连接”。
+    }
     m_remoteCursorShape = Qt::ArrowCursor; // wjy: 替换 Viewer 会话不得继承旧 Host 最后的缩放形状；旧 Host 或暂未发送状态时保持普通箭头。
     m_remoteMouseBackend = RemoteMouseBackend::System;
     m_pendingRemoteMouseBackend = RemoteMouseBackend::System;
@@ -4577,7 +4765,8 @@ void RemoteDesktopWindow::releaseViewerStartupAdmission()
 void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
 {
     const bool should_query_mouse_backend = code == FSREMOTE_STATUS_RECEIVING_VIDEO
-        && m_connectionStatusCode != FSREMOTE_STATUS_RECEIVING_VIDEO; // wjy: 每个 Viewer 代际首次进入可输入状态时查询一次，持续帧状态不会重复刷控制通道。
+        && m_connectionStatusCode != FSREMOTE_STATUS_RECEIVING_VIDEO
+        && !m_networkReconnectActive; // wjy: 重连时状态50只代表解码器拿到首帧，必须等UI成功Present后再恢复输入并查询后端。
     // =====wjy====
     if (RemoteConnectionState::releasesViewerStartupAdmission(code)) {
         releaseViewerStartupAdmission(); // wjy: 首帧表示初始化完成；断开/失败表示本轮初始化终止，三种终态都立即补位下一窗口。
@@ -4592,11 +4781,12 @@ void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
     }
     // =====wjy====
     if (remoteUpdateActive()) {
-        if (m_remoteUpdateState == RemoteUpdateState::Reconnecting && code == 50) {
+        if (m_remoteUpdateState == RemoteUpdateState::Reconnecting
+            && code == FSREMOTE_STATUS_RECEIVING_VIDEO) {
             finishRemoteUpdateWait();
             return;
         }
-        if (code == 80 || code == 90) {
+        if (code == FSREMOTE_STATUS_REMOTE_CLOSED || code == FSREMOTE_STATUS_ERROR) {
             m_remoteUpdateState = RemoteUpdateState::Installing;
             m_remoteUpdateReconnectRequested = false;
             m_nextRemoteUpdateProbeAtMs = 0;
@@ -4612,15 +4802,47 @@ void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
         return; // wjy: 更新遮罩接管连接文字，不显示“连接失败/已断开”。
     }
     // ===end====
-    m_connectionStatusCode = code;
-    m_connectionStatus = RemoteConnectionState::displayText(code, message); // wjy: 状态码到文案的纯映射由独立辅助类负责，窗口只保留生命周期副作用和重绘。
-    m_connectionStatus = RemoteConnectionState::displayText(code, message); // wjy: 纯状态映射由独立辅助类复核，窗口继续负责协调器通知和重绘。
+    // =====wjy====
+    const bool wasReceivingVideo = m_hasReceivedVideoInCurrentViewer;
+    const bool recoverableSession = wasReceivingVideo || m_networkReconnectActive;
+    const bool transientNetworkProblem = recoverableSession
+        && (code == FSREMOTE_STATUS_NETWORK_UNSTABLE
+            || code == FSREMOTE_STATUS_NETWORK_RECOVERING);
+    const bool terminalNetworkProblem = recoverableSession
+        && (code == FSREMOTE_STATUS_REMOTE_CLOSED
+            || code == FSREMOTE_STATUS_ERROR);
+    if (transientNetworkProblem || terminalNetworkProblem) {
+        setRemoteMouseCaptureActive(false);
+        releaseForwardedKeys(); // wjy: 状态仍是50时先尽力向旧会话补发抬键，随后再关闭输入资格和键盘hook。
+        setKeyboardForwardingActive(false);
+        if (m_clipboardPollTimer) m_clipboardPollTimer->stop();
+    }
+    if (code == FSREMOTE_STATUS_RECEIVING_VIDEO) {
+        m_hasReceivedVideoInCurrentViewer = true;
+        if (!m_networkReconnectActive) {
+            m_networkWarningVisible = false; // wjy: 普通首帧可立即清理提示；断网恢复必须等UI真正Present成功后再恢复输入。
+        }
+    } else if (transientNetworkProblem || terminalNetworkProblem) {
+        m_networkWarningVisible = true;
+    }
+    // ===end====
+    const bool deferRecoveredVideo = code == FSREMOTE_STATUS_RECEIVING_VIDEO
+        && m_networkReconnectActive;
+    m_connectionStatusCode = deferRecoveredVideo
+        ? FSREMOTE_STATUS_NETWORK_RECOVERING
+        : code;
+    m_connectionStatus = deferRecoveredVideo
+        ? QString::fromUtf8("网络已恢复，正在等待画面显示")
+        : RemoteConnectionState::displayText(code, message); // wjy: 重连首帧只有真正Present后才提交状态50，避免同步输入提前恢复。
     if (m_inputBroadcastCoordinator) {
         m_inputBroadcastCoordinator->notifyEligibilityChanged(this); // wjy: 断线/失败会关闭主控或移除跟随端，连接成功后则从后续事件开始动态加入。
     }
     update(isFullScreen() ? rect() : QRect(0, titleBarHeight(), width(), height() - titleBarHeight())); // wjy: 连接状态在全屏覆盖整窗。
-    if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
-        presentCompositorOverlay(); // wjy: 合成路径的连接文字由DComp叠加层独占，状态变化后立即提交新快照，避免旧提示残留。
+    requestTitleBarUpdate(); // wjy: 状态变化立即刷新DComp或原生DIB标题栏，网络提示不等待一秒计时器。
+    if (transientNetworkProblem) {
+        beginNetworkRecoveryGracePeriod(); // wjy: ICE暂断或刚恢复都继续等待真实新帧，三秒超时才销毁旧会话。
+    } else if (terminalNetworkProblem) {
+        beginNetworkReconnect(); // wjy: Failed/Closed或恢复流程中的运行错误立即停止旧Viewer并进入无限退避。
     }
     if (should_query_mouse_backend) queryRemoteMouseBackend(); // wjy: 先提交 code=50 再发送 query，sendInputMessage 的连接资格门禁此时已经满足。
 }
@@ -4965,12 +5187,14 @@ void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
         return;
     }
     if (!m_viewerHandle && !m_viewerStopInProgress) {
+        cancelNetworkReconnect(); // wjy: 退避等待阶段可能没有Viewer句柄，直接关闭时也必须先取消定时器。
         QWidget::closeEvent(event);
         return;
     }
 
     event->ignore();
     m_closeInProgress = true;
+    cancelNetworkReconnect(); // wjy: 用户主动关闭后取消三秒等待和所有无限退避，stop完成不得重新创建会话。
     discardPendingTextureFrame(); // wjy: 关闭窗口时取消排队帧并归还共享纹理槽，随后再异步停止Viewer。
     if (m_remoteUpdateTimer) {
         m_remoteUpdateTimer->stop();

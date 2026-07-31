@@ -26,6 +26,8 @@ enum class StreamStatusCode : int {
     ControlRequestPending = FSREMOTE_STATUS_CONTROL_REQUEST_PENDING,
     ControlRevoked = FSREMOTE_STATUS_CONTROL_REVOKED,
     RemoteClosed = FSREMOTE_STATUS_REMOTE_CLOSED,
+    NetworkUnstable = FSREMOTE_STATUS_NETWORK_UNSTABLE, // wjy: Qt层可区分短时ICE波动与已经终止的连接。
+    NetworkRecovering = FSREMOTE_STATUS_NETWORK_RECOVERING, // wjy: ICE恢复后仍以首个成功呈现帧作为最终恢复条件。
     Error = FSREMOTE_STATUS_ERROR,
     CapacityRejected = FSREMOTE_STATUS_CAPACITY_REJECTED,
     AuthorizationRejected = FSREMOTE_STATUS_AUTHORIZATION_REJECTED,
