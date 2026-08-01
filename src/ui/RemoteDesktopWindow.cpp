@@ -1,4 +1,4 @@
-﻿#include "ui/RemoteDesktopWindow.h"
+#include "ui/RemoteDesktopWindow.h"
 
 #include "system/AppSettings.h"
 #include "system/DeviceCommandService.h"
@@ -202,7 +202,7 @@ bool sameQualityDecision(const RemoteQualityDecision& left, const RemoteQualityD
 
 enum class NearbyWindowSnapSide {
     None,
-    Above,
+我现在控了16个设备  我给其中任何一个窗口焦点 基本上都会完全卡住    Above,
     Below,
     Left,
     Right,
@@ -1784,7 +1784,7 @@ bool RemoteDesktopWindow::event(QEvent* event)
             || event->type() == QEvent::Show
             || event->type() == QEvent::Hide
             || event->type() == QEvent::WindowActivate
-            || event->type() == QEvent::WindowDeactivate); // wjy: 显隐、最小化和焦点状态变化统一触发一次窗口面积策略重算；音频按钮仍独立控制。
+            || event->type() == QEvent::WindowDeactivate); // wjy: 显隐、最小化和焦点状态变化统一触发一次焦点策略重算；音频按钮仍独立控制。
     const bool titleBarScaleChanged = event
         && event->type() == QEvent::DevicePixelRatioChange; // wjy: 跨不同DPI显示器后必须按新物理像素尺寸重建标题栏DIB，逻辑命中矩形保持不变。
     if (event && event->type() == QEvent::WindowActivate) {
@@ -1800,7 +1800,7 @@ bool RemoteDesktopWindow::event(QEvent* event)
         update(); // wjy: 状态改变后重绘，确保旧标题栏不会残留在全屏画面顶部。
     }
     if (qualityVisibilityChanged && !m_closeInProgress) {
-        emit remoteQualityInputsChanged(); // wjy: 显隐、最小化和窗口状态变化立即重算最大窗口与后台FPS，不等待1秒轮询。
+        emit remoteQualityInputsChanged(); // wjy: 显隐、最小化和窗口状态变化立即重算焦点窗口与后台FPS，不等待1秒轮询。
     }
     if (titleBarScaleChanged) {
         ++m_titleBarVisualRevision;
@@ -1930,7 +1930,7 @@ RemoteQualityWindowMetrics RemoteDesktopWindow::remoteQualityMetrics()
     metrics.effectiveMode = effectiveQualityMode();
     metrics.visible = isVisible() && !m_closeInProgress;
     metrics.minimized = isMinimized();
-    metrics.fullScreen = isFullScreen(); // wjy: 保留全屏状态用于标题栏/诊断；视频高性能现在只由最大可见面积决定。
+    metrics.fullScreen = isFullScreen(); // wjy: 保留全屏状态用于标题栏/诊断；视频高性能现在只由真实焦点决定。
     metrics.softwareFallback = m_softwareFallbackActive; // wjy: 重试开放期间也保持BGRA回退硬上限，必须等纹理实际成功后才恢复。
     const QSize sourceSize = remoteFrameSize().isValid() ? remoteFrameSize() : QSize(1920, 1080);
     metrics.sourceWidth = sourceSize.width();
