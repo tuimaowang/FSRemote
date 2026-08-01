@@ -252,6 +252,21 @@ if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_VIEWER_STABILITY_TESTS) # wjy: 多窗
     endif()
     add_test(NAME fsremote_remote_input_broadcast_tests COMMAND fsremote_remote_input_broadcast_tests)
 
+    # =====wjy====
+    add_executable(fsremote_remote_input_script_tests EXCLUDE_FROM_ALL
+        tests/remote_input_script_tests.cpp
+        src/ui/RemoteInputScript.cpp
+        src/ui/RemoteInputScript.h
+        src/ui/RemoteInputBroadcastCoordinator.h
+    ) # wjy: 键鼠脚本格式测试只验证本地原子保存、重名避让和严格加载校验，不启动远控连接或加入默认构建。
+    target_include_directories(fsremote_remote_input_script_tests PRIVATE src)
+    target_link_libraries(fsremote_remote_input_script_tests PRIVATE Qt6::Core)
+    if(MSVC)
+        target_compile_options(fsremote_remote_input_script_tests PRIVATE /utf-8) # wjy: 脚本名称和错误提示包含中文，测试目标固定按UTF-8解析源码。
+    endif()
+    add_test(NAME fsremote_remote_input_script_tests COMMAND fsremote_remote_input_script_tests)
+    # ===end====
+
     add_executable(fsremote_remote_cursor_shape_tests EXCLUDE_FROM_ALL
         tests/remote_cursor_shape_tests.cpp
         src/ui/RemoteCursorShape.h
@@ -461,6 +476,10 @@ qt_add_executable(FSRemote WIN32
     # =====wjy====
     src/ui/RemoteInputBroadcastCoordinator.cpp
     src/ui/RemoteInputBroadcastCoordinator.h
+    # ===end====
+    # =====wjy====
+    src/ui/RemoteInputScript.cpp
+    src/ui/RemoteInputScript.h
     # ===end====
     src/ui/D3D11FramePresenter.cpp
     src/ui/D3D11FramePresenter.h

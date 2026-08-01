@@ -20,6 +20,7 @@
 #include "ui/LatestTextureFrameSlot.h" // wjy: 远控纹理跨线程交接改为可单测的单槽最新帧模型，禁止每帧都堆积Qt任务。
 #include "ui/RemoteQualityCoordinator.h"
 #include "ui/RemoteInputBroadcastCoordinator.h"
+#include "ui/RemoteInputScript.h" // wjy: 远控窗口直接保存和回放统一语义键鼠事件，文件格式与既有远程PowerShell脚本面板完全隔离。
 #include "ui/RemoteWindowCompositor.h" // wjy: 统一记录输出几何、缩放状态和回退状态，旧可见路径仍由开关控制。
 
 class QEvent;
@@ -60,7 +61,7 @@ public:
     void setRemoteFrame(const QImage& image);
     void setConnectionStatus(int code, const QString& message);
     void setEncodedBitrateMbps(double mbps);
-    void setRemoteMouseCaptureActive(bool active);
+    void setRemoteMouseCaptureActive(bool active); // wjy: Host 的 absolute/relative 状态只更新自动请求，最终捕获由 Host 请求与 F2 手动锁定共同决定。
     // =====wjy====
     void setRemoteCursorShape(const QString& statusMessage); // wjy: 查看器状态回调在 Qt 主线程缓存远端 Windows 标准光标，并按当前命中区域安全刷新。
     void setRemoteMouseBackendStatus(const QString& statusMessage); // wjy: 只接受 Host 已确认的 system/faker 状态，不在按钮点击时乐观修改真实后端。
@@ -192,6 +193,10 @@ private:
     void toggleRemoteMouseBackend(); // wjy: 兼容沿用现有协议入口，根据 Host 确认状态同时切换键盘和鼠标注入后端。
     void requestRemoteMouseBackend(RemoteMouseBackend backend);
     void queryRemoteMouseBackend(); // wjy: 每次新 Viewer 收到画面后查询 Host 全局状态，多控制窗口由真实值对齐。
+    void toggleManualMouseLock(); // wjy: F2 只切换本窗口的手动相对鼠标意图，播放脚本期间也允许立即锁定或解除手动覆盖。
+    void updateRemoteMouseCaptureState(); // wjy: 根据 Host 请求、F2 手动意图、连接资格和窗口焦点统一计算实际捕获状态。
+    void applyRemoteMouseCaptureState(bool active); // wjy: 只负责实际 Raw Input、光标隐藏、回中心和远端释放，不改变两类请求来源。
+    void suspendRemoteMouseCapture(); // wjy: 焦点离开、断线、更新或关闭时强制释放实际捕获，同时保留 F2 手动意图供重新获得资格后恢复。
     stream::RemoteQualityMode effectiveQualityMode() const; // wjy: FollowGlobal解析为最新全局模式，局部覆盖则直接返回覆盖值。
     void sendCurrentRemoteQualityDecision(); // wjy: 把内存中的最新决策转换为稳定C ABI结构；连接中只保留最新请求，重连后按新代际补发。
     void sendCurrentViewerAudioDecision(); // wjy: 按Viewer代际和布尔状态去重在线音频切换，连接前只保留协调器最新决策。
@@ -203,6 +208,22 @@ private:
     bool normalizedRemotePoint(const QPoint& position, int* x, int* y) const;
     bool sendInputMessage(const QByteArray& message);
     bool dispatchRemoteInputEvent(const RemoteInputEvent& event); // wjy: 来源窗口只发送一次，并由共享协调器决定是否向当前跟随窗口扇出。
+    // =====wjy====
+    void toggleInputScriptRecording(); // wjy: F9固定在当前远控窗口切换录制状态，停止时再进入命名和原子保存流程。
+    void startInputScriptRecording();
+    void finishInputScriptRecording(bool limitReached = false);
+    void cancelInputScriptRecording(const QString& reason); // wjy: 关闭、更新或失去控制权时直接丢弃未完成录制，生命周期路径不得弹出模态命名框。
+    void recordRemoteInputEvent(const RemoteInputEvent& event);
+    void toggleInputScriptPlayback(); // wjy: F10在空闲时选择本地脚本，播放中再次按下则立即停止并释放远端持有输入。
+    void chooseAndStartInputScriptPlayback();
+    void scheduleNextInputScriptPlaybackEvent();
+    void processInputScriptPlaybackEvents();
+    void completeInputScriptPlaybackLoop(); // wjy: 每轮结束统一释放持有输入，再按循环次数决定自然结束或等待 F10 配置的轮间隔后重启。
+    void stopInputScriptPlayback(const QString& reason, bool releaseRemoteInputs = true);
+    void releaseInputScriptPlaybackInputs();
+    void trackInputScriptPlaybackState(const RemoteInputEvent& event);
+    void setInputScriptDialogActive(bool active); // wjy: 命名和文件选择期间暂停全局键盘转发，防止对话框文字误送到远端。
+    // ===end====
     bool synchronizedInputEligible() const override;
     QSize synchronizedInputFrameSize() const override;
     bool sendSynchronizedInputEvent(const RemoteInputEvent& event) override;
@@ -373,8 +394,10 @@ private:
     int m_centerRgbMin = 0; // wjy: Center-region minimum sampled RGB value for black-page testing.
     int m_centerRgbAvg = 0; // wjy: Center-region average sampled RGB value for black-page testing.
     int m_centerRgbMax = 0; // wjy: Center-region maximum sampled RGB value for black-page testing.
-    bool m_remoteMouseCaptureActive = false;
     // =====wjy====
+    bool m_remoteMouseCaptureRequested = false; // wjy: 保存 Host 游戏检测产生的 relative 请求；焦点离开只暂停实际捕获，不丢失该请求。
+    bool m_manualMouseLockActive = false; // wjy: 保存 F2 手动锁定意图，断线或窗口失焦期间仍保留，恢复连接和焦点后自动重新生效。
+    bool m_remoteMouseCaptureActive = false; // wjy: 仅表示当前窗口正在实际隐藏光标并接收相对鼠标输入，不再等同于 Host 请求。
     bool m_rawInputMouseCaptureActive = false; // wjy: 仅表示控制端 WM_INPUT 已成功注册；目标端仍独立选择系统或 FakerInput 注入后端。
     Qt::CursorShape m_remoteCursorShape = Qt::ArrowCursor; // wjy: 缓存最近一次远端桌面光标，退出相对鼠标模式后无需等待下一条状态即可恢复。
     RemoteMouseBackend m_remoteMouseBackend = RemoteMouseBackend::System;
@@ -391,6 +414,30 @@ private:
     bool m_waitingShortcutRelease = false;
     QVector<int> m_shortcutReleaseVirtualKeys;
     QSet<int> m_pressedKeys;
+    // =====wjy====
+    bool m_inputScriptRecording = false;
+    bool m_inputScriptRecordingStopQueued = false; // wjy: 事件或时长达到安全上限时只投递一次停止任务，避免高频鼠标事件重复打开命名框。
+    QElapsedTimer m_inputScriptRecordingClock;
+    QSize m_inputScriptRecordingFrameSize;
+    QVector<RemoteInputScriptEvent> m_recordedInputScriptEvents;
+    bool m_inputScriptPlaying = false;
+    bool m_dispatchingInputScriptPlayback = false; // wjy: 区分定时器产生的脚本事件和用户实时输入，播放期间只允许前者进入远端发送路径。
+    bool m_inputScriptDialogActive = false;
+    QTimer* m_inputScriptPlaybackTimer = nullptr;
+    QElapsedTimer m_inputScriptPlaybackClock;
+    QString m_inputScriptPlaybackFilePath; // wjy: 同一远控窗口再次按F10时默认带回上次选择，仍可在设置弹窗内重新选择。
+    int m_inputScriptPlaybackLoopCount = 1;
+    int m_inputScriptPlaybackCompletedLoopCount = 0;
+    int m_inputScriptPlaybackLoopIntervalMs = 0; // wjy: 保存 F10 设置的两轮完整脚本之间等待时间，0 表示连续执行。
+    bool m_inputScriptPlaybackWaitingForLoopInterval = false; // wjy: 复用可取消的播放定时器等待下一轮，F10 停止时无需处理遗留 singleShot 回调。
+    double m_inputScriptPlaybackSpeedMultiplier = 1.0;
+    QVector<RemoteInputScriptEvent> m_inputScriptPlaybackEvents;
+    qsizetype m_inputScriptPlaybackIndex = 0;
+    QSet<int> m_inputScriptPlaybackHeldKeys;
+    QSet<int> m_inputScriptPlaybackHeldButtons;
+    int m_inputScriptPlaybackX = 32768;
+    int m_inputScriptPlaybackY = 32768;
+    // ===end====
     bool m_inputSyncButtonPressed = false; // wjy: 仅按下并在同一按钮内释放才切换主控，拖出热区不会误操作同步状态。
     // =====wjy====
     bool m_clipboardSyncEnabled = true; // wjy: 标题栏按钮与 Ctrl+B 共同切换，默认开启。

@@ -1,4 +1,4 @@
-#include "ui/RemoteDesktopWindow.h"
+﻿#include "ui/RemoteDesktopWindow.h"
 
 #include "system/AppSettings.h"
 #include "system/DeviceCommandService.h"
@@ -16,16 +16,25 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QCloseEvent>
+#include <QComboBox>
 #include <QCoreApplication>
 #include <QCursor>
 #include <QDateTime>
 #include <QDir>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QDoubleSpinBox>
 #include <QEvent>
 #include <QFile>
 #include <QFileInfo>
+#include <QFormLayout>
 #include <QGuiApplication>
+#include <QInputDialog>
 #include <QKeyEvent>
 #include <QKeySequence>
+#include <QLabel>
+#include <QLineEdit>
+#include <QMessageBox>
 #include <QMetaObject>
 #include <QMouseEvent>
 #include <QMutexLocker>
@@ -33,13 +42,17 @@
 #include <QPainterPath>
 #include <QPixmap>
 #include <QPointer>
+#include <QPushButton>
 #include <QRegion>
 #include <QResizeEvent>
 #include <QRubberBand>
 #include <QScreen>
+#include <QScopedValueRollback>
+#include <QSpinBox>
 #include <QStringList>
 #include <QTextStream>
 #include <QTimer>
+#include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QWindow>
 
@@ -129,7 +142,146 @@ constexpr int kWindowResizeMargin = 6; // wjy: 无边框远控窗口四周统一
 constexpr int kWindowEdgeSnapDistance = 16; // wjy: 标题栏拖动到屏幕可用区域 16px 内时自动贴边，既容易触发又不会在远处突然跳动。
 constexpr int kWindowGroupJoinTolerance = 2; // wjy: 已贴齐窗口允许 2px 的系统边框/缩放误差，超过后不再视为同一连续窗口组。
 constexpr int kTextureFailuresBeforeSoftwareFallback = 3; // wjy: 单个瞬时共享纹理失败先保留上一帧，连续三次失败才进入有上限的软件保活。
+// =====wjy====
+constexpr qsizetype kMaximumRecordedInputScriptEvents = 100000; // wjy: 与脚本存储层保持一致，限制停止录制时构造JSON造成的主线程内存与延迟峰值。
+constexpr qint64 kMaximumRecordedInputScriptDurationMs = 24LL * 60LL * 60LL * 1000LL;
+constexpr qint64 kAbsoluteMouseMoveMergeWindowMs = 8; // wjy: 高频绝对鼠标移动在8毫秒内只保留最新位置，明显压缩文件但不改变最终落点和按钮时序。
+constexpr qint64 kRelativeMouseMoveMergeWindowMs = 4; // wjy: 相对鼠标只在极短窗口内累加位移，降低高回报率鼠标事件量且不丢失移动总量。
+constexpr qsizetype kMaximumInputScriptEventsPerPlaybackTick = 128; // wjy: 即使脚本包含大量同时间戳事件，每轮也只发送有限批次，让F10停止和窗口消息持续获得事件循环机会。
+constexpr int kMaximumInputScriptLoopIntervalMs = 60 * 60 * 1000; // wjy: F10轮间隔上限为一小时，既覆盖长等待自动化，也保持QTimer参数在明确安全范围内。
+// ===end====
 #define FSREMOTE_LEGACY_PARENT_TITLE_BAR 0 // wjy: 迁移期间保留旧父窗口标题栏绘制块供快速回退，生产默认只启用持久原生DIB表面。
+
+// =====wjy====
+struct RemoteInputPlaybackOptions {
+    QString filePath;
+    int loopCount = 1; // wjy: 0表示无限循环，正数表示包含第一次播放在内的总执行次数。
+    int loopIntervalMs = 0; // wjy: 仅作用于两轮完整脚本之间；0表示上一轮结束后立即进入下一轮。
+    double speedMultiplier = 1.0;
+};
+
+class RemoteInputPlaybackDialog final : public QDialog {
+public:
+    RemoteInputPlaybackDialog(
+        const QString& scriptDirectory,
+        const QString& initialFilePath,
+        int initialLoopCount,
+        int initialLoopIntervalMs,
+        double initialSpeedMultiplier,
+        QWidget* parent)
+        : QDialog(parent)
+    {
+        setWindowTitle(QString::fromUtf8("键鼠脚本播放设置"));
+        setModal(true);
+        setMinimumWidth(540);
+
+        auto* description = new QLabel(
+            QString::fromUtf8("选择本地键鼠脚本，并设置循环次数、每轮间隔与执行速度。"), this);
+        description->setWordWrap(true);
+
+        m_fileCombo = new QComboBox(this);
+        const QFileInfoList scriptFiles = QDir(scriptDirectory).entryInfoList(
+            QStringList{QStringLiteral("*.fsinput.json")},
+            QDir::Files | QDir::Readable,
+            QDir::Name | QDir::IgnoreCase); // wjy: F10窗口直接列出固定script目录中的合法扩展名文件，不再打开第二层文件浏览器。
+        int initialFileIndex = -1;
+        for (const QFileInfo& scriptFile : scriptFiles) {
+            const QString absolutePath = scriptFile.absoluteFilePath();
+            m_fileCombo->addItem(scriptFile.fileName(), absolutePath);
+            if (QDir::cleanPath(absolutePath).compare(
+                    QDir::cleanPath(initialFilePath), Qt::CaseInsensitive) == 0) {
+                initialFileIndex = m_fileCombo->count() - 1;
+            }
+        }
+        if (m_fileCombo->count() == 0) {
+            m_fileCombo->addItem(QString::fromUtf8("script 文件夹中暂无键鼠脚本"));
+            m_fileCombo->setEnabled(false);
+        } else {
+            m_fileCombo->setCurrentIndex(initialFileIndex >= 0 ? initialFileIndex : 0);
+            m_fileCombo->setToolTip(QDir::toNativeSeparators(
+                m_fileCombo->currentData().toString()));
+            connect(m_fileCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) {
+                m_fileCombo->setToolTip(QDir::toNativeSeparators(
+                    m_fileCombo->currentData().toString())); // wjy: 下拉框显示短文件名，悬停提示始终展示当前脚本完整本地路径。
+            });
+        }
+
+        m_loopCountSpin = new QSpinBox(this);
+        m_loopCountSpin->setRange(0, 1000000);
+        m_loopCountSpin->setSpecialValueText(QString::fromUtf8("无限循环"));
+        m_loopCountSpin->setSuffix(QString::fromUtf8(" 次"));
+        m_loopCountSpin->setValue(std::clamp(initialLoopCount, 0, 1000000)); // wjy: 正数是总执行次数，0通过特殊文本明确表示不会自然结束。
+
+        m_loopIntervalSpin = new QSpinBox(this);
+        m_loopIntervalSpin->setRange(0, kMaximumInputScriptLoopIntervalMs); // wjy: 单轮间隔最多一小时，避免输入溢出，同时足够覆盖长期自动化等待场景。
+        m_loopIntervalSpin->setSingleStep(100);
+        m_loopIntervalSpin->setSpecialValueText(QString::fromUtf8("无间隔"));
+        m_loopIntervalSpin->setSuffix(QString::fromUtf8(" 毫秒"));
+        m_loopIntervalSpin->setValue(std::clamp(initialLoopIntervalMs, 0, kMaximumInputScriptLoopIntervalMs)); // wjy: F10再次打开时保留本窗口上次使用的循环间隔。
+
+        m_speedSpin = new QDoubleSpinBox(this);
+        m_speedSpin->setRange(0.10, 10.00);
+        m_speedSpin->setDecimals(2);
+        m_speedSpin->setSingleStep(0.10);
+        m_speedSpin->setSuffix(QString::fromUtf8(" 倍"));
+        m_speedSpin->setValue(std::clamp(initialSpeedMultiplier, 0.10, 10.00)); // wjy: 小于1倍减速，大于1倍加速，1倍严格沿用原录制时间。
+
+        auto* form = new QFormLayout();
+        form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+        form->addRow(QString::fromUtf8("脚本文件："), m_fileCombo);
+        form->addRow(QString::fromUtf8("循环次数："), m_loopCountSpin);
+        form->addRow(QString::fromUtf8("循环间隔："), m_loopIntervalSpin);
+        form->addRow(QString::fromUtf8("执行速度："), m_speedSpin);
+
+        auto* hint = new QLabel(
+            QString::fromUtf8("循环次数填 0 时持续播放；循环间隔只在一轮完整脚本结束后等待，不影响脚本内部事件速度，也不会在第一次执行前等待。"), this);
+        hint->setWordWrap(true);
+        hint->setStyleSheet(QStringLiteral("color:#667085;"));
+
+        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+        if (QPushButton* startButton = buttons->button(QDialogButtonBox::Ok)) {
+            startButton->setText(QString::fromUtf8("开始播放"));
+            startButton->setEnabled(m_fileCombo->isEnabled()); // wjy: script目录为空时不能提交无效播放请求，用户仍可取消关闭窗口。
+        }
+        if (QPushButton* cancelButton = buttons->button(QDialogButtonBox::Cancel)) {
+            cancelButton->setText(QString::fromUtf8("取消"));
+        }
+
+        auto* rootLayout = new QVBoxLayout(this);
+        rootLayout->addWidget(description);
+        rootLayout->addSpacing(4);
+        rootLayout->addLayout(form);
+        rootLayout->addWidget(hint);
+        rootLayout->addWidget(buttons);
+
+        connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+        connect(buttons, &QDialogButtonBox::accepted, this, [this] {
+            if (!QFileInfo(m_fileCombo->currentData().toString()).isFile()) {
+                QMessageBox::warning(this, QString::fromUtf8("无法播放"),
+                    QString::fromUtf8("请先选择一个有效的键鼠脚本文件。"));
+                return;
+            }
+            accept();
+        });
+    }
+
+    RemoteInputPlaybackOptions options() const
+    {
+        RemoteInputPlaybackOptions result;
+        result.filePath = QFileInfo(m_fileCombo->currentData().toString()).absoluteFilePath();
+        result.loopCount = m_loopCountSpin->value();
+        result.loopIntervalMs = m_loopIntervalSpin->value();
+        result.speedMultiplier = m_speedSpin->value();
+        return result;
+    }
+
+private:
+    QComboBox* m_fileCombo = nullptr;
+    QSpinBox* m_loopCountSpin = nullptr;
+    QSpinBox* m_loopIntervalSpin = nullptr;
+    QDoubleSpinBox* m_speedSpin = nullptr;
+};
+// ===end====
 
 // =====wjy====
 uint32_t viewerQualityModeValue(stream::RemoteQualityMode mode)
@@ -202,7 +354,7 @@ bool sameQualityDecision(const RemoteQualityDecision& left, const RemoteQualityD
 
 enum class NearbyWindowSnapSide {
     None,
-我现在控了16个设备  我给其中任何一个窗口焦点 基本上都会完全卡住    Above,
+    Above,
     Below,
     Left,
     Right,
@@ -1663,6 +1815,14 @@ RemoteDesktopWindow::RemoteDesktopWindow(
     m_sessionTimer->start();
 
     // =====wjy====
+    m_inputScriptPlaybackTimer = new QTimer(this);
+    m_inputScriptPlaybackTimer->setSingleShot(true);
+    m_inputScriptPlaybackTimer->setTimerType(Qt::PreciseTimer); // wjy: 使用单次高精度定时器并按绝对录制时间反复校正，单次事件处理延迟不会累计成整段脚本漂移。
+    connect(m_inputScriptPlaybackTimer, &QTimer::timeout,
+        this, &RemoteDesktopWindow::processInputScriptPlaybackEvents);
+    // ===end====
+
+    // =====wjy====
     m_networkReconnectTimer = new QTimer(this);
     m_networkReconnectTimer->setSingleShot(true); // wjy: 同一个单次定时器分时承担3秒自恢复等待和后续退避重连，不创建常驻轮询线程。
     connect(m_networkReconnectTimer, &QTimer::timeout, this, [this] {
@@ -1725,6 +1885,10 @@ RemoteDesktopWindow::~RemoteDesktopWindow()
     appendViewerDebugLog(QStringLiteral("RemoteDesktopWindow dtor begin")); // wjy: identify crashes during window teardown.
     // ===end====
     // =====wjy====
+    cancelInputScriptRecording(QStringLiteral("window_destructed"));
+    stopInputScriptPlayback(QStringLiteral("window_destructed"), true); // wjy: 异常析构也在注销同步端点和清空Viewer句柄前尽力释放脚本持有键鼠。
+    // ===end====
+    // =====wjy====
     if (m_inputBroadcastCoordinator) {
         m_inputBroadcastCoordinator->unregisterEndpoint(this); // wjy: 在清空 Viewer 句柄前兜底注销，使协调器仍有机会向可达会话补发释放事件。
     }
@@ -1743,7 +1907,9 @@ RemoteDesktopWindow::~RemoteDesktopWindow()
     m_viewerStartQueued = false;
     m_viewerStartAdmissionActive = false;
     // ===end====
-    setRemoteMouseCaptureActive(false);
+    m_remoteMouseCaptureRequested = false;
+    m_manualMouseLockActive = false;
+    suspendRemoteMouseCapture(); // wjy: 析构必须无条件撤销实际 Raw Input；对象即将销毁，因此两类锁定意图也一并清空。
     releasePressedKeys();
     setKeyboardForwardingActive(false);
     // =====wjy====
@@ -2189,7 +2355,12 @@ void RemoteDesktopWindow::beginRemoteUpdateWait()
     }
 
     cancelNetworkReconnect(); // wjy: 远程更新拥有独立重连状态机，开始更新前必须取消普通断网无限重试。
-    setRemoteMouseCaptureActive(false); // wjy: 切换状态前先向旧连接释放鼠标和按键，防止目标端残留输入状态。
+    // =====wjy====
+    cancelInputScriptRecording(QStringLiteral("remote_update"));
+    stopInputScriptPlayback(QStringLiteral("remote_update"), true); // wjy: 更新遮罩接管输入前先结束脚本并补发抬起，目标重启后不会继承旧按键状态。
+    // ===end====
+    m_remoteMouseCaptureRequested = false; // wjy: 更新会替换 Viewer 代际，旧 Host 的 relative 请求不能带入新会话。
+    suspendRemoteMouseCapture(); // wjy: F2 手动意图仍保留，但更新遮罩期间必须立即释放本机光标和远端捕获。
     releaseForwardedKeys();
     m_waitingShortcutRelease = false;
     m_shortcutReleaseVirtualKeys.clear(); // wjy: 更新开始后不再等待本地组合键释放，确保键盘 hook 可以立即卸载。
@@ -2322,6 +2493,8 @@ void RemoteDesktopWindow::stopViewerConnectionAsync(bool deleteAfterStop)
         m_lifecycleManager->cancelViewerStart(this, false); // wjy: 尚未获得初始化名额的窗口关闭时直接从FIFO移除，不再启动一个马上要停止的Viewer。
         m_viewerStartQueued = false;
     }
+    m_remoteMouseCaptureRequested = false; // wjy: 任意 Viewer 停止都会作废旧 Host 的自动 relative 请求，重连后必须由新代际重新上报。
+    suspendRemoteMouseCapture(); // wjy: 在清空句柄前发送 CaptureRelease，并释放本机 Raw Input；F2 手动意图可在新会话恢复后重新生效。
     // ===end====
     const FsRemoteStreamHandle handle = m_viewerHandle;
     m_viewerHandle = nullptr;
@@ -2698,6 +2871,15 @@ RemoteTitleBarVisualState RemoteDesktopWindow::titleBarVisualState() const
     state.hostIp = m_hostIp;
     state.connectionStatus = m_connectionStatus;
     state.networkWarningText = m_networkWarningVisible ? zh("网络不佳") : QString(); // wjy: 原生DIB和DComp完整标题栏都从同一快照取得静态网络提示。
+    // =====wjy====
+    if (m_inputScriptRecording) {
+        state.scriptStatusText = QString::fromUtf8("录制中");
+        state.scriptStatusColor = QColor(QStringLiteral("#DC2626")); // wjy: 录制使用稳定红色静态文字，不闪烁也不依赖一秒性能统计刷新。
+    } else if (m_inputScriptPlaying) {
+        state.scriptStatusText = QString::fromUtf8("脚本播放");
+        state.scriptStatusColor = QColor(QStringLiteral("#2563EB")); // wjy: 回放使用稳定蓝色静态文字，与录制状态互斥且由F10停止后立即清除。
+    }
+    // ===end====
     state.updateAvailable = m_remoteUpdateAvailable; // wjy: 即使当前视觉由layout.update表示，快照仍完整记录标题栏更新入口来源状态，便于后续渲染演进不回读窗口。
 
     const qint64 elapsedSeconds = m_sessionClock.elapsed() / 1000;
@@ -2742,6 +2924,10 @@ RemoteTitleBarVisualState RemoteDesktopWindow::titleBarVisualState() const
         state.mouseBackendText += QLatin1Char('!');
     } else if (!m_remoteMouseBackendKnown) {
         state.mouseBackendText += QLatin1Char('?');
+    }
+    if (m_manualMouseLockActive) {
+        state.mouseLockText = QString::fromUtf8("鼠标锁定");
+        state.mouseLockColor = QColor(QStringLiteral("#DC2626")); // wjy: 仅显示 F2 手动意图；游戏自动 relative 不额外占用标题栏状态文字。
     }
 
     // wjy: 标题栏快照不再携带画质胶囊状态，避免把只读策略信息误认为手动操作入口。
@@ -3373,12 +3559,508 @@ bool RemoteDesktopWindow::sendInputMessage(const QByteArray& message)
 // =====wjy====
 bool RemoteDesktopWindow::dispatchRemoteInputEvent(const RemoteInputEvent& event)
 {
-    if (!m_inputBroadcastCoordinator) {
-        return sendSynchronizedInputEvent(event); // wjy: 独立测试或兜底窗口没有共享协调器时保持原有单会话输入路径。
+    // =====wjy====
+    if (m_inputScriptPlaying && !m_dispatchingInputScriptPlayback) {
+        return false; // wjy: 回放期间屏蔽人工键鼠进入远端，但F10仍在本地快捷键层优先处理并可立即停止。
     }
-    const std::uint64_t generation = m_inputBroadcastCoordinator->capturedGenerationFor(this);
-    return m_inputBroadcastCoordinator->routeInput(this, event, generation); // wjy: 在同一 UI 调用栈捕获代际并发送，切换主控后的旧事件无法进入新组。
+
+    bool sent = false;
+    if (!m_inputBroadcastCoordinator) {
+        sent = sendSynchronizedInputEvent(event); // wjy: 独立测试或兜底窗口没有共享协调器时保持原有单会话输入路径。
+    } else {
+        const std::uint64_t generation = m_inputBroadcastCoordinator->capturedGenerationFor(this);
+        sent = m_inputBroadcastCoordinator->routeInput(this, event, generation); // wjy: 在同一 UI 调用栈捕获代际并发送，切换主控后的旧事件无法进入新组。
+    }
+    if (sent && m_inputScriptRecording && !m_dispatchingInputScriptPlayback) {
+        recordRemoteInputEvent(event); // wjy: 仅记录来源窗口实际发送成功的语义事件；本地快捷键、失败输入和回放事件都不会污染脚本。
+    }
+    return sent;
+    // ===end====
 }
+
+// =====wjy====
+void RemoteDesktopWindow::toggleInputScriptRecording()
+{
+    if (m_inputScriptPlaying) {
+        appendViewerDebugLog(QStringLiteral("input script record ignored while playback host=%1").arg(m_hostIp));
+        QApplication::beep(); // wjy: 录制与回放互斥，播放中F9只给出本地提示且不改变正在执行的脚本。
+        return;
+    }
+    if (m_inputScriptRecording || m_inputScriptRecordingStopQueued) {
+        finishInputScriptRecording(false);
+        return;
+    }
+    startInputScriptRecording();
+}
+
+void RemoteDesktopWindow::startInputScriptRecording()
+{
+    if (m_closeInProgress || remoteUpdateActive() || m_inputScriptPlaying || m_inputScriptRecording) {
+        return;
+    }
+    if (!synchronizedInputEligible()) {
+        setInputScriptDialogActive(true);
+        QMessageBox::warning(this, QString::fromUtf8("无法录制"),
+            QString::fromUtf8("当前远控连接尚未进入可操作状态。"));
+        setInputScriptDialogActive(false);
+        return;
+    }
+
+    m_recordedInputScriptEvents.clear();
+    m_recordedInputScriptEvents.reserve(4096); // wjy: 为常见短脚本预留少量连续空间，长时间录制仍由QVector按需扩展和硬上限保护。
+    m_inputScriptRecordingFrameSize = remoteFrameSize();
+    m_inputScriptRecordingStopQueued = false;
+    m_inputScriptRecordingClock.start();
+    m_inputScriptRecording = true;
+    requestTitleBarUpdate();
+    appendViewerDebugLog(QStringLiteral("input script recording started host=%1 frame=%2x%3")
+        .arg(m_hostIp)
+        .arg(m_inputScriptRecordingFrameSize.width())
+        .arg(m_inputScriptRecordingFrameSize.height())); // wjy: 只记录录制生命周期，不逐事件写磁盘，避免高频鼠标日志影响远控流畅度。
+}
+
+void RemoteDesktopWindow::finishInputScriptRecording(bool limitReached)
+{
+    if (!m_inputScriptRecording && !m_inputScriptRecordingStopQueued) {
+        return;
+    }
+
+    m_inputScriptRecording = false;
+    m_inputScriptRecordingStopQueued = false;
+    const qint64 durationMs = m_inputScriptRecordingClock.isValid()
+        ? m_inputScriptRecordingClock.elapsed()
+        : 0;
+    m_inputScriptRecordingClock.invalidate();
+    QVector<RemoteInputScriptEvent> recordedEvents = std::move(m_recordedInputScriptEvents);
+    m_recordedInputScriptEvents.clear();
+    requestTitleBarUpdate(); // wjy: 先撤下“录制中”，再打开命名框，标题栏状态不会在模态窗口期间继续误报。
+
+    const QString defaultName = QString::fromUtf8("键鼠脚本-%1")
+        .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")));
+    setInputScriptDialogActive(true);
+    bool accepted = false;
+    QString scriptName = QInputDialog::getText(
+        this,
+        limitReached ? QString::fromUtf8("录制已达到安全上限") : QString::fromUtf8("保存键鼠脚本"),
+        QString::fromUtf8("脚本名称："),
+        QLineEdit::Normal,
+        defaultName,
+        &accepted).trimmed();
+    if (!accepted) {
+        appendViewerDebugLog(QStringLiteral("input script recording discarded host=%1 events=%2 duration_ms=%3")
+            .arg(m_hostIp)
+            .arg(recordedEvents.size())
+            .arg(durationMs));
+        setInputScriptDialogActive(false);
+        return;
+    }
+    if (scriptName.isEmpty()) scriptName = defaultName; // wjy: 用户确认但清空名称时仍使用时间戳默认名，避免生成不可辨认的空名脚本。
+
+    RemoteInputScript script;
+    script.name = scriptName;
+    script.sourceHost = m_hostIp;
+    script.sourceFrameSize = m_inputScriptRecordingFrameSize;
+    script.events = std::move(recordedEvents);
+    QString savedFilePath;
+    QString errorMessage;
+    if (!RemoteInputScriptStore::saveToDirectory(
+            RemoteInputScriptStore::defaultDirectory(), script, &savedFilePath, &errorMessage)) {
+        QMessageBox::warning(this, QString::fromUtf8("保存失败"), errorMessage);
+        appendViewerDebugLog(QStringLiteral("input script save failed host=%1 events=%2 error=%3")
+            .arg(m_hostIp)
+            .arg(script.events.size())
+            .arg(errorMessage));
+        setInputScriptDialogActive(false);
+        return;
+    }
+    appendViewerDebugLog(QStringLiteral("input script saved host=%1 events=%2 duration_ms=%3 path=%4")
+        .arg(m_hostIp)
+        .arg(script.events.size())
+        .arg(durationMs)
+        .arg(savedFilePath));
+    setInputScriptDialogActive(false);
+}
+
+void RemoteDesktopWindow::cancelInputScriptRecording(const QString& reason)
+{
+    if (!m_inputScriptRecording && !m_inputScriptRecordingStopQueued) {
+        return;
+    }
+    const qsizetype eventCount = m_recordedInputScriptEvents.size();
+    m_inputScriptRecording = false;
+    m_inputScriptRecordingStopQueued = false;
+    m_inputScriptRecordingClock.invalidate();
+    m_recordedInputScriptEvents.clear();
+    requestTitleBarUpdate();
+    appendViewerDebugLog(QStringLiteral("input script recording cancelled host=%1 events=%2 reason=%3")
+        .arg(m_hostIp)
+        .arg(eventCount)
+        .arg(reason)); // wjy: 生命周期中断只写一次原因并丢弃半成品，不在关闭或断线流程中弹出命名窗口。
+}
+
+void RemoteDesktopWindow::recordRemoteInputEvent(const RemoteInputEvent& event)
+{
+    if (!m_inputScriptRecording || !m_inputScriptRecordingClock.isValid()) {
+        return;
+    }
+    const qint64 elapsedMs = m_inputScriptRecordingClock.elapsed();
+    if (elapsedMs > kMaximumRecordedInputScriptDurationMs) {
+        m_inputScriptRecording = false;
+        requestTitleBarUpdate();
+        if (!m_inputScriptRecordingStopQueued) {
+            m_inputScriptRecordingStopQueued = true;
+            QMetaObject::invokeMethod(this, [this] {
+                finishInputScriptRecording(true); // wjy: 上限停止通过Qt队列打开命名框，绝不在Windows低级键盘Hook回调栈内进入模态事件循环。
+            }, Qt::QueuedConnection);
+        }
+        return;
+    }
+
+    if (!m_recordedInputScriptEvents.isEmpty()) {
+        RemoteInputScriptEvent& previous = m_recordedInputScriptEvents.last();
+        const qint64 gapMs = elapsedMs - previous.elapsedMs;
+        if (event.type == RemoteInputEventType::AbsoluteMove
+            && previous.input.type == RemoteInputEventType::AbsoluteMove
+            && gapMs >= 0 && gapMs <= kAbsoluteMouseMoveMergeWindowMs) {
+            previous.elapsedMs = elapsedMs;
+            previous.input = event;
+            return; // wjy: 绝对移动只需保留合并窗口末端位置，按钮、滚轮和键盘事件仍保持原始边界。
+        }
+        if (event.type == RemoteInputEventType::RelativeMove
+            && previous.input.type == RemoteInputEventType::RelativeMove
+            && previous.input.buttons == event.buttons
+            && gapMs >= 0 && gapMs <= kRelativeMouseMoveMergeWindowMs) {
+            const double relativeX = previous.input.relativeX + event.relativeX;
+            const double relativeY = previous.input.relativeY + event.relativeY;
+            const int fallbackX = previous.input.fallbackDeltaX + event.fallbackDeltaX;
+            const int fallbackY = previous.input.fallbackDeltaY + event.fallbackDeltaY;
+            if (relativeX >= -4.0 && relativeX <= 4.0 && relativeY >= -4.0 && relativeY <= 4.0
+                && fallbackX >= -200 && fallbackX <= 200 && fallbackY >= -200 && fallbackY <= 200) {
+                previous.elapsedMs = elapsedMs;
+                previous.input.relativeX = relativeX;
+                previous.input.relativeY = relativeY;
+                previous.input.fallbackDeltaX = fallbackX;
+                previous.input.fallbackDeltaY = fallbackY;
+                return; // wjy: 相对移动累加而不是覆盖，确保高回报率鼠标压缩后远端总位移保持一致。
+            }
+        }
+    }
+
+    if (m_recordedInputScriptEvents.size() >= kMaximumRecordedInputScriptEvents) {
+        m_inputScriptRecording = false;
+        requestTitleBarUpdate();
+        if (!m_inputScriptRecordingStopQueued) {
+            m_inputScriptRecordingStopQueued = true;
+            QMetaObject::invokeMethod(this, [this] {
+                finishInputScriptRecording(true);
+            }, Qt::QueuedConnection);
+        }
+        return;
+    }
+    m_recordedInputScriptEvents.push_back(RemoteInputScriptEvent{elapsedMs, event});
+}
+
+void RemoteDesktopWindow::toggleInputScriptPlayback()
+{
+    if (m_inputScriptPlaying) {
+        stopInputScriptPlayback(QStringLiteral("user_f10"), true);
+        return;
+    }
+    if (m_inputScriptRecording || m_inputScriptRecordingStopQueued) {
+        appendViewerDebugLog(QStringLiteral("input script playback ignored while recording host=%1").arg(m_hostIp));
+        QApplication::beep(); // wjy: 录制中F10不打断也不保存半成品，仍由第二次F9完成命名流程。
+        return;
+    }
+    chooseAndStartInputScriptPlayback();
+}
+
+void RemoteDesktopWindow::chooseAndStartInputScriptPlayback()
+{
+    if (m_closeInProgress || remoteUpdateActive() || m_inputScriptRecording || m_inputScriptPlaying) {
+        return;
+    }
+    if (!synchronizedInputEligible()) {
+        setInputScriptDialogActive(true);
+        QMessageBox::warning(this, QString::fromUtf8("无法回放"),
+            QString::fromUtf8("当前远控连接尚未进入可操作状态。"));
+        setInputScriptDialogActive(false);
+        return;
+    }
+
+    QDir scriptDirectory(RemoteInputScriptStore::defaultDirectory());
+    if (!scriptDirectory.mkpath(QStringLiteral("."))) {
+        setInputScriptDialogActive(true);
+        QMessageBox::warning(this, QString::fromUtf8("无法回放"),
+            QString::fromUtf8("无法创建或访问本地script文件夹。"));
+        setInputScriptDialogActive(false);
+        return;
+    }
+
+    RemoteInputPlaybackDialog playbackDialog(
+        scriptDirectory.absolutePath(),
+        m_inputScriptPlaybackFilePath,
+        m_inputScriptPlaybackLoopCount,
+        m_inputScriptPlaybackLoopIntervalMs,
+        m_inputScriptPlaybackSpeedMultiplier,
+        this);
+    setInputScriptDialogActive(true);
+    if (playbackDialog.exec() != QDialog::Accepted) {
+        setInputScriptDialogActive(false);
+        return;
+    }
+    const RemoteInputPlaybackOptions options = playbackDialog.options();
+    const QString filePath = options.filePath;
+    m_inputScriptPlaybackFilePath = filePath;
+    m_inputScriptPlaybackLoopCount = options.loopCount;
+    m_inputScriptPlaybackLoopIntervalMs = options.loopIntervalMs;
+    m_inputScriptPlaybackSpeedMultiplier = options.speedMultiplier; // wjy: 文件、循环次数、轮间隔和速度由同一个F10设置窗口一次性提交。
+
+    RemoteInputScript script;
+    QString errorMessage;
+    if (!RemoteInputScriptStore::loadFromFile(filePath, &script, &errorMessage)) {
+        QMessageBox::warning(this, QString::fromUtf8("脚本无效"), errorMessage);
+        appendViewerDebugLog(QStringLiteral("input script load failed host=%1 path=%2 error=%3")
+            .arg(m_hostIp, QDir::toNativeSeparators(filePath), errorMessage));
+        setInputScriptDialogActive(false);
+        return;
+    }
+    if (script.events.isEmpty()) {
+        QMessageBox::warning(this, QString::fromUtf8("无法回放"),
+            QString::fromUtf8("所选脚本中没有键鼠事件。"));
+        setInputScriptDialogActive(false);
+        return;
+    }
+    if (!synchronizedInputEligible()) {
+        QMessageBox::warning(this, QString::fromUtf8("无法回放"),
+            QString::fromUtf8("选择脚本期间远控连接已不可操作。"));
+        setInputScriptDialogActive(false);
+        return;
+    }
+
+    const QString scriptName = script.name;
+    const qsizetype eventCount = script.events.size();
+    const qint64 durationMs = script.events.last().elapsedMs;
+    const qint64 adjustedDurationMs = remoteInputScriptPlaybackTimeMs(
+        durationMs, m_inputScriptPlaybackSpeedMultiplier);
+    m_inputScriptPlaybackEvents = std::move(script.events);
+    m_inputScriptPlaybackIndex = 0;
+    m_inputScriptPlaybackCompletedLoopCount = 0;
+    m_inputScriptPlaybackWaitingForLoopInterval = false; // wjy: 第一次播放立即开始，循环间隔只能出现在已经完整执行过一轮之后。
+    m_inputScriptPlaybackHeldKeys.clear();
+    m_inputScriptPlaybackHeldButtons.clear();
+    m_inputScriptPlaybackX = 32768;
+    m_inputScriptPlaybackY = 32768;
+    m_inputScriptPlaybackClock.start();
+    m_inputScriptPlaying = true;
+    requestTitleBarUpdate();
+    appendViewerDebugLog(QStringLiteral("input script playback started host=%1 name=%2 events=%3 duration_ms=%4 adjusted_ms=%5 loops=%6 loop_interval_ms=%7 speed=%8 path=%9")
+        .arg(m_hostIp, scriptName)
+        .arg(eventCount)
+        .arg(durationMs)
+        .arg(adjustedDurationMs)
+        .arg(m_inputScriptPlaybackLoopCount)
+        .arg(m_inputScriptPlaybackLoopIntervalMs)
+        .arg(QString::number(m_inputScriptPlaybackSpeedMultiplier, 'f', 2))
+        .arg(QDir::toNativeSeparators(filePath)));
+    setInputScriptDialogActive(false);
+    processInputScriptPlaybackEvents(); // wjy: 时间戳为0的首批事件立即发送，其余事件再由单次高精度定时器调度。
+}
+
+void RemoteDesktopWindow::scheduleNextInputScriptPlaybackEvent()
+{
+    if (!m_inputScriptPlaying || !m_inputScriptPlaybackTimer) {
+        return;
+    }
+    if (m_inputScriptPlaybackIndex >= m_inputScriptPlaybackEvents.size()) {
+        completeInputScriptPlaybackLoop();
+        return;
+    }
+    const qint64 elapsedMs = m_inputScriptPlaybackClock.isValid()
+        ? m_inputScriptPlaybackClock.elapsed()
+        : 0;
+    const qint64 eventTimeMs = remoteInputScriptPlaybackTimeMs(
+        m_inputScriptPlaybackEvents.at(m_inputScriptPlaybackIndex).elapsedMs,
+        m_inputScriptPlaybackSpeedMultiplier);
+    const qint64 delayMs = eventTimeMs - elapsedMs;
+    const int timerDelayMs = static_cast<int>(std::clamp<qint64>(
+        delayMs, 1, std::numeric_limits<int>::max()));
+    m_inputScriptPlaybackTimer->start(timerDelayMs); // wjy: 每次都基于脚本绝对时间减去当前实耗重新计算，UI偶发卡顿只造成追帧而不会永久累积误差。
+}
+
+void RemoteDesktopWindow::processInputScriptPlaybackEvents()
+{
+    if (!m_inputScriptPlaying) {
+        return;
+    }
+    if (!synchronizedInputEligible()) {
+        stopInputScriptPlayback(QStringLiteral("connection_unavailable"), true);
+        return;
+    }
+    if (m_inputScriptPlaybackWaitingForLoopInterval) {
+        m_inputScriptPlaybackWaitingForLoopInterval = false;
+        m_inputScriptPlaybackClock.start(); // wjy: 间隔结束后从已失效状态启动全新时间轴，等待时间不会导致下一轮事件被误判为全部逾期并瞬间发送。
+    }
+
+    qint64 elapsedMs = m_inputScriptPlaybackClock.elapsed();
+    qsizetype processedThisTick = 0;
+    while (m_inputScriptPlaybackIndex < m_inputScriptPlaybackEvents.size()
+        && remoteInputScriptPlaybackTimeMs(
+                m_inputScriptPlaybackEvents.at(m_inputScriptPlaybackIndex).elapsedMs,
+                m_inputScriptPlaybackSpeedMultiplier) <= elapsedMs
+        && processedThisTick < kMaximumInputScriptEventsPerPlaybackTick) {
+        const RemoteInputEvent event = m_inputScriptPlaybackEvents.at(m_inputScriptPlaybackIndex).input;
+        bool sent = false;
+        {
+            QScopedValueRollback<bool> playbackDispatch(m_dispatchingInputScriptPlayback, true);
+            sent = dispatchRemoteInputEvent(event); // wjy: 回放复用正常语义分发，因此当前窗口若是同步主控，脚本会按现有规则同步到全部跟随设备。
+        }
+        if (sent || (event.type != RemoteInputEventType::KeyUp
+                && event.type != RemoteInputEventType::ButtonUp)) {
+            trackInputScriptPlaybackState(event); // wjy: 失败的按下按“可能已到达部分跟随端”保守记录；失败的抬起不清除持有态，停止时再补发一次最安全。
+        }
+        if (!sent) {
+            stopInputScriptPlayback(QStringLiteral("send_failed"), true);
+            return;
+        }
+        ++m_inputScriptPlaybackIndex;
+        ++processedThisTick;
+        elapsedMs = m_inputScriptPlaybackClock.elapsed(); // wjy: 一批同时间事件发送后重新取时钟，及时追上处理期间已经到期的后续事件。
+    }
+
+    if (m_inputScriptPlaybackIndex >= m_inputScriptPlaybackEvents.size()) {
+        completeInputScriptPlaybackLoop();
+        return;
+    }
+    if (processedThisTick >= kMaximumInputScriptEventsPerPlaybackTick
+        && remoteInputScriptPlaybackTimeMs(
+                m_inputScriptPlaybackEvents.at(m_inputScriptPlaybackIndex).elapsedMs,
+                m_inputScriptPlaybackSpeedMultiplier) <= elapsedMs) {
+        m_inputScriptPlaybackTimer->start(0);
+        return; // wjy: 到期积压拆到下一轮事件循环继续追赶，恶意或异常脚本不能用同时间戳长循环卡死UI线程。
+    }
+    scheduleNextInputScriptPlaybackEvent();
+}
+
+void RemoteDesktopWindow::completeInputScriptPlaybackLoop()
+{
+    if (!m_inputScriptPlaying) return;
+
+    if (m_inputScriptPlaybackCompletedLoopCount < std::numeric_limits<int>::max()) {
+        ++m_inputScriptPlaybackCompletedLoopCount; // wjy: 无限循环长期运行时计数饱和而不发生有符号整数溢出，0无限语义不受影响。
+    }
+    releaseInputScriptPlaybackInputs(); // wjy: 每个完整循环都强制释放未配对键鼠和相对捕获，下一轮从干净输入状态开始。
+    if (!remoteInputScriptShouldRepeat(
+            m_inputScriptPlaybackLoopCount, m_inputScriptPlaybackCompletedLoopCount)) {
+        stopInputScriptPlayback(QStringLiteral("completed"), false);
+        return;
+    }
+
+    m_inputScriptPlaybackIndex = 0;
+    if (m_inputScriptPlaybackTimer) {
+        if (m_inputScriptPlaybackLoopIntervalMs > 0) {
+            m_inputScriptPlaybackWaitingForLoopInterval = true;
+            m_inputScriptPlaybackClock.invalidate(); // wjy: 等待期间暂停脚本时间轴，间隔不参与下一轮原始时间戳换算。
+            m_inputScriptPlaybackTimer->start(m_inputScriptPlaybackLoopIntervalMs); // wjy: 复用同一个单次定时器，因此等待期间再次按 F10 可以立即 stop 并取消下一轮。
+        } else {
+            m_inputScriptPlaybackWaitingForLoopInterval = false;
+            m_inputScriptPlaybackClock.restart(); // wjy: 无间隔时仍重新以0毫秒为绝对时间基准，前一轮处理耗时不会累积。
+            m_inputScriptPlaybackTimer->start(0); // wjy: 即使全部事件时间戳都是0，无限循环也逐轮让出事件循环，F10始终可以及时停止。
+        }
+    }
+}
+
+void RemoteDesktopWindow::stopInputScriptPlayback(const QString& reason, bool releaseRemoteInputs)
+{
+    if (!m_inputScriptPlaying && m_inputScriptPlaybackEvents.isEmpty()
+        && m_inputScriptPlaybackHeldKeys.isEmpty() && m_inputScriptPlaybackHeldButtons.isEmpty()) {
+        if (m_inputScriptPlaybackTimer) m_inputScriptPlaybackTimer->stop();
+        m_inputScriptPlaybackWaitingForLoopInterval = false;
+        return; // wjy: 普通关闭或析构没有活动脚本时不额外向远端发送无意义的CaptureRelease。
+    }
+    const bool wasPlaying = m_inputScriptPlaying;
+    const qsizetype completedEvents = m_inputScriptPlaybackIndex;
+    const qsizetype totalEvents = m_inputScriptPlaybackEvents.size();
+    if (m_inputScriptPlaybackTimer) m_inputScriptPlaybackTimer->stop();
+    m_inputScriptPlaybackWaitingForLoopInterval = false; // wjy: F10、断线或关闭都取消尚未开始的下一轮，定时器不会在停止后重新唤醒脚本。
+    m_inputScriptPlaying = false;
+    if (releaseRemoteInputs) {
+        releaseInputScriptPlaybackInputs(); // wjy: 先撤销播放门禁再补发抬起，F10、断线和自然结束都不会在远端留下按住状态。
+    } else {
+        m_inputScriptPlaybackHeldKeys.clear();
+        m_inputScriptPlaybackHeldButtons.clear();
+    }
+    m_inputScriptPlaybackEvents.clear();
+    m_inputScriptPlaybackIndex = 0;
+    m_inputScriptPlaybackClock.invalidate();
+    if (wasPlaying) {
+        requestTitleBarUpdate();
+        appendViewerDebugLog(QStringLiteral("input script playback stopped host=%1 event_index=%2 event_total=%3 completed_loops=%4 configured_loops=%5 loop_interval_ms=%6 speed=%7 reason=%8")
+            .arg(m_hostIp)
+            .arg(completedEvents)
+            .arg(totalEvents)
+            .arg(m_inputScriptPlaybackCompletedLoopCount)
+            .arg(m_inputScriptPlaybackLoopCount)
+            .arg(m_inputScriptPlaybackLoopIntervalMs)
+            .arg(QString::number(m_inputScriptPlaybackSpeedMultiplier, 'f', 2))
+            .arg(reason));
+    }
+}
+
+void RemoteDesktopWindow::releaseInputScriptPlaybackInputs()
+{
+    const QSet<int> heldKeys = m_inputScriptPlaybackHeldKeys;
+    const QSet<int> heldButtons = m_inputScriptPlaybackHeldButtons;
+    m_inputScriptPlaybackHeldKeys.clear();
+    m_inputScriptPlaybackHeldButtons.clear();
+
+    for (int virtualKey : heldKeys) {
+        RemoteInputEvent release;
+        release.type = RemoteInputEventType::KeyUp;
+        release.virtualKey = virtualKey;
+        QScopedValueRollback<bool> playbackDispatch(m_dispatchingInputScriptPlayback, true);
+        dispatchRemoteInputEvent(release);
+    }
+    for (int button : heldButtons) {
+        RemoteInputEvent release;
+        release.type = RemoteInputEventType::ButtonUp;
+        release.button = button;
+        release.normalizedX = m_inputScriptPlaybackX;
+        release.normalizedY = m_inputScriptPlaybackY;
+        QScopedValueRollback<bool> playbackDispatch(m_dispatchingInputScriptPlayback, true);
+        dispatchRemoteInputEvent(release);
+    }
+    RemoteInputEvent captureRelease;
+    captureRelease.type = RemoteInputEventType::CaptureRelease;
+    QScopedValueRollback<bool> playbackDispatch(m_dispatchingInputScriptPlayback, true);
+    dispatchRemoteInputEvent(captureRelease); // wjy: 即使脚本没有显式按钮按下，也兜底退出可能由相对移动触发的远端鼠标捕获。
+}
+
+void RemoteDesktopWindow::trackInputScriptPlaybackState(const RemoteInputEvent& event)
+{
+    if (event.type == RemoteInputEventType::AbsoluteMove
+        || event.type == RemoteInputEventType::ButtonDown
+        || event.type == RemoteInputEventType::ButtonUp
+        || event.type == RemoteInputEventType::Wheel) {
+        m_inputScriptPlaybackX = std::clamp(event.normalizedX, 0, 65535);
+        m_inputScriptPlaybackY = std::clamp(event.normalizedY, 0, 65535);
+    }
+    if (event.type == RemoteInputEventType::KeyDown && event.virtualKey > 0) {
+        m_inputScriptPlaybackHeldKeys.insert(event.virtualKey);
+    } else if (event.type == RemoteInputEventType::KeyUp) {
+        m_inputScriptPlaybackHeldKeys.remove(event.virtualKey);
+    } else if (event.type == RemoteInputEventType::ButtonDown && event.button > 0) {
+        m_inputScriptPlaybackHeldButtons.insert(event.button);
+    } else if (event.type == RemoteInputEventType::ButtonUp) {
+        m_inputScriptPlaybackHeldButtons.remove(event.button);
+    }
+}
+
+void RemoteDesktopWindow::setInputScriptDialogActive(bool active)
+{
+    m_inputScriptDialogActive = active;
+    setKeyboardForwardingActive(!active && !remoteUpdateActive()); // wjy: 模态框期间即使远控窗口仍是活动窗口也不转发键盘，关闭后再按连接和焦点资格恢复。
+}
+// ===end====
 
 bool RemoteDesktopWindow::synchronizedInputEligible() const
 {
@@ -3417,14 +4099,49 @@ void RemoteDesktopWindow::toggleInputSynchronization()
 
 void RemoteDesktopWindow::setRemoteMouseCaptureActive(bool active)
 {
-    if (active && (remoteUpdateActive() || !m_viewerHandle
-        || !RemoteConnectionState::acceptsRemoteInput(m_connectionStatusCode))) {
+    // =====wjy====
+    if (active && !synchronizedInputEligible()) {
         return; // wjy: 更新或断网重连期间忽略旧流迟到的relative状态，防止本机鼠标再次被隐藏或锁定。
     }
+    m_remoteMouseCaptureRequested = active; // wjy: Host 状态只改变自动请求；F2 手动锁定开启时，Host 回到 absolute 也不能覆盖用户意图。
+    updateRemoteMouseCaptureState();
+    // ===end====
+}
+
+// =====wjy====
+void RemoteDesktopWindow::toggleManualMouseLock()
+{
+    m_manualMouseLockActive = !m_manualMouseLockActive; // wjy: F2 维护独立手动意图，不伪造 Host 的游戏检测状态。
+    updateRemoteMouseCaptureState(); // wjy: 当前连接且有焦点时立即切换；失焦或断线时只保存意图，恢复资格后自动生效。
+    requestTitleBarUpdate(); // wjy: 标题栏静态“鼠标锁定”文字只在开关变化时刷新，不引入逐鼠标事件重绘。
+    appendViewerDebugLog(QStringLiteral("manual mouse lock changed host=%1 enabled=%2 effective=%3 host_requested=%4 shortcut=F2")
+        .arg(m_hostIp)
+        .arg(m_manualMouseLockActive ? 1 : 0)
+        .arg(m_remoteMouseCaptureActive ? 1 : 0)
+        .arg(m_remoteMouseCaptureRequested ? 1 : 0)); // wjy: 仅记录低频开关结果到既有 data 日志，禁止记录 Raw Input 高频位移。
+}
+
+void RemoteDesktopWindow::updateRemoteMouseCaptureState()
+{
+    const bool shouldCapture = (m_remoteMouseCaptureRequested || m_manualMouseLockActive)
+        && synchronizedInputEligible()
+        && isActiveWindow(); // wjy: 只有当前活动且可输入的远控窗口能占用进程唯一 Raw Input 鼠标目标。
+    applyRemoteMouseCaptureState(shouldCapture);
+}
+
+void RemoteDesktopWindow::suspendRemoteMouseCapture()
+{
+    applyRemoteMouseCaptureState(false); // wjy: 生命周期暂停只撤销实际捕获，Host 请求或 F2 手动意图由调用方按场景决定是否保留。
+}
+
+void RemoteDesktopWindow::applyRemoteMouseCaptureState(bool active)
+{
     if (m_remoteMouseCaptureActive == active) {
         if (active) {
-            setRawInputMouseCaptureEnabled(true); // wjy: 状态重复通知时允许上次注册失败的设备重新尝试，仍失败则保留旧 Qt 相对路径。
+            setRawInputMouseCaptureEnabled(true); // wjy: 重复激活时允许上次注册失败的设备重试，仍失败则继续使用 Qt 中心差值回退路径。
             recenterRemoteMouseCapture();
+        } else if (m_rawInputMouseCaptureActive) {
+            setRawInputMouseCaptureEnabled(false); // wjy: 即使极端焦点切换造成实际状态与 Raw Input 标志短暂不同步，暂停和析构路径也会强制清理注册。
         }
         return;
     }
@@ -3439,9 +4156,18 @@ void RemoteDesktopWindow::setRemoteMouseCaptureActive(bool active)
         updateResizeCursor(mapFromGlobal(QCursor::pos())); // wjy: 退出捕获后立即按当前位置恢复本地边框或已缓存的远端桌面光标。
         RemoteInputEvent event;
         event.type = RemoteInputEventType::CaptureRelease;
-        dispatchRemoteInputEvent(event); // wjy: 主控退出相对鼠标模式时把释放同步到所有跟随端，避免其它目标继续隐藏或锁定鼠标。
+        QScopedValueRollback<bool> localCaptureRelease(m_dispatchingInputScriptPlayback, true);
+        dispatchRemoteInputEvent(event); // wjy: 生命周期和 F2 产生的释放必须穿过播放门禁，但不应作为用户键鼠动作写入 F9 录制脚本。
     }
+    appendViewerDebugLog(QStringLiteral("remote mouse capture changed host=%1 active=%2 manual=%3 host_requested=%4 focused=%5 eligible=%6")
+        .arg(m_hostIp)
+        .arg(m_remoteMouseCaptureActive ? 1 : 0)
+        .arg(m_manualMouseLockActive ? 1 : 0)
+        .arg(m_remoteMouseCaptureRequested ? 1 : 0)
+        .arg(isActiveWindow() ? 1 : 0)
+        .arg(synchronizedInputEligible() ? 1 : 0)); // wjy: 只记录实际捕获生命周期，便于排查多窗口焦点切换，不记录任何逐帧鼠标数据。
 }
+// ===end====
 
 // =====wjy====
 void RemoteDesktopWindow::setRemoteCursorShape(const QString& statusMessage)
@@ -3728,10 +4454,10 @@ void RemoteDesktopWindow::setKeyboardForwardingActive(bool active)
 #if defined(Q_OS_WIN)
     if (m_waitingShortcutRelease && !m_closeInProgress) {
         installKeyboardHook(this); // wjy: 等待组合键松开时保留 hook，但 hook 只记录 keyup，不转发远端。
-    } else if (active && !m_closeInProgress && !remoteUpdateActive() && isActiveWindow()
+    } else if (active && !m_inputScriptDialogActive && !m_closeInProgress && !remoteUpdateActive() && isActiveWindow()
         && m_viewerHandle
         && RemoteConnectionState::acceptsRemoteInput(m_connectionStatusCode)) {
-        installKeyboardHook(this);
+        installKeyboardHook(this); // wjy: 键鼠脚本命名或选择对话框打开时禁止重新安装转发Hook，用户输入只留在本地模态窗口。
     } else {
         uninstallKeyboardHook(this);
     }
@@ -3840,6 +4566,10 @@ void RemoteDesktopWindow::releaseForwardedKeys()
 void RemoteDesktopWindow::shutdownForApplicationExit()
 {
     saveWindowGeometry();
+    // =====wjy====
+    cancelInputScriptRecording(QStringLiteral("application_exit"));
+    stopInputScriptPlayback(QStringLiteral("application_exit"), true); // wjy: 进程批量退出仍在有效Viewer句柄清理前结束回放，避免远端留下脚本按住的键鼠。
+    // ===end====
     m_closeInProgress = true;
     m_applicationExitInProgress = true; // wjy: 窗口删除权交给DeviceGrid，异步stop完成时不得通过deleteLater改变批量退出顺序。
     m_remoteUpdateState = RemoteUpdateState::None;
@@ -3851,7 +4581,8 @@ void RemoteDesktopWindow::shutdownForApplicationExit()
     m_waitingShortcutRelease = false;
     m_shortcutReleaseVirtualKeys.clear();
     hide();
-    setRemoteMouseCaptureActive(false);
+    m_remoteMouseCaptureRequested = false;
+    suspendRemoteMouseCapture(); // wjy: 应用退出不等待焦点事件，主动释放实际捕获；析构阶段会再做幂等兜底。
     releaseForwardedKeys();
     if (m_inputBroadcastCoordinator) {
         m_inputBroadcastCoordinator->unregisterEndpoint(this); // wjy: 应用退出隐藏窗口前注销成员，主控退出会同步关闭整组且补发剩余按钮释放。
@@ -4331,6 +5062,7 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
             if (m_remoteUpdateState == RemoteUpdateState::Reconnecting) {
                 finishRemoteUpdateWait(); // wjy: 共享纹理首帧成功呈现后才移除更新遮罩并恢复输入。
             }
+            updateRemoteMouseCaptureState(); // wjy: 即使状态回调先后顺序异常，只要共享纹理已成功显示，也会恢复仍开启的 F2 手动锁定。
             if (connectionTitleChanged || recoveredFromSoftwareFallback) {
                 requestTitleBarUpdate(); // wjy: 60 FPS纹理呈现不再连带重画标题栏，只提交真实可见状态变化。
             }
@@ -4408,6 +5140,7 @@ void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
     if (m_remoteUpdateState == RemoteUpdateState::Reconnecting) {
         finishRemoteUpdateWait(); // wjy: 软件帧路径同样以首帧到达作为恢复正常远控的唯一完成点。
     }
+    updateRemoteMouseCaptureState(); // wjy: BGRA 回退路径与共享纹理路径使用同一手动锁定恢复条件，不依赖状态回调到达顺序。
     if (!textureWasVisible) {
         update(contentRect); // wjy: 普通软件帧继续异步刷新；只有D3D→BGRA交接首帧使用一次同步重绘。
     }
@@ -4547,6 +5280,9 @@ bool RemoteDesktopWindow::forwardNativeKey(int virtualKey, bool down)
     if (m_closeInProgress || remoteUpdateActive() || virtualKey <= 0) {
         return false;
     }
+    if (m_inputScriptPlaying) {
+        return true; // wjy: F10已在本地快捷键层优先消费，播放期间其余实体键盘事件直接吞掉且不进入远端持有集合。
+    }
     if (down) {
         m_pressedKeys.insert(virtualKey);
     } else {
@@ -4562,9 +5298,32 @@ bool RemoteDesktopWindow::forwardNativeKey(int virtualKey, bool down)
 bool RemoteDesktopWindow::handleLocalShortcutKey(int virtualKey, Qt::KeyboardModifiers modifiers)
 {
 #if defined(Q_OS_WIN)
-    if (m_closeInProgress || remoteUpdateActive()) {
+    if (m_closeInProgress) {
         return false;
     }
+    // =====wjy====
+    if (modifiers == Qt::NoModifier && virtualKey == VK_F2) {
+        beginShortcutReleaseGuard(QKeySequence(QStringLiteral("F2"))); // wjy: F2 固定为当前远控窗口的本地手动鼠标锁定键，按下和抬起都不能发送到目标端。
+        QMetaObject::invokeMethod(this, [this] {
+            toggleManualMouseLock(); // wjy: 通过 Qt 队列切换状态，低级键盘 Hook 回调栈内不直接注册 Raw Input 或刷新标题栏。
+        }, Qt::QueuedConnection);
+        return true;
+    }
+    if (remoteUpdateActive()) {
+        return false; // wjy: 更新期间仍允许 F2 修改保留的手动意图，但录制、回放和远端快捷键继续保持禁用。
+    }
+    if (modifiers == Qt::NoModifier && (virtualKey == VK_F9 || virtualKey == VK_F10)) {
+        const bool recordingShortcut = virtualKey == VK_F9;
+        beginShortcutReleaseGuard(QKeySequence(recordingShortcut
+                ? QStringLiteral("F9")
+                : QStringLiteral("F10"))); // wjy: 使用稳定的Qt可移植文本构造单键序列，松键门禁仍可映射回对应Windows虚拟键码。
+        QMetaObject::invokeMethod(this, [this, recordingShortcut] {
+            if (recordingShortcut) toggleInputScriptRecording();
+            else toggleInputScriptPlayback(); // wjy: 模态命名和文件选择延迟到Qt队列执行，绝不在WH_KEYBOARD_LL回调栈内打开窗口。
+        }, Qt::QueuedConnection);
+        return true;
+    }
+    // ===end====
     const QKeySequence current = shortcutSequenceFromNativeVirtualKey(virtualKey, modifiers); // wjy: 低级键盘钩子路径同样使用用户保存的快捷键设置。
     if (matchesShortcut(current, platform::AppSettings::remoteShortcutFullscreen())) {
         beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutFullscreen());
@@ -4709,6 +5468,7 @@ void RemoteDesktopWindow::finishNetworkReconnect()
     if (isActiveWindow()) {
         setKeyboardForwardingActive(true); // wjy: 第一帧已经成功显示后才重新安装键盘hook，等待期间不会向失效句柄发送输入。
     }
+    updateRemoteMouseCaptureState(); // wjy: 网络恢复以真实首帧为准，只有此时才允许 F2 手动锁定重新占用 Raw Input。
     if (m_inputBroadcastCoordinator) {
         m_inputBroadcastCoordinator->notifyEligibilityChanged(this);
     }
@@ -4780,6 +5540,7 @@ void RemoteDesktopWindow::startViewerConnectionWithAdmission()
     m_remoteMouseBackendPending = false;
     m_remoteMouseBackendFallback = false;
     m_mouseBackendButtonPressed = false;
+    m_remoteMouseCaptureRequested = false; // wjy: 新 Viewer 从无自动 relative 请求开始，旧连接状态不得跨代际继承。
     ++m_remoteMouseBackendRequestGeneration; // wjy: 新 Viewer 代际从安全系统默认重新查询，旧连接迟到确认和超时都不能污染本次标题栏。
     m_remoteMouseBackendMessage = zh("等待目标端确认键鼠模式");
     if (!m_remoteMouseCaptureActive) {
@@ -4846,6 +5607,13 @@ void RemoteDesktopWindow::releaseViewerStartupAdmission()
 
 void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
 {
+    // =====wjy====
+    if (RemoteConnectionState::acceptsRemoteInput(m_connectionStatusCode)
+        && !RemoteConnectionState::acceptsRemoteInput(code)) {
+        cancelInputScriptRecording(QStringLiteral("connection_lost"));
+        stopInputScriptPlayback(QStringLiteral("connection_lost"), true); // wjy: 在覆盖旧状态码之前补发脚本持有输入，此时旧会话仍有最后一次安全发送机会。
+    }
+    // ===end====
     const bool should_query_mouse_backend = code == FSREMOTE_STATUS_RECEIVING_VIDEO
         && m_connectionStatusCode != FSREMOTE_STATUS_RECEIVING_VIDEO
         && !m_networkReconnectActive; // wjy: 重连时状态50只代表解码器拿到首帧，必须等UI成功Present后再恢复输入并查询后端。
@@ -4894,7 +5662,8 @@ void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
         && (code == FSREMOTE_STATUS_REMOTE_CLOSED
             || code == FSREMOTE_STATUS_ERROR);
     if (transientNetworkProblem || terminalNetworkProblem) {
-        setRemoteMouseCaptureActive(false);
+        m_remoteMouseCaptureRequested = false; // wjy: 网络异常使旧 Host 状态失效；F2 手动意图单独保留，恢复首帧后按资格重新启用。
+        suspendRemoteMouseCapture();
         releaseForwardedKeys(); // wjy: 状态仍是50时先尽力向旧会话补发抬键，随后再关闭输入资格和键盘hook。
         setKeyboardForwardingActive(false);
         if (m_clipboardPollTimer) m_clipboardPollTimer->stop();
@@ -4916,6 +5685,7 @@ void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
     m_connectionStatus = deferRecoveredVideo
         ? QString::fromUtf8("网络已恢复，正在等待画面显示")
         : RemoteConnectionState::displayText(code, message); // wjy: 重连首帧只有真正Present后才提交状态50，避免同步输入提前恢复。
+    updateRemoteMouseCaptureState(); // wjy: 普通连接状态建立后立即应用 Host/F2 捕获请求；断线状态会保持实际捕获关闭。
     if (m_inputBroadcastCoordinator) {
         m_inputBroadcastCoordinator->notifyEligibilityChanged(this); // wjy: 断线/失败会关闭主控或移除跟随端，连接成功后则从后续事件开始动态加入。
     }
@@ -5279,6 +6049,10 @@ void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
     // ===end====
     saveWindowGeometry();
     // =====wjy====
+    cancelInputScriptRecording(QStringLiteral("window_close"));
+    stopInputScriptPlayback(QStringLiteral("window_close"), true); // wjy: 无论当前是否已有Viewer句柄，关闭路径都先终止脚本定时器和远端持有状态。
+    // ===end====
+    // =====wjy====
     appendViewerDebugLog(QStringLiteral("closeEvent handle=%1 closing=%2")
         .arg(reinterpret_cast<quintptr>(m_viewerHandle))
         .arg(m_closeInProgress ? 1 : 0)); // wjy: show whether a crash is triggered by closing/stop.
@@ -5300,7 +6074,8 @@ void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
     if (m_remoteUpdateTimer) {
         m_remoteUpdateTimer->stop();
     }
-    setRemoteMouseCaptureActive(false);
+    m_remoteMouseCaptureRequested = false;
+    suspendRemoteMouseCapture(); // wjy: 关闭阶段在隐藏窗口和停止 Viewer 前释放捕获；手动意图无需额外刷新标题栏。
     releasePressedKeys();
     if (m_inputBroadcastCoordinator) {
         m_inputBroadcastCoordinator->unregisterEndpoint(this); // wjy: 用户关闭时在 Viewer stop 前注销，利用仍有效的句柄完成同步组释放屏障。
@@ -5615,6 +6390,28 @@ void RemoteDesktopWindow::keyPressEvent(QKeyEvent* event)
     }
 #endif
 // =====wjy====
+    if (!event->isAutoRepeat() && event->modifiers() == Qt::NoModifier
+        && event->key() == Qt::Key_F2) {
+        beginShortcutReleaseGuard(QKeySequence(QStringLiteral("F2")));
+        QMetaObject::invokeMethod(this, [this] {
+            toggleManualMouseLock(); // wjy: 非 Windows 或 Hook 未接管时仍保持同一 F2 行为，并在普通输入转发前消费按键。
+        }, Qt::QueuedConnection);
+        event->accept();
+        return;
+    }
+    if (!event->isAutoRepeat() && event->modifiers() == Qt::NoModifier
+        && (event->key() == Qt::Key_F9 || event->key() == Qt::Key_F10)) {
+        const bool recordingShortcut = event->key() == Qt::Key_F9;
+        beginShortcutReleaseGuard(QKeySequence(recordingShortcut
+                ? QStringLiteral("F9")
+                : QStringLiteral("F10")));
+        QMetaObject::invokeMethod(this, [this, recordingShortcut] {
+            if (recordingShortcut) toggleInputScriptRecording();
+            else toggleInputScriptPlayback(); // wjy: 非Windows或Hook未接管时保持同一F9/F10行为，并用队列隔离模态对话框。
+        }, Qt::QueuedConnection);
+        event->accept();
+        return;
+    }
     const QKeySequence current = shortcutSequenceFromKeyEvent(event); // wjy: 普通 Qt 按键路径也读取设置页自定义快捷键。
     if (matchesShortcut(current, platform::AppSettings::remoteShortcutFullscreen())) {
         beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutFullscreen());
@@ -5648,6 +6445,10 @@ void RemoteDesktopWindow::keyPressEvent(QKeyEvent* event)
     }
 // ===end====
 
+    if (m_inputScriptPlaying) {
+        event->accept();
+        return; // wjy: Qt兜底路径同样屏蔽播放期间的人工键盘输入，只有前面的F10停止快捷键可以穿过。
+    }
     if (event->nativeVirtualKey() > 0) {
         m_pressedKeys.insert(event->nativeVirtualKey());
         RemoteInputEvent input;
@@ -5670,6 +6471,15 @@ void RemoteDesktopWindow::keyReleaseEvent(QKeyEvent* event)
         return;
     }
 #endif
+    if (event->modifiers() == Qt::NoModifier
+        && (event->key() == Qt::Key_F2 || event->key() == Qt::Key_F9 || event->key() == Qt::Key_F10)) {
+        event->accept();
+        return; // wjy: Qt兜底平台固定吞掉 F2/F9/F10 的 KeyUp，远端不会收到没有配对 KeyDown 的本地快捷键抬键。
+    }
+    if (m_inputScriptPlaying) {
+        event->accept();
+        return; // wjy: 被播放门禁吞掉的实体KeyDown不向远端补发孤立KeyUp，脚本自己的持有状态由停止流程统一释放。
+    }
     if (event->nativeVirtualKey() > 0) {
         m_pressedKeys.remove(event->nativeVirtualKey());
         RemoteInputEvent input;
@@ -5686,10 +6496,7 @@ void RemoteDesktopWindow::focusInEvent(QFocusEvent* event)
 {
     emit activated(this);
     // =====wjy====
-    if (m_remoteMouseCaptureActive) {
-        setRawInputMouseCaptureEnabled(true); // wjy: 同步跟随窗口可能在后台收到 relative 状态，真正获得焦点时再接管进程唯一的 WM_INPUT 鼠标目标。
-        recenterRemoteMouseCapture();
-    }
+    updateRemoteMouseCaptureState(); // wjy: 重新获得焦点时按 Host 请求或 F2 手动意图恢复实际捕获，并安全接管进程唯一 Raw Input 目标。
     // ===end====
     setKeyboardForwardingActive(!remoteUpdateActive()); // wjy: 更新遮罩获得焦点时也不安装全局键盘转发钩子。
     QWidget::focusInEvent(event);
@@ -5697,7 +6504,7 @@ void RemoteDesktopWindow::focusInEvent(QFocusEvent* event)
 
 void RemoteDesktopWindow::focusOutEvent(QFocusEvent* event)
 {
-    setRemoteMouseCaptureActive(false);
+    suspendRemoteMouseCapture(); // wjy: 失焦只暂停实际捕获，不清除 Host relative 请求或 F2 手动意图，切回本窗口时可直接恢复。
     releasePressedKeys();
     setKeyboardForwardingActive(false);
     QWidget::focusOutEvent(event);
