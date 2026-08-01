@@ -16,6 +16,7 @@
 #include <wrl/client.h>
 
 #include "signaling.h"
+#include "stream_capture_diagnostics.h"
 
 extern "C" {
 #include <libswresample/swresample.h>
@@ -25,9 +26,12 @@ extern "C" {
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <string>
 #include <thread>
 #include <vector>
@@ -449,7 +453,7 @@ private:
     bool started_ = false;
 };
 
-uintptr_t listen_tcp(uint16_t port, std::atomic_bool& running, std::atomic_uintptr_t& server_socket)
+uintptr_t create_audio_listener(uint16_t port, std::atomic_uintptr_t& server_socket)
 {
     if (!ensure_wsa()) {
         return 0;
@@ -468,32 +472,92 @@ uintptr_t listen_tcp(uint16_t port, std::atomic_bool& running, std::atomic_uintp
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
     if (::bind(server, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR ||
-        ::listen(server, 1) == SOCKET_ERROR) {
+        ::listen(server, SOMAXCONN) == SOCKET_ERROR) {
         closesocket(server);
         return 0;
     }
 
-    server_socket = static_cast<uintptr_t>(server);
-    SOCKET client = ::accept(server, nullptr, nullptr);
-    const uintptr_t published = server_socket.exchange(0);
-    if (published) {
-        uu::close_socket(published);
-    }
-
-    if (!running || client == INVALID_SOCKET) {
-        if (client != INVALID_SOCKET) {
-            uu::close_socket(static_cast<uintptr_t>(client));
-        }
+    u_long nonBlocking = 1;
+    if (::ioctlsocket(server, FIONBIO, &nonBlocking) == SOCKET_ERROR) {
+        closesocket(server);
         return 0;
     }
+    server_socket = static_cast<uintptr_t>(server);
+    return static_cast<uintptr_t>(server);
+}
 
-    return static_cast<uintptr_t>(client);
+bool send_all_until(
+    SOCKET socket,
+    const uint8_t* data,
+    size_t size,
+    std::chrono::steady_clock::time_point deadline)
+{
+    while (size > 0) {
+        const int sent = ::send(socket, reinterpret_cast<const char*>(data), static_cast<int>(size), 0);
+        if (sent > 0) {
+            data += sent;
+            size -= static_cast<size_t>(sent);
+            continue;
+        }
+
+        const int error = ::WSAGetLastError();
+        if (error != WSAEWOULDBLOCK && error != WSAEINPROGRESS && error != WSAEINVAL) {
+            return false;
+        }
+
+        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining.count() <= 0) {
+            return false;
+        }
+
+        fd_set writable;
+        FD_ZERO(&writable);
+        FD_SET(socket, &writable);
+        timeval timeout = {};
+        timeout.tv_sec = static_cast<long>(remaining.count() / 1000000);
+        timeout.tv_usec = static_cast<long>(remaining.count() % 1000000);
+        const int selected = ::select(0, nullptr, &writable, nullptr, &timeout);
+        if (selected <= 0 || !FD_ISSET(socket, &writable)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool send_audio_message_bounded(uintptr_t socket_value, const std::string& message)
+{
+    constexpr auto kSendDeadline = std::chrono::milliseconds(100);
+    const SOCKET socket = static_cast<SOCKET>(socket_value);
+    const uint32_t size = htonl(static_cast<uint32_t>(message.size()));
+    const auto deadline = std::chrono::steady_clock::now() + kSendDeadline;
+    return send_all_until(
+               socket,
+               reinterpret_cast<const uint8_t*>(&size),
+               sizeof(size),
+               deadline)
+        && send_all_until(
+               socket,
+               reinterpret_cast<const uint8_t*>(message.data()),
+               message.size(),
+               deadline);
 }
 
 } // namespace
 
 class HostAudioStreamer::Impl {
 public:
+    struct Client final {
+        uintptr_t socket = 0;
+        std::mutex mutex;
+        std::condition_variable condition;
+        std::string pending_payload;
+        bool has_payload = false;
+        bool running = true;
+        bool failed = false;
+        std::thread worker;
+    };
+
     ~Impl()
     {
         stop();
@@ -506,6 +570,7 @@ public:
         }
         running_ = true;
         worker_ = std::thread([this, port] { run(port ? port : kDefaultAudioPort); });
+        capture_worker_ = std::thread([this] { capture_loop(); });
         return true;
     }
 
@@ -520,49 +585,273 @@ public:
         if (worker_.joinable()) {
             worker_.join();
         }
+        if (capture_worker_.joinable()) {
+            capture_worker_.join();
+        }
     }
 
     void reset_client()
     {
-        const uintptr_t client = client_socket_.exchange(0);
-        if (client) {
-            uu::close_socket(client);
+        std::vector<std::shared_ptr<Client>> clients;
+        {
+            std::lock_guard lock(clients_mutex_);
+            clients.reserve(clients_.size());
+            for (auto& [socket, client] : clients_) {
+                (void)socket;
+                clients.push_back(std::move(client));
+            }
+            clients_.clear();
+        }
+        clients_condition_.notify_all();
+        for (const auto& client : clients) {
+            stop_client(client);
+        }
+        for (const auto& client : clients) {
+            join_client(client);
         }
     }
 
+    bool add_client(uintptr_t socket)
+    {
+        if (!socket || !running_) {
+            if (socket) uu::close_socket(socket);
+            return false;
+        }
+        u_long nonBlocking = 1;
+        if (::ioctlsocket(static_cast<SOCKET>(socket), FIONBIO, &nonBlocking) == SOCKET_ERROR) {
+            uu::close_socket(socket);
+            return false;
+        }
+
+        auto client = std::make_shared<Client>();
+        client->socket = socket;
+        client->worker = std::thread([this, client] { client_loop(client); });
+        {
+            std::lock_guard lock(clients_mutex_);
+            if (!running_) {
+                stop_client(client);
+                join_client(client);
+                return false;
+            }
+            clients_[socket] = client;
+        }
+        clients_condition_.notify_all();
+        lsp::append_stream_capture_diagnostic_log(
+            "audio",
+            "client accepted socket=" + std::to_string(socket));
+        return true;
+    }
+
+    void remove_client(uintptr_t socket)
+    {
+        if (!socket) return;
+        std::shared_ptr<Client> client;
+        {
+            std::lock_guard lock(clients_mutex_);
+            const auto iterator = clients_.find(socket);
+            if (iterator == clients_.end()) return;
+            client = std::move(iterator->second);
+            clients_.erase(iterator);
+        }
+        clients_condition_.notify_all();
+        stop_client(client);
+        join_client(client);
+        lsp::append_stream_capture_diagnostic_log(
+            "audio",
+            "client removed socket=" + std::to_string(socket));
+    }
+
 private:
+    static void stop_client(const std::shared_ptr<Client>& client)
+    {
+        if (!client) return;
+        {
+            std::lock_guard lock(client->mutex);
+            client->running = false;
+            client->has_payload = false;
+            client->pending_payload.clear();
+        }
+        client->condition.notify_all();
+        if (client->socket) {
+            uu::close_socket(client->socket);
+        }
+    }
+
+    static void join_client(const std::shared_ptr<Client>& client)
+    {
+        if (!client || !client->worker.joinable()
+            || client->worker.get_id() == std::this_thread::get_id()) {
+            return;
+        }
+        client->worker.join();
+    }
+
+    static bool client_is_failed(const std::shared_ptr<Client>& client)
+    {
+        std::lock_guard lock(client->mutex);
+        return client->failed;
+    }
+
+    bool has_clients() const
+    {
+        std::lock_guard lock(clients_mutex_);
+        return !clients_.empty();
+    }
+
+    void reap_failed_clients()
+    {
+        std::vector<std::shared_ptr<Client>> failed;
+        {
+            std::lock_guard lock(clients_mutex_);
+            for (auto iterator = clients_.begin(); iterator != clients_.end();) {
+                if (!client_is_failed(iterator->second)) {
+                    ++iterator;
+                    continue;
+                }
+                failed.push_back(std::move(iterator->second));
+                iterator = clients_.erase(iterator);
+            }
+        }
+        for (const auto& client : failed) {
+            stop_client(client);
+            join_client(client);
+            lsp::append_stream_capture_diagnostic_log_rate_limited(
+                "audio",
+                "client send failed socket=" + std::to_string(client->socket),
+                1000);
+        }
+    }
+
+    void client_loop(const std::shared_ptr<Client>& client)
+    {
+        for (;;) {
+            std::string payload;
+            {
+                std::unique_lock lock(client->mutex);
+                client->condition.wait(lock, [&] {
+                    return !client->running || client->has_payload || !running_;
+                });
+                if (!client->running || !running_) {
+                    break;
+                }
+                payload.swap(client->pending_payload);
+                client->has_payload = false;
+            }
+
+            if (!send_audio_message_bounded(client->socket, payload)) {
+                std::lock_guard lock(client->mutex);
+                client->failed = true;
+                client->running = false;
+                break;
+            }
+        }
+    }
+
     void run(uint16_t port)
     {
+        const uintptr_t listener = create_audio_listener(port, server_socket_);
+        if (!listener) {
+            lsp::append_stream_capture_diagnostic_log(
+                "audio",
+                "listener create failed port=" + std::to_string(port));
+            return;
+        }
+        lsp::append_stream_capture_diagnostic_log(
+            "audio",
+            "listener ready port=" + std::to_string(port));
         while (running_) {
-            const uintptr_t client = listen_tcp(port, running_, server_socket_);
-            if (!client || !running_) {
+            fd_set readable;
+            FD_ZERO(&readable);
+            FD_SET(static_cast<SOCKET>(listener), &readable);
+            timeval timeout = {};
+            timeout.tv_usec = 100000;
+            const int ready = ::select(0, &readable, nullptr, nullptr, &timeout);
+            if (!running_) break;
+            if (ready == SOCKET_ERROR) break;
+            if (ready == 0 || !FD_ISSET(static_cast<SOCKET>(listener), &readable)) {
+                reap_failed_clients();
                 continue;
             }
-            client_socket_ = client;
+
+            for (;;) {
+                const SOCKET client = ::accept(static_cast<SOCKET>(listener), nullptr, nullptr);
+                if (client == INVALID_SOCKET) {
+                    const int error = ::WSAGetLastError();
+                    if (error != WSAEWOULDBLOCK && error != WSAEINPROGRESS) {
+                        lsp::append_stream_capture_diagnostic_log_rate_limited(
+                            "audio",
+                            "accept failed error=" + std::to_string(error),
+                            1000);
+                    }
+                    break;
+                }
+                add_client(static_cast<uintptr_t>(client));
+            }
+            reap_failed_clients();
+        }
+        const uintptr_t currentListener = server_socket_.exchange(0);
+        if (currentListener) uu::close_socket(currentListener);
+    }
+
+    void capture_loop()
+    {
+        while (running_) {
+            {
+                std::unique_lock lock(clients_mutex_);
+                clients_condition_.wait(lock, [&] {
+                    return !running_ || !clients_.empty();
+                });
+            }
+            if (!running_) break;
 
             LoopbackCapture capture;
             std::string error;
-            if (capture.start(&error)) {
-                std::string payload;
-                while (running_ && client_socket_.load() == client &&
-                       capture.read_frame(&payload, running_, &client_socket_, client)) {
-                    if (!uu::send_message(client, payload)) {
-                        break;
-                    }
-                }
+            if (!capture.start(&error)) {
+                lsp::append_stream_capture_diagnostic_log_rate_limited(
+                    "audio",
+                    "loopback capture start failed error=" + error,
+                    1000);
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                continue;
             }
 
-            const uintptr_t current = client_socket_.exchange(0);
-            if (current) {
-                uu::close_socket(current);
+            std::string payload;
+            while (running_ && has_clients() && capture.read_frame(&payload, running_)) {
+                broadcast(payload);
             }
         }
+    }
+
+    void broadcast(const std::string& payload)
+    {
+        std::vector<std::shared_ptr<Client>> clients;
+        {
+            std::lock_guard lock(clients_mutex_);
+            clients.reserve(clients_.size());
+            for (const auto& [socket, client] : clients_) {
+                (void)socket;
+                clients.push_back(client);
+            }
+        }
+        for (const auto& client : clients) {
+            {
+                std::lock_guard lock(client->mutex);
+                if (!client->running) continue;
+                client->pending_payload = payload;
+                client->has_payload = true;
+            }
+            client->condition.notify_one();
+        }
+        reap_failed_clients();
     }
 
     std::atomic_bool running_ = false;
     std::atomic_uintptr_t server_socket_ = 0;
-    std::atomic_uintptr_t client_socket_ = 0;
+    mutable std::mutex clients_mutex_;
+    std::condition_variable clients_condition_;
+    std::unordered_map<uintptr_t, std::shared_ptr<Client>> clients_;
     std::thread worker_;
+    std::thread capture_worker_;
 };
 
 HostAudioStreamer::HostAudioStreamer()
@@ -589,6 +878,16 @@ void HostAudioStreamer::resetClient()
     if (impl_) {
         impl_->reset_client();
     }
+}
+
+bool HostAudioStreamer::addClient(uintptr_t socket)
+{
+    return impl_ && impl_->add_client(socket);
+}
+
+void HostAudioStreamer::removeClient(uintptr_t socket)
+{
+    if (impl_) impl_->remove_client(socket);
 }
 
 class ViewerAudioPlayer::Impl {

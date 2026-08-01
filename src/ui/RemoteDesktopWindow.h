@@ -174,6 +174,7 @@ private:
     QRect remoteUpdateButtonRect() const; // wjy: 更新按钮位于剪切板按钮左侧，对应用户标出的标题栏空白区域。
     QRect mouseInputModeRect() const; // wjy: 兼容保留既有函数名；该标题栏开关现在统一切换系统/驱动键鼠后端。
     QRect clipboardSyncRect() const;
+    QRect audioToggleRect() const; // wjy: 标题栏独立音频开关，默认静音且不参与画质焦点判定。
     QRect inputSyncRect() const; // wjy: 键鼠同步按钮固定在剪切板按钮左侧，并作为标题栏本地点击区排除远端输入。
     // ===end====
     QRect minimizeRect() const;
@@ -186,6 +187,7 @@ private:
     bool isTitleBarBlankArea(const QPoint& position) const; // wjy: 统一判断标题栏可拖动/可双击区域，排除右侧窗口控制按钮。
     void toggleMaximizedState(); // wjy: 删除最大化图标后仅由标题栏双击调用，统一切换最大化与普通状态。
     void toggleClipboardSync();
+    void toggleViewerAudio(); // wjy: 只切换当前远控窗口本地音频播放器，不影响其它窗口。
     void toggleInputSynchronization(); // wjy: 标题栏一次点击根据关闭、主控、跟随三态执行开启、关闭或主控切换。
     void toggleRemoteMouseBackend(); // wjy: 兼容沿用现有协议入口，根据 Host 确认状态同时切换键盘和鼠标注入后端。
     void requestRemoteMouseBackend(RemoteMouseBackend backend);
@@ -392,6 +394,7 @@ private:
     bool m_inputSyncButtonPressed = false; // wjy: 仅按下并在同一按钮内释放才切换主控，拖出热区不会误操作同步状态。
     // =====wjy====
     bool m_clipboardSyncEnabled = true; // wjy: 标题栏按钮与 Ctrl+B 共同切换，默认开启。
+    bool m_viewerAudioEnabled = false; // wjy: 每个远控窗口默认静音，状态不与焦点或画质绑定。
     QString m_lastLocalClipboardText;
     QString m_lastAppliedRemoteClipboardText;
     QTimer* m_clipboardPollTimer = nullptr;

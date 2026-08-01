@@ -248,7 +248,7 @@ stream::RemoteQualityConfiguration AppSettings::remoteQualityConfiguration()
     stream::RemoteQualityConfiguration configuration;
     configuration.defaultMode = static_cast<stream::RemoteQualityMode>(
         appSettings.value(QStringLiteral("remoteQuality/defaultMode"), static_cast<int>(stream::RemoteQualityMode::Automatic)).toInt()); // wjy: 全局默认模式读取整数枚举，未知值在统一归一化阶段回退自动。
-    return stream::normalizedRemoteQualityConfiguration(configuration); // wjy: 旧版复杂FPS/预算参数不再读取，仅保留默认模式；四档预设和后台档由代码统一定义。
+    return stream::normalizedRemoteQualityConfiguration(configuration); // wjy: 旧版复杂FPS/预算参数和历史阈值设置不再读取，高清面积阈值由代码默认值决定。
 }
 
 void AppSettings::setRemoteQualityConfiguration(const stream::RemoteQualityConfiguration& configuration)
@@ -257,7 +257,7 @@ void AppSettings::setRemoteQualityConfiguration(const stream::RemoteQualityConfi
         stream::normalizedRemoteQualityConfiguration(configuration); // wjy: 保存前校验默认模式，固定预设参数不再开放持久化修改。
     QSettings appSettings = settings();
     appSettings.setValue(QStringLiteral("remoteQuality/defaultMode"), static_cast<int>(normalized.defaultMode));
-    // wjy: 旧键保留在注册表中以便历史诊断，但新版本既不读取也不覆盖，避免它们再次改变固定预设。
+    // wjy: 旧阈值键保留在注册表中以便历史诊断，但新版本既不读取也不覆盖，避免它们改变代码内置阈值。
 }
 // ===end====
 

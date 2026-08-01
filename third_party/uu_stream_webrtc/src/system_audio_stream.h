@@ -18,6 +18,8 @@ public:
     bool start(uint16_t port, std::string* error);
     void stop();
     void resetClient();
+    bool addClient(uintptr_t socket);
+    void removeClient(uintptr_t socket);
 
 private:
     class Impl;

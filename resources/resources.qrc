@@ -28,6 +28,8 @@
         <file alias="resource/images/titlebar/rd_maximize.svg">uuguest/titlebar/rd_maximize.svg</file>
         <file alias="resource/images/titlebar/rd_close.svg">uuguest/titlebar/rd_close.svg</file>
         <file alias="resource/images/titlebar/rd_control_center.svg">uuguest/titlebar/rd_control_center.svg</file>
+        <file alias="resource/images/titlebar/rd_audio_on.svg">uuguest/titlebar/rd_audio_on.svg</file>
+        <file alias="resource/images/titlebar/rd_audio_off.svg">uuguest/titlebar/rd_audio_off.svg</file>
         <file alias="resource/images/desktop_bk_image.png">uuguest/desktop_bk_image.png</file>
         <file alias="resource/images/menu/terminal.svg">uuguest/menu/terminal.svg</file>
         <file alias="resource/images/menu/power.svg">uuguest/menu/power.svg</file>

@@ -164,6 +164,7 @@ QString remoteQualityReasonText(RemoteQualityDegradationReason reason)
     case RemoteQualityDegradationReason::ModePreference: return QString::fromUtf8("模式预设");
     case RemoteQualityDegradationReason::Background: return QString::fromUtf8("后台低性能保活");
     case RemoteQualityDegradationReason::Minimized: return QString::fromUtf8("最小化保活");
+    case RemoteQualityDegradationReason::LargestWindowBelowThreshold: return QString::fromUtf8("最大窗口未达到高清阈值");
     case RemoteQualityDegradationReason::PipelinePressure: return QString::fromUtf8("接收管线持续压力");
     case RemoteQualityDegradationReason::SeverePipelinePressure: return QString::fromUtf8("接收管线严重压力");
     case RemoteQualityDegradationReason::SoftwareFallback: return QString::fromUtf8("D3D11恢复中，软件保活");
@@ -195,7 +196,7 @@ bool sameQualityDecision(const RemoteQualityDecision& left, const RemoteQualityD
         && left.fullScreen == right.fullScreen
         && left.minimized == right.minimized
         && left.softwareFallback == right.softwareFallback
-        && left.audioEnabled == right.audioEnabled; // wjy: 焦点和音频所有权变化必须作为真实决策变化处理，不能被相同画质参数去重。
+        && left.audioEnabled == right.audioEnabled; // wjy: 独立音频按钮状态作为真实决策变化处理，不能被相同画质参数去重。
 }
 // ===end====
 
@@ -1783,7 +1784,7 @@ bool RemoteDesktopWindow::event(QEvent* event)
             || event->type() == QEvent::Show
             || event->type() == QEvent::Hide
             || event->type() == QEvent::WindowActivate
-            || event->type() == QEvent::WindowDeactivate); // wjy: 焦点进入/离开也会切换唯一音频与前后台画质，必须立即通知协调器。
+            || event->type() == QEvent::WindowDeactivate); // wjy: 显隐、最小化和焦点状态变化统一触发一次窗口面积策略重算；音频按钮仍独立控制。
     const bool titleBarScaleChanged = event
         && event->type() == QEvent::DevicePixelRatioChange; // wjy: 跨不同DPI显示器后必须按新物理像素尺寸重建标题栏DIB，逻辑命中矩形保持不变。
     if (event && event->type() == QEvent::WindowActivate) {
@@ -1799,7 +1800,7 @@ bool RemoteDesktopWindow::event(QEvent* event)
         update(); // wjy: 状态改变后重绘，确保旧标题栏不会残留在全屏画面顶部。
     }
     if (qualityVisibilityChanged && !m_closeInProgress) {
-        emit remoteQualityInputsChanged(); // wjy: 显隐、最小化和焦点变化都在下一轮Qt事件切换画质与音频，不等待1秒轮询。
+        emit remoteQualityInputsChanged(); // wjy: 显隐、最小化和窗口状态变化立即重算最大窗口与后台FPS，不等待1秒轮询。
     }
     if (titleBarScaleChanged) {
         ++m_titleBarVisualRevision;
@@ -1929,13 +1930,14 @@ RemoteQualityWindowMetrics RemoteDesktopWindow::remoteQualityMetrics()
     metrics.effectiveMode = effectiveQualityMode();
     metrics.visible = isVisible() && !m_closeInProgress;
     metrics.minimized = isMinimized();
-    metrics.fullScreen = isFullScreen(); // wjy: 可见全屏窗口即使暂时失焦也保持高性能，但音频仍由协调器只授予真实焦点窗口。
+    metrics.fullScreen = isFullScreen(); // wjy: 保留全屏状态用于标题栏/诊断；视频高性能现在只由最大可见面积决定。
     metrics.softwareFallback = m_softwareFallbackActive; // wjy: 重试开放期间也保持BGRA回退硬上限，必须等纹理实际成功后才恢复。
     const QSize sourceSize = remoteFrameSize().isValid() ? remoteFrameSize() : QSize(1920, 1080);
     metrics.sourceWidth = sourceSize.width();
     metrics.sourceHeight = sourceSize.height();
     metrics.viewportWidth = qMax(1, width());
     metrics.viewportHeight = qMax(1, height() - titleBarHeight()); // wjy: 平铺小窗口按真实显示高度降低像素，优先把资源留给FPS。
+    metrics.viewportArea = metrics.viewportWidth * metrics.viewportHeight;
     metrics.receiveFps = qMax(0.0, m_receiveFps);
     metrics.encodedMbps = qMax(0.0, m_encodedMbps);
 
@@ -1990,17 +1992,20 @@ void RemoteDesktopWindow::applyRemoteQualityDecision(const RemoteQualityDecision
     m_remoteQualityDecision = decision; // wjy: 无论Viewer是否已创建都保存最新值，连接成功后只补发这一份。
     m_hasRemoteQualityDecision = true;
     sendCurrentRemoteQualityDecision();
-    sendCurrentViewerAudioDecision(); // wjy: 画质和音频共用同一焦点决策，但音频通过独立可选ABI在线切换。
+    sendCurrentViewerAudioDecision(); // wjy: 质量请求变化时顺带补发本窗口独立音频状态，二者不共享所有权判定。
     if (feedbackChanged) {
-        appendViewerDebugLog(QStringLiteral("quality role host=%1 active=%2 fullscreen=%3 background=%4 audio=%5 resolution=%6 fps=%7 priority=%8")
+        appendViewerDebugLog(QStringLiteral("quality role host=%1 active=%2 fullscreen=%3 background=%4 audio=%5 resolution=%6 target=%7x%8 fps=%9 priority=%10 reason=%11")
             .arg(m_hostIp)
             .arg(decision.active ? 1 : 0)
             .arg(decision.fullScreen ? 1 : 0)
             .arg(!decision.active && !decision.fullScreen ? 1 : 0)
             .arg(decision.audioEnabled ? 1 : 0)
             .arg(static_cast<int>(decision.resolution))
+            .arg(decision.targetWidth)
+            .arg(decision.targetHeight)
             .arg(decision.targetFps)
-            .arg(decision.priority)); // wjy: 只在角色/档位状态变化时写data日志，不按每秒评估或每帧重复输出。
+            .arg(decision.priority)
+            .arg(static_cast<int>(decision.reason))); // wjy: 只在角色/档位状态变化时写data日志，额外记录目标尺寸和原因便于确认最大窗口/后台降帧策略。
         requestTitleBarUpdate();
     }
 }
@@ -2051,7 +2056,7 @@ void RemoteDesktopWindow::sendCurrentViewerAudioDecision()
     if (!m_hasRemoteQualityDecision || !m_viewerHandle || m_closeInProgress) {
         return;
     }
-    const bool enabled = m_remoteQualityDecision.audioEnabled;
+    const bool enabled = m_viewerAudioEnabled;
     const quint64 currentGeneration = m_viewerGeneration.load(std::memory_order_acquire);
     if (m_hasLastSentViewerAudioState
         && m_lastAudioViewerGeneration == currentGeneration
@@ -2063,11 +2068,11 @@ void RemoteDesktopWindow::sendCurrentViewerAudioDecision()
     m_lastSentViewerAudioEnabled = enabled;
     m_hasLastSentViewerAudioState = true;
     m_lastAudioViewerGeneration = currentGeneration; // wjy: 即使旧DLL缺失导出也锁存本次结果，避免一秒轮询持续尝试；新代际会重新探测。
-    appendViewerDebugLog(QStringLiteral("audio owner host=%1 enabled=%2 api_supported=%3 generation=%4")
+    appendViewerDebugLog(QStringLiteral("audio state host=%1 enabled=%2 api_supported=%3 generation=%4")
         .arg(m_hostIp)
         .arg(enabled ? 1 : 0)
         .arg(supported ? 1 : 0)
-        .arg(currentGeneration)); // wjy: 焦点音频所有权每次真实变化只记录一条data诊断。
+        .arg(currentGeneration)); // wjy: 标题栏音频状态每次真实变化只记录一条data诊断。
 }
 
 void RemoteDesktopWindow::refreshAppliedRemoteQualityStatus()
@@ -2757,6 +2762,7 @@ RemoteTitleBarVisualState RemoteDesktopWindow::titleBarVisualState() const
         state.inputSyncBackground = QColor(QStringLiteral("#E2E8F0"));
     }
     state.inputSyncPressed = m_inputSyncButtonPressed;
+    state.audioEnabled = m_viewerAudioEnabled;
     state.clipboardEnabled = m_clipboardSyncEnabled;
     return state;
 }
@@ -3027,7 +3033,7 @@ QRect RemoteDesktopWindow::titleBarHoverRectAt(const QPoint& position) const
     }
     const RemoteTitleBarLayoutSnapshot layout = titleBarLayoutSnapshot();
     for (const QRect& control : {layout.update, layout.mouseBackend,
-             layout.inputSync, layout.clipboard, layout.minimize, layout.close}) {
+             layout.inputSync, layout.audio, layout.clipboard, layout.minimize, layout.close}) {
         if (!control.isEmpty() && control.contains(position)) {
             return control; // wjy: 只把实际可见按钮视为悬停区域，设备文字和标题栏空白区移动不会产生绘制请求。
         }
@@ -3095,6 +3101,11 @@ QRect RemoteDesktopWindow::clipboardSyncRect() const
     return titleBarLayoutSnapshot().clipboard;
 }
 
+QRect RemoteDesktopWindow::audioToggleRect() const
+{
+    return titleBarLayoutSnapshot().audio;
+}
+
 // =====wjy====
 QRect RemoteDesktopWindow::inputSyncRect() const
 {
@@ -3120,6 +3131,7 @@ bool RemoteDesktopWindow::isTitleBarBlankArea(const QPoint& position) const
         && !(m_remoteUpdateAvailable && remoteUpdateButtonRect().contains(position)) // wjy: 更新按钮可见时从拖动、双击和右键空白区中排除。
         && !mouseInputModeRect().contains(position) // wjy: 键鼠注入后端是本地标题栏开关，不能触发拖窗、右键设备菜单或远端输入。
         && !inputSyncRect().contains(position) // wjy: 键鼠同步是纯本地标题栏操作，不能落入拖窗或远端鼠标路径。
+        && !audioToggleRect().contains(position)
         && !clipboardSyncRect().contains(position)
         && !minimizeRect().contains(position)
         && !closeRect().contains(position);
@@ -3156,6 +3168,16 @@ void RemoteDesktopWindow::toggleClipboardSync()
 {
     setClipboardSyncEnabled(!m_clipboardSyncEnabled);
     platform::AppSettings::setRemoteClipboardSyncEnabled(m_clipboardSyncEnabled);
+}
+
+void RemoteDesktopWindow::toggleViewerAudio()
+{
+    m_viewerAudioEnabled = !m_viewerAudioEnabled;
+    sendCurrentViewerAudioDecision();
+    requestTitleBarUpdate(audioToggleRect());
+    appendViewerDebugLog(QStringLiteral("audio toggle host=%1 enabled=%2")
+        .arg(m_hostIp)
+        .arg(m_viewerAudioEnabled ? 1 : 0));
 }
 
 stream::RemoteQualityMode RemoteDesktopWindow::effectiveQualityMode() const
@@ -4800,7 +4822,7 @@ void RemoteDesktopWindow::startViewerConnectionWithAdmission()
             releaseViewerStartupAdmission(); // wjy: 创建失败不继续占用初始化预算，下一台设备可以立即补位。
         } else {
             sendCurrentRemoteQualityDecision(); // wjy: 窗口排队初始化期间若全局/局部策略已变化，只向新Viewer补发最终最新值。
-            sendCurrentViewerAudioDecision(); // wjy: Viewer默认静音，创建成功后立即按当前真实焦点补发唯一音频状态。
+            sendCurrentViewerAudioDecision(); // wjy: Viewer默认静音，创建成功后立即补发本窗口当前音频按钮状态。
         }
     } else {
         setConnectionStatus(90, QString::fromUtf8("设备 IP 为空"));
@@ -5050,7 +5072,7 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     constexpr int elapsedGap = 14;
     int titleTextRight = width() - 6;
     for (const QRect& control : {titleLayout.update, titleLayout.mouseBackend,
-             titleLayout.inputSync, titleLayout.clipboard, titleLayout.minimize, titleLayout.close}) {
+             titleLayout.inputSync, titleLayout.audio, titleLayout.clipboard, titleLayout.minimize, titleLayout.close}) {
         if (!control.isEmpty()) titleTextRight = qMin(titleTextRight, control.left());
     } // wjy: 标题辅助文字只让位给当前真正可见的最左侧控件，隐藏控件不会继续占用空白。
     const int maxIpWidth = qMax(0, titleTextRight - ipX - elapsedGap - elapsedTextWidth - 8);
@@ -5094,6 +5116,25 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
         painter.setFont(updateFont);
         painter.setPen(QColor(QStringLiteral("#FFFFFF")));
         painter.drawText(updateRect, Qt::AlignCenter, QString::fromUtf8("更新")); // wjy: 只在目标端明确返回需要更新时显示文字按钮。
+    }
+
+    if (!titleLayout.audio.isEmpty()) {
+        const QPixmap audioIcon = icon(m_viewerAudioEnabled
+                ? QStringLiteral("rd_audio_on.svg")
+                : QStringLiteral("rd_audio_off.svg"));
+        if (!audioIcon.isNull()) {
+            const QRect audioRect = titleLayout.audio;
+            if (audioRect.contains(m_hoveredPos)) {
+                painter.setPen(Qt::NoPen);
+                painter.setBrush(QColor(QStringLiteral("#DCE4EC")));
+                painter.drawRect(audioRect);
+            }
+            QSize target = audioIcon.size();
+            target.scale(qMax(16, audioRect.width() - 12), qMax(16, barH - 8), Qt::KeepAspectRatio);
+            painter.drawPixmap(audioRect.center().x() - target.width() / 2,
+                audioRect.center().y() - target.height() / 2,
+                audioIcon);
+        }
     }
 
     // =====wjy====
@@ -5292,6 +5333,11 @@ void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
             requestTitleBarUpdate(inputSyncRect());
             event->accept();
             return; // wjy: 按下阶段只记录视觉状态，必须在同一热区释放后才真正切换主控。
+        }
+        if (!isFullScreen() && audioToggleRect().contains(event->pos())) {
+            toggleViewerAudio();
+            event->accept();
+            return; // wjy: 音频按钮单击立即切换当前窗口播放器，默认静音且不参与拖窗。
         }
         // ===end====
         m_resizeEdges = resizeEdgesAt(event->pos());
@@ -5506,6 +5552,10 @@ void RemoteDesktopWindow::mouseReleaseEvent(QMouseEvent* event)
                 toggleClipboardSync(); // wjy: 标题栏按钮切换剪切板同步，与 Ctrl+B 共用同一状态。
                 event->accept();
                 return;
+            }
+            if (audioToggleRect().contains(event->pos())) {
+                event->accept();
+                return; // wjy: 音频在按下阶段已完成切换，释放阶段不重复切换。
             }
             if (minimizeRect().contains(event->pos())) {
                 showMinimized();

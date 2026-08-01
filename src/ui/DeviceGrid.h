@@ -233,7 +233,7 @@ private:
     void saveRemoteQualitySettingsFromControls(); // wjy: 收集远控画质页字段、统一归一化持久化并立即通知跟随全局的窗口。
     void registerRemoteQualityWindow(RemoteDesktopWindow* window); // wjy: 普通和平铺窗口共用同一套质量注册、销毁清理和即时重算逻辑。
     void requestRemoteQualityEvaluation(); // wjy: 合并同一事件循环内多次窗口变化，最多排队一个全局质量计算任务。
-    void evaluateRemoteQuality(); // wjy: 每秒汇总窗口；固定模式重复确认预设，仅自动模式计算60/45/30 FPS档位。
+    void evaluateRemoteQuality(); // wjy: 每秒汇总窗口，保留最大可见窗口的原始/60请求并按数量/Presenter压力降低其它窗口。
     void saveShortcutKeySetting(int shortcutIndex, const QString& shortcutText); // wjy: Save one keyboard shortcut when its editor loses focus or receives Enter.
     void registerGlobalShortcuts();
     void unregisterGlobalShortcuts();

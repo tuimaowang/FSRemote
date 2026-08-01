@@ -3166,7 +3166,7 @@ void drawSettingsPage(
         painter.setPen(QColor(QStringLiteral("#687384")));
         painter.drawText(QRectF(qualityCard.x() + 28, qualityCard.y() + 38, qualityCard.width() - 56, 18),
             Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("根据当前控制窗口、全屏和后台状态自动切换，不需要手动选择。")); // wjy: 设置页明确展示新的焦点驱动画质策略。
+            QString::fromUtf8("按最大可见窗口面积选择高清，其它窗口使用低质保活档；音频由标题栏按钮独立控制。")); // wjy: 设置页与当前最大窗口阈值策略保持一致。
 
         QFont labelFont(textFont);
         labelFont.setPixelSize(12);
@@ -3182,11 +3182,12 @@ void drawSettingsPage(
         presetFont.setPixelSize(12);
         painter.setFont(presetFont);
         const QStringList presetLines = {
-            QString::fromUtf8("当前控制窗口    原始分辨率 · 60 FPS"),
-            QString::fromUtf8("全屏窗口            原始分辨率 · 60 FPS"),
-            QString::fromUtf8("其它可见窗口    720p · 60 FPS"),
+            QString::fromUtf8("最大可见窗口    原始分辨率 · 60 FPS"),
+            QString::fromUtf8("低于面积阈值    720p · 15 FPS"),
+            QString::fromUtf8("其它可见窗口    720p · 15 FPS"),
             QString::fromUtf8("最小化/隐藏       540p · 15 FPS"),
             QString::fromUtf8("软件回退            540p · 24 FPS 安全档"),
+            QString::fromUtf8("音频                    默认静音，按钮独立控制"),
         };
         for (int index = 0; index < presetLines.size(); ++index) {
             const QRectF lineRect(
@@ -6564,7 +6565,7 @@ void DeviceGrid::saveRemoteQualitySettingsFromControls()
         return; // wjy: 构造阶段下拉框尚未创建时不写入默认模式。
     }
 
-    stream::RemoteQualityConfiguration configuration;
+    stream::RemoteQualityConfiguration configuration = m_remoteQualityConfiguration;
     configuration.defaultMode = stream::RemoteQualityMode::Automatic; // wjy: 智能策略固定为唯一入口，保留配置对象仅兼容现有在线质量管线。
     m_remoteQualityConfiguration = stream::normalizedRemoteQualityConfiguration(configuration); // wjy: 只接受四种可持久化默认模式，其余FPS/分辨率字段恢复代码内置预设。
     platform::AppSettings::setRemoteQualityConfiguration(m_remoteQualityConfiguration);
@@ -6615,14 +6616,12 @@ void DeviceGrid::evaluateRemoteQuality()
     }
     try {
         const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
-        auto* activeWindow = qobject_cast<RemoteDesktopWindow*>(QApplication::activeWindow()); // wjy: 使用Qt当前真实活动顶层窗口；切到主界面或其它应用后不再沿用“最近激活”远控窗口。
         std::vector<RemoteQualityWindowMetrics> metrics;
         metrics.reserve(static_cast<std::size_t>(windows.size()));
         for (const QPointer<RemoteDesktopWindow>& window : windows) {
             if (window) {
                 RemoteQualityWindowMetrics snapshot = window->remoteQualityMetrics();
-                snapshot.active = snapshot.visible && !snapshot.minimized
-                    && (window.data() == activeWindow || window->isActiveWindow()); // wjy: 只让真实可见焦点窗口成为音频/最高性能所有者，原生子窗口焦点由isActiveWindow兜底识别。
+                snapshot.active = snapshot.visible && !snapshot.minimized && window->isActiveWindow(); // wjy: active仅保留兼容状态，高清候选改由可见窗口面积决定。
                 metrics.push_back(snapshot); // wjy: 只在Qt线程附加真实焦点身份，不跨线程访问原生WebRTC对象。
             }
         }
@@ -6632,21 +6631,9 @@ void DeviceGrid::evaluateRemoteQuality()
             metrics,
             nowMs);
         for (const RemoteQualityDecision& decision : decisions) {
-            if (decision.audioEnabled) {
-                continue; // wjy: 先关闭所有非所有者音频，再启动新所有者，焦点切换过程中也不出现双音频重叠窗口。
-            }
             auto* window = reinterpret_cast<RemoteDesktopWindow*>(decision.windowId);
             if (window && windows.contains(QPointer<RemoteDesktopWindow>(window))) {
-                window->applyRemoteQualityDecision(decision); // wjy: 每个窗口内部按Viewer代际去重并在线发送，未连接窗口仅缓存最后决策。
-            }
-        }
-        for (const RemoteQualityDecision& decision : decisions) {
-            if (!decision.audioEnabled) {
-                continue;
-            }
-            auto* window = reinterpret_cast<RemoteDesktopWindow*>(decision.windowId);
-            if (window && windows.contains(QPointer<RemoteDesktopWindow>(window))) {
-                window->applyRemoteQualityDecision(decision); // wjy: 全部旧播放器停止后才启用唯一焦点窗口，严格维持全局单音频所有权。
+                window->applyRemoteQualityDecision(decision); // wjy: 画质按最大可见窗口统一下发，音频由每个窗口自己的标题栏按钮控制。
             }
         }
         if (!windows.isEmpty()
@@ -8891,7 +8878,7 @@ void DeviceGrid::refreshRealtimeUpdateAvailability()
 void DeviceGrid::rememberRemoteWindowActivation(RemoteDesktopWindow* window)
 {
     m_remoteWindowCoordinator->rememberActivation(window); // wjy: 激活顺序由协调器维护，快捷键不再依赖 DeviceGrid 容器。
-    requestRemoteQualityEvaluation(); // wjy: 用户切换控制窗口后立即把新窗口升为高质量，并把其它普通窗口切为流畅。
+    requestRemoteQualityEvaluation(); // wjy: 激活变化只触发一次面积策略重算；高质量保留者由最大可见窗口决定，不由焦点决定。
 }
 
 RemoteDesktopWindow* DeviceGrid::topmostRemoteWindow() const
