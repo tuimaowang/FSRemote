@@ -233,11 +233,6 @@ QRect titleBarCenteredRect(int x, int width, int visualHeight = kTitleBarVisualH
     return QRect(x, (kTitleBarHeight - visualHeight) / 2, width, visualHeight); // wjy: 根据标题栏总高度统一计算垂直居中位置，让刷新、最小化、关闭和左上标题名高度对齐。
 }
 
-QRect titlebarLaunchButtonRect()
-{
-    return QRect(12, 0, 132, kTitleBarHeight); // wjy: 左上角“丰实远程控制”标题名现在作为打开远程窗口的点击入口。
-}
-
 QRect titlebarSettingsRect()
 {
     return QRect(shellWidth() - 180, 0, 48, kTitleBarHeight); // wjy: 设置入口贴着刷新按钮左侧，窗口变宽时跟随右边缘移动。
@@ -497,8 +492,11 @@ void drawResourceIcon(QPainter& painter, const QRect& target, const QString& nam
 
 // =====wjy====
 constexpr int kRemoteShortcutCount = 5; // wjy: 增加剪切板同步快捷键编辑项。
-constexpr int kShortcutEditorCount = 6; // wjy: 五个远控全局快捷键加一个仅主窗口生效的删除设备快捷键都使用相同编辑控件。
-constexpr int kDeleteDeviceShortcutIndex = 5;
+constexpr int kRemoteWindowShortcutMouseLockIndex = 5;
+constexpr int kRemoteWindowShortcutRecordingIndex = 6;
+constexpr int kRemoteWindowShortcutPlaybackIndex = 7;
+constexpr int kShortcutEditorCount = 9; // wjy: 五个远控全局快捷键、三个远控窗口快捷键和一个删除设备快捷键共用同一编辑控件。
+constexpr int kDeleteDeviceShortcutIndex = 8;
 constexpr int kGlobalShortcutIdBase = 0x5100;
 
 bool isShortcutModifierKey(int key)
@@ -548,6 +546,9 @@ QKeySequence remoteShortcutForIndex(int index)
     case 2: return platform::AppSettings::remoteShortcutCloseTopmost();
     case 3: return platform::AppSettings::remoteShortcutCloseAll();
     case 4: return platform::AppSettings::remoteShortcutClipboardSync();
+    case kRemoteWindowShortcutMouseLockIndex: return platform::AppSettings::remoteShortcutMouseLock();
+    case kRemoteWindowShortcutRecordingIndex: return platform::AppSettings::remoteShortcutInputScriptRecording();
+    case kRemoteWindowShortcutPlaybackIndex: return platform::AppSettings::remoteShortcutInputScriptPlayback();
     case kDeleteDeviceShortcutIndex: return platform::AppSettings::deviceShortcutDelete();
     default: return {};
     }
@@ -561,6 +562,9 @@ void setRemoteShortcutForIndex(int index, const QKeySequence& shortcut)
     case 2: platform::AppSettings::setRemoteShortcutCloseTopmost(shortcut); break;
     case 3: platform::AppSettings::setRemoteShortcutCloseAll(shortcut); break;
     case 4: platform::AppSettings::setRemoteShortcutClipboardSync(shortcut); break;
+    case kRemoteWindowShortcutMouseLockIndex: platform::AppSettings::setRemoteShortcutMouseLock(shortcut); break;
+    case kRemoteWindowShortcutRecordingIndex: platform::AppSettings::setRemoteShortcutInputScriptRecording(shortcut); break;
+    case kRemoteWindowShortcutPlaybackIndex: platform::AppSettings::setRemoteShortcutInputScriptPlayback(shortcut); break;
     case kDeleteDeviceShortcutIndex: platform::AppSettings::setDeviceShortcutDelete(shortcut); break;
     default: break;
     }
@@ -1339,6 +1343,7 @@ struct BatchAddResult {
     QString ip;
     QString mac;
     QString broadcastIp;
+    platform::DeviceStatusInfo status; // wjy: 保留 TCP 49101 返回的完整权威状态，UI 线程通过实时归并器应用而不是直接写 Online。
 };
 
 bool isSameSubnet(const QString& targetIp, const QString& candidateIp, const QString& subnetMask)
@@ -1811,11 +1816,20 @@ int maxSettingsScrollOffset(bool localInfoExpanded, bool addDeviceExpanded)
 }
 
 // =====wjy====
-ui::SettingsLayoutSnapshot settingsLayoutSnapshot(bool localInfoExpanded, bool addDeviceExpanded, int requestedScrollOffset)
+int keyboardShortcutMaxScrollOffset(); // wjy: 键盘页布局快照在快捷键几何函数定义前使用前置声明，避免回退到常规页滚动上限。
+
+ui::SettingsLayoutSnapshot settingsLayoutSnapshot(
+    bool localInfoExpanded,
+    bool addDeviceExpanded,
+    int requestedScrollOffset,
+    bool keyboardSelected = false)
 {
+    const int maxScrollOffset = keyboardSelected
+        ? keyboardShortcutMaxScrollOffset()
+        : maxSettingsScrollOffset(localInfoExpanded, addDeviceExpanded);
     return ui::SettingsLayoutSnapshot(
         settingsScrollViewportRect(),
-        maxSettingsScrollOffset(localInfoExpanded, addDeviceExpanded),
+        maxScrollOffset,
         requestedScrollOffset); // wjy: DeviceGrid 只提供内容相关输入，滚动换算和命中规则交给独立辅助类。
 }
 // ===end====
@@ -3039,6 +3053,13 @@ QRect settingsShortcutKeyEditRect(int index)
     const QRect keyboardCard = settingsScrollViewportRect(); // wjy: 快捷键页面板和设备详情页主体区域共用同一矩形。
     return QRect(keyboardCard.right() - 170, keyboardCard.y() + 65 + index * 48, 140, 30); // wjy: 每个快捷键输入框贴在键盘设置行右侧，宽度加大以容纳 Ctrl+Shift+X 这类组合。
 }
+
+int keyboardShortcutMaxScrollOffset()
+{
+    const QRect keyboardCard = settingsScrollViewportRect();
+    const QRect lastShortcutRect = settingsShortcutKeyEditRect(kShortcutEditorCount - 1);
+    return qMax(0, lastShortcutRect.bottom() - keyboardCard.bottom()); // wjy: 键盘页只按九行实际高度计算滚动上限，不把常规页更长内容的偏移带到快捷键页。
+}
 // ===end====
 
 void drawSettingsTab(QPainter& painter, const QRect& rect, const QString& text, bool selected, const QFont& font)
@@ -3084,6 +3105,19 @@ void drawSettingsOptionIcon(QPainter& painter, const QRect& rect, int iconKind)
         painter.drawRoundedRect(QRectF(c.x() - 8, c.y() - 7, 16, 14), 2, 2);
         painter.drawLine(QPointF(c.x() - 5, c.y() - 1), QPointF(c.x() + 5, c.y() - 1));
         painter.drawLine(QPointF(c.x() - 5, c.y() + 4), QPointF(c.x() + 5, c.y() + 4));
+    } else if (iconKind == 7) {
+        painter.drawRoundedRect(QRectF(c.x() - 6, c.y() - 1, 12, 9), 2, 2); // wjy: 锁体图标对应 F2 手动鼠标锁定。
+        painter.drawArc(QRectF(c.x() - 5, c.y() - 9, 10, 12), 0, 180 * 16);
+    } else if (iconKind == 8) {
+        painter.drawEllipse(QRectF(c.x() - 7, c.y() - 7, 14, 14)); // wjy: 空心录制圆点对应 F9 键鼠录制。
+        painter.setBrush(QColor(QStringLiteral("#3A7BFC")));
+        painter.drawEllipse(QRectF(c.x() - 3, c.y() - 3, 6, 6));
+    } else if (iconKind == 9) {
+        painter.drawPolygon(QPolygonF{QPointF(c.x() - 4, c.y() - 8), QPointF(c.x() + 7, c.y()), QPointF(c.x() - 4, c.y() + 8)}); // wjy: 播放三角对应 F10 脚本播放。
+    } else if (iconKind == 10) {
+        painter.drawRoundedRect(QRectF(c.x() - 6, c.y() - 5, 12, 12), 1, 1); // wjy: 简单垃圾桶图标对应删除设备。
+        painter.drawLine(QPointF(c.x() - 8, c.y() - 7), QPointF(c.x() + 8, c.y() - 7));
+        painter.drawLine(QPointF(c.x() - 3, c.y() - 9), QPointF(c.x() + 3, c.y() - 9));
     } else {
         painter.drawRoundedRect(QRectF(c.x() - 9, c.y() - 7, 18, 14), 2, 2); // wjy: 壁纸测试项使用横向图片框图标，与本机信息文档图标区分。
         painter.drawEllipse(QRectF(c.x() + 3, c.y() - 4, 3, 3)); // wjy: 右上圆点表示图片中的太阳。
@@ -3128,7 +3162,11 @@ void drawSettingsPage(
     const platform::DeviceInfo& localInfo,
     int settingsScrollOffset)
 {
-    const SettingsLayoutSnapshot layout = settingsLayoutSnapshot(localInfoExpanded, addDeviceExpanded, settingsScrollOffset); // wjy: 这一帧绘制固定使用同一份布局快照，避免视口、滚动上限和真实控件各自重新计算。
+    const SettingsLayoutSnapshot layout = settingsLayoutSnapshot(
+        localInfoExpanded,
+        addDeviceExpanded,
+        settingsScrollOffset,
+        keyboardSelected); // wjy: 键盘页使用九行快捷键自己的滚动上限，绘制、滚动条和真实输入框保持同一快照。
     QFont tabFont(textFont);
     tabFont.setPixelSize(14);
     tabFont.setBold(true);
@@ -3220,7 +3258,7 @@ void drawSettingsPage(
         painter.setPen(QColor(QStringLiteral("#040B18")));
         painter.drawText(QRectF(keyboardCard.x() + 28, keyboardCard.y() + 18, keyboardCard.width() - 56, 22),
             Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("键盘快捷键")); // wjy: 键盘页统一展示并编辑远控窗口快捷键和删除设备快捷键。
+            QString::fromUtf8("键盘快捷键")); // wjy: 键盘页统一展示并编辑主窗口、远控窗口和删除设备快捷键。
 
         const struct ShortcutRow {
             const char* action;
@@ -3231,6 +3269,9 @@ void drawSettingsPage(
             {"关闭最上方窗口", "关闭当前最上方的一个远控窗口"},
             {"关闭全部窗口", "关闭所有已经调出的远控窗口"},
             {"剪切板同步", "开启或关闭远控窗口剪切板同步"},
+            {"鼠标锁定", "切换当前远控窗口的手动相对鼠标锁定"},
+            {"键鼠录制", "开始或结束当前远控窗口的键鼠录制"},
+            {"脚本播放", "选择脚本并开始或停止键鼠回放"},
             {"删除设备", "从本机设备列表中移除当前选中的设备"},
         };
 
@@ -3238,11 +3279,15 @@ void drawSettingsPage(
         rowTitle.setPixelSize(13);
         QFont rowDetail(textFont);
         rowDetail.setPixelSize(12);
+        painter.save();
+        painter.setClipRect(keyboardCard.adjusted(0, 56, 0, -1)); // wjy: 追加快捷键行超出最低窗口高度时，只裁剪内容区，标题仍固定在卡片顶部。
+        painter.translate(0, -layout.scrollOffset()); // wjy: 键盘页快捷键行与真实 QLineEdit 共用设置页滚动偏移，保证 9 行在窄窗口仍可访问。
         for (int i = 0; i < kShortcutEditorCount; ++i) {
             const int y = keyboardCard.y() + 64 + i * 48;
             const QRect keyRect = settingsShortcutKeyEditRect(i); // wjy: 绘制背景和真实输入框共用同一矩形，避免视觉/点击区域错位。
             // wjy: 快捷键行之间不再画分隔横线，界面更紧凑。
-            drawSettingsOptionIcon(painter, QRect(keyboardCard.x() + 28, y + 2, 28, 28), i + 1);
+            const int iconKind = i < 5 ? i + 1 : i + 2; // wjy: 保留 iconKind=6 给常规页自动壁纸，新增远控快捷键从 7 开始。
+            drawSettingsOptionIcon(painter, QRect(keyboardCard.x() + 28, y + 2, 28, 28), iconKind);
             painter.setFont(rowTitle);
             painter.setPen(QColor(QStringLiteral("#111827")));
             painter.drawText(QRectF(keyboardCard.x() + 72, y, 180, 18), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8(rows[i].action));
@@ -3250,6 +3295,16 @@ void drawSettingsPage(
             painter.setPen(QColor(QStringLiteral("#687384")));
             painter.drawText(QRectF(keyboardCard.x() + 72, y + 20, qMax(120, keyRect.left() - keyboardCard.x() - 88), 18), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8(rows[i].detail));
             drawShortcutKey(painter, keyRect, remoteShortcutDisplayText(i));
+        }
+        painter.restore();
+        const int keyboardMaxScrollOffset = keyboardShortcutMaxScrollOffset();
+        if (keyboardMaxScrollOffset > 0) {
+            const QRect track = settingsVerticalScrollbarTrackRect();
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(QColor(QStringLiteral("#E5EAF1")));
+            painter.drawRoundedRect(QRectF(track), 2.5, 2.5); // wjy: 键盘页超出最低窗口高度时显示与常规页一致的滚动轨道。
+            painter.setBrush(QColor(QStringLiteral("#AAB3C0")));
+            painter.drawRoundedRect(QRectF(settingsVerticalScrollbarThumbRect(layout.scrollOffset(), keyboardMaxScrollOffset)), 2.5, 2.5); // wjy: 滑块位置与快捷键行滚动偏移保持一致。
         }
         painter.restore();
         return;
@@ -3630,7 +3685,7 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     });
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after group rename editor create")); // wjy: 记录分组原地重命名输入框创建和信号连接完成。
 
-    m_deviceListNameEdit = new QLineEdit(this); // wjy: 设备双击后在左侧列表原地重命名，和分组重命名保持同一交互。
+    m_deviceListNameEdit = new QLineEdit(this); // wjy: 设备通过右键“系统设置/重命名”在左侧列表原地编辑，双击交互专用于启动远控。
     m_deviceListNameEdit->setVisible(false);
     m_deviceListNameEdit->setStyleSheet(QStringLiteral(
         "QLineEdit{background:#FFFFFF;border:1px solid #3A7BFC;border-radius:4px;"
@@ -3681,6 +3736,7 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
             && m_deviceDetailTab == DeviceDetailTab::Local;
         if (!localPageVisible) {
             m_localSystemInfoTimer->stop(); // wjy: 页面状态变化但尚未来得及刷新控件时，定时回调再次兜底停止隐藏采样。
+            m_localDiskRefreshTick = 0; // wjy: 离开本机页后清空累计次数，下次进入由完整快照重新建立磁盘基线。
             m_localCpuUsageAnimation->stop();
             m_localGpuUsageAnimation->stop();
             m_localMemoryUsageAnimation->stop(); // wjy: 页面已经隐藏时同时停止三类显示动画，不再投递无意义重绘。
@@ -3704,6 +3760,12 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
         if (sampledMemory.percent >= 0) {
             m_localMemoryUsage = sampledMemory; // wjy: 先提交最新容量，再让圆环平滑过渡；每次重绘看到的容量始终是最新完整快照。
             animateLocalUsageTo(m_localMemoryUsageAnimation, m_localMemoryUsagePercent, sampledMemory.percent); // wjy: 三类有效样本分别从当前画面平滑过渡，不会互相重置。
+        }
+        constexpr int kLocalDiskRefreshTicks = 10;
+        if (++m_localDiskRefreshTick >= kLocalDiskRefreshTicks) {
+            m_localDiskRefreshTick = 0;
+            m_localSystemInfo.disks = platform::LocalSystemInfoService::localDisks(); // wjy: 每十秒只更新磁盘总量和已用量，不重复枚举 CPU、GPU、内存条等静态硬件信息。
+            update(scriptFileEditorRect()); // wjy: 磁盘容量变化只重绘本机详情内容区域，不影响设备列表和其它页面。
         }
     });
     QTimer::singleShot(0, this, [this] {
@@ -6041,7 +6103,7 @@ void DeviceGrid::setupSettingsControls()
             saveShortcutKeySetting(shortcutIndex, shortcutText);
             return remoteShortcutDisplayText(shortcutIndex); // wjy: 保存后把输入框文本同步成最终应用的快捷键显示。
         };
-        m_shortcutKeyEdits.append(shortcutEdit); // wjy: 六个输入框按行号映射五项远控操作和删除设备操作。
+        m_shortcutKeyEdits.append(shortcutEdit); // wjy: 九个输入框按行号映射五项全局操作、三项远控窗口操作和删除设备操作。
     }
     // ===end====
 
@@ -6257,7 +6319,10 @@ void DeviceGrid::updateAddDeviceControls()
     }
 
     const SettingsLayoutSnapshot layout = settingsLayoutSnapshot(
-        m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded, m_settingsScrollOffset); // wjy: 新增设备控件直接消费统一布局快照，避免和手绘卡片使用不同滚动边界。
+        m_settingsLocalInfoExpanded,
+        m_settingsAddDeviceExpanded,
+        m_settingsScrollOffset,
+        m_settingsTab == SettingsTab::Keyboard); // wjy: 即使键盘页暂时隐藏新增设备控件，也不能把快捷键页偏移重新夹回常规页范围。
     m_settingsScrollOffset = layout.scrollOffset();
     const QRect ipRect = layout.scrolled(settingsAddDeviceIpEditRect(m_settingsLocalInfoExpanded));
     const QRect nameRect = layout.scrolled(settingsAddDeviceNameEditRect(m_settingsLocalInfoExpanded));
@@ -6330,7 +6395,10 @@ void DeviceGrid::updateLocalInfoControls()
 {
     syncResponsiveLayoutState();
     const SettingsLayoutSnapshot layout = settingsLayoutSnapshot(
-        m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded, m_settingsScrollOffset); // wjy: 本机信息复制按钮和设置页其它控件共享同一视口快照。
+        m_settingsLocalInfoExpanded,
+        m_settingsAddDeviceExpanded,
+        m_settingsScrollOffset,
+        m_settingsTab == SettingsTab::Keyboard); // wjy: 本机信息控件隐藏时仍共享当前页滚动上限，避免刷新把键盘页位置改回常规页。
     m_settingsScrollOffset = layout.scrollOffset();
     const bool visible = !m_detailPanelCollapsed
         && m_settingsSelected
@@ -6477,7 +6545,10 @@ void DeviceGrid::updateSettingsControls()
     syncResponsiveLayoutState();
 // =====wjy====
     const SettingsLayoutSnapshot layout = settingsLayoutSnapshot(
-        m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded, m_settingsScrollOffset); // wjy: 所有真实设置控件在同一快照下计算滚动后几何和视口可见性。
+        m_settingsLocalInfoExpanded,
+        m_settingsAddDeviceExpanded,
+        m_settingsScrollOffset,
+        m_settingsTab == SettingsTab::Keyboard); // wjy: 所有真实设置控件在同一快照下计算滚动后几何和视口可见性。
     m_settingsScrollOffset = layout.scrollOffset();
     if (m_periodicDeviceDiscoveryIntervalEdit) {
         const QRect discoveryIntervalRect = layout.scrolled(settingsPeriodicDeviceDiscoveryIntervalInputRect());
@@ -6535,8 +6606,11 @@ void DeviceGrid::updateSettingsControls()
         if (!edit) {
             continue;
         }
-        const QRect shortcutRect = settingsShortcutKeyEditRect(i);
-        const bool shortcutVisible = m_settingsSelected && m_settingsTab == SettingsTab::Keyboard; // wjy: 快捷键输入框只属于设置的键盘页，常规页和设备详情页必须隐藏。
+        const QRect shortcutContentRect = settingsShortcutKeyEditRect(i);
+        const QRect shortcutRect = layout.scrolled(shortcutContentRect);
+        const bool shortcutVisible = m_settingsSelected
+            && m_settingsTab == SettingsTab::Keyboard
+            && layout.fullyVisible(shortcutContentRect); // wjy: 快捷键输入框随键盘页滚动，只有完整进入视口才允许获得焦点和接收输入。
         applySettingsControlGeometry(edit, shortcutRect, shortcutVisible, shortcutVisible, true);
         if (auto* shortcutEdit = static_cast<ShortcutKeyEdit*>(edit); shortcutEdit && !shortcutEdit->hasFocus()) {
             shortcutEdit->setCommittedText(remoteShortcutDisplayText(i)); // wjy: 控件未录入时跟随当前保存设置刷新显示。
@@ -6788,6 +6862,7 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
                         : info.deviceName.trimmed(); // wjy: 设备名优先使用远端电脑名，取不到时用 IP 兜底，不再使用登录账户名。
                     result.mac = info.mac.trimmed();
                     result.broadcastIp = info.broadcastIp.trimmed();
+                    result.status = info; // wjy: 扫描线程把在线/占用、会话和脚本状态完整带回主线程，避免只留下布尔在线结论。
 
                     std::lock_guard lock(resultMutex);
                     results.append(result);
@@ -6816,6 +6891,7 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
             int addedCount = 0;
             int updatedCount = 0;
             QSet<QString> addedIps;
+            QHash<QString, platform::DeviceStatusInfo> discoveredStatuses; // wjy: 本轮每个命中 IP 只保留一份完整 TCP 校准结果，目录更新完成后统一应用。
             for (const BatchAddResult& result : results) {
                 const QString ip = result.ip.trimmed();
                 if (ip.isEmpty() || addedIps.contains(ip)) {
@@ -6834,7 +6910,7 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
                         existingDevice.broadcastIp = result.broadcastIp.trimmed(); // wjy: 同步保存广播地址，远程开机代理可直接复用扫描到的网段信息。
                         deviceUpdated = true;
                     }
-                    grid->m_deviceStatuses.insert(ip, platform::DevicePresenceState::Online);
+                    discoveredStatuses.insert(ip, result.status); // wjy: 已存在设备也把本次 TCP 结果交给下面的统一归并步骤，不能绕过 TTL 直接标记在线。
                     addedIps.insert(ip);
                     if (deviceUpdated && g_deviceCatalog.updateDevice(existingDevice.id, std::move(existingDevice))) {
                         ++updatedCount;
@@ -6852,7 +6928,7 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
                 if (!g_deviceCatalog.addDevice(std::move(newDevice))) {
                     continue; // wjy: 目录统一拒绝重复 IP 或非法地址，扫描回调不再直接向权威容器追加记录。
                 }
-                grid->m_deviceStatuses.insert(ip, platform::DevicePresenceState::Online);
+                discoveredStatuses.insert(ip, result.status); // wjy: 新设备加入白名单后再应用真实 Online/Busy 状态，后续由 UDP 心跳或校准 TTL 自动修正。
                 addedIps.insert(ip);
                 if (firstAddedIndex < 0) {
                     firstAddedIndex = g_deviceCatalog.deviceIndexForIp(ip); // wjy: 新实体加入后重新解析展示位置，下标只用于本次选择和动画。
@@ -6864,6 +6940,23 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
                 saveDevices();
                 grid->updateRealtimeConfiguredDevices(); // wjy: 批量新增完成后立即允许这些 IP 的实时广播进入，不再自动对全部设备做 TCP 状态刷新。
             }
+
+            // =====wjy====
+            const bool realtimeAvailable = grid->m_realtimeStateService
+                && grid->m_realtimeStateService->isRunning(); // wjy: 批量扫描与标题栏刷新使用同一实时服务可用性判定。
+            const platform::DeviceStatusResultSink statusSink =
+                platform::deviceStatusResultSink(realtimeAvailable); // wjy: 统一选择实时归并或旧版缓存，禁止扫描路径自行决定状态生命周期。
+            for (auto it = discoveredStatuses.cbegin(); it != discoveredStatuses.cend(); ++it) {
+                if (deviceIndexForIp(it.key()) < 0) {
+                    continue; // wjy: 扫描期间被目录同步删除的设备不再接收迟到状态，避免旧 IP 重新污染界面。
+                }
+                if (statusSink == platform::DeviceStatusResultSink::RealtimeReducer) {
+                    grid->m_realtimeStateService->applyManualCalibration(it.key(), it.value()); // wjy: TCP 49101 结果进入与 UDP 心跳相同的队列，受 15 秒校准 TTL 和新鲜快照优先级约束。
+                } else {
+                    grid->m_deviceStatuses.insert(it.key(), it.value().state); // wjy: 实时服务不可用时保留真实 Online/Busy，而不是无条件写成 Online。
+                }
+            }
+            // ===end====
 
             if (addedCount > 0 && userInitiated) {
                 grid->m_remoteAssistSelected = false;
@@ -7609,7 +7702,8 @@ void DeviceGrid::showDeviceContextMenuForIndexes(
     QAction* shutdownAction = systemMenu->addAction(menuIcon(QStringLiteral("shutdown.svg")), batchDeviceMenu ? QString::fromUtf8("批量关机") : QString::fromUtf8("关机"));
     QAction* restartAction = systemMenu->addAction(menuIcon(QStringLiteral("restart.svg")), batchDeviceMenu ? QString::fromUtf8("批量重启") : QString::fromUtf8("重启"));
     QAction* updateAction = systemMenu->addAction(menuIcon(QStringLiteral("update.svg")), batchDeviceMenu ? QString::fromUtf8("批量更新") : QString::fromUtf8("更新"));
-    QAction* terminalAction = systemMenu->addAction(menuIcon(QStringLiteral("terminal.svg")), QString::fromUtf8("终端")); // wjy: 系统设置顺序固定为开机、关机、重启、更新、终端。
+    QAction* terminalAction = systemMenu->addAction(menuIcon(QStringLiteral("terminal.svg")), QString::fromUtf8("终端"));
+    QAction* renameAction = systemMenu->addAction(menuIcon(QStringLiteral("rename.svg")), QString::fromUtf8("重命名")); // wjy: 设备双击改为远控后，把原地重命名入口移动到右键“系统设置”末尾。
     // =====wjy====
     QAction* createGroupAction = nullptr;
     QVector<QAction*> existingGroupActions; // wjy: 按菜单创建时的分组顺序保存动作指针，不能占用脚本动作使用的 data 字段。
@@ -7669,6 +7763,8 @@ void DeviceGrid::showDeviceContextMenuForIndexes(
         }
     } else if (selectedAction == terminalAction) {
         batchOpenDeviceTerminals(validTargetIndexes);
+    } else if (selectedAction == renameAction) {
+        beginDeviceRename(deviceIndex); // wjy: 多选菜单仍只重命名触发右键的设备，避免一次输入误改多台名称。
     } else if (selectedAction == deleteDeviceAction) {
         deleteDeviceForIndex(deviceIndex); // wjy: 使用菜单绑定的真实设备下标，远控标题栏右键不会误删主界面当前选择。
     }
@@ -9895,7 +9991,10 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
         const bool settingsPage = m_settingsSelected && !m_remoteAssistSelected && !m_localInfoSelected; // wjy: 设置页也参照设备详情页，使用同一条底部绘制边界。
         painter.setClipRect((deviceDetailPage || settingsPage) ? deviceDetailContentClipRect() : contentClipRect()); // wjy: 详情栏展开时才创建右侧裁剪区域，紧凑态完全跳过详情绘制。
         if (m_settingsSelected) {
-        m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded));
+            const int settingsMaxScrollOffset = m_settingsTab == SettingsTab::Keyboard
+                ? keyboardShortcutMaxScrollOffset()
+                : maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+            m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, settingsMaxScrollOffset);
         drawSettingsPage(
             painter,
             textFont,
@@ -10093,6 +10192,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
 void DeviceGrid::refreshLocalSystemInfoTab()
 {
     m_localSystemInfo = platform::LocalSystemInfoService::local(); // wjy: 仅在用户进入本机页时读取静态信息，启动和普通设备切换不增加系统查询。
+    m_localDiskRefreshTick = 0; // wjy: 完整快照已经包含最新磁盘容量，从此重新累计十秒再做第一次轻量刷新。
     if (m_localCpuUsageAnimation) {
         m_localCpuUsageAnimation->stop();
     }
@@ -10162,6 +10262,7 @@ void DeviceGrid::updateLocalSystemMonitorState()
     if (m_localSystemInfoTimer->isActive()) {
         m_localSystemInfoTimer->stop();
     }
+    m_localDiskRefreshTick = 0; // wjy: 页面主动切走时定时器可能来不及再次回调，统一在停止入口清空磁盘刷新计数。
     if (m_localCpuUsageAnimation) {
         m_localCpuUsageAnimation->stop();
     }
@@ -10495,14 +10596,18 @@ void DeviceGrid::animateDeviceListScrollTo(int targetOffset)
 
 void DeviceGrid::animateSettingsScrollTo(int targetOffset)
 {
-    const int maxOffset = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+    const int maxOffset = m_settingsTab == SettingsTab::Keyboard
+        ? keyboardShortcutMaxScrollOffset()
+        : maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
     const int boundedTarget = qBound(0, targetOffset, maxOffset); // wjy: 设置卡片展开状态决定当前滚动上限，动画目标必须使用本帧真实范围。
     if (!m_settingsScrollbarAnimation) {
         m_settingsScrollbarAnimation = new QVariantAnimation(this);
         m_settingsScrollbarAnimation->setDuration(140); // wjy: 与设备区保持相同速度，两个滚动条的点击手感一致。
         m_settingsScrollbarAnimation->setEasingCurve(QEasingCurve::OutCubic);
         connect(m_settingsScrollbarAnimation, &QVariantAnimation::valueChanged, this, [this](const QVariant& value) {
-            const int currentMax = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+            const int currentMax = m_settingsTab == SettingsTab::Keyboard
+                ? keyboardShortcutMaxScrollOffset()
+                : maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
             m_settingsScrollOffset = qBound(0, value.toInt(), currentMax); // wjy: 动画每帧同步设置页偏移，避免折叠卡片后保留无效位置。
             updateSettingsControls();
             updateAddDeviceControls();
@@ -10570,14 +10675,16 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
     if (event->button() == Qt::LeftButton
         && !m_detailPanelCollapsed
         && m_settingsSelected
-        && m_settingsTab == SettingsTab::General) {
-        const int maxScrollOffset = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+        && (m_settingsTab == SettingsTab::General || m_settingsTab == SettingsTab::Keyboard)) {
+        const int maxScrollOffset = m_settingsTab == SettingsTab::Keyboard
+            ? keyboardShortcutMaxScrollOffset()
+            : maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
         const QRect track = settingsVerticalScrollbarTrackRect();
         const QRect thumb = settingsVerticalScrollbarThumbRect(m_settingsScrollOffset, maxScrollOffset);
         const QRect trackHitRect = track.adjusted(-5, -2, 5, 2); // wjy: 设置滚动条视觉较窄，扩大横向和纵向命中区后更容易拖动且不改变绘制宽度。
         const bool thumbHit = thumb.isValid() && thumb.adjusted(-5, -2, 5, 2).contains(event->pos());
         if (maxScrollOffset > 0 && trackHitRect.contains(event->pos())) {
-            m_draggingSettingsScrollbar = true; // wjy: 设置页滚动条按下后独占当前左键手势，不会误触发卡片开关或按钮。
+            m_draggingSettingsScrollbar = true; // wjy: 常规页和键盘页共用滚动条，按下后独占当前左键手势，不会误触发卡片或快捷键输入框。
             m_settingsScrollbarGrabOffsetY = thumbHit
                 ? qBound(0, event->pos().y() - thumb.top(), qMax(0, thumb.height() - 1))
                 : thumb.height() / 2; // wjy: 轨道空白点击按滑块中心跳转，直接点击滑块则保留原抓取点。
@@ -10787,7 +10894,6 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
     if (event->button() == Qt::LeftButton
         && event->pos().y() >= 0
         && event->pos().y() < kTitleBarHeight //窗口拖动
-        && !titlebarLaunchButtonRect().contains(event->pos())
         && !(!m_detailPanelCollapsed && m_updateAvailable && titlebarUpdateRect().contains(event->pos())) // wjy: 只有完整标题栏中真实可见的更新按钮排除拖窗命中。
         && !(!m_detailPanelCollapsed && titlebarSettingsRect().contains(event->pos()))
         && !(!m_detailPanelCollapsed && refreshRect().contains(event->pos())) // wjy: 紧凑态隐藏设置和刷新后，对应旧矩形重新成为可拖动标题栏空白。
@@ -10875,6 +10981,8 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
                     deviceIndex);
             }
 
+            m_doubleClickRemoteDeviceIndexes = m_draggingDeviceIndexes; // wjy: 第一次按下时保留原多选目标，双击事件发生前的单击释放即使改变选择也不会丢失批量远控范围。
+
             m_deviceDragStartPos = event->pos();
             m_deviceDragCurrentPos = event->pos();
 
@@ -10930,7 +11038,9 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
 
     // =====wjy====
     if (m_draggingSettingsScrollbar) {
-        const int maxScrollOffset = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded); // wjy: 卡片展开或窗口尺寸变化后始终使用最新滚动范围。
+        const int maxScrollOffset = m_settingsTab == SettingsTab::Keyboard
+            ? keyboardShortcutMaxScrollOffset()
+            : maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded); // wjy: 卡片展开或窗口尺寸变化后始终使用当前页最新滚动范围。
         if (!(event->buttons() & Qt::LeftButton) || maxScrollOffset <= 0) {
             m_draggingSettingsScrollbar = false;
             m_settingsScrollbarGrabOffsetY = 0;
@@ -11087,22 +11197,26 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
     const bool deviceListScrollbarHovered = m_deviceGroupExpanded
         && deviceListMaxScrollOffset > 0
         && deviceListScrollbarTrackRect().adjusted(-4, -2, 1, 2).intersected(deviceListViewportRect(true)).contains(event->pos()); // wjy: 整条设备轨道都显示可抓取手型，滑块和空白位置使用相同点击语义。
-    const int settingsMaxScrollOffset = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+    const int settingsMaxScrollOffset = m_settingsTab == SettingsTab::Keyboard
+        ? keyboardShortcutMaxScrollOffset()
+        : maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
     const bool settingsScrollbarHovered = !m_detailPanelCollapsed
         && m_settingsSelected
-        && m_settingsTab == SettingsTab::General
+        && (m_settingsTab == SettingsTab::General || m_settingsTab == SettingsTab::Keyboard)
         && settingsMaxScrollOffset > 0
-        && settingsVerticalScrollbarTrackRect().adjusted(-5, -2, 5, 2).contains(event->pos()); // wjy: 常规页整条滚动轨道均可拖拽或点击跳转，悬停时提前给出手型反馈。
+        && settingsVerticalScrollbarTrackRect().adjusted(-5, -2, 5, 2).contains(event->pos()); // wjy: 常规页和键盘页整条滚动轨道均可拖拽或点击跳转，悬停时提前给出手型反馈。
     // ===end====
     const bool detailPanelButtonHovered = detailPanelToggleButtonRect(m_detailPanelCollapsed).contains(event->pos());
-    const bool titlebarButtonHovered = titlebarLaunchButtonRect().contains(event->pos())
-        || (!m_detailPanelCollapsed
-            && ((m_updateAvailable && titlebarUpdateRect().contains(event->pos()))
-                || titlebarSettingsRect().contains(event->pos())
-                || refreshRect().contains(event->pos()))); // wjy: 紧凑态隐藏的标题栏入口不再产生手型或点击暗示。
+    const bool titlebarButtonHovered = !m_detailPanelCollapsed
+        && ((m_updateAvailable && titlebarUpdateRect().contains(event->pos()))
+            || titlebarSettingsRect().contains(event->pos())
+            || refreshRect().contains(event->pos())); // wjy: 左上标题恢复为普通拖动区域，只有设置、更新和刷新入口显示按钮手型。
     const bool wakeButtonHovered = false;
     const SettingsLayoutSnapshot settingsLayout = settingsLayoutSnapshot(
-        m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded, m_settingsScrollOffset); // wjy: 命中测试与绘制、子控件几何共用同一设置页快照。
+        m_settingsLocalInfoExpanded,
+        m_settingsAddDeviceExpanded,
+        m_settingsScrollOffset,
+        m_settingsTab == SettingsTab::Keyboard); // wjy: 命中测试与绘制、子控件几何共用同一设置页快照。
     const bool settingsSwitchHovered = !m_detailPanelCollapsed
         && m_settingsSelected
         && m_settingsTab == SettingsTab::General
@@ -11165,7 +11279,7 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
 void DeviceGrid::mouseDoubleClickEvent(QMouseEvent* event)
 {
 // =====wjy====
-    if (event->button() == Qt::LeftButton && m_deviceGroupExpanded) { // wjy: 紧凑窗口仍允许双击重命名设备和分组。
+    if (event->button() == Qt::LeftButton && m_deviceGroupExpanded) { // wjy: 紧凑窗口也支持双击设备远控；分组双击仍保留原地重命名。
         const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 双击命中也使用可见行，分组和设备位置会跟随 UI 绘制变化。
         const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 双击只识别当前可见视口内的列表行。
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
@@ -11188,19 +11302,17 @@ void DeviceGrid::mouseDoubleClickEvent(QMouseEvent* event)
                     continue;
                 }
 
-                m_settingsSelected = false;
-                m_remoteAssistSelected = false;
-                m_localInfoSelected = false;
-                m_selectedDeviceIndexes.clear();
-                m_selectedDeviceIndexes.insert(deviceIndex);
+                QSet<int> launchIndexes = m_doubleClickRemoteDeviceIndexes; // wjy: 先恢复第一次按下时的多选快照，普通双击不会被首个单击释放收敛成一台。
+                launchIndexes.unite(m_selectedDeviceIndexes); // wjy: 同时合并首个释放事件产生的 Shift/Ctrl 新选择，按住修饰键直接双击也能覆盖完整目标。
+                if (!launchIndexes.contains(deviceIndex)) {
+                    launchIndexes.clear();
+                    launchIndexes.insert(deviceIndex); // wjy: 双击未选设备时只控制命中的这一台，不继承其它设备的旧选择。
+                }
+                m_selectedDeviceIndexes = launchIndexes;
                 m_selectionAnchorDeviceIndex = deviceIndex;
-                setDesktopHoverActive(false);
-                clearBottomActionHover();
-                updateAddDeviceControls();
-                updateLocalInfoControls();
-                updateSettingsControls();
-                startDeviceSwitchAnimation(deviceIndex, deviceDisplayName(g_devices.at(deviceIndex))); // wjy: 双击设备时先同步详情选择，然后进入左侧行内重命名。
-                beginDeviceRename(deviceIndex);
+                update(deviceListViewportRect(m_deviceGroupExpanded)); // wjy: 启动批量远控前恢复多选高亮，让界面显示的目标和实际打开窗口一致。
+                launchSelectedRemoteDesktopWindows(); // wjy: 单选双击打开一台；Shift/Ctrl 已形成多选时复用现有批量授权和开窗流程。
+                m_doubleClickRemoteDeviceIndexes.clear();
                 event->accept();
                 return;
             }
@@ -11253,10 +11365,12 @@ void DeviceGrid::wheelEvent(QWheelEvent* event)
         return;
     }
 
-    const int maxSettingsOffset = maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+    const int maxSettingsOffset = m_settingsTab == SettingsTab::Keyboard
+        ? keyboardShortcutMaxScrollOffset()
+        : maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
     if (!m_detailPanelCollapsed
         && m_settingsSelected
-        && m_settingsTab == SettingsTab::General
+        && (m_settingsTab == SettingsTab::General || m_settingsTab == SettingsTab::Keyboard)
         && maxSettingsOffset > 0
         && settingsScrollViewportRect().contains(event->position().toPoint())) {
         const int wheelDelta = !event->pixelDelta().isNull()
@@ -11664,14 +11778,6 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
             return;
         }
 
-        if (titlebarLaunchButtonRect().contains(event->pos())) {
-            finishDeviceGroupRename(true);
-            finishDeviceRename(true);
-            launchSelectedRemoteDesktopWindows();
-            event->accept();
-            return;
-        }
-
         // =====wjy====
         if (!m_detailPanelCollapsed && m_updateAvailable && titlebarUpdateRect().contains(event->pos())) {
             if (!m_updatePreparing && !m_rollbackPreparing && !m_publishPreparing) {
@@ -11930,7 +12036,10 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
 
         if (!m_detailPanelCollapsed && m_settingsSelected) {
             const SettingsLayoutSnapshot settingsLayout = settingsLayoutSnapshot(
-                m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded, m_settingsScrollOffset); // wjy: 设置页点击命中与手绘/子控件布局共享同一滚动快照。
+                m_settingsLocalInfoExpanded,
+                m_settingsAddDeviceExpanded,
+                m_settingsScrollOffset,
+                m_settingsTab == SettingsTab::Keyboard); // wjy: 设置页点击命中与手绘/子控件布局共享同一滚动快照。
             if (settingsGeneralTabRect().contains(event->pos())
                 || settingsKeyboardTabRect().contains(event->pos())
                 || settingsRemoteControlTabRect().contains(event->pos())) {

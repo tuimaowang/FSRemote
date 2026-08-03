@@ -2364,6 +2364,7 @@ void RemoteDesktopWindow::beginRemoteUpdateWait()
     releaseForwardedKeys();
     m_waitingShortcutRelease = false;
     m_shortcutReleaseVirtualKeys.clear(); // wjy: 更新开始后不再等待本地组合键释放，确保键盘 hook 可以立即卸载。
+    m_localShortcutReleaseKeys.clear(); // wjy: 更新遮罩不再保留自定义脚本快捷键的 Qt 松键门禁。
     setKeyboardForwardingActive(false);
     if (m_clipboardPollTimer) {
         m_clipboardPollTimer->stop();
@@ -4114,11 +4115,12 @@ void RemoteDesktopWindow::toggleManualMouseLock()
     m_manualMouseLockActive = !m_manualMouseLockActive; // wjy: F2 维护独立手动意图，不伪造 Host 的游戏检测状态。
     updateRemoteMouseCaptureState(); // wjy: 当前连接且有焦点时立即切换；失焦或断线时只保存意图，恢复资格后自动生效。
     requestTitleBarUpdate(); // wjy: 标题栏静态“鼠标锁定”文字只在开关变化时刷新，不引入逐鼠标事件重绘。
-    appendViewerDebugLog(QStringLiteral("manual mouse lock changed host=%1 enabled=%2 effective=%3 host_requested=%4 shortcut=F2")
+    appendViewerDebugLog(QStringLiteral("manual mouse lock changed host=%1 enabled=%2 effective=%3 host_requested=%4 shortcut=%5")
         .arg(m_hostIp)
         .arg(m_manualMouseLockActive ? 1 : 0)
         .arg(m_remoteMouseCaptureActive ? 1 : 0)
-        .arg(m_remoteMouseCaptureRequested ? 1 : 0)); // wjy: 仅记录低频开关结果到既有 data 日志，禁止记录 Raw Input 高频位移。
+        .arg(m_remoteMouseCaptureRequested ? 1 : 0)
+        .arg(platform::AppSettings::remoteShortcutMouseLock().toString(QKeySequence::PortableText))); // wjy: 仅记录低频开关结果和当前配置到既有 data 日志，禁止记录 Raw Input 高频位移。
 }
 
 void RemoteDesktopWindow::updateRemoteMouseCaptureState()
@@ -4501,6 +4503,7 @@ void RemoteDesktopWindow::updateShortcutReleaseGuard()
 
     m_waitingShortcutRelease = false;
     m_shortcutReleaseVirtualKeys.clear();
+    m_localShortcutReleaseKeys.clear();
     if (!m_closeInProgress && isActiveWindow()) {
         setKeyboardForwardingActive(true);
     } else {
@@ -5281,7 +5284,7 @@ bool RemoteDesktopWindow::forwardNativeKey(int virtualKey, bool down)
         return false;
     }
     if (m_inputScriptPlaying) {
-        return true; // wjy: F10已在本地快捷键层优先消费，播放期间其余实体键盘事件直接吞掉且不进入远端持有集合。
+        return true; // wjy: 设置页当前播放快捷键已在本地层优先消费，播放期间其余实体键盘事件直接吞掉且不进入远端持有集合。
     }
     if (down) {
         m_pressedKeys.insert(virtualKey);
@@ -5302,29 +5305,35 @@ bool RemoteDesktopWindow::handleLocalShortcutKey(int virtualKey, Qt::KeyboardMod
         return false;
     }
     // =====wjy====
-    if (modifiers == Qt::NoModifier && virtualKey == VK_F2) {
-        beginShortcutReleaseGuard(QKeySequence(QStringLiteral("F2"))); // wjy: F2 固定为当前远控窗口的本地手动鼠标锁定键，按下和抬起都不能发送到目标端。
+    const QKeySequence current = shortcutSequenceFromNativeVirtualKey(virtualKey, modifiers); // wjy: 低级键盘 Hook 把当前物理键转换为设置页同一套 QKeySequence。
+    const QKeySequence mouseLockShortcut = platform::AppSettings::remoteShortcutMouseLock();
+    if (matchesShortcut(current, mouseLockShortcut)) {
+        beginShortcutReleaseGuard(mouseLockShortcut); // wjy: 自定义鼠标锁定组合的修饰键和主键都会进入释放门禁，避免被控端残留 Ctrl/Shift。
         QMetaObject::invokeMethod(this, [this] {
             toggleManualMouseLock(); // wjy: 通过 Qt 队列切换状态，低级键盘 Hook 回调栈内不直接注册 Raw Input 或刷新标题栏。
         }, Qt::QueuedConnection);
         return true;
     }
     if (remoteUpdateActive()) {
-        return false; // wjy: 更新期间仍允许 F2 修改保留的手动意图，但录制、回放和远端快捷键继续保持禁用。
+        return false; // wjy: 更新期间仍允许手动鼠标锁定修改保留意图，但录制、回放和其它远端快捷键继续保持禁用。
     }
-    if (modifiers == Qt::NoModifier && (virtualKey == VK_F9 || virtualKey == VK_F10)) {
-        const bool recordingShortcut = virtualKey == VK_F9;
-        beginShortcutReleaseGuard(QKeySequence(recordingShortcut
-                ? QStringLiteral("F9")
-                : QStringLiteral("F10"))); // wjy: 使用稳定的Qt可移植文本构造单键序列，松键门禁仍可映射回对应Windows虚拟键码。
-        QMetaObject::invokeMethod(this, [this, recordingShortcut] {
-            if (recordingShortcut) toggleInputScriptRecording();
-            else toggleInputScriptPlayback(); // wjy: 模态命名和文件选择延迟到Qt队列执行，绝不在WH_KEYBOARD_LL回调栈内打开窗口。
+    const QKeySequence recordingShortcut = platform::AppSettings::remoteShortcutInputScriptRecording();
+    if (matchesShortcut(current, recordingShortcut)) {
+        beginShortcutReleaseGuard(recordingShortcut); // wjy: F9 默认值现在来自设置页，自定义组合仍保持原有松键保护。
+        QMetaObject::invokeMethod(this, [this] {
+            toggleInputScriptRecording(); // wjy: 模态命名框只在 Qt 队列执行，绝不在低级 Hook 回调栈内打开。
+        }, Qt::QueuedConnection);
+        return true;
+    }
+    const QKeySequence playbackShortcut = platform::AppSettings::remoteShortcutInputScriptPlayback();
+    if (matchesShortcut(current, playbackShortcut)) {
+        beginShortcutReleaseGuard(playbackShortcut); // wjy: F10 默认值现在来自设置页，自定义组合也会先释放已转发的修饰键。
+        QMetaObject::invokeMethod(this, [this] {
+            toggleInputScriptPlayback(); // wjy: 播放设置窗口和再次按键停止逻辑继续复用原有入口。
         }, Qt::QueuedConnection);
         return true;
     }
     // ===end====
-    const QKeySequence current = shortcutSequenceFromNativeVirtualKey(virtualKey, modifiers); // wjy: 低级键盘钩子路径同样使用用户保存的快捷键设置。
     if (matchesShortcut(current, platform::AppSettings::remoteShortcutFullscreen())) {
         beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutFullscreen());
         emit shortcutFullscreenRequested();
@@ -6069,6 +6078,7 @@ void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
 
     event->ignore();
     m_closeInProgress = true;
+    m_localShortcutReleaseKeys.clear(); // wjy: 关闭窗口后不再等待已经失去焦点的自定义快捷键 KeyUp。
     cancelNetworkReconnect(); // wjy: 用户主动关闭后取消三秒等待和所有无限退避，stop完成不得重新创建会话。
     discardPendingTextureFrame(); // wjy: 关闭窗口时取消排队帧并归还共享纹理槽，随后再异步停止Viewer。
     if (m_remoteUpdateTimer) {
@@ -6390,29 +6400,37 @@ void RemoteDesktopWindow::keyPressEvent(QKeyEvent* event)
     }
 #endif
 // =====wjy====
-    if (!event->isAutoRepeat() && event->modifiers() == Qt::NoModifier
-        && event->key() == Qt::Key_F2) {
-        beginShortcutReleaseGuard(QKeySequence(QStringLiteral("F2")));
+    const QKeySequence current = shortcutSequenceFromKeyEvent(event); // wjy: Qt 兜底路径和 Windows Hook 共用设置页产生的完整组合键。
+    const QKeySequence mouseLockShortcut = platform::AppSettings::remoteShortcutMouseLock();
+    if (!event->isAutoRepeat() && matchesShortcut(current, mouseLockShortcut)) {
+        beginShortcutReleaseGuard(mouseLockShortcut);
+        m_localShortcutReleaseKeys.insert(event->key()); // wjy: 非 Windows 或 Hook 未接管时记录主键，KeyUp 也必须被本地快捷键层吞掉。
         QMetaObject::invokeMethod(this, [this] {
-            toggleManualMouseLock(); // wjy: 非 Windows 或 Hook 未接管时仍保持同一 F2 行为，并在普通输入转发前消费按键。
+            toggleManualMouseLock(); // wjy: 自定义鼠标锁定组合仍在普通输入转发前消费按键。
         }, Qt::QueuedConnection);
         event->accept();
         return;
     }
-    if (!event->isAutoRepeat() && event->modifiers() == Qt::NoModifier
-        && (event->key() == Qt::Key_F9 || event->key() == Qt::Key_F10)) {
-        const bool recordingShortcut = event->key() == Qt::Key_F9;
-        beginShortcutReleaseGuard(QKeySequence(recordingShortcut
-                ? QStringLiteral("F9")
-                : QStringLiteral("F10")));
-        QMetaObject::invokeMethod(this, [this, recordingShortcut] {
-            if (recordingShortcut) toggleInputScriptRecording();
-            else toggleInputScriptPlayback(); // wjy: 非Windows或Hook未接管时保持同一F9/F10行为，并用队列隔离模态对话框。
+    const QKeySequence recordingShortcut = platform::AppSettings::remoteShortcutInputScriptRecording();
+    if (!event->isAutoRepeat() && matchesShortcut(current, recordingShortcut)) {
+        beginShortcutReleaseGuard(recordingShortcut);
+        m_localShortcutReleaseKeys.insert(event->key()); // wjy: 记录自定义录制快捷键主键，防止 Qt KeyUp 进入远端。
+        QMetaObject::invokeMethod(this, [this] {
+            toggleInputScriptRecording(); // wjy: 模态命名框仍通过队列打开，不在普通 Qt KeyPress 调用栈内重入。
         }, Qt::QueuedConnection);
         event->accept();
         return;
     }
-    const QKeySequence current = shortcutSequenceFromKeyEvent(event); // wjy: 普通 Qt 按键路径也读取设置页自定义快捷键。
+    const QKeySequence playbackShortcut = platform::AppSettings::remoteShortcutInputScriptPlayback();
+    if (!event->isAutoRepeat() && matchesShortcut(current, playbackShortcut)) {
+        beginShortcutReleaseGuard(playbackShortcut);
+        m_localShortcutReleaseKeys.insert(event->key()); // wjy: 记录自定义播放快捷键主键，等待 KeyUp 后再解除本地门禁。
+        QMetaObject::invokeMethod(this, [this] {
+            toggleInputScriptPlayback(); // wjy: F10 设置窗口和再次按键停止逻辑继续复用原有入口。
+        }, Qt::QueuedConnection);
+        event->accept();
+        return;
+    }
     if (matchesShortcut(current, platform::AppSettings::remoteShortcutFullscreen())) {
         beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutFullscreen());
         emit shortcutFullscreenRequested();
@@ -6447,7 +6465,7 @@ void RemoteDesktopWindow::keyPressEvent(QKeyEvent* event)
 
     if (m_inputScriptPlaying) {
         event->accept();
-        return; // wjy: Qt兜底路径同样屏蔽播放期间的人工键盘输入，只有前面的F10停止快捷键可以穿过。
+        return; // wjy: Qt兜底路径同样屏蔽播放期间的人工键盘输入，只有前面匹配到的播放快捷键可以穿过。
     }
     if (event->nativeVirtualKey() > 0) {
         m_pressedKeys.insert(event->nativeVirtualKey());
@@ -6463,6 +6481,7 @@ void RemoteDesktopWindow::keyPressEvent(QKeyEvent* event)
 
 void RemoteDesktopWindow::keyReleaseEvent(QKeyEvent* event)
 {
+    const bool localShortcutKeyUp = m_localShortcutReleaseKeys.remove(event->key()) > 0; // wjy: 自定义鼠标锁定/录制/播放快捷键主键的 Qt KeyUp 与录入时修饰键状态无关，按实际主键配对吞掉。
 #if defined(Q_OS_WIN)
     const bool wasWaitingShortcutRelease = m_waitingShortcutRelease;
     updateShortcutReleaseGuard();
@@ -6471,10 +6490,9 @@ void RemoteDesktopWindow::keyReleaseEvent(QKeyEvent* event)
         return;
     }
 #endif
-    if (event->modifiers() == Qt::NoModifier
-        && (event->key() == Qt::Key_F2 || event->key() == Qt::Key_F9 || event->key() == Qt::Key_F10)) {
+    if (localShortcutKeyUp) {
         event->accept();
-        return; // wjy: Qt兜底平台固定吞掉 F2/F9/F10 的 KeyUp，远端不会收到没有配对 KeyDown 的本地快捷键抬键。
+        return; // wjy: Qt 兜底路径吞掉设置页自定义脚本快捷键的 KeyUp，远端不会收到没有配对 KeyDown 的主键抬起。
     }
     if (m_inputScriptPlaying) {
         event->accept();
@@ -6505,6 +6523,7 @@ void RemoteDesktopWindow::focusInEvent(QFocusEvent* event)
 void RemoteDesktopWindow::focusOutEvent(QFocusEvent* event)
 {
     suspendRemoteMouseCapture(); // wjy: 失焦只暂停实际捕获，不清除 Host relative 请求或 F2 手动意图，切回本窗口时可直接恢复。
+    m_localShortcutReleaseKeys.clear(); // wjy: 组合键在失焦时不再等待本窗口收到松键，避免下一次焦点进入误吞首个普通按键。
     releasePressedKeys();
     setKeyboardForwardingActive(false);
     QWidget::focusOutEvent(event);

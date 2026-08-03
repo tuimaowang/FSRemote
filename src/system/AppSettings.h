@@ -53,6 +53,12 @@ public:
     // =====wjy====
     static QKeySequence remoteShortcutClipboardSync();
     static void setRemoteShortcutClipboardSync(const QKeySequence& shortcut);
+    static QKeySequence remoteShortcutMouseLock(); // wjy: 远控窗口 F2 手动鼠标锁定快捷键，默认仍为 F2 但允许键盘设置页自定义。
+    static void setRemoteShortcutMouseLock(const QKeySequence& shortcut);
+    static QKeySequence remoteShortcutInputScriptRecording(); // wjy: 远控窗口 F9 键鼠录制快捷键，设置修改后由远控窗口实时读取。
+    static void setRemoteShortcutInputScriptRecording(const QKeySequence& shortcut);
+    static QKeySequence remoteShortcutInputScriptPlayback(); // wjy: 远控窗口 F10 脚本播放快捷键，默认仍为 F10 并持久化用户修改。
+    static void setRemoteShortcutInputScriptPlayback(const QKeySequence& shortcut);
     static QKeySequence deviceShortcutDelete();
     static void setDeviceShortcutDelete(const QKeySequence& shortcut);
     static bool remoteClipboardSyncEnabled();

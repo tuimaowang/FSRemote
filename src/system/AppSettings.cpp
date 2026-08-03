@@ -343,6 +343,36 @@ void AppSettings::setRemoteShortcutClipboardSync(const QKeySequence& shortcut)
     setShortcutToSettings(QStringLiteral("remoteShortcutClipboardSync"), shortcut, QKeySequence(QStringLiteral("Ctrl+B")));
 }
 
+QKeySequence AppSettings::remoteShortcutMouseLock()
+{
+    return shortcutFromSettings(QStringLiteral("remoteShortcutMouseLock"), QKeySequence(QStringLiteral("F2"))); // wjy: 兼容原先固定 F2 行为，旧配置首次读取自动采用相同默认值。
+}
+
+void AppSettings::setRemoteShortcutMouseLock(const QKeySequence& shortcut)
+{
+    setShortcutToSettings(QStringLiteral("remoteShortcutMouseLock"), shortcut, QKeySequence(QStringLiteral("F2"))); // wjy: 保存设置页录入的手动鼠标锁定快捷键。
+}
+
+QKeySequence AppSettings::remoteShortcutInputScriptRecording()
+{
+    return shortcutFromSettings(QStringLiteral("remoteShortcutInputScriptRecording"), QKeySequence(QStringLiteral("F9"))); // wjy: 兼容原先固定 F9 录制行为。
+}
+
+void AppSettings::setRemoteShortcutInputScriptRecording(const QKeySequence& shortcut)
+{
+    setShortcutToSettings(QStringLiteral("remoteShortcutInputScriptRecording"), shortcut, QKeySequence(QStringLiteral("F9"))); // wjy: 保存设置页录入的键鼠录制快捷键。
+}
+
+QKeySequence AppSettings::remoteShortcutInputScriptPlayback()
+{
+    return shortcutFromSettings(QStringLiteral("remoteShortcutInputScriptPlayback"), QKeySequence(QStringLiteral("F10"))); // wjy: 兼容原先固定 F10 播放行为。
+}
+
+void AppSettings::setRemoteShortcutInputScriptPlayback(const QKeySequence& shortcut)
+{
+    setShortcutToSettings(QStringLiteral("remoteShortcutInputScriptPlayback"), shortcut, QKeySequence(QStringLiteral("F10"))); // wjy: 保存设置页录入的脚本播放快捷键。
+}
+
 QKeySequence AppSettings::deviceShortcutDelete()
 {
     return shortcutFromSettings(QStringLiteral("deviceShortcutDelete"), QKeySequence(QStringLiteral("Delete"))); // wjy: 删除设备默认保持 Delete，同时允许从键盘设置页持久化为其它组合键。

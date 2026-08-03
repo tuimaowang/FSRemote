@@ -73,7 +73,7 @@ protected:
     void paintEvent(QPaintEvent* event) override;
     void mousePressEvent(QMouseEvent* event) override;
     void mouseMoveEvent(QMouseEvent* event) override;
-    void mouseDoubleClickEvent(QMouseEvent* event) override; // wjy: Double click device or group rows to rename in place.
+    void mouseDoubleClickEvent(QMouseEvent* event) override; // wjy: 双击设备启动当前单选或多选远控；双击分组仍进入原地重命名。
     void mouseReleaseEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override; // wjy: The hand-painted device list handles scrolling here.
     void keyPressEvent(QKeyEvent* event) override;
@@ -322,7 +322,7 @@ private:
     // =====wjy====
     QComboBox* m_rollbackVersionCombo = nullptr; // wjy: 常规页只展示低于当前安装版本且关键载荷完整的共享历史版本。
     // ===end====
-    QVector<QLineEdit*> m_shortcutKeyEdits; // wjy: Keyboard settings shortcut editors, one per remote-window action.
+    QVector<QLineEdit*> m_shortcutKeyEdits; // wjy: 键盘设置页统一承载主窗口、远控窗口和删除设备快捷键输入框。
     // =====wjy====
     stream::RemoteQualityConfiguration m_remoteQualityConfiguration; // wjy: 主窗口缓存当前持久化全局画质，所有跟随全局窗口读取同一份值。
     QComboBox* m_remoteQualityModeCombo = nullptr; // wjy: 远控画质设置只保留默认模式，下方固定预设由手绘说明展示。
@@ -342,6 +342,7 @@ private:
     platform::MemoryUsageSampler m_localMemoryUsageSampler; // wjy: 每秒只读当前物理内存负载，不保存跨页面基线。
     platform::LocalMemoryUsage m_localMemoryUsage; // wjy: 保存最新同一时刻的已用、总量和可用容量，页面重绘不再次调用系统 API。
     QTimer* m_localSystemInfoTimer = nullptr; // wjy: 本机页 CPU、GPU、内存占用共用一秒刷新定时器，离开页面后停止。
+    int m_localDiskRefreshTick = 0; // wjy: 复用一秒定时器累计十次后刷新磁盘容量，避免新增常驻定时器或每秒枚举盘符。
     QVariantAnimation* m_localCpuUsageAnimation = nullptr; // wjy: CPU 圆环在相邻样本间平滑扫动。
     QVariantAnimation* m_localGpuUsageAnimation = nullptr; // wjy: GPU 圆环独立缓动，不与 CPU 新样本互相抢占动画状态。
     QVariantAnimation* m_localMemoryUsageAnimation = nullptr; // wjy: 内存圆环独立缓动，并与 CPU/GPU 使用相同速度曲线。
@@ -456,6 +457,8 @@ private:
 
     // wjy: All selected device indexes in the left list.
     QSet<int> m_selectedDeviceIndexes;
+
+    QSet<int> m_doubleClickRemoteDeviceIndexes; // wjy: 保存第一次按下前的可见选择快照，避免双击首个释放事件把多选收敛后只远控一台。
 
     // wjy: Anchor index for Shift range selection.
     int m_selectionAnchorDeviceIndex = -1;

@@ -209,12 +209,12 @@ private:
     bool sendInputMessage(const QByteArray& message);
     bool dispatchRemoteInputEvent(const RemoteInputEvent& event); // wjy: 来源窗口只发送一次，并由共享协调器决定是否向当前跟随窗口扇出。
     // =====wjy====
-    void toggleInputScriptRecording(); // wjy: F9固定在当前远控窗口切换录制状态，停止时再进入命名和原子保存流程。
+    void toggleInputScriptRecording(); // wjy: 按设置页当前录制快捷键在当前远控窗口切换录制状态，停止时再进入命名和原子保存流程。
     void startInputScriptRecording();
     void finishInputScriptRecording(bool limitReached = false);
     void cancelInputScriptRecording(const QString& reason); // wjy: 关闭、更新或失去控制权时直接丢弃未完成录制，生命周期路径不得弹出模态命名框。
     void recordRemoteInputEvent(const RemoteInputEvent& event);
-    void toggleInputScriptPlayback(); // wjy: F10在空闲时选择本地脚本，播放中再次按下则立即停止并释放远端持有输入。
+    void toggleInputScriptPlayback(); // wjy: 按设置页当前播放快捷键在空闲时选择本地脚本，播放中再次按下则立即停止并释放远端持有输入。
     void chooseAndStartInputScriptPlayback();
     void scheduleNextInputScriptPlaybackEvent();
     void processInputScriptPlaybackEvents();
@@ -413,6 +413,7 @@ private:
     QTimer* m_sessionTimer = nullptr;
     bool m_waitingShortcutRelease = false;
     QVector<int> m_shortcutReleaseVirtualKeys;
+    QSet<int> m_localShortcutReleaseKeys; // wjy: Qt 兜底路径记录已消费的自定义 F2/F9/F10 主键，确保组合键松开顺序变化时也不漏给远端。
     QSet<int> m_pressedKeys;
     // =====wjy====
     bool m_inputScriptRecording = false;

@@ -160,6 +160,19 @@ endif()
 find_package(Qt6 REQUIRED COMPONENTS Widgets Svg Network Gui) # wjy: 壁纸服务测试直接使用 QImage/QImageReader，因此显式声明 Qt Gui 组件。
 
 # =====wjy====
+option(FSREMOTE_BUILD_INSTALLER_TESTS "Build installer firewall rule tests" ON) # wjy: 默认随显式测试总开关创建轻量安装器契约测试。
+if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_INSTALLER_TESTS) # wjy: 安装器文本测试无需编译程序，只在显式测试配置中校验跨网段状态端口规则。
+    enable_testing()
+    add_test(
+        NAME fsremote_installer_firewall_rule_tests
+        COMMAND "${CMAKE_COMMAND}"
+            "-DFSREMOTE_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/installer_firewall_rule_tests.cmake"
+    ) # wjy: 通过 CMake 脚本锁定安装、覆盖升级和卸载三条防火墙契约，避免打包调整时静默丢失 UDP 49104。
+endif()
+# ===end====
+
+# =====wjy====
 option(FSREMOTE_BUILD_WALLPAPER_TESTS "Build shared wallpaper discovery tests" ON)
 if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_WALLPAPER_TESTS) # wjy: 壁纸测试受统一总开关控制，旧缓存中的分类 ON 不再拖慢普通构建。
     enable_testing()
@@ -385,6 +398,20 @@ if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_DEVICE_SYNC_TESTS) # wjy: 设备目�
         target_compile_options(fsremote_device_action_target_tests PRIVATE /utf-8) # wjy: 测试中的中文注释和设备名称统一使用 UTF-8 编译。
     endif()
     add_test(NAME fsremote_device_action_target_tests COMMAND fsremote_device_action_target_tests)
+
+    # =====wjy====
+    add_executable(fsremote_network_interface_policy_tests EXCLUDE_FROM_ALL
+        tests/network_interface_policy_tests.cpp
+        src/system/NetworkInterfacePolicy.h
+    ) # wjy: 纯策略测试模拟 VMware VMnet8、Hyper-V 和真实网卡名称，不禁用或枚举开发机网络接口。
+    target_include_directories(fsremote_network_interface_policy_tests PRIVATE src)
+    target_link_libraries(fsremote_network_interface_policy_tests PRIVATE Qt6::Network)
+    if(MSVC)
+        target_compile_options(fsremote_network_interface_policy_tests PRIVATE /utf-8) # wjy: 中文所有权说明统一按 UTF-8 编译。
+    endif()
+    add_test(NAME fsremote_network_interface_policy_tests COMMAND fsremote_network_interface_policy_tests)
+    # ===end====
+
     add_executable(fsremote_script_ui_state_store_tests EXCLUDE_FROM_ALL
         tests/script_ui_state_store_tests.cpp
         src/ui/ScriptUiStateStore.cpp
@@ -547,6 +574,7 @@ qt_add_executable(FSRemote WIN32
     # =====wjy====
     src/system/DeviceRealtimeStateService.cpp
     src/system/DeviceRealtimeStateService.h
+    src/system/NetworkInterfacePolicy.h # wjy: 将虚拟网卡识别策略登记到正式工程源列表，便于 Qt Creator 直接审阅生产筛选规则。
     # ===end====
     src/system/WakeOnLanSender.cpp
     src/system/WakeOnLanSender.h
