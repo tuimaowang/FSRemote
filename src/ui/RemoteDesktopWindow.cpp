@@ -2160,18 +2160,19 @@ void RemoteDesktopWindow::applyRemoteQualityDecision(const RemoteQualityDecision
     sendCurrentRemoteQualityDecision();
     sendCurrentViewerAudioDecision(); // wjy: 质量请求变化时顺带补发本窗口独立音频状态，二者不共享所有权判定。
     if (feedbackChanged) {
+        const bool backgroundRole = decision.effectiveMode != stream::RemoteQualityMode::HighQualityLocked; // wjy: 日志按实际质量角色判断后台，单窗口无焦点保持高清时不再误报background=1。
         appendViewerDebugLog(QStringLiteral("quality role host=%1 active=%2 fullscreen=%3 background=%4 audio=%5 resolution=%6 target=%7x%8 fps=%9 priority=%10 reason=%11")
             .arg(m_hostIp)
             .arg(decision.active ? 1 : 0)
             .arg(decision.fullScreen ? 1 : 0)
-            .arg(!decision.active && !decision.fullScreen ? 1 : 0)
+            .arg(backgroundRole ? 1 : 0)
             .arg(decision.audioEnabled ? 1 : 0)
             .arg(static_cast<int>(decision.resolution))
             .arg(decision.targetWidth)
             .arg(decision.targetHeight)
             .arg(decision.targetFps)
             .arg(decision.priority)
-            .arg(static_cast<int>(decision.reason))); // wjy: 只在角色/档位状态变化时写data日志，额外记录目标尺寸和原因便于确认最大窗口/后台降帧策略。
+            .arg(static_cast<int>(decision.reason))); // wjy: 只在角色/档位状态变化时写data日志，额外记录目标尺寸和原因便于确认单窗口/焦点后台策略。
         requestTitleBarUpdate();
     }
 }

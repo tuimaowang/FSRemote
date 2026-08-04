@@ -5378,12 +5378,15 @@ void DeviceGrid::updateScriptFileEditorControls()
                 const bool hadSelection = oldCursor.hasSelection();
                 const int oldPosition = oldCursor.position();
                 const int oldAnchor = oldCursor.anchor();
-                const QScrollBar* oldScrollBar = m_scriptOutputEdit->verticalScrollBar();
+                QScrollBar* scrollBar = m_scriptOutputEdit->verticalScrollBar();
+                const int oldScrollValue = scrollBar->value(); // wjy: 文档整体替换前保存真实QTextEdit滚动位置，用户向上查看时刷新后仍停在原处。
+                const int oldScrollMaximum = scrollBar->maximum();
                 const bool followNewest = m_scriptOutputAutoScroll
-                    || oldScrollBar->value() >= oldScrollBar->maximum();
+                    || oldScrollValue >= oldScrollMaximum; // wjy: 首次刚出现滚动条时也按刷新前状态决定是否跟随尾部，不读取重建过程中的临时0范围。
+                const QSignalBlocker scrollSignalBlocker(scrollBar); // wjy: setPlainText重建文档时会把滚动条暂时归零，禁止该程序行为反向改写用户的自动滚动意图。
                 m_scriptOutputEdit->setPlainText(normalizedOutput); // wjy: 仅日志内容真正变化时刷新控件，避免每次重绘都破坏选择和复制操作。
+                const int documentLength = qMax(0, m_scriptOutputEdit->document()->characterCount() - 1);
                 if (hadSelection) {
-                    const int documentLength = qMax(0, m_scriptOutputEdit->document()->characterCount() - 1);
                     QTextCursor restoredCursor(m_scriptOutputEdit->document());
                     restoredCursor.setPosition(qBound(0, oldAnchor, documentLength));
                     restoredCursor.setPosition(qBound(0, oldPosition, documentLength), QTextCursor::KeepAnchor);
@@ -5392,8 +5395,16 @@ void DeviceGrid::updateScriptFileEditorControls()
                     QTextCursor endCursor = m_scriptOutputEdit->textCursor();
                     endCursor.movePosition(QTextCursor::End);
                     m_scriptOutputEdit->setTextCursor(endCursor);
-                    m_scriptOutputEdit->ensureCursorVisible();
+                } else {
+                    QTextCursor restoredCursor(m_scriptOutputEdit->document());
+                    restoredCursor.setPosition(qBound(0, oldPosition, documentLength));
+                    m_scriptOutputEdit->setTextCursor(restoredCursor); // wjy: 未跟随尾部时保留只读文本光标，键盘选择不会在每行日志到达后跳回开头。
                 }
+                const int restoredScrollValue = followNewest
+                    ? scrollBar->maximum()
+                    : qBound(scrollBar->minimum(), oldScrollValue, scrollBar->maximum());
+                scrollBar->setValue(restoredScrollValue); // wjy: 文档范围稳定后只设置一次最终位置，消除新日志到达时首页与尾页交替跳转。
+                m_scriptOutputAutoScroll = followNewest; // wjy: 刷新完成后恢复刷新前的跟随意图，只有真实用户滚动产生的信号才允许改变它。
             }
             m_scriptOutputEdit->raise(); // wjy: 真实文本控件覆盖原自绘正文区域，但不遮挡标题、脚本树和启动/停止按钮。
         }
