@@ -21,6 +21,7 @@
 #include "system/WolDetector.h"
 #include "system/WjyDiagnosticLog.h"
 #include "ui/DeviceSearchPanel.h"
+#include "ui/DeviceListSortPolicy.h" // wjy: 设备栏统一复用在线优先、数字自然排序和英文字母排序策略。
 #include "ui/RemoteDesktopWindow.h"
 #include "ui/ScriptPanelVisibility.h"
 #include "ui/SettingsLayoutSnapshot.h"
@@ -1433,10 +1434,11 @@ QStringList deviceNames();
 int visibleDeviceListRowCount(); // wjy: 统计“我的设备”下拉框里的可见行数，包含设备行和新建分组行。
 // =====wjy====self1
 bool deviceGroupExpandedForIndex(int groupIndex);
-QVector<DeviceListRow> visibleDeviceRows();
+QVector<DeviceListRow> visibleDeviceRows(); // wjy: 仅供行数/几何统计使用；真实绘制和命中必须传入当前状态缓存。
+QVector<DeviceListRow> visibleDeviceRows(const QHash<QString, platform::DevicePresenceState>& deviceStatuses); // wjy: 绘制、点击和拖拽共享同一份在线优先排序快照。
 int rootDeviceRowCount();
-int visualRowIndexForDeviceIndex(int deviceIndex);
-int visualRowIndexForGroupIndex(int groupIndex);
+int visualRowIndexForDeviceIndex(int deviceIndex, const QHash<QString, platform::DevicePresenceState>& deviceStatuses); // wjy: 状态变化会重排设备，定位行号时必须使用当前缓存。
+int visualRowIndexForGroupIndex(int groupIndex, const QHash<QString, platform::DevicePresenceState>& deviceStatuses); // wjy: 分组定位和设备列表使用同一排序上下文。
 QRect visibleDeviceRowRect(int rowIndex);
 int visibleDeviceListContentHeight();
 int visibleDeviceListViewportHeight(bool deviceGroupExpanded);
@@ -1521,26 +1523,23 @@ int deviceGroupIndexByName(const QString& groupName)
     return -1;
 }
 
-bool deviceIndexLessByLeadingCharacter(int leftIndex, int rightIndex)
+platform::DevicePresenceState devicePresenceForSorting(
+    int deviceIndex,
+    const QHash<QString, platform::DevicePresenceState>& deviceStatuses)
 {
-    const QString leftName = deviceDisplayName(g_devices.at(leftIndex)).trimmed();
-    const QString rightName = deviceDisplayName(g_devices.at(rightIndex)).trimmed();
-    const QString leftKey = leftName.left(1).toCaseFolded();
-    const QString rightKey = rightName.left(1).toCaseFolded();
-    const int keyCompare = QString::localeAwareCompare(leftKey, rightKey);
-    if (keyCompare != 0) {
-        return keyCompare < 0;
+    if (deviceIndex < 0 || deviceIndex >= g_devices.size()) {
+        return platform::DevicePresenceState::Unknown; // wjy: 失效下标按非在线处理，排序阶段不访问越界设备。
     }
-
-    const int nameCompare = QString::localeAwareCompare(leftName, rightName);
-    if (nameCompare != 0) {
-        return nameCompare < 0;
+    const QString ip = g_devices.at(deviceIndex).ip.trimmed(); // wjy: 状态缓存和设备列表继续以规范化 IP 关联，不引入第二套状态来源。
+    if (ip.isEmpty()) {
+        return platform::DevicePresenceState::Offline;
     }
-
-    return leftIndex < rightIndex;
+    return deviceStatuses.value(ip, platform::DevicePresenceState::Unknown); // wjy: 尚未收到心跳或探测结果的设备归入非在线分区。
 }
 
-QVector<int> sortedDeviceIndexesForGroup(int groupIndex)
+QVector<int> sortedDeviceIndexesForGroup(
+    int groupIndex,
+    const QHash<QString, platform::DevicePresenceState>& deviceStatuses)
 {
     QVector<int> deviceIndexes;
     deviceIndexes.reserve(g_devices.size());
@@ -1561,18 +1560,32 @@ QVector<int> sortedDeviceIndexesForGroup(int groupIndex)
         }
     }
 
-    std::stable_sort(deviceIndexes.begin(), deviceIndexes.end(), deviceIndexLessByLeadingCharacter);
+    const ui::DeviceListNaturalLess naturalLess; // wjy: 同一分组的一轮排序复用一个 QCollator，数字按数值、英文按字母比较。
+    std::stable_sort(deviceIndexes.begin(), deviceIndexes.end(), [&](int leftIndex, int rightIndex) {
+        const ui::DeviceListSortItem left{
+            deviceDisplayName(g_devices.at(leftIndex)),
+            devicePresenceForSorting(leftIndex, deviceStatuses),
+            leftIndex,
+        }; // wjy: 每台设备把展示名、实时状态和稳定源下标组合成排序键。
+        const ui::DeviceListSortItem right{
+            deviceDisplayName(g_devices.at(rightIndex)),
+            devicePresenceForSorting(rightIndex, deviceStatuses),
+            rightIndex,
+        };
+        return naturalLess(left, right); // wjy: 第一关键字是在线状态，同一状态分区内再执行自然名称排序。
+    });
     return deviceIndexes;
 }
 
-QVector<DeviceListRow> visibleDeviceRows()
+QVector<DeviceListRow> visibleDeviceRows(
+    const QHash<QString, platform::DevicePresenceState>& deviceStatuses)
 {
     QVector<DeviceListRow> rows;
     rows.reserve(g_devices.size() + g_deviceGroupNames.size());
 
     // 1. 先显示没有分组的设备。
     // 如果设备 group 指向一个已经不存在的分组，也先显示在根部，避免设备消失。
-    for (int deviceIndex : sortedDeviceIndexesForGroup(-1)) {
+    for (int deviceIndex : sortedDeviceIndexesForGroup(-1, deviceStatuses)) {
         rows.append({DeviceListRow::Type::Device, deviceIndex, -1});
     }
 
@@ -1585,12 +1598,18 @@ QVector<DeviceListRow> visibleDeviceRows()
             continue;
         }
 
-        for (int deviceIndex : sortedDeviceIndexesForGroup(groupIndex)) {
+        for (int deviceIndex : sortedDeviceIndexesForGroup(groupIndex, deviceStatuses)) {
             rows.append({DeviceListRow::Type::Device, deviceIndex, groupIndex});
         }
     }
 
     return rows;
+}
+
+QVector<DeviceListRow> visibleDeviceRows()
+{
+    static const QHash<QString, platform::DevicePresenceState> emptyDeviceStatuses; // wjy: 行数和几何只关心元素数量，不依赖在线排序结果。
+    return visibleDeviceRows(emptyDeviceStatuses);
 }
 // ===end====
 
@@ -1614,9 +1633,11 @@ int rootDeviceRowCount()
 // ===end====
 }
 
-int visualRowIndexForDeviceIndex(int deviceIndex)
+int visualRowIndexForDeviceIndex(
+    int deviceIndex,
+    const QHash<QString, platform::DevicePresenceState>& deviceStatuses)
 {
-    const QVector<DeviceListRow> rows = visibleDeviceRows();
+    const QVector<DeviceListRow> rows = visibleDeviceRows(deviceStatuses); // wjy: 设备定位必须和当前在线优先显示顺序完全一致。
     for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
         const DeviceListRow& row = rows.at(rowIndex);
         if (row.type == DeviceListRow::Type::Device && row.deviceIndex == deviceIndex) {
@@ -1627,10 +1648,12 @@ int visualRowIndexForDeviceIndex(int deviceIndex)
     return -1;
 }
 
-int visualRowIndexForGroupIndex(int groupIndex)
+int visualRowIndexForGroupIndex(
+    int groupIndex,
+    const QHash<QString, platform::DevicePresenceState>& deviceStatuses)
 {
     // =====wjy====
-    const QVector<DeviceListRow> rows = visibleDeviceRows();
+    const QVector<DeviceListRow> rows = visibleDeviceRows(deviceStatuses); // wjy: 分组行号也从同一实时排序快照中解析，避免设备重排后编辑框错位。
     for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
         const DeviceListRow& row = rows.at(rowIndex);
         if (row.type == DeviceListRow::Type::Group && row.groupIndex == groupIndex) {
@@ -7070,7 +7093,7 @@ void DeviceGrid::revealDeviceGroup(int groupIndex, bool beginRename)
     m_deviceGroupExpanded = true; // wjy: 若整个设备列表被收起，操作后自动打开以展示目标分组。
     g_deviceCatalog.setGroupExpanded(g_deviceGroupIds.at(groupIndex), true); // wjy: 目标组始终展开，稳定 ID 保证视觉重排后仍命中原分组。
 
-    const int rowIndex = visualRowIndexForGroupIndex(groupIndex); // wjy: 设备归组会重排可见行，因此必须在归组完成后重新解析目标视觉行。
+    const int rowIndex = visualRowIndexForGroupIndex(groupIndex, m_deviceStatuses); // wjy: 设备归组或在线状态变化都会重排行，使用当前状态缓存重新解析目标分组位置。
     if (rowIndex < 0) {
         update();
         return;
@@ -7095,7 +7118,7 @@ void DeviceGrid::beginDeviceGroupRename(int groupIndex)
     }
     finishDeviceRename(true);
 
-    const int rowIndex = visualRowIndexForGroupIndex(groupIndex); // wjy: 找到分组当前在左侧列表中的视觉行号。
+    const int rowIndex = visualRowIndexForGroupIndex(groupIndex, m_deviceStatuses); // wjy: 按当前在线优先快照找到分组在左侧列表中的视觉行号。
     if (rowIndex < 0) {
         return;
     }
@@ -7120,7 +7143,7 @@ void DeviceGrid::finishDeviceGroupRename(bool saveText)
     }
 
     const int groupIndex = m_renamingDeviceGroupIndex; // wjy: 先保存下标，后面会清空编辑状态。
-    const int rowIndex = visualRowIndexForGroupIndex(groupIndex);
+    const int rowIndex = visualRowIndexForGroupIndex(groupIndex, m_deviceStatuses); // wjy: 提交分组名称前按最新状态排序定位原编辑行。
     const QRect rowRect = rowIndex >= 0 ? scrolledVisibleDeviceRowRect(rowIndex, m_deviceListScrollOffset) : QRect();
     if (saveText && groupIndex >= 0 && groupIndex < g_deviceGroupNames.size()) {
         const QString oldName = g_deviceGroupNames.at(groupIndex).trimmed();
@@ -7164,12 +7187,12 @@ bool DeviceGrid::beginDeviceRename(int deviceIndex)
     }
     finishDeviceGroupRename(true);
 
-    const int rowIndex = visualRowIndexForDeviceIndex(deviceIndex);
+    const int rowIndex = visualRowIndexForDeviceIndex(deviceIndex, m_deviceStatuses); // wjy: 在线优先可能改变设备位置，开始编辑时按当前状态解析行号。
     if (rowIndex < 0) {
         return false;
     }
 
-    const QVector<DeviceListRow> rows = visibleDeviceRows();
+    const QVector<DeviceListRow> rows = visibleDeviceRows(m_deviceStatuses); // wjy: 编辑框位置、缩进和绘制使用同一份在线优先自然排序快照。
     if (rowIndex >= rows.size()) {
         return false;
     }
@@ -7196,7 +7219,7 @@ void DeviceGrid::finishDeviceRename(bool saveText)
     }
 
     const int deviceIndex = m_renamingDeviceIndex;
-    const int rowIndex = visualRowIndexForDeviceIndex(deviceIndex);
+    const int rowIndex = visualRowIndexForDeviceIndex(deviceIndex, m_deviceStatuses); // wjy: 结束编辑时按最新在线状态重新定位需要刷新的设备行。
     const QRect rowRect = rowIndex >= 0 ? scrolledVisibleDeviceRowRect(rowIndex, m_deviceListScrollOffset) : QRect();
     if (saveText && deviceIndex >= 0 && deviceIndex < g_devices.size()) {
         applyDeviceRename(deviceIndex, m_deviceListNameEdit->text().trimmed());
@@ -8785,7 +8808,7 @@ void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex)
 void DeviceGrid::launchSelectedRemoteDesktopWindows()
 {
     QVector<int> launchIndexes;
-    const QVector<DeviceListRow> rows = visibleDeviceRows();
+    const QVector<DeviceListRow> rows = visibleDeviceRows(m_deviceStatuses); // wjy: 批量远控目标按当前在线优先自然排序后的可见顺序收集。
     for (const DeviceListRow& row : rows) {
         if (row.type == DeviceListRow::Type::Device
             && row.deviceIndex >= 0
@@ -9809,7 +9832,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
 // =====wjy====
     const QSet<int> badges = deviceBadgeIndexes(); // wjy: 远程控制角标仍然按真实设备下标判断，避免分组行影响设备下标。
     m_deviceListScrollOffset = qBound(0, m_deviceListScrollOffset, maxDeviceListScrollOffset()); // wjy: 详情栏收起后仍校正设备滚动偏移，设备栏交互不受影响。
-    const QVector<DeviceListRow> deviceRows = visibleDeviceRows(); // wjy: 设备栏在展开和紧凑状态下使用同一份可见行快照。
+    const QVector<DeviceListRow> deviceRows = visibleDeviceRows(m_deviceStatuses); // wjy: 设备栏绘制使用在线优先、组内自然名称排序后的唯一可见行快照。
     const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: “我的设备”内部滚动视口始终限制在 240px 设备栏内。
     if (m_deviceGroupExpanded) {
         painter.save();
@@ -10417,7 +10440,7 @@ void DeviceGrid::selectDeviceFromSearch(const QString& deviceId)
     m_draggingDeviceIndexes.clear();
     m_selectionAnchorDeviceIndex = deviceIndex; // wjy: 搜索定位收敛为单选，并把 Shift 范围选择锚点同步到目标设备。
 
-    const int rowIndex = visualRowIndexForDeviceIndex(deviceIndex);
+    const int rowIndex = visualRowIndexForDeviceIndex(deviceIndex, m_deviceStatuses); // wjy: 搜索定位遵循用户当前看到的在线优先自然排序位置。
     if (rowIndex >= 0) {
         const QRect viewport = deviceListViewportRect(true);
         const QRect currentRowRect = scrolledVisibleDeviceRowRect(rowIndex, m_deviceListScrollOffset);
@@ -10464,7 +10487,7 @@ void DeviceGrid::startDeviceSwitchAnimation(int newIndex, const QString& newName
 // =====wjy====
 void DeviceGrid::pruneHiddenDeviceSelections()
 {
-    const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 以当前展开/折叠后的可见行作为唯一可信的选择范围。
+    const QVector<DeviceListRow> rows = visibleDeviceRows(m_deviceStatuses); // wjy: 以当前展开/折叠及在线优先排序后的可见行作为唯一可信的选择范围。
     QSet<int> visibleDeviceIndexes; // wjy: 保存当前左侧列表里真实可见的设备下标，用来过滤隐藏设备。
     int firstVisibleDeviceIndex = -1; // wjy: 当前主设备被隐藏时，用第一个可见设备作为详情页兜底目标。
     int firstSelectedVisibleDeviceIndex = -1; // wjy: 如果多选里还有可见设备，优先用它作为新的主设备。
@@ -10762,7 +10785,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
     }
 
     if (event->button() == Qt::RightButton && m_deviceGroupExpanded) {
-        const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 设备行右键命中使用当前可见行，保证滚动后菜单出现在真实设备上。
+        const QVector<DeviceListRow> rows = visibleDeviceRows(m_deviceStatuses); // wjy: 设备右键命中复用在线优先自然排序后的可见行，保证菜单对应真实设备。
         const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded);
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
             const DeviceListRow& row = rows.at(rowIndex);
@@ -10808,7 +10831,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
     }
 
     if (event->button() == Qt::RightButton && m_deviceGroupExpanded) { // wjy: 详情栏收起时分组右键仍可用，设备栏交互不受影响。
-        const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 分组右键命中也复用当前可见行，滚动后坐标和绘制保持一致。
+        const QVector<DeviceListRow> rows = visibleDeviceRows(m_deviceStatuses); // wjy: 分组右键命中也复用当前状态排序快照，滚动后坐标和绘制保持一致。
         const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 只允许右键当前可见视口里的分组行。
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
             const DeviceListRow& row = rows.at(rowIndex);
@@ -10919,7 +10942,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
 
 // =====wjy====
     if (event->button() == Qt::LeftButton && m_deviceGroupExpanded) { // wjy: 详情栏收起时设备拖拽仍从完整设备栏正常开始。
-        const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 拖拽按下也使用当前可见行顺序，避免分组行插入后设备下标错位。
+        const QVector<DeviceListRow> rows = visibleDeviceRows(m_deviceStatuses); // wjy: 拖拽按下使用在线优先自然排序后的当前可见行，避免设备下标错位。
         const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 只允许在当前可见滚动视口内开始拖拽。
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
             const DeviceListRow& row = rows.at(rowIndex); // wjy: rowIndex 是界面行号，row.deviceIndex 才是真实设备下标。
@@ -11143,7 +11166,7 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
     {
         QString tip;
         if (m_deviceGroupExpanded) {
-            const QVector<DeviceListRow> deviceRows = visibleDeviceRows();
+            const QVector<DeviceListRow> deviceRows = visibleDeviceRows(m_deviceStatuses); // wjy: 徽标悬停命中和当前在线优先绘制顺序保持一致。
             const QRect listClip = deviceListViewportRect(m_deviceGroupExpanded);
             for (int rowIndex = 0; rowIndex < deviceRows.size(); ++rowIndex) {
                 const DeviceListRow& row = deviceRows.at(rowIndex);
@@ -11291,7 +11314,7 @@ void DeviceGrid::mouseDoubleClickEvent(QMouseEvent* event)
 {
 // =====wjy====
     if (event->button() == Qt::LeftButton && m_deviceGroupExpanded) { // wjy: 紧凑窗口也支持双击设备远控；分组双击仍保留原地重命名。
-        const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 双击命中也使用可见行，分组和设备位置会跟随 UI 绘制变化。
+        const QVector<DeviceListRow> rows = visibleDeviceRows(m_deviceStatuses); // wjy: 双击命中使用在线优先自然排序行，设备位置始终跟随 UI 绘制变化。
         const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 双击只识别当前可见视口内的列表行。
         for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
             const DeviceListRow& row = rows.at(rowIndex);
@@ -11593,7 +11616,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
 
             int targetInsertionIndex = g_deviceGroupNames.size();
             if (m_deviceGroupExpanded) {
-                const QVector<DeviceListRow> rows = visibleDeviceRows();
+                const QVector<DeviceListRow> rows = visibleDeviceRows(m_deviceStatuses); // wjy: 分组拖拽落点按当前状态排序后的真实行位置计算。
                 const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded);
                 targetInsertionIndex = 0;
                 for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
@@ -11659,7 +11682,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
             QString targetGroup;
             const bool deleteUngroupedDevices = deviceIndexesAreAllUngrouped(m_draggingDeviceIndexes); // wjy: 只有整个拖拽快照都是根部设备时，顶部危险区域才具备删除含义。
             if (m_deviceGroupExpanded) {
-                const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 拖拽落点按当前可见行识别，和 UI 绘制顺序保持一致。
+                const QVector<DeviceListRow> rows = visibleDeviceRows(m_deviceStatuses); // wjy: 设备拖拽落点按在线优先自然排序后的可见行识别，与绘制顺序一致。
                 const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 拖拽落点只在当前可见滚动视口内识别。
                 const QRect ghostRect = deviceDragGhostRect(m_deviceDragCurrentPos, size());
                 if (ghostRect.intersects(topDragDropZoneRect())) {
@@ -11867,7 +11890,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         }
 
         if (m_deviceGroupExpanded) {
-            const QVector<DeviceListRow> rows = visibleDeviceRows(); // wjy: 普通点击也使用可见行，保证点击位置和绘制出来的行一致。
+            const QVector<DeviceListRow> rows = visibleDeviceRows(m_deviceStatuses); // wjy: 普通点击使用在线优先自然排序后的可见行，保证命中位置与绘制一致。
             const QRect deviceListClip = deviceListViewportRect(m_deviceGroupExpanded); // wjy: 普通点击也只命中当前滚动视口内的列表行。
 // =====wjy====
             for (int rowIndex = 0; rowIndex < rows.size(); ++rowIndex) { // wjy: 一次遍历当前 UI 的每一行，设备行和分组行按同一套坐标命中。

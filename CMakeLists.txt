@@ -405,6 +405,20 @@ if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_DEVICE_SYNC_TESTS) # wjy: 设备目�
     add_test(NAME fsremote_device_action_target_tests COMMAND fsremote_device_action_target_tests)
 
     # =====wjy====
+    add_executable(fsremote_device_list_sort_policy_tests EXCLUDE_FROM_ALL
+        tests/device_list_sort_policy_tests.cpp
+        src/ui/DeviceListSortPolicy.h
+        src/system/DeviceStatusService.h
+    ) # wjy: 纯排序策略测试覆盖自然数字、英文字母和在线优先，不启动窗口、网络或真实设备探测。
+    target_include_directories(fsremote_device_list_sort_policy_tests PRIVATE src)
+    target_link_libraries(fsremote_device_list_sort_policy_tests PRIVATE Qt6::Core)
+    if(MSVC)
+        target_compile_options(fsremote_device_list_sort_policy_tests PRIVATE /utf-8) # wjy: 测试和策略中的中文说明统一按 UTF-8 编译。
+    endif()
+    add_test(NAME fsremote_device_list_sort_policy_tests COMMAND fsremote_device_list_sort_policy_tests)
+    # ===end====
+
+    # =====wjy====
     add_executable(fsremote_network_interface_policy_tests EXCLUDE_FROM_ALL
         tests/network_interface_policy_tests.cpp
         src/system/NetworkInterfacePolicy.h
@@ -496,6 +510,7 @@ qt_add_executable(FSRemote WIN32
     # ===end====
     src/ui/DeviceGrid.cpp
     src/ui/DeviceGrid.h
+    src/ui/DeviceListSortPolicy.h # wjy: 主设备列表复用可独立测试的在线优先与自然名称排序策略。
     src/ui/RemoteDesktopWindow.cpp
     src/ui/RemoteDesktopWindow.h
     src/ui/NativeRemoteTitleBarSurface.cpp
