@@ -318,27 +318,86 @@ DecodeResult H264Decoder::convert_d3d11_frame(DecodedFrame* decoded, std::string
     decoded->srv = output_srvs_[output_index_];
     decoded->shared_handle = output_shared_handles_[output_index_];
     decoded->shared_texture_index = output_index_; // wjy: 上层根据纹理回调结果决定交给消费者key还是直接归还生产者key。
-    decoded->shared_texture_locked = true; // wjy: 回调返回前生产端持续持有该槽，消费者只能在正式交接后读取。
+    decoded->shared_texture_locked = true; // wjy: VideoProcessor输出完成后仍持有生产者key 0，handoff会在应用回调前切换到消费者key 1。
+    decoded->shared_texture_handed_off = false; // wjy: 每个新输出槽都从生产者持有态开始，禁止沿用上一帧的交接状态。
     return {DecodeStatus::Success};
 }
 
 // =====wjy====
-void H264Decoder::release_shared_texture(DecodedFrame* frame, bool consumerAccepted)
+bool H264Decoder::handoff_shared_texture(DecodedFrame* frame)
 {
     if (!frame || !frame->shared_texture_locked
         || frame->shared_texture_index < 0
         || frame->shared_texture_index >= kOutputTextureCount) {
-        return;
+        return false; // wjy: 只有当前确实持有生产者key的有效槽位才允许交给消费者。
     }
 
     const int textureIndex = frame->shared_texture_index;
-    if (output_keyed_mutexes_[textureIndex]) {
-        context_->Flush(); // wjy: 将本设备对共享纹理的命令提交后再切换同步key。
-        output_keyed_mutexes_[textureIndex]->ReleaseSync(
-            consumerAccepted ? kSharedTextureConsumerKey : kSharedTextureProducerKey); // wjy: 接受帧交给Presenter；丢帧或BGRA回退则立即复用。
+    if (!output_keyed_mutexes_[textureIndex]) {
+        return false;
+    }
+    context_->Flush(); // wjy: 先提交VideoProcessor写入，再把完整纹理交给控制端读取。
+    const HRESULT result = output_keyed_mutexes_[textureIndex]->ReleaseSync(kSharedTextureConsumerKey);
+    if (FAILED(result)) {
+        return false; // wjy: ReleaseSync失败时仍保留生产者持有标记，由reclaim兜底归还或触发设备恢复。
+    }
+    frame->shared_texture_locked = false; // wjy: 生产端从此不能覆盖该槽，直到消费者归还key 0。
+    frame->shared_texture_handed_off = true; // wjy: 应用回调现在可以立即由RenderWorker AcquireSync(key 1)，不再等待回调返回后的迟到交接。
+    return true;
+}
+
+bool H264Decoder::reclaim_shared_texture(DecodedFrame* frame)
+{
+    if (!frame || frame->shared_texture_index < 0
+        || frame->shared_texture_index >= kOutputTextureCount) {
+        return false;
+    }
+
+    const int textureIndex = frame->shared_texture_index;
+    auto& keyedMutex = output_keyed_mutexes_[textureIndex];
+    if (!keyedMutex) {
+        return false;
+    }
+
+    if (frame->shared_texture_handed_off) {
+        const HRESULT acquire = keyedMutex->AcquireSync(kSharedTextureConsumerKey, 2); // wjy: 回调已同步拒绝该帧，短等待只覆盖key切换的线程抖动。
+        if (acquire != S_OK) {
+            return false; // wjy: 未真实取得key 1时不伪造释放，交由异常恢复路径处理。
+        }
+        frame->shared_texture_handed_off = false;
+        frame->shared_texture_locked = true; // wjy: 软件读回完成前继续独占该纹理，下一帧不能覆盖当前像素。
+        return true;
+    }
+
+    return frame->shared_texture_locked; // wjy: 尚未交接的回退路径本来就持有生产者key，可继续读取纹理。
+}
+
+bool H264Decoder::release_shared_texture(DecodedFrame* frame)
+{
+    if (!frame || frame->shared_texture_index < 0
+        || frame->shared_texture_index >= kOutputTextureCount) {
+        return false;
+    }
+    if (frame->shared_texture_handed_off && !reclaim_shared_texture(frame)) {
+        return false; // wjy: 必须先真实取得消费者key，再把槽位归还生产者，禁止跳过AcquireSync。
+    }
+    if (!frame->shared_texture_locked) {
+        return true; // wjy: 已完成归还的帧重复进入清理路径时保持幂等。
+    }
+
+    context_->Flush(); // wjy: 提交本设备对该纹理的最后操作后再允许生产端覆盖。
+    auto& keyedMutex = output_keyed_mutexes_[frame->shared_texture_index];
+    if (!keyedMutex) {
+        return false;
+    }
+    const HRESULT release = keyedMutex->ReleaseSync(kSharedTextureProducerKey);
+    if (FAILED(release)) {
+        return false;
     }
     frame->shared_texture_locked = false;
-    frame->shared_texture_index = -1;
+    frame->shared_texture_handed_off = false;
+    frame->shared_texture_index = -1; // wjy: 成功回到key 0后清除槽位身份，防止析构守卫重复归还。
+    return true;
 }
 
 int H264Decoder::acquire_output_texture(DecodeStatus* status, std::string* error)

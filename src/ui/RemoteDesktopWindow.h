@@ -57,7 +57,16 @@ public:
         QWidget* parent = nullptr); // wjy: 每个窗口共享同一生命周期管理器，不再自行创建无法等待的后台线程。
     ~RemoteDesktopWindow() override;
     void enqueueRemoteFrame(QImage image, quint64 viewerGeneration); // wjy: BGRA回调携带viewer代际，重连后迟到旧帧会在写入pending前被拒绝。
-    int enqueueRemoteTextureFrame(int width, int height, void* sharedHandle, quint64 frameId, double encodedMbps, quint64 viewerGeneration); // wjy: 返回接受、回退或受控丢帧，解码器据此安全切换keyed mutex所有权。
+    int enqueueRemoteTextureFrame(
+        int width,
+        int height,
+        void* sharedHandle,
+        quint64 frameId,
+        qint64 rtpTimestamp,
+        qint64 renderTimeMs,
+        quint64 decodedAtUs,
+        double encodedMbps,
+        quint64 viewerGeneration); // wjy: 旧Presenter迁移路径保留三态结果，同时接收真实解码时间轴供后续诊断和RenderWorker使用。
     void setRemoteFrame(const QImage& image);
     void setConnectionStatus(int code, const QString& message);
     void setEncodedBitrateMbps(double mbps);

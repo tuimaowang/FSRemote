@@ -856,21 +856,37 @@ private:
         struct SharedTextureReleaseGuard {
             lsp::H264Decoder* decoder = nullptr;
             lsp::DecodedFrame* frame = nullptr;
-            bool released = false;
+            bool completed = false;
 
             ~SharedTextureReleaseGuard()
             {
-                if (!released && decoder && frame) {
-                    decoder->release_shared_texture(frame, false); // wjy: 任意异常或提前返回都把生产端持有的纹理归还key 0。
+                if (!completed && decoder && frame) {
+                    decoder->release_shared_texture(frame); // wjy: 任意异常或提前返回都先取得真实所有权再归还生产者key 0。
                 }
             }
 
-            void release(bool consumerAccepted)
+            bool handoff()
             {
-                if (!released && decoder && frame) {
-                    decoder->release_shared_texture(frame, consumerAccepted); // wjy: GPU接管交给key 1，其余路径立即回到生产者key。
-                    released = true;
+                return !completed && decoder && frame
+                    && decoder->handoff_shared_texture(frame); // wjy: 应用回调执行前先准备key 1，异步消费者不会抢在交接前超时。
+            }
+
+            bool reclaim()
+            {
+                return !completed && decoder && frame
+                    && decoder->reclaim_shared_texture(frame); // wjy: 软件回退继续读取共享纹理前必须重新取得独占权。
+            }
+
+            void release()
+            {
+                if (!completed && decoder && frame && decoder->release_shared_texture(frame)) {
+                    completed = true; // wjy: 只有生产者key 0真实归还成功后才关闭析构兜底。
                 }
+            }
+
+            void dismissAccepted()
+            {
+                completed = true; // wjy: 接受帧由Presenter负责最终归还key 0，解码器守卫不得重复回收。
             }
         } sharedTextureGuard;
         sharedTextureGuard.decoder = &decoder_; // wjy: 显式绑定当前解码器，避免依赖局部守卫是否满足聚合初始化规则。
@@ -885,20 +901,26 @@ private:
         }
 
         webrtc::scoped_refptr<webrtc::I420Buffer> buffer; // wjy: 纹理直显路径不申请整张I420，只有软件回退时才分配。
+        const uint64_t decodedAtUs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count()); // wjy: 在解码器完成点记录单调时间，应用层不得用回调到达时刻替代。
         int texture_result = DecodedTextureFallback; // wjy: 使用编解码公共库内部三态，避免底层目标反向依赖上层FsRemoteStreamApi头文件。
-        if (texture_callback_ && decoded.shared_handle) {
+        if (texture_callback_ && decoded.shared_handle && sharedTextureGuard.handoff()) {
             texture_result = texture_callback_(
                 static_cast<int>(decoded.size.width),
                 static_cast<int>(decoded.size.height),
                 decoded.shared_handle,
                 decoded_frames_ + 1,
+                static_cast<int64_t>(input_image.RtpTimestamp()),
+                render_time_ms,
+                decodedAtUs,
                 encoded_mbps_);
         }
 
-        if (texture_result != DecodedTextureFallback) {
+        if (texture_result == DecodedTextureAccepted) {
             // =====wjy====
-            // GPU纹理已经交给Presenter或被受控丢弃；不再构造无效黑色I420，也不再重复触发WebRTC软件帧回调。
-            sharedTextureGuard.release(texture_result == DecodedTextureAccepted); // wjy: 按接管结果完成一次且仅一次key交接。
+            // GPU纹理已经由Presenter接管；最终key 0归还责任随共享句柄转移，不再触发软件帧回调。
+            sharedTextureGuard.dismissAccepted(); // wjy: 结束解码器栈守卫，避免把已异步交付的纹理提前收回。
             waiting_for_keyframe_ = false; // wjy: 当前压缩帧已经成功解码，继续使用后续参考帧。
             ++decoded_frames_; // wjy: 统计GPU直显路径帧数，避免与软件回退统计混淆。
             if (decoded_frames_ == 1 || decoded_frames_ % 120 == 0) {
@@ -907,14 +929,23 @@ private:
             }
             return WEBRTC_VIDEO_CODEC_OK;
             // ===end====
+        } else if (texture_result == DecodedTextureDropped) {
+            sharedTextureGuard.release(); // wjy: 单槽繁忙时应用没有保留句柄，立即把消费者key取回并归还生产者槽位。
+            waiting_for_keyframe_ = false;
+            ++decoded_frames_;
+            return WEBRTC_VIDEO_CODEC_OK;
         } else {
             // =====wjy====
+            if (!sharedTextureGuard.reclaim()) {
+                append_viewer_log("decoder software fallback failed to reclaim shared texture");
+                return WEBRTC_VIDEO_CODEC_ERROR; // wjy: 未取得真实纹理所有权时禁止继续GPU读回或错误释放key。
+            }
             // 仅软件回退路径申请与真实分辨率相同的I420缓冲，GPU直显路径不会触发这段分配。
             buffer = i420_fallback_pool_.CreateI420Buffer(
                 static_cast<int>(decoded.size.width),
                 static_cast<int>(decoded.size.height)); // wjy: 复用有界I420缓冲，只有回退帧被释放后才归还池槽。
             if (!buffer) {
-                sharedTextureGuard.release(false); // wjy: 内存不足时也必须归还生产者key。
+                sharedTextureGuard.release(); // wjy: 内存不足时也必须归还生产者key。
                 append_viewer_log("decoder I420 allocation failed");
                 return WEBRTC_VIDEO_CODEC_ERROR;
             }
@@ -933,7 +964,7 @@ private:
                 append_viewer_log("decoder BGRA buffer empty");
                 return WEBRTC_VIDEO_CODEC_ERROR;
             }
-            sharedTextureGuard.release(false); // wjy: GPU到CPU回读完成后归还纹理，Qt复制与I420转换不再占用共享槽。
+            sharedTextureGuard.release(); // wjy: GPU到CPU回读完成后归还纹理，Qt复制与I420转换不再占用共享槽。
             // append_viewer_log("decoder bgra ready size=" + std::to_string(bgra.size())); // wjy: per-frame BGRA-ready log disabled.
             {
                 DecodedBgraCallback hook = bgra_callback_; // wjy: prefer this decoder's viewer callback, so tiled windows do not overwrite each other.

@@ -26,7 +26,8 @@ struct DecodedFrame {
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
     void* shared_handle = nullptr;
     int shared_texture_index = -1; // wjy: 记录本帧占用的共享纹理槽，回调返回后按接管或丢弃结果释放对应keyed mutex。
-    bool shared_texture_locked = false; // wjy: 只有生产端成功AcquireSync的帧才允许执行一次ReleaseSync，避免异常路径重复释放。
+    bool shared_texture_locked = false; // wjy: true表示解码器仍持有生产者key 0，尚未把完整帧交给控制端。
+    bool shared_texture_handed_off = false; // wjy: true表示key 1已经在调用应用回调前交给消费者，拒绝帧时必须显式取回再归还key 0。
 };
 
 // =====wjy====
@@ -60,7 +61,9 @@ public:
     bool initialize_d3d11(ID3D11Device* device, ID3D11DeviceContext* context, std::string* error);
     DecodeResult decode(const uint8_t* h264, std::size_t h264Size, DecodedFrame* frame, std::string* error); // wjy: 直接接收压缩包并在解码器内部补齐FFmpeg padding，避免上层重复复制。
     DecodeResult decode(const std::vector<uint8_t>& h264, DecodedFrame* frame, std::string* error); // wjy: 返回结构化状态，显示背压不再伪装成码流错误。
-    void release_shared_texture(DecodedFrame* frame, bool consumerAccepted); // wjy: GPU接管时交给消费者key，回退或主动丢帧时直接归还生产者key。
+    bool handoff_shared_texture(DecodedFrame* frame); // wjy: 在调用异步消费者回调前完成key 0到key 1的交接，消除RenderWorker抢先读取竞态。
+    bool reclaim_shared_texture(DecodedFrame* frame); // wjy: 软件回退前重新取得已交接的纹理所有权，保证GPU/CPU读回仍在keyed mutex保护内。
+    bool release_shared_texture(DecodedFrame* frame); // wjy: 丢帧、回退结束或异常退出时统一归还生产者key 0，保证输出池槽位可复用。
     void reset();
 
 private:

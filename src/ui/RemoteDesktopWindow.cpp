@@ -1557,7 +1557,16 @@ void FSREMOTE_STREAM_CALL onRemoteFrame(void* user, int width, int height, const
     }
 }
 
-int FSREMOTE_STREAM_CALL onRemoteTextureFrame(void* user, int width, int height, void* sharedHandle, uint64_t frameId, double encodedMbps)
+int FSREMOTE_STREAM_CALL onRemoteTextureFrame(
+    void* user,
+    int width,
+    int height,
+    void* sharedHandle,
+    uint64_t frameId,
+    int64_t rtpTimestamp,
+    int64_t renderTimeMs,
+    uint64_t decodedAtUs,
+    double encodedMbps)
 {
     try {
         auto* context = static_cast<RemoteDesktopViewerCallbackContext*>(user); // wjy: 每个纹理回调携带固定代际，旧连接即使仍在解码也只能写入自己的上下文。
@@ -1565,7 +1574,16 @@ int FSREMOTE_STREAM_CALL onRemoteTextureFrame(void* user, int width, int height,
         if (!window || !context || width <= 0 || height <= 0 || !sharedHandle) {
             return 0;
         }
-        return window->enqueueRemoteTextureFrame(width, height, sharedHandle, frameId, encodedMbps, context->generation); // wjy: 代际判断交给窗口统一计数；旧Viewer返回受控丢帧，不能触发无意义BGRA回读。
+        return window->enqueueRemoteTextureFrame(
+            width,
+            height,
+            sharedHandle,
+            frameId,
+            rtpTimestamp,
+            renderTimeMs,
+            decodedAtUs,
+            encodedMbps,
+            context->generation); // wjy: 代际判断与真实解码时间轴一起交给窗口，旧Viewer仍只返回受控丢帧。
     } catch (...) {
         return 0;
     } // wjy: Qt投递或单槽更新异常只让该帧走软件回退，不得越过原生解码回调边界。
@@ -4925,7 +4943,16 @@ void RemoteDesktopWindow::enqueueRemoteFrame(QImage image, quint64 viewerGenerat
     m_pendingRemoteFrame = std::move(image); // wjy: Overwrite stale frames; the UI timer will pull the newest one when the event loop is ready.
 }
 
-int RemoteDesktopWindow::enqueueRemoteTextureFrame(int width, int height, void* sharedHandle, quint64 frameId, double encodedMbps, quint64 viewerGeneration)
+int RemoteDesktopWindow::enqueueRemoteTextureFrame(
+    int width,
+    int height,
+    void* sharedHandle,
+    quint64 frameId,
+    qint64 rtpTimestamp,
+    qint64 renderTimeMs,
+    quint64 decodedAtUs,
+    double encodedMbps,
+    quint64 viewerGeneration)
 {
     if (!acceptsViewerGeneration(viewerGeneration)) {
         m_staleTextureFrameDrops.fetch_add(1, std::memory_order_relaxed); // wjy: 重连或关闭后的旧解码回调只记代际丢帧，不进入新Viewer队列。
@@ -4941,6 +4968,9 @@ int RemoteDesktopWindow::enqueueRemoteTextureFrame(int width, int height, void* 
         height,
         sharedHandle,
         frameId,
+        rtpTimestamp,
+        renderTimeMs,
+        decodedAtUs,
         encodedMbps,
         viewerGeneration,
     }); // wjy: 单槽为空才接管纹理；槽已占用时保留旧pending并让生产端回收本次新帧。

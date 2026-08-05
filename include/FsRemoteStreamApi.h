@@ -30,6 +30,9 @@ typedef int(FSREMOTE_STREAM_CALL* FsRemoteTextureFrameCallback)(
     int height,
     void* shared_handle,
     uint64_t frame_id,
+    int64_t rtp_timestamp,
+    int64_t render_time_ms,
+    uint64_t decoded_at_us,
     double encoded_mbps);
 
 // =====wjy====

@@ -3281,7 +3281,15 @@ private:
         report_status(status_callback_, user_, FSREMOTE_STATUS_INITIALIZING_WEBRTC, "Initializing WebRTC");
         uu::NativeWebrtcRuntime runtime;
         std::atomic_bool frameReported = false;
-        runtime.set_decoded_texture_callback([this, &frameReported](int width, int height, void* shared_handle, uint64_t frame_id, double encoded_mbps) -> int {
+        runtime.set_decoded_texture_callback([this, &frameReported](
+            int width,
+            int height,
+            void* shared_handle,
+            uint64_t frame_id,
+            int64_t rtp_timestamp,
+            int64_t render_time_ms,
+            uint64_t decoded_at_us,
+            double encoded_mbps) -> int {
             if (!texture_callback_ || !running_ || !shared_handle) {
                 return FSREMOTE_TEXTURE_FRAME_FALLBACK; // wjy: 无纹理接收方时保留原有BGRA软件回退。
             }
@@ -3299,7 +3307,16 @@ private:
             requestPerformanceStats(); // wjy: 低频拉取标准接收统计，为原因感知降帧提供解码、网络和冻结证据。
             trySendPendingQualityRequest(); // wjy: data-channel通常在首帧前后打开，未发送请求在每帧以单槽状态低成本重试。
             checkPendingQualityTimeout();
-            return texture_callback_(user_, width, height, shared_handle, frame_id, encoded_mbps); // wjy: 原样传递接受/回退/受控丢帧，不能把结果2压缩成bool。
+            return texture_callback_(
+                user_,
+                width,
+                height,
+                shared_handle,
+                frame_id,
+                rtp_timestamp,
+                render_time_ms,
+                decoded_at_us,
+                encoded_mbps); // wjy: 原样传递三态结果与真实时间戳，旧Presenter迁移期仍能计算可靠帧龄。
         });
         // =====wjy====
         runtime.set_decoded_bgra_callback([this, &frameReported](int width, int height, const uint8_t* bgra, size_t size, double encoded_mbps) {

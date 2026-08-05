@@ -242,15 +242,20 @@ if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_VIEWER_STABILITY_TESTS) # wjy: 多窗
     endif()
     add_test(NAME fsremote_remote_quality_coordinator_tests COMMAND fsremote_remote_quality_coordinator_tests)
 
-    add_executable(fsremote_viewer_audio_stop_tests EXCLUDE_FROM_ALL
-        tests/viewer_audio_player_stop_tests.cpp
-    ) # wjy: 使用不可达测试地址验证音频仍在连接阶段时stop也能快速返回，不需要真实远端或音频设备。
-    target_link_libraries(fsremote_viewer_audio_stop_tests PRIVATE uu_stream_common)
-    if(MSVC)
-        set_property(TARGET fsremote_viewer_audio_stop_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded") # wjy: 与原生公共静态库保持/MT一致，避免测试链接时混用CRT。
-        target_compile_options(fsremote_viewer_audio_stop_tests PRIVATE /utf-8)
+    if(TARGET uu_stream_common)
+        add_executable(fsremote_viewer_audio_stop_tests EXCLUDE_FROM_ALL
+            tests/viewer_audio_player_stop_tests.cpp
+        ) # wjy: 只有WebRTC公共库目标存在时才注册音频停止测试，纯Qt测试配置不会引用不存在的目标。
+        target_include_directories(fsremote_viewer_audio_stop_tests PRIVATE third_party/uu_stream_webrtc/src) # wjy: 测试直接包含Viewer音频实现头，显式提供其公共头目录。
+        target_link_libraries(fsremote_viewer_audio_stop_tests PRIVATE uu_stream_common)
+        if(MSVC)
+            set_property(TARGET fsremote_viewer_audio_stop_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded") # wjy: 与原生公共静态库保持/MT一致，避免测试链接时混用CRT。
+            target_compile_options(fsremote_viewer_audio_stop_tests PRIVATE /utf-8)
+        endif()
+        add_test(NAME fsremote_viewer_audio_stop_tests COMMAND fsremote_viewer_audio_stop_tests)
+    else()
+        message(STATUS "Skipping fsremote_viewer_audio_stop_tests because the WebRTC common target is disabled")
     endif()
-    add_test(NAME fsremote_viewer_audio_stop_tests COMMAND fsremote_viewer_audio_stop_tests)
 
     # =====wjy====
     add_executable(fsremote_remote_input_broadcast_tests EXCLUDE_FROM_ALL
@@ -308,7 +313,7 @@ if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_VIEWER_STABILITY_TESTS) # wjy: 多窗
         src/ui/RemoteConnectionState.cpp
         src/ui/RemoteConnectionState.h
     ) # wjy: 纯 Qt Core 测试验证连接状态文案、启动名额终态和输入资格，不启动真实 Viewer。
-    target_include_directories(fsremote_remote_connection_state_tests PRIVATE src)
+    target_include_directories(fsremote_remote_connection_state_tests PRIVATE src include) # wjy: 连接状态测试还会读取稳定C ABI状态码，必须显式加入公共include目录。
     target_link_libraries(fsremote_remote_connection_state_tests PRIVATE Qt6::Core)
     if(MSVC)
         target_compile_options(fsremote_remote_connection_state_tests PRIVATE /utf-8)
@@ -463,6 +468,8 @@ if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_UPDATE_TESTS) # wjy: 更新服务测�
         src/system/StartupPerformanceLog.h
         src/system/AppSettings.cpp
         src/system/AppSettings.h
+        src/system/WjyDiagnosticLog.cpp
+        src/system/WjyDiagnosticLog.h
     ) # wjy: 直接编译生产更新服务，验证真实语义版本逻辑而不是测试替身。
     target_include_directories(fsremote_update_service_tests PRIVATE src)
     target_link_libraries(fsremote_update_service_tests PRIVATE Qt6::Widgets Qt6::Network) # wjy: 更新测试包含异步 SMB 端口门禁，需要 Qt Network。

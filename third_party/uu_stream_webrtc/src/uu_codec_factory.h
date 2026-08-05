@@ -21,7 +21,15 @@ enum DecodedTextureFrameResult {
 };
 // ===end====
 
-using DecodedTextureCallback = std::function<int(int width, int height, void* shared_handle, uint64_t frame_id, double encoded_mbps)>; // wjy: 0表示软件回退，1表示GPU接管，2表示受控丢帧并立即归还共享纹理。
+using DecodedTextureCallback = std::function<int(
+    int width,
+    int height,
+    void* shared_handle,
+    uint64_t frame_id,
+    int64_t rtp_timestamp,
+    int64_t render_time_ms,
+    uint64_t decoded_at_us,
+    double encoded_mbps)>; // wjy: 在保留三态迁移契约的同时贯通真实WebRTC和解码单调时间轴。
 
 std::unique_ptr<webrtc::VideoEncoderFactory> CreateUuVideoEncoderFactory();
 std::unique_ptr<webrtc::VideoDecoderFactory> CreateUuVideoDecoderFactory(DecodedBgraCallback bgra_callback = {}, DecodedTextureCallback texture_callback = {});
