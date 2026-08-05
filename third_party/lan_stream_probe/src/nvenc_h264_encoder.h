@@ -22,6 +22,7 @@ public:
                 std::vector<uint8_t>* output, bool* keyframe, std::string* error);
     void shutdown();
     bool ready() const { return encoder_ && bitstream_; }
+    const std::string& diagnostics() const { return diagnostics_; } // wjy: 把本次会话查询到的输入格式和Temporal AQ能力交给目标端诊断日志。
 
 private:
     struct RegisteredTextureEntry {
@@ -31,6 +32,8 @@ private:
     };
 
     bool load_api(std::string* error);
+    bool query_input_formats();
+    bool query_capability(NV_ENC_CAPS capability, int* value) const;
     bool register_texture(ID3D11Texture2D* texture, std::string* error);
     bool check(NVENCSTATUS status, const char* call, std::string* error) const;
 
@@ -45,6 +48,11 @@ private:
     Size size_;
     NV_ENC_CONFIG config_ = {}; // wjy: 保存成功初始化配置，后续ReconfigureEncoder基于同一编码会话安全修改速率参数。
     NV_ENC_INITIALIZE_PARAMS init_ = {};
+    bool input_formats_known_ = false; // wjy: 能力查询成功时严格拒绝驱动未声明支持的BGRA/NV12格式，查询失败则保持旧版兼容行为。
+    bool supports_nv12_ = false;
+    bool supports_argb_ = false;
+    bool temporal_aq_supported_ = false;
+    std::string diagnostics_; // wjy: 保存API版本、输入格式和Temporal AQ能力，首帧失败时无需再次猜测目标显卡特性。
     uint32_t fps_ = 60;
     uint32_t api_version_ = NVENCAPI_VERSION;
 };

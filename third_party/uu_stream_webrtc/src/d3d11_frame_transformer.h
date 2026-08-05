@@ -16,7 +16,7 @@ public:
     bool transform(const D3D11NativeFrameBuffer& frame,
                    Microsoft::WRL::ComPtr<ID3D11Texture2D>* output,
                    uint64_t* transformTimeUs,
-                   std::string* error); // wjy: 原始尺寸直接返回采集纹理，固定低分辨率使用VideoProcessor在GPU内裁剪、缩放并优先输出NV12。
+                   std::string* error); // wjy: 所有原生D3D11帧都经VideoProcessor裁剪/缩放并优先输出NV12，兼容旧代NVENC对DXGI BGRA纹理的限制。
     void reset();
 
 private:

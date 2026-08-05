@@ -177,6 +177,7 @@ public:
         force_keyframe_next_ = true; // wjy: 新编码器会话首帧必须输出IDR和参数集，禁止从无参考帧的P帧开始。
         first_input_enqueued_logged_ = false;
         first_worker_frame_logged_ = false;
+        first_encode_texture_logged_ = false;
         first_encoded_frame_logged_ = false; // wjy: 每个InitEncode代际重新记录“入队→工作线程→码流”三道首帧边界。
         if (!ensure_device(nullptr)) {
             lsp::append_stream_capture_diagnostic_log(
@@ -229,6 +230,7 @@ public:
         tex_w_ = tex_h_ = 0;
         first_input_enqueued_logged_ = false;
         first_worker_frame_logged_ = false;
+        first_encode_texture_logged_ = false;
         first_encoded_frame_logged_ = false;
         lsp::append_stream_capture_diagnostic_log(
             "encoder",
@@ -299,7 +301,7 @@ private:
                 encode_texture->GetDesc(&desc);
                 width = static_cast<int>(desc.Width);
                 height = static_cast<int>(desc.Height);
-                native_ready = true; // wjy: 原始高质量帧直接使用采集纹理，低分辨率档使用GPU缩放/NV12纹理，均不经过CPU颜色往返。
+                native_ready = true; // wjy: 原始和低分辨率档统一使用GPU VideoProcessor纹理，优先以NV12进入NVENC且不经过CPU颜色往返。
             } else if (!transform_error.empty() && frame_id_ % 120 == 0) {
                 std::cerr << "D3D11 native transform fallback: " << transform_error << "\n";
                 lsp::append_stream_capture_diagnostic_log_rate_limited(
@@ -348,10 +350,26 @@ private:
         }
 
         // =====wjy====
+        if (!first_encode_texture_logged_ && encode_texture) {
+            D3D11_TEXTURE2D_DESC desc = {};
+            encode_texture->GetDesc(&desc);
+            lsp::append_stream_capture_diagnostic_log(
+                "encoder",
+                "first encode texture format=" + std::to_string(static_cast<uint32_t>(desc.Format))
+                    + " bind_flags=" + std::to_string(desc.BindFlags)
+                    + " misc_flags=" + std::to_string(desc.MiscFlags)
+                    + " native_path=" + std::to_string(native_ready ? 1 : 0)
+                    + " source_requires_transform=" + std::to_string(native && native->requires_transform() ? 1 : 0)); // wjy: 首帧记录真实NVENC输入纹理，确认原始1920x1080也已从DXGI BGRA转换为NV12。
+            first_encode_texture_logged_ = true;
+        }
+        // ===end====
+
+        // =====wjy====
         const uint32_t requested_bitrate_kbps = bitrate_kbps_.load(); // wjy: NVENC 严格使用 WebRTC 已分配码率；档位下限现在由 Sender 和 PeerConnection 同层保证，禁止编码器私自超发造成发送队列、丢包和清晰度反复恢复。
         const uint32_t requested_fps = fps_.load();
         // ===end====
-        if (encoder_.ready() && should_reconfigure_rate(requested_bitrate_kbps, requested_fps)) {
+        // =====wjy====
+        if (frame_id_ > 0 && encoder_.ready() && should_reconfigure_rate(requested_bitrate_kbps, requested_fps)) { // wjy: 首份码流成功前禁止在线重配置，避免旧驱动用第二个非法参数错误干扰首帧根因和恢复流程。
             std::string reconfigure_error;
             if (encoder_.reconfigure(requested_bitrate_kbps, requested_fps, &reconfigure_error)) {
                 encoder_bitrate_kbps_ = requested_bitrate_kbps; // wjy: NVENC会话、纹理注册和bitstream全部保留，只更新实时码率/FPS。
@@ -365,6 +383,7 @@ private:
             }
             last_bitrate_reconfigure_ms_ = GetTickCount64(); // wjy: 成功或失败都短暂冷却，避免每帧重复调用不支持的驱动入口。
         }
+        // ===end====
         if (!encoder_.ready() || size_.width != static_cast<uint32_t>(width) || size_.height != static_cast<uint32_t>(height)) {
             std::string error;
             size_ = {static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
@@ -385,7 +404,7 @@ private:
             encoder_fps_ = requested_fps;
             lsp::append_stream_capture_diagnostic_log(
                 "encoder",
-                "NVENC initialize success"); // wjy: 驱动编码会话可用后记录成功，后续无首码流只需查看encode阶段。
+                "NVENC initialize success " + encoder_.diagnostics()); // wjy: 同时落盘HEVC输入格式和Temporal AQ能力，旧显卡复现时可直接核对兼容分支。
         }
 
         bool force_keyframe = frame_id_ == 0 || force_keyframe_next_ || force_keyframe_requested; // wjy: 首帧、尺寸切换和被覆盖帧继承的关键帧请求统一在工作线程执行。
@@ -606,6 +625,7 @@ private:
             encoder_fps_ = 0;
             tex_w_ = tex_h_ = 0;
             force_keyframe_next_ = true;
+            first_encode_texture_logged_ = false; // wjy: D3D11设备切换后重新记录新设备的NVENC输入纹理属性。
             device_ = preferred_device;
             device_->GetImmediateContext(&context_); // wjy: 原生采集纹理必须由同一D3D11设备注册给NVENC，设备切换时完整重置编码资源。
             if (!context_) {
@@ -675,7 +695,7 @@ private:
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<ID3D11Texture2D> texture_;
     std::vector<uint8_t> argb_;
-    D3D11FrameTransformer transformer_; // wjy: 原生高质量帧直通，均衡/流畅档位在GPU内裁剪缩放并优先转换NV12。
+    D3D11FrameTransformer transformer_; // wjy: 所有原生档位在GPU内裁剪/缩放并优先转换NV12，避免旧NVENC直接注册DXGI BGRA纹理。
     lsp::NvencH264Encoder encoder_;
     lsp::Size size_;
     lsp::Size target_size_;
@@ -701,6 +721,7 @@ private:
     uint64_t nvenc_time_us_since_report_ = 0;
     std::atomic_bool first_input_enqueued_logged_ = false; // wjy: 跨WebRTC调用线程安全记录第一帧进入编码单槽。
     bool first_worker_frame_logged_ = false; // wjy: 仅编码工作线程访问，标记第一帧是否保持原生D3D11路径。
+    bool first_encode_texture_logged_ = false; // wjy: 每个设备代际只记录一次NVENC输入纹理格式和资源标志。
     bool first_encoded_frame_logged_ = false; // wjy: 仅编码工作线程访问，标记第一份H265码流已经交给WebRTC。
 };
 

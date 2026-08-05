@@ -17,11 +17,9 @@ bool D3D11FrameTransformer::transform(
         return false;
     }
     if (transformTimeUs) *transformTimeUs = 0;
-    if (!frame.requires_transform()) {
-        *output = frame.texture(); // wjy: 高质量原始分辨率直接把采集纹理交给NVENC，完全跳过额外GPU复制和颜色转换。
-        return true;
-    }
-    if (!ensure_resources(frame, error)) return false;
+    // =====wjy====
+    if (!ensure_resources(frame, error)) return false; // wjy: 原始分辨率也统一经过VideoProcessor输出NV12，避免GTX 10/16系列把DXGI采集BGRA纹理直送NVENC时首帧返回非法参数8。
+    // ===end====
 
     const auto started = std::chrono::steady_clock::now();
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_desc = {};

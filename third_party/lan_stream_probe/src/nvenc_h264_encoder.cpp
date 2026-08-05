@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <sstream>
 #include <utility>
 #include <windows.h>
 
@@ -68,6 +69,20 @@ bool NvencH264Encoder::initialize(ID3D11Device* device, Size size, uint32_t bitr
         return false;
     }
 
+    // =====wjy====
+    query_input_formats(); // wjy: 会话建立后读取HEVC真实输入格式，旧代显卡不再靠型号名单猜测BGRA/NV12兼容性。
+    int temporal_aq_capability = 0;
+    temporal_aq_supported_ = query_capability(NV_ENC_CAPS_SUPPORT_TEMPORAL_AQ, &temporal_aq_capability)
+        && temporal_aq_capability > 0; // wjy: 只有驱动能力查询明确支持时才启用Temporal AQ，避免旧驱动接受初始化却在首帧拒绝参数组合。
+    std::ostringstream diagnostics;
+    diagnostics << "api_version=" << api_version_
+                << " input_formats_known=" << (input_formats_known_ ? 1 : 0)
+                << " nv12=" << (supports_nv12_ ? 1 : 0)
+                << " argb=" << (supports_argb_ ? 1 : 0)
+                << " temporal_aq=" << (temporal_aq_supported_ ? 1 : 0);
+    diagnostics_ = diagnostics.str(); // wjy: 初始化成功日志记录能力快照，下一次目标端复现可直接确认实际分支。
+    // ===end====
+
     NV_ENC_PRESET_CONFIG preset = {};
     preset.version = nvenc_struct_version(api_version_, 5, true);
     preset.presetCfg.version = nvenc_struct_version(api_version_, 9, true);
@@ -91,7 +106,7 @@ bool NvencH264Encoder::initialize(ID3D11Device* device, Size size, uint32_t bitr
     config.rcParams.vbvBufferSize = std::max<uint32_t>(bitrate * 6 / safe_fps, 1); // wjy: 保留约六帧 VBV 吸收关键帧复杂度，但不允许 VBR 长周期压低后续桌面细节。
     config.rcParams.vbvInitialDelay = config.rcParams.vbvBufferSize;
     config.rcParams.enableAQ = 1;
-    config.rcParams.enableTemporalAQ = 1; // wjy: 时间AQ把码率优先分配给连续帧中的运动与高频细节，提升高质量模式下视频和滚动画面观感。
+    config.rcParams.enableTemporalAQ = temporal_aq_supported_ ? 1u : 0u; // wjy: Temporal AQ按NVENC能力开关，旧代驱动不支持时自动保持空间AQ。
     config.rcParams.aqStrength = 10; // wjy: 在默认中值基础上适度增强AQ，避免过强量化造成大面积平坦区域噪声或码率失控。
     // ===end====
     config.rcParams.zeroReorderDelay = 1;
@@ -269,6 +284,11 @@ void NvencH264Encoder::shutdown()
     size_ = {};
     config_ = {};
     init_ = {};
+    input_formats_known_ = false;
+    supports_nv12_ = false;
+    supports_argb_ = false;
+    temporal_aq_supported_ = false;
+    diagnostics_.clear();
 }
 
 bool NvencH264Encoder::load_api(std::string* error)
@@ -305,6 +325,44 @@ bool NvencH264Encoder::load_api(std::string* error)
     return check(create_instance(&fn_), "NvEncodeAPICreateInstance", error);
 }
 
+// =====wjy====
+bool NvencH264Encoder::query_input_formats()
+{
+    input_formats_known_ = false;
+    supports_nv12_ = false;
+    supports_argb_ = false;
+    if (!encoder_ || !fn_.nvEncGetInputFormatCount || !fn_.nvEncGetInputFormats) {
+        return false; // wjy: 很旧的API缺少能力函数时保留原有注册尝试，由具体NVENC调用返回结果。
+    }
+
+    uint32_t count = 0;
+    if (fn_.nvEncGetInputFormatCount(encoder_, NV_ENC_CODEC_HEVC_GUID, &count) != NV_ENC_SUCCESS || count == 0) {
+        return false;
+    }
+    std::vector<NV_ENC_BUFFER_FORMAT> formats(count, NV_ENC_BUFFER_FORMAT_UNDEFINED);
+    uint32_t returned_count = 0;
+    if (fn_.nvEncGetInputFormats(encoder_, NV_ENC_CODEC_HEVC_GUID, formats.data(), count, &returned_count) != NV_ENC_SUCCESS) {
+        return false;
+    }
+    formats.resize(std::min(count, returned_count)); // wjy: 只遍历驱动实际写回的格式数量，忽略预分配数组中未使用的尾部。
+    for (const NV_ENC_BUFFER_FORMAT format : formats) {
+        supports_nv12_ = supports_nv12_ || format == NV_ENC_BUFFER_FORMAT_NV12; // wjy: NV12是统一GPU转换路径的首选输入。
+        supports_argb_ = supports_argb_ || format == NV_ENC_BUFFER_FORMAT_ARGB; // wjy: ARGB仅作为VideoProcessor或CPU上传失败后的兼容回退。
+    }
+    input_formats_known_ = true;
+    return true;
+}
+
+bool NvencH264Encoder::query_capability(NV_ENC_CAPS capability, int* value) const
+{
+    if (!encoder_ || !value || !fn_.nvEncGetEncodeCaps) return false;
+    NV_ENC_CAPS_PARAM params = {};
+    params.version = nvenc_struct_version(api_version_, 1);
+    params.capsToQuery = capability;
+    return fn_.nvEncGetEncodeCaps(encoder_, NV_ENC_CODEC_HEVC_GUID, &params, value) == NV_ENC_SUCCESS; // wjy: 能力查询失败不阻断编码，只关闭对应可选特性。
+}
+// ===end====
+
 bool NvencH264Encoder::register_texture(ID3D11Texture2D* texture, std::string* error)
 {
     for (const auto& entry : registered_textures_) {
@@ -323,6 +381,18 @@ bool NvencH264Encoder::register_texture(ID3D11Texture2D* texture, std::string* e
         if (error) *error = "unsupported NVENC D3D11 texture format";
         return false; // wjy: 未知格式交给上层I420兼容回退，禁止NVENC按ARGB误读导致花屏或色偏。
     }
+    // =====wjy====
+    const bool format_supported = buffer_format == NV_ENC_BUFFER_FORMAT_NV12
+        ? supports_nv12_
+        : buffer_format == NV_ENC_BUFFER_FORMAT_ARGB && supports_argb_;
+    if (input_formats_known_ && !format_supported) {
+        if (error) {
+            *error = "NVENC HEVC input format is not advertised by driver: "
+                + std::to_string(static_cast<uint32_t>(buffer_format));
+        }
+        return false; // wjy: 驱动能力明确不含该格式时提前给出可读错误，不把不兼容纹理送进首帧编码。
+    }
+    // ===end====
     NV_ENC_REGISTER_RESOURCE registered = {};
     registered.version = nvenc_struct_version(api_version_, 5);
     registered.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
@@ -352,6 +422,15 @@ bool NvencH264Encoder::check(NVENCSTATUS status, const char* call, std::string* 
     }
     if (error) {
         *error = std::string(call) + " failed: " + std::to_string(static_cast<int>(status));
+        // =====wjy====
+        if (encoder_ && fn_.nvEncGetLastErrorString) {
+            const char* detail = fn_.nvEncGetLastErrorString(encoder_);
+            if (detail && *detail) {
+                *error += " detail=";
+                *error += detail; // wjy: 保留驱动提供的具体参数说明，错误码8不再只能靠反复发布猜测。
+            }
+        }
+        // ===end====
     }
     return false;
 }
