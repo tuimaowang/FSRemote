@@ -1856,6 +1856,10 @@ RemoteDesktopWindow::RemoteDesktopWindow(
         }
         attemptNetworkReconnect(); // wjy: 退避到期后只尝试一次，失败状态回调会再次安排下一档。
     });
+    m_firstFrameWatchdogTimer = new QTimer(this); // wjy: 首次连接和退避重连共用同一条“真实呈现首帧”超时边界。
+    m_firstFrameWatchdogTimer->setSingleShot(true);
+    connect(m_firstFrameWatchdogTimer, &QTimer::timeout,
+        this, &RemoteDesktopWindow::handleFirstFrameTimeout); // wjy: 超时处理固定回到Qt主线程，不从原生回调线程直接停止Viewer。
     // ===end====
 
     // =====wjy====
@@ -2501,6 +2505,9 @@ void RemoteDesktopWindow::pollRemoteUpdateStatus()
 
 void RemoteDesktopWindow::stopViewerConnectionAsync(bool deleteAfterStop)
 {
+    // =====wjy====
+    stopFirstFrameWatchdog(); // wjy: 任意主动停止都终止当前代际的首帧倒计时，防止stop过程中再次触发重连。
+    // ===end====
     if (deleteAfterStop) {
         m_deleteAfterViewerStop = true;
     }
@@ -5081,6 +5088,15 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
             m_connectionStatusCode = 50;
             m_connectionStatus = QString::fromUtf8("画面已接收");
             m_hasReceivedVideoInCurrentViewer = true;
+            const bool firstPresentedFrame = !m_hasPresentedVideoInCurrentViewer;
+            m_hasPresentedVideoInCurrentViewer = true; // wjy: 共享纹理已经成功提交到SwapChain/DComp，可作为首帧看门狗的唯一成功条件。
+            stopFirstFrameWatchdog();
+            if (firstPresentedFrame) {
+                appendViewerDebugLog(QStringLiteral("first frame presented host=%1 path=d3d11 frame_id=%2 generation=%3")
+                    .arg(m_hostIp)
+                    .arg(frame->frameId)
+                    .arg(frame->viewerGeneration)); // wjy: 区分“解码状态50”和“用户真正可见”，DESKTOP-P2类现场可直接确认Presenter是否完成。
+            }
             if (m_networkReconnectActive) {
                 finishNetworkReconnect(); // wjy: 共享纹理已成功Present，至此才确认网络、解码和DComp整条路径恢复。
             } else {
@@ -5165,6 +5181,16 @@ void RemoteDesktopWindow::setRemoteFrame(const QImage& image)
     m_connectionStatusCode = 50;
     m_connectionStatus = QString::fromUtf8("画面已接收");
     m_hasReceivedVideoInCurrentViewer = true;
+    const bool firstPresentedFrame = !m_hasPresentedVideoInCurrentViewer;
+    m_hasPresentedVideoInCurrentViewer = true; // wjy: BGRA帧已经写入软件显示路径，与D3D路径使用相同首帧完成语义。
+    stopFirstFrameWatchdog();
+    if (firstPresentedFrame) {
+        appendViewerDebugLog(QStringLiteral("first frame presented host=%1 path=bgra size=%2x%3 generation=%4")
+            .arg(m_hostIp)
+            .arg(image.width())
+            .arg(image.height())
+            .arg(m_viewerGeneration.load(std::memory_order_acquire))); // wjy: 软件回退首帧也留下可见边界，便于区分解码成功但硬件呈现失败。
+    }
     if (m_networkReconnectActive) {
         finishNetworkReconnect(); // wjy: 软件帧真实进入显示路径后结束无限重连，行为与共享纹理路径一致。
     } else {
@@ -5400,6 +5426,44 @@ bool RemoteDesktopWindow::handleLocalShortcutKey(int virtualKey, Qt::KeyboardMod
 }
 
 // =====wjy====
+void RemoteDesktopWindow::startFirstFrameWatchdog()
+{
+    if (!m_firstFrameWatchdogTimer || m_closeInProgress || m_applicationExitInProgress
+        || remoteUpdateActive() || !m_viewerHandle) {
+        return;
+    }
+    m_firstFrameWatchdogTimer->start(15000); // wjy: 正常局域网建链约数秒，15秒覆盖VDD启动和首个关键帧，同时不会让失败窗口无限等待。
+    appendViewerDebugLog(QStringLiteral("first frame watchdog started host=%1 timeout_ms=15000 generation=%2")
+        .arg(m_hostIp)
+        .arg(m_viewerGeneration.load(std::memory_order_acquire))); // wjy: 现场日志可把超时与具体Viewer代际、目标IP精确对齐。
+}
+
+void RemoteDesktopWindow::stopFirstFrameWatchdog()
+{
+    if (m_firstFrameWatchdogTimer) {
+        m_firstFrameWatchdogTimer->stop(); // wjy: QTimer归属Qt线程，重复停止安全且不会影响网络退避定时器。
+    }
+}
+
+void RemoteDesktopWindow::handleFirstFrameTimeout()
+{
+    if (m_closeInProgress || m_applicationExitInProgress || remoteUpdateActive()
+        || !m_viewerHandle || m_hasPresentedVideoInCurrentViewer) {
+        return;
+    }
+
+    appendViewerDebugLog(QStringLiteral("first frame watchdog timeout host=%1 status=%2 generation=%3")
+        .arg(m_hostIp)
+        .arg(m_connectionStatusCode)
+        .arg(m_viewerGeneration.load(std::memory_order_acquire))); // wjy: 无论停在TCP、WebRTC还是已解码未显示，都记录最后状态供定位目标端采集/编码或本地Presenter。
+    setConnectionStatus(
+        FSREMOTE_STATUS_ERROR,
+        QString::fromUtf8("等待远程首帧超时，目标端采集或编码可能失败，正在自动重连")); // wjy: 复用统一终态入口释放键鼠、同步资格和启动名额，避免仅改文字而留下仍可输入的半连接会话。
+    if (!m_networkReconnectActive) {
+        beginNetworkReconnect(); // wjy: 从未收到解码状态50的首次连接也要进入自动恢复；已有视频状态会在setConnectionStatus内直接接管重连。
+    }
+}
+
 void RemoteDesktopWindow::beginNetworkRecoveryGracePeriod()
 {
     if (m_closeInProgress || m_applicationExitInProgress || remoteUpdateActive()
@@ -5567,11 +5631,11 @@ void RemoteDesktopWindow::startViewerConnectionWithAdmission()
     m_viewerStartQueued = false;
     m_viewerStartAdmissionActive = true; // wjy: 从此刻到连接成功/失败/stop完成期间占用一个初始化预算。
     m_hasReceivedVideoInCurrentViewer = false; // wjy: 新Viewer独立判断是否曾正常出画，首次连接错误不能继承旧会话的网络警告依据。
+    m_hasPresentedVideoInCurrentViewer = false; // wjy: 新代际必须重新通过D3D或BGRA真实呈现确认，旧窗口保留画面不能冒充新连接首帧。
     if (!m_networkReconnectActive) {
         m_networkWarningVisible = false; // wjy: 普通首次连接清理历史提示；无限重连中的新代际必须继续显示“网络不佳”。
-    } else if (m_networkReconnectTimer) {
+    } else {
         m_networkRecoveryGraceActive = true;
-        m_networkReconnectTimer->start(15000); // wjy: 重试Viewer取得初始化名额后最多等待15秒首帧，半连接状态不会永久卡在“正在连接”。
     }
     m_remoteCursorShape = Qt::ArrowCursor; // wjy: 替换 Viewer 会话不得继承旧 Host 最后的缩放形状；旧 Host 或暂未发送状态时保持普通箭头。
     m_remoteMouseBackend = RemoteMouseBackend::System;
@@ -5624,6 +5688,7 @@ void RemoteDesktopWindow::startViewerConnectionWithAdmission()
         } else {
             sendCurrentRemoteQualityDecision(); // wjy: 窗口排队初始化期间若全局/局部策略已变化，只向新Viewer补发最终最新值。
             sendCurrentViewerAudioDecision(); // wjy: Viewer默认静音，创建成功后立即补发本窗口当前音频按钮状态。
+            startFirstFrameWatchdog(); // wjy: 原生句柄创建成功后才开始15秒计时，排队等待初始化名额的时间不算目标端故障。
         }
     } else {
         setConnectionStatus(90, QString::fromUtf8("设备 IP 为空"));
@@ -5647,6 +5712,11 @@ void RemoteDesktopWindow::releaseViewerStartupAdmission()
 
 void RemoteDesktopWindow::setConnectionStatus(int code, const QString& message)
 {
+    // =====wjy====
+    if (code == FSREMOTE_STATUS_REMOTE_CLOSED || code >= FSREMOTE_STATUS_ERROR) {
+        stopFirstFrameWatchdog(); // wjy: 原生层已经给出终态时取消首帧超时，避免同一失败随后又被错误改写并重复stop。
+    }
+    // ===end====
     // =====wjy====
     if (RemoteConnectionState::acceptsRemoteInput(m_connectionStatusCode)
         && !RemoteConnectionState::acceptsRemoteInput(code)) {

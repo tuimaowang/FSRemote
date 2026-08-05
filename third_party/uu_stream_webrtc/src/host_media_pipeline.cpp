@@ -268,6 +268,15 @@ private:
                 }
             } else if (capture_error == "busy") {
                 ++busy_frames_; // wjy: 编码端占满四槽时不覆盖纹理，继续发布最后安全帧保持控制低延迟。
+            // =====wjy====
+            } else if (capture_error == "DXGI access lost") {
+                last_frame_ = {}; // wjy: Duplication失效后旧纹理属于已经销毁的D3D设备，立即丢弃，禁止后续循环持续向WebRTC复用无效画面。
+                ++dropped_frames_; // wjy: 把本轮拓扑切换计入受控丢帧；下一轮capture会按原VDD设备名重新初始化并取得新纹理。
+                append_stream_capture_diagnostic_log_rate_limited(
+                    "capture",
+                    "DXGI access lost; stale reusable frame discarded before reinitialize",
+                    1000); // wjy: 日志明确旧帧已清除，现场若仍无新帧即可继续检查VDD输出是否重新挂载。
+            // ===end====
             } else if (capture_error != "timeout" && capture_error != "DXGI access lost") {
                 ++dropped_frames_;
             }

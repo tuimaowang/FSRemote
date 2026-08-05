@@ -164,6 +164,9 @@ private:
     void attemptNetworkReconnect(); // wjy: 单次重试仍通过共享初始化管理器，不能绕过多窗口并发上限。
     void finishNetworkReconnect(); // wjy: 只有成功呈现新帧才恢复输入、清除警告并重置退避。
     void cancelNetworkReconnect(); // wjy: 关闭窗口、程序退出或远程更新接管时终止所有后续重试。
+    void startFirstFrameWatchdog(); // wjy: 每个Viewer代际最多等待15秒真实呈现首帧，超时后给出采集/编码提示并自动重连。
+    void stopFirstFrameWatchdog(); // wjy: 首帧呈现、会话停止或终态到达时取消当前代际的超时任务。
+    void handleFirstFrameTimeout(); // wjy: Qt主线程统一提交明确错误并进入安全stop与退避重建流程。
     // ===end====
     // =====wjy====
     void pollRemoteUpdateStatus();
@@ -300,9 +303,11 @@ private:
     bool m_networkWarningVisible = false; // wjy: 只保存静态“网络不佳”可见状态，不跟随每帧或计时器闪动。
     // =====wjy====
     QTimer* m_networkReconnectTimer = nullptr;
+    QTimer* m_firstFrameWatchdogTimer = nullptr; // wjy: 与网络退避定时器分离，避免首次连接无画面时永远停在等待状态。
     bool m_networkReconnectActive = false; // wjy: 一旦正常远控因网络中断进入恢复流程，窗口保持到用户主动关闭并无限重试。
     bool m_networkRecoveryGraceActive = false; // wjy: true表示当前3秒计时器用于等待旧ICE会话自恢复，false表示用于退避重建。
     int m_networkReconnectAttempt = 0; // wjy: 保存0到5的退避档位，第五档后固定10秒且不停止累计恢复流程。
+    bool m_hasPresentedVideoInCurrentViewer = false; // wjy: 只在D3D或BGRA真正进入可见路径后置位，不能被解码回调提前上报的状态50替代。
     // ===end====
     QImage m_remoteFrame;
     QSize m_remoteTextureSize;

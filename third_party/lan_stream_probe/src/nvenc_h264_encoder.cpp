@@ -164,7 +164,9 @@ bool NvencH264Encoder::reconfigure(uint32_t bitrate_kbps, uint32_t fps, std::str
     nextInit.frameRateDen = 1;
     nextInit.encodeConfig = &nextConfig;
     NV_ENC_RECONFIGURE_PARAMS reconfigure = {};
-    reconfigure.version = nvenc_struct_version(api_version_, 1);
+    // =====wjy====
+    reconfigure.version = nvenc_struct_version(api_version_, 2, true); // wjy: NVIDIA SDK 要求 RECONFIGURE_PARAMS 使用结构版本2并带扩展位；旧版本会在 GTX 10/16 系列驱动上返回非法参数8。
+    // ===end====
     reconfigure.reInitEncodeParams = nextInit;
     reconfigure.resetEncoder = 0; // wjy: 只更新速率控制参数，不重置位流队列或注册输入资源。
     reconfigure.forceIDR = 0; // wjy: 码率/FPS在线调节不改变画面尺寸，无需周期性强制IDR，避免流畅模式频繁调参放大解码纹理切换和闪黑。
@@ -207,9 +209,13 @@ bool NvencH264Encoder::encode(ID3D11Texture2D* texture, uint32_t frame_id, bool 
     pic.bufferFmt = mapped.mappedBufferFmt;
     pic.inputWidth = desc.Width;
     pic.inputHeight = desc.Height;
+    // =====wjy====
+    pic.inputPitch = desc.Width; // wjy: D3D11纹理无法直接取得字节步长时按SDK要求至少填写输入宽度，禁止保留0导致旧显卡驱动拒绝首帧。
+    pic.frameIdx = frame_id; // wjy: 把调用方仅在编码成功后递增的帧号交给NVENC，保证失败重试和驱动内部帧序一致。
+    // ===end====
     pic.outputBitstream = bitstream_;
     pic.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
-    pic.pictureType = force_idr ? NV_ENC_PIC_TYPE_IDR : NV_ENC_PIC_TYPE_P;
+    pic.pictureType = NV_ENC_PIC_TYPE_UNKNOWN; // wjy: enablePTD已开启，由驱动根据GOP和FORCEIDR标志决定帧型，避免手工指定P帧形成不完整参考链。
     if (force_idr) {
         pic.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
     }
