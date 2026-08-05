@@ -1,0 +1,179 @@
+; =====wjy====
+; wjy: 安装器自身不携带 FSRemote 运行载荷；启动时读取共享目录当前版本，再把对应 release 完整复制到用户自定义安装目录。
+[Setup]
+AppId={{4E827FFB-1A1E-45E2-9036-03145D74BC5A}
+AppName=FSRemote
+AppVersion=1.0.0
+AppVerName=FSRemote 网络安装器
+AppPublisher=FSRemote
+DefaultDirName={localappdata}\Programs\FSRemote
+DefaultGroupName=FSRemote
+DisableDirPage=no
+DisableProgramGroupPage=yes
+PrivilegesRequired=admin
+RestartIfNeededByRun=no
+OutputDir=@FSREMOTE_INSTALLER_OUTPUT_DIR_NATIVE@
+OutputBaseFilename=FSRemote安装器
+SetupIconFile=@FSREMOTE_SETUP_ICON_NATIVE@
+UninstallDisplayIcon={app}\FSRemote.exe
+Compression=lzma2/max
+SolidCompression=yes
+WizardStyle=modern
+CloseApplications=yes
+RestartApplications=no
+UsePreviousAppDir=yes
+ArchitecturesAllowed=x64compatible
+VersionInfoVersion=1.0.0.0
+VersionInfoProductName=FSRemote
+VersionInfoProductVersion=1.0.0
+VersionInfoDescription=FSRemote 网络安装器
+
+[Files]
+; wjy: external 让文件在安装运行阶段从动态 release 路径读取，而不是在编译安装器时把 200MB 运行文件打包进去。
+Source: "{code:GetReleaseSource}\*"; DestDir: "{app}"; Flags: external ignoreversion recursesubdirs createallsubdirs
+
+[Icons]
+Name: "{autodesktop}\FSRemote"; Filename: "{app}\FSRemote.exe"; WorkingDir: "{app}"
+Name: "{autoprograms}\FSRemote"; Filename: "{app}\FSRemote.exe"; WorkingDir: "{app}"
+
+[Registry]
+; wjy: 与 StartupManager 使用同一个 HKCU Run 值名和 --minimized 参数，避免重复启动项或开机弹出主窗口。
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "FSRemote"; ValueData: """{app}\FSRemote.exe"" --minimized"; Flags: uninsdeletevalue
+
+[Run]
+; =====wjy====
+; wjy: 安装和覆盖升级前先删除同名旧规则，确保程序路径、私网范围或配置变化后不会残留重复防火墙项。
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""FSRemote Realtime UDP 49104"""; Flags: runhidden waituntilterminated
+; wjy: 每台设备既发布也接收实时状态；只允许 RFC1918 私网访问程序 UDP 49104，并覆盖 Public 误分类的公司网络配置。
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""FSRemote Realtime UDP 49104"" dir=in action=allow program=""{app}\FSRemote.exe"" protocol=UDP localport=49104 remoteip=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16 profile=any enable=yes"; Flags: runhidden waituntilterminated
+; ===end====
+Filename: "{app}\FSRemote.exe"; Description: "安装完成后启动 FSRemote"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+
+; =====wjy====
+[UninstallRun]
+; wjy: 卸载时删除安装器拥有的固定规则，不影响管理员为其它程序或端口创建的策略。
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""FSRemote Realtime UDP 49104"""; Flags: runhidden waituntilterminated
+; ===end====
+
+[Code]
+var
+  RemoteVersion: String;
+  ReleaseSource: String;
+  // =====wjy====
+  FakerInputRestartRequired: Boolean; // wjy: MSI 返回 3010/1641 时由安装器统一提示重启，不允许 msiexec 自行重启被控端。
+  // ===end====
+
+// =====wjy====
+function MsiQueryProductState(ProductCode: String): Integer;
+  external 'MsiQueryProductStateW@msi.dll stdcall'; // wjy: 调用系统 Windows Installer API 判断固定 ProductCode，已安装设备不重复进入维护安装。
+
+procedure InstallFakerInputSilently;
+var
+  InstallerPath: String;
+  InstallerHash: String;
+  PublisherCertificatePath: String;
+  PublisherCertificateHash: String;
+  ProductState: Integer;
+  ResultCode: Integer;
+begin
+  ProductState := MsiQueryProductState('{17AA3E01-1012-4BF7-B908-1C499909B259}'); // wjy: 单次读取避免产品状态在两个系统调用之间变化。
+  if ProductState = 5 then
+  begin
+    Log('FakerInput 0.1.1 is already installed; silent MSI installation skipped.'); // wjy: 只有 DEFAULT 视为完整安装；advertised 状态仍执行 MSI，确保目标端真正拥有驱动。
+    Exit;
+  end;
+
+  InstallerPath := ExpandConstant('{app}\FakerInput_Setup_0.1.1_x64.msi'); // wjy: 只安装刚从不可变 release 复制到 FSRemote 目录的固定文件。
+  if not FileExists(InstallerPath) then
+    RaiseException('发布文件缺少 FakerInput_Setup_0.1.1_x64.msi，无法安装驱动。');
+
+  InstallerHash := GetSHA256OfFile(InstallerPath); // wjy: 提交管理员 MSI 前复核与程序内相同的固定哈希，拒绝传输损坏或被替换的安装包。
+  if CompareText(InstallerHash, '4C0AEFB7340051A91D606776243298B5CD1143EF5508BBAE6800C474F9ED0840') <> 0 then
+    RaiseException('FakerInput 安装包 SHA-256 校验失败，已停止驱动安装。');
+
+  PublisherCertificatePath := ExpandConstant('{app}\FakerInput_Ryodigi_Solutions_LLC.cer'); // wjy: 网络安装器从同一不可变 release 读取固定发布者证书，不接受外部路径参数。
+  if not FileExists(PublisherCertificatePath) then
+    RaiseException('发布文件缺少 FakerInput 发布者证书，无法执行无人值守驱动安装。');
+  PublisherCertificateHash := GetSHA256OfFile(PublisherCertificatePath); // wjy: 证书内容固定后才允许加入系统信任区，拒绝共享目录中被替换的其它证书。
+  if CompareText(PublisherCertificateHash, 'B715544B8CAAC8B9A48402D04B06A15DFAB0E3E0EF44E82BABFC768E3500C228') <> 0 then
+    RaiseException('FakerInput 发布者证书 SHA-256 校验失败，已停止驱动安装。');
+
+  if not Exec(
+      ExpandConstant('{sys}\certutil.exe'),
+      '-f -addstore TrustedPublisher "' + PublisherCertificatePath + '"',
+      ExpandConstant('{app}'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) then
+    RaiseException('无法启动 Windows 证书管理工具，系统错误码：' + IntToStr(ResultCode));
+  if ResultCode <> 0 then
+    RaiseException('无法信任 FakerInput 固定发布者证书，certutil 返回码：' + IntToStr(ResultCode)); // wjy: 证书导入失败时禁止继续 MSI，避免再次停在远控无法点击的系统确认窗口。
+
+  if not Exec(
+      ExpandConstant('{sys}\msiexec.exe'),
+      '/i "' + InstallerPath + '" /qn /norestart',
+      ExpandConstant('{app}'),
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode) then
+    RaiseException('无法启动 Windows Installer，系统错误码：' + IntToStr(ResultCode));
+
+  FakerInputRestartRequired := (ResultCode = 3010) or (ResultCode = 1641); // wjy: 两种返回码都表示安装成功但系统需要重启，不能误报成失败。
+  if (ResultCode <> 0) and (not FakerInputRestartRequired) then
+    RaiseException('FakerInput 静默安装失败，msiexec 返回码：' + IntToStr(ResultCode));
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    InstallFakerInputSilently; // wjy: 所有程序文件落盘后、FSRemote 首次启动前完成驱动安装，目标端不再看到独立 MSI 向导。
+end;
+
+function NeedRestart(): Boolean;
+begin
+  Result := FakerInputRestartRequired; // wjy: 仅尊重 MSI 明确返回的重启要求，正常安装保持不中断远控设备。
+end;
+// ===end====
+
+function InitializeSetup(): Boolean;
+var
+  VersionFile: String;
+  RemoteVersionData: AnsiString;
+begin
+  Result := False;
+  VersionFile := '\\192.168.1.100\广告部工具\远程软件_FS\更新资源\FSRemote.version';
+  if not LoadStringFromFile(VersionFile, RemoteVersionData) then
+  begin
+    MsgBox('无法读取共享目录版本文件：' + #13#10 + VersionFile + #13#10 + '请确认设备已连接公司网络并且有共享目录访问权限。', mbError, MB_OK);
+    Exit;
+  end;
+
+  RemoteVersion := Trim(String(RemoteVersionData)); // wjy: Inno 文件 API 使用 AnsiString 接收原始内容，再转换为 Unicode String 处理中文路径环境下的版本文本。
+  if RemoteVersion = '' then
+  begin
+    MsgBox('共享目录版本文件内容为空，无法继续安装。', mbError, MB_OK);
+    Exit;
+  end;
+
+  ReleaseSource := '\\192.168.1.100\广告部工具\远程软件_FS\更新资源\releases\' + RemoteVersion;
+  // =====wjy====
+  if (not DirExists(ReleaseSource))
+      or (not FileExists(ReleaseSource + '\FSRemote.exe'))
+      or (not FileExists(ReleaseSource + '\FakerInputBridge.exe'))
+      or (not FileExists(ReleaseSource + '\FakerInput_Setup_0.1.1_x64.msi'))
+      or (not FileExists(ReleaseSource + '\FakerInput_Ryodigi_Solutions_LLC.cer')) then
+  begin
+    MsgBox('共享目录中的版本文件不完整（需要 FSRemote、FakerInputBridge、驱动 MSI 和发布者证书）：'
+      + #13#10 + ReleaseSource + #13#10 + '请先在发布设备上重新执行“发布更新”。', mbError, MB_OK);
+    Exit;
+  end;
+  // ===end====
+
+  Result := True; // wjy: 只有版本标记和目标 release 主程序均存在时才进入安装向导，防止生成半安装目录。
+end;
+
+function GetReleaseSource(Param: String): String;
+begin
+  Result := ReleaseSource; // wjy: [Files] 在真正复制阶段取得已校验的不可变版本目录，安装过程中不会因下一次发布而切换源文件。
+end;
+// ===end====

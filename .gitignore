@@ -6,6 +6,7 @@
 /build_webrtc/
 /build_webrtc_host/
 /build_webrtc_slim/
+/build-video*/
 /dist/
 
 # CMake generated files
@@ -26,6 +27,11 @@
 /AI_PROJECT_HANDOFF.md
 /temp.txt
 /WJY_CODE_CHANGE_LOG.md
+/temp/
+/experiments/
+/outputs/
+/rustdesk/
+/.codex/
 
 # IDE / editor
 /.vs/
