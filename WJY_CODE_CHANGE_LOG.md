@@ -9877,3 +9877,138 @@ cleanupFixedMachineNumberProcessesAtStartup(); // wjy: 单实例确认后立即�
 - `git diff --check`：通过，未发现空白错误。
 - 已静态确认代码中不再引用 `DeviceInfoService`，目标列表仅含两个固定字面量。
 - 未执行构建和运行测试：遵循用户此前“不用构建”的要求。
+
+## 2026-08-06 14:37 - 新增 FSRemote 局域网带宽余量被动监控器
+
+### Changed Location
+- `BandwidthCapacityMonitor/.gitignore:1-2`：忽略独立项目的本地构建目录和运行产物。
+- `BandwidthCapacityMonitor/CMakeLists.txt:1-35`：新增不依赖 Qt 或 FSRemote 主程序的 Windows CMake 工程、监控器目标和数学测试目标。
+- `BandwidthCapacityMonitor/src/MonitorMath.h:9-68`：新增 Mbps、理论余量、利用率和风险等级计算策略。
+- `BandwidthCapacityMonitor/src/main.cpp:1-741`：新增 Windows 网卡计数、链路速率、丢弃/错误、整机 CPU、FSRemote 进程资源和 CSV 采样逻辑。
+- `BandwidthCapacityMonitor/tests/monitor_math_tests.cpp:1-76`：新增纯 C++ 边界测试，覆盖默认链路容量、手工有效容量、风险阈值和计数器复位。
+- `BandwidthCapacityMonitor/README.md:1-91`：新增构建、使用、余量口径限制和卡顿判定说明。
+
+### Reason
+用户需要在 FSRemote 同时远控约 20 台设备时观察当前局域网还剩多少带宽，而不是向网络发送模拟压测流量。独立监控器只读取 Windows 网卡累计计数和协商速率，因此不会改变远控流量；同时采集 FSRemote 与整机 CPU、内存和线程，帮助区分网络瓶颈与解码/渲染/线程压力。程序将“余量”明确标为本机网卡理论余量，并支持 `--capacity-mbps` 使用实测有效容量覆盖协商速率，避免把 Wi-Fi 或交换机上联能力误当成保证带宽。
+
+### Original Code
+```text
+// BandwidthCapacityMonitor/.gitignore:1-2
+新增目录，原位置无旧代码。
+
+// BandwidthCapacityMonitor/CMakeLists.txt:1-35
+新增独立工程，原位置无旧代码。
+
+// BandwidthCapacityMonitor/src/MonitorMath.h:1-71
+新增头文件，原位置无旧代码。
+
+// BandwidthCapacityMonitor/src/main.cpp:1-741
+新增 Windows 控制台程序，原位置无旧代码。
+
+// BandwidthCapacityMonitor/tests/monitor_math_tests.cpp:1-76
+新增测试文件，原位置无旧代码。
+
+// BandwidthCapacityMonitor/README.md:1-91
+新增使用文档，原位置无旧代码。
+```
+
+### Modified Code
+```cmake
+// BandwidthCapacityMonitor/CMakeLists.txt:14-34
+add_executable(BandwidthCapacityMonitor
+    src/main.cpp
+    src/MonitorMath.h
+)
+target_link_libraries(BandwidthCapacityMonitor PRIVATE iphlpapi psapi)
+add_executable(BandwidthCapacityMonitorTests
+    tests/monitor_math_tests.cpp
+    src/MonitorMath.h
+)
+enable_testing()
+add_test(NAME BandwidthCapacityMonitorTests COMMAND BandwidthCapacityMonitorTests)
+```
+
+```cpp
+// BandwidthCapacityMonitor/src/MonitorMath.h:9-68
+enum class RiskLevel { Normal, Attention, High, Saturated };
+
+inline DirectionMetrics calculateDirection(
+    std::uint64_t byteDelta,
+    double elapsedSeconds,
+    std::uint64_t linkBitsPerSecond,
+    double capacityOverrideMbps)
+{
+    DirectionMetrics metrics;
+    metrics.currentMbps = bytesToMbps(byteDelta, elapsedSeconds);
+    metrics.capacityMbps = capacityOverrideMbps > 0.0
+        ? capacityOverrideMbps
+        : static_cast<double>(linkBitsPerSecond) / 1'000'000.0;
+    metrics.headroomMbps = std::max(0.0, metrics.capacityMbps - metrics.currentMbps);
+    metrics.utilizationPercent = metrics.capacityMbps > 0.0
+        ? metrics.currentMbps * 100.0 / metrics.capacityMbps
+        : 0.0;
+    metrics.risk = classifyRisk(metrics.utilizationPercent);
+    return metrics;
+}
+```
+
+```cpp
+// BandwidthCapacityMonitor/src/main.cpp:273-311、364-451、568-629
+std::vector<AdapterSample> queryAdapters()
+{
+    PMIB_IF_TABLE2 table = nullptr;
+    if (::GetIfTable2(&table) != NO_ERROR || table == nullptr) {
+        return {};
+    }
+    // 复制活动物理网卡的累计字节、链路速率、丢弃和错误计数后释放 IP Helper 表。
+}
+
+class ProcessMonitor final {
+    // 按 FSRemote.exe 的 PID 聚合 CPU、工作集、私有内存和线程数。
+};
+
+void printAdapterReport(...)
+{
+    // 接收和发送方向分别计算当前 Mbps、理论余量、利用率与丢弃/错误增量，并写入 CSV。
+}
+```
+
+```cpp
+// BandwidthCapacityMonitor/src/main.cpp:631-741
+int wmain(int argc, wchar_t* argv[])
+{
+    // 建立采样基线后按周期读取网卡和进程状态，不创建 socket、不发送测试数据。
+}
+```
+
+```cpp
+// BandwidthCapacityMonitor/tests/monitor_math_tests.cpp:13-76
+void testRateAndLinkHeadroom();
+void testEffectiveCapacityOverride();
+void testRiskThresholdsAndSaturationClamp();
+void testCounterResetAndZeroInterval();
+```
+
+```markdown
+// BandwidthCapacityMonitor/README.md:1-91
+# BandwidthCapacityMonitor
+
+说明被动监控能够观测的本机网卡余量、无法直接观测的 Wi-Fi/交换机瓶颈，以及卡顿时结合带宽和 CPU 指标的判断方法。
+```
+
+### Steps
+1. 创建 `BandwidthCapacityMonitor` 独立目录和独立 CMake 工程，避免修改 FSRemote 主程序构建入口。
+2. 使用 IP Helper `GetIfTable2` 读取活动物理网卡的累计字节、协商速率、丢弃和错误计数，并以相邻采样差计算接收/发送 Mbps。
+3. 增加 `--interface`、`--interval-ms`、`--duration`、`--capacity-mbps`、`--process` 和 `--csv` 参数，支持按网卡筛选、有效容量校准和故障前数据留存。
+4. 使用 Toolhelp32 与 Process/PSAPI API 聚合 `FSRemote.exe` 的 CPU、工作集、私有内存和线程数。
+5. 增加 70%、85%、95% 利用率风险阈值，并把网卡丢弃/错误增长单独提示，避免只依据理论余量下结论。
+6. 在源码中加入 WJY 所有权标记和中文解释，补充独立项目 README 与纯数学回归测试。
+
+### Verification
+- `cmake -S . -B build -A x64`：配置成功，使用 Visual Studio 17 2022 x64 生成器。
+- `cmake --build build --config Release`：`BandwidthCapacityMonitor.exe` 和 `BandwidthCapacityMonitorTests.exe` 构建成功。
+- `ctest --test-dir build -C Release --output-on-failure`：1/1 测试通过。
+- `BandwidthCapacityMonitor.exe --list`：成功识别 `[9] 以太网`，Realtek PCIe GbE Family Controller，接收/发送协商速率均为 1000 Mbps。
+- `BandwidthCapacityMonitor.exe --duration 2 --csv build/monitor-smoke.csv`：完成两次真实网卡采样，输出接收/发送 Mbps、理论余量、FSRemote 进程资源和丢弃/错误计数，CSV 文件成功落盘。
+- `BandwidthCapacityMonitor.exe --help`：返回退出码 0；非法参数返回退出码 1。
+- `git diff --check`：已检查本次独立目录改动，未发现空白错误。
