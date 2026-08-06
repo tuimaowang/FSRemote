@@ -266,11 +266,19 @@ typedef enum {
     VDD_IOCTL_UNKONWN = 0x0022a00c, // CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800 + 5, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 } VddCtlCode;
 
+// =====wjy====
 // Generic DeviceIoControl for all IoControl codes.
-static DWORD VddIoControl(HANDLE vdd, VddCtlCode code, const void *data, size_t size)
+static DWORD VddIoControlWithTimeout(HANDLE vdd, VddCtlCode code, const void *data, size_t size,
+                                     DWORD timeoutMs, DWORD *lastError)
 {
+    if (lastError != NULL)
+        *lastError = ERROR_SUCCESS; // wjy: 调用方可区分驱动返回失败、等待超时和无效句柄，不再只得到模糊的 -1。
     if (vdd == NULL || vdd == INVALID_HANDLE_VALUE)
+    {
+        if (lastError != NULL)
+            *lastError = ERROR_INVALID_HANDLE;
         return -1;
+    }
 
     BYTE InBuffer[32];
     ZeroMemory(InBuffer, sizeof(InBuffer));
@@ -279,16 +287,40 @@ static DWORD VddIoControl(HANDLE vdd, VddCtlCode code, const void *data, size_t 
     ZeroMemory(&Overlapped, sizeof(OVERLAPPED));
 
     DWORD OutBuffer = 0;
-    DWORD NumberOfBytesTransferred;
+    DWORD NumberOfBytesTransferred = 0;
 
     if (data != NULL && size > 0)
         memcpy(InBuffer, data, (size < sizeof(InBuffer)) ? size : sizeof(InBuffer));
 
     Overlapped.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
-    DeviceIoControl(vdd, (DWORD)code, InBuffer, sizeof(InBuffer), &OutBuffer, sizeof(DWORD), NULL, &Overlapped);
-
-    if (!GetOverlappedResultEx(vdd, &Overlapped, &NumberOfBytesTransferred, 5000, FALSE))
+    if (Overlapped.hEvent == NULL)
     {
+        if (lastError != NULL)
+            *lastError = GetLastError();
+        return -1;
+    }
+
+    const BOOL issued = DeviceIoControl(
+        vdd, (DWORD)code, InBuffer, sizeof(InBuffer), &OutBuffer, sizeof(DWORD), NULL, &Overlapped);
+    const DWORD issueError = issued ? ERROR_SUCCESS : GetLastError();
+    if (!issued && issueError != ERROR_IO_PENDING)
+    {
+        if (lastError != NULL)
+            *lastError = issueError; // wjy: IOCTL 没有进入异步等待时立即返回真实 Win32 错误。
+        CloseHandle(Overlapped.hEvent);
+        return -1;
+    }
+
+    if (!GetOverlappedResultEx(vdd, &Overlapped, &NumberOfBytesTransferred, timeoutMs, FALSE))
+    {
+        const DWORD waitError = GetLastError();
+        if (waitError == WAIT_TIMEOUT || waitError == ERROR_IO_INCOMPLETE)
+        {
+            CancelIoEx(vdd, &Overlapped); // wjy: 超时后必须撤销仍引用栈上 OVERLAPPED 和缓冲区的请求，禁止关闭事件后留下悬空异步 IO。
+            GetOverlappedResult(vdd, &Overlapped, &NumberOfBytesTransferred, TRUE); // wjy: 等待取消完成后再离开函数，保证栈上输入输出缓冲区生命周期安全。
+        }
+        if (lastError != NULL)
+            *lastError = waitError;
         CloseHandle(Overlapped.hEvent);
         return -1;
     }
@@ -298,6 +330,12 @@ static DWORD VddIoControl(HANDLE vdd, VddCtlCode code, const void *data, size_t 
 
     return OutBuffer;
 }
+
+static DWORD VddIoControl(HANDLE vdd, VddCtlCode code, const void *data, size_t size)
+{
+    return VddIoControlWithTimeout(vdd, code, data, size, 5000, NULL); // wjy: 添加、移除和版本查询保持原五秒兼容窗口，只有高频心跳使用更短超时。
+}
+// ===end====
 
 /**
 * Query VDD minor version.
@@ -322,6 +360,13 @@ static void VddUpdate(HANDLE vdd)
 {
     VddIoControl(vdd, VDD_IOCTL_UPDATE, NULL, 0);
 }
+
+// =====wjy====
+static BOOL VddUpdateWithTimeout(HANDLE vdd, DWORD timeoutMs, DWORD *lastError)
+{
+    return VddIoControlWithTimeout(vdd, VDD_IOCTL_UPDATE, NULL, 0, timeoutMs, lastError) != (DWORD)-1; // wjy: 心跳线程取得成功状态并限制单次阻塞，避免五秒等待直接跨过驱动保活窗口。
+}
+// ===end====
 
 /**
 * Add/plug a virtual display.

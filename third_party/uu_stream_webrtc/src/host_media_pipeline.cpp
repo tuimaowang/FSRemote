@@ -218,6 +218,7 @@ private:
                   << " reused=" << reused_frames_
                   << " busy=" << busy_frames_
                   << " dropped=" << dropped_frames_
+                  << " recovery_suppressed=" << recovery_suppressed_frames_
                   << " capture_ms=" << average_capture_ms << "\n"; // wjy: 两秒聚合一次定位采集瓶颈，禁止逐帧磁盘日志干扰60 FPS测量。
         std::ostringstream diagnostic;
         diagnostic << "telemetry publish_fps=" << published_frames_ / seconds
@@ -226,12 +227,16 @@ private:
                    << " reused=" << reused_frames_
                    << " busy=" << busy_frames_
                    << " dropped=" << dropped_frames_
+                   << " recovery_events=" << recovery_events_
+                   << " recovery_suppressed=" << recovery_suppressed_frames_
+                   << " recovering=" << (capture_recovering_ ? 1 : 0)
                    << " average_capture_ms=" << average_capture_ms;
         append_stream_capture_diagnostic_log(
             "capture",
             diagnostic.str()); // wjy: 每两秒一条聚合采集指标，复现卡死时可判断是否仍在循环、是否只有超时或槽位阻塞。
         report_started_ = now;
         capture_attempts_ = new_frames_ = reused_frames_ = busy_frames_ = dropped_frames_ = published_frames_ = 0;
+        recovery_events_ = recovery_suppressed_frames_ = 0; // wjy: 恢复统计与普通帧计数使用同一个两秒窗口，避免新增逐帧日志和磁盘开销。
         capture_time_us_ = 0;
     }
 
@@ -250,7 +255,9 @@ private:
             const auto capture_begin = std::chrono::steady_clock::now();
             lsp::CapturedFrame captured;
             std::string capture_error;
-            const bool fresh = capture_.capture(&captured, &capture_error);
+            const lsp::DxgiCaptureResult capture_result = capture_.capture_frame(&captured, &capture_error); // wjy: 类型化结果直接区分静止桌面、轻量恢复和设备恢复，删除脆弱的错误字符串分支。
+            const bool fresh = capture_result.status == lsp::DxgiCaptureStatus::FreshFrame;
+            bool publish_allowed = true;
             const auto capture_end = std::chrono::steady_clock::now();
             ++capture_attempts_;
             capture_time_us_ += static_cast<uint64_t>(
@@ -259,6 +266,12 @@ private:
             if (fresh) {
                 last_frame_ = std::move(captured); // wjy: 新桌面图像替换源端最后帧，旧租约由下游引用决定何时归还。
                 ++new_frames_;
+                if (capture_recovering_) {
+                    capture_recovering_ = false;
+                    append_stream_capture_diagnostic_log(
+                        "capture",
+                        "DXGI recovery completed; fresh frame resumed on retained pipeline"); // wjy: 首张真实恢复帧到达后一次性结束恢复态，确认旧画面保留期间没有重启会话。
+                }
                 if (!first_fresh_frame_logged_) {
                     first_fresh_frame_logged_ = true;
                     append_stream_capture_diagnostic_log(
@@ -266,29 +279,36 @@ private:
                         "first fresh frame size=" + std::to_string(last_frame_.size.width)
                             + "x" + std::to_string(last_frame_.size.height)); // wjy: 第一张DXGI新帧是区分“输出创建成功但Acquire无帧”的关键边界。
                 }
-            } else if (capture_error == "busy") {
+            } else if (capture_result.status == lsp::DxgiCaptureStatus::FrameSlotBusy) {
                 ++busy_frames_; // wjy: 编码端占满四槽时不覆盖纹理，继续发布最后安全帧保持控制低延迟。
             // =====wjy====
-            } else if (capture_error == "DXGI access lost") {
-                last_frame_ = {}; // wjy: Duplication失效后旧纹理属于已经销毁的D3D设备，立即丢弃，禁止后续循环持续向WebRTC复用无效画面。
-                ++dropped_frames_; // wjy: 把本轮拓扑切换计入受控丢帧；下一轮capture会按原VDD设备名重新初始化并取得新纹理。
-                append_stream_capture_diagnostic_log_rate_limited(
-                    "capture",
-                    "DXGI access lost; stale reusable frame discarded before reinitialize",
-                    1000); // wjy: 日志明确旧帧已清除，现场若仍无新帧即可继续检查VDD输出是否重新挂载。
+            } else if (capture_result.status == lsp::DxgiCaptureStatus::DuplicationRecovering
+                       || capture_result.status == lsp::DxgiCaptureStatus::DeviceRecovering) {
+                publish_allowed = false; // wjy: 恢复期不清空最后纹理，也不重复送入 NVENC；控制端 SwapChain 自然保留上一张成功画面。
+                ++recovery_suppressed_frames_;
+                if (!capture_recovering_) {
+                    capture_recovering_ = true;
+                    ++recovery_events_;
+                    append_stream_capture_diagnostic_log(
+                        "capture",
+                        "DXGI recovery begin status=" + std::to_string(static_cast<int>(capture_result.status))
+                            + " hr=" + std::to_string(static_cast<unsigned long>(capture_result.result))
+                            + " retained_frame=" + std::to_string(last_frame_.texture ? 1 : 0)); // wjy: 每次恢复只记录入口，证明画面保留状态并避免五秒周期产生逐帧日志。
+                }
             // ===end====
-            } else if (capture_error != "timeout" && capture_error != "DXGI access lost") {
+            } else if (capture_result.status == lsp::DxgiCaptureStatus::FatalError) {
+                publish_allowed = false; // wjy: 未分类错误不继续反复编码可能失效的源纹理，等待下一轮采集恢复或上层会话策略处理。
                 ++dropped_frames_;
             }
-            if (!fresh && capture_error != "timeout" && capture_error != "busy") {
+            if (capture_result.status == lsp::DxgiCaptureStatus::FatalError) {
                 append_stream_capture_diagnostic_log_rate_limited(
                     "capture",
                     "capture returned error='" + capture_error + "' has_last_frame="
                         + std::to_string(last_frame_.texture ? 1 : 0),
-                    1000); // wjy: ACCESS_LOST、初始化和纹理错误每秒最多记录一次，同时标明能否继续复用旧帧。
+                    1000); // wjy: 初始化和纹理等未分类错误每秒最多记录一次，同时标明是否仍保留最后成功帧。
             }
 
-            if (last_frame_.texture) {
+            if (publish_allowed && last_frame_.texture) {
                 if (!fresh) ++reused_frames_; // wjy: 静止桌面也按目标节奏复用纹理，健康FPS不再被DXGI仅上报变化帧误导。
                 if (publish_frame(last_frame_)) {
                     ++published_frames_;
@@ -299,7 +319,7 @@ private:
                             "first WebRTC source frame published"); // wjy: 证明D3D11NativeFrameBuffer已进入AdaptedVideoTrackSource，后续无画面应继续查编码/WebRTC。
                     }
                 }
-            } else {
+            } else if (publish_allowed) {
                 ++dropped_frames_;
                 OnFrameDropped();
                 append_stream_capture_diagnostic_log_rate_limited(
@@ -330,7 +350,10 @@ private:
     uint64_t busy_frames_ = 0;
     uint64_t dropped_frames_ = 0;
     uint64_t published_frames_ = 0;
+    uint64_t recovery_events_ = 0;
+    uint64_t recovery_suppressed_frames_ = 0; // wjy: 恢复空档只做内存计数，不提交旧帧编码，也不增加任何新线程或定时器。
     uint64_t capture_time_us_ = 0;
+    bool capture_recovering_ = false;
     bool first_fresh_frame_logged_ = false; // wjy: 首张DXGI新帧只记录一次，避免正常60 FPS路径产生磁盘压力。
     bool first_published_frame_logged_ = false; // wjy: 首张送入WebRTC的源帧单独标记，用于与NVENC首帧配对。
 };

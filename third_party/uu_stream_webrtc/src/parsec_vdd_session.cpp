@@ -26,6 +26,7 @@ namespace {
 
 // =====wjy====
 using lsp::append_stream_capture_diagnostic_log; // wjy: 仅把统一诊断函数引入当前VDD实现作用域，不改变显示创建、复用或释放流程。
+using lsp::append_stream_capture_diagnostic_log_rate_limited; // wjy: 心跳异常只按秒聚合落盘，正常 100ms 保活循环不产生磁盘 IO。
 // ===end====
 
 constexpr DWORD kDisplayEnumerateTimeoutMs = 5000;
@@ -423,10 +424,47 @@ public:
 
         heartbeat_running_ = true;
         heartbeat_thread_ = std::thread([this] {
+            // =====wjy====
+            auto next_heartbeat = std::chrono::steady_clock::now();
+            uint32_t consecutive_failures = 0;
             while (heartbeat_running_) {
-                parsec_vdd::VddUpdate(handle_);
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                next_heartbeat += std::chrono::milliseconds(100); // wjy: 绝对节拍避免正常 IOCTL 耗时逐轮累积，健康驱动保持约 100ms 一次 ping。
+                const auto update_begin = std::chrono::steady_clock::now();
+                DWORD update_error = ERROR_SUCCESS;
+                const BOOL update_ok = parsec_vdd::VddUpdateWithTimeout(handle_, 250, &update_error); // wjy: 单次心跳最多等待 250ms，替代现场每五秒一次的阻塞空档。
+                const auto update_end = std::chrono::steady_clock::now();
+                const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(update_end - update_begin).count();
+
+                if (!update_ok) {
+                    ++consecutive_failures;
+                    append_stream_capture_diagnostic_log_rate_limited(
+                        "vdd",
+                        "heartbeat failed error=" + std::to_string(update_error)
+                            + " elapsed_ms=" + std::to_string(elapsed_ms)
+                            + " consecutive=" + std::to_string(consecutive_failures),
+                        1000); // wjy: 驱动无响应时只记录结果和连续次数，不在心跳线程执行拔屏或重建设备等扩大拓扑变化的操作。
+                } else {
+                    if (consecutive_failures > 0) {
+                        append_stream_capture_diagnostic_log(
+                            "vdd",
+                            "heartbeat recovered previous_failures=" + std::to_string(consecutive_failures)
+                                + " elapsed_ms=" + std::to_string(elapsed_ms)); // wjy: 失败后首次成功单独落盘，和 DXGI 轻量恢复结束时间对齐。
+                    } else if (elapsed_ms >= 200) {
+                        append_stream_capture_diagnostic_log_rate_limited(
+                            "vdd",
+                            "heartbeat slow elapsed_ms=" + std::to_string(elapsed_ms),
+                            1000); // wjy: 成功但接近超时的调用也低频提示，正常快速心跳完全不写日志。
+                    }
+                    consecutive_failures = 0;
+                }
+
+                const auto pacing_now = std::chrono::steady_clock::now();
+                if (pacing_now > next_heartbeat + std::chrono::milliseconds(100)) {
+                    next_heartbeat = pacing_now; // wjy: 超时后丢弃已经过期的节拍，立即进入下一轮而不是连续补发多次心跳。
+                }
+                std::this_thread::sleep_until(next_heartbeat);
             }
+            // ===end====
         });
 
         DisplayInfo info;

@@ -22,5 +22,22 @@ int main()
     retained.reset();
     assert(!state->leased());
     assert(state->try_acquire(&denied)); // wjy: 最后一份引用释放后，同一槽位才允许下一帧复用。
+
+    // =====wjy====
+    assert(lsp::dxgi_failure_action(DXGI_ERROR_ACCESS_LOST, S_OK)
+        == lsp::DxgiFailureAction::RecreateDuplication); // wjy: ACCESS_LOST 只重建 Duplication，禁止把一次显示拓扑抖动扩大成 NVENC 重启。
+    assert(lsp::dxgi_failure_action(DXGI_ERROR_INVALID_CALL, S_OK)
+        == lsp::DxgiFailureAction::RecreateDuplication); // wjy: INVALID_CALL 必须退出坏掉的 Acquire 状态，不能每秒重复同一个错误。
+    assert(lsp::dxgi_failure_action(DXGI_ERROR_WAIT_TIMEOUT, S_OK)
+        == lsp::DxgiFailureAction::KeepResources); // wjy: 静止桌面的正常超时不进入任何恢复流程。
+    assert(lsp::dxgi_failure_action(DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_DEVICE_REMOVED)
+        == lsp::DxgiFailureAction::RecreateDevice); // wjy: 设备移除原因优先于表层 ACCESS_LOST，防止失效 Device 被轻量恢复永久保留。
+    assert(lsp::dxgi_failure_action(E_FAIL, DXGI_ERROR_DEVICE_REMOVED)
+        == lsp::DxgiFailureAction::RecreateDevice); // wjy: GetDeviceRemovedReason 确认设备丢失时才执行完整设备恢复。
+    assert(lsp::dxgi_duplication_retry_delay_ms(1) == 0);
+    assert(lsp::dxgi_duplication_retry_delay_ms(2) == 50);
+    assert(lsp::dxgi_duplication_retry_delay_ms(3) == 100);
+    assert(lsp::dxgi_duplication_retry_delay_ms(20) == 250); // wjy: 连续失败退避有固定上限，不会增长到数秒而让远控长期停在旧画面。
+    // ===end====
     return 0;
 }
