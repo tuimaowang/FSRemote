@@ -55,7 +55,7 @@ public:
     bool hasCompositorOverlay() const; // wjy: 叠加SwapChain创建成功后才隐藏旧标题栏/性能层，创建失败保留可用回退表面。
     void setPresentationVisible(bool visible); // wjy: 统一控制旧子HWND或DComp视频视觉的可见性，更新遮罩不会露出旧帧。
     bool setCompositorOutputRect(const QRect& rect); // wjy: 提交统一内容矩形并返回结果；失败时实现会恢复上一份可见几何。
-    bool presentCompositorOverlay(const QImage& image, const QRect& dirtyPhysicalRect = QRect()); // 空脏区完整提交；标题栏变化只上传物理脏区并使用Present1。
+    bool presentCompositorOverlay(const QImage& image, const QRect& dirtyPhysicalRect = QRect()); // 空脏区完整上传；标题栏只上传物理脏区，但透明整窗表面始终完整Flip Present。
     void setInteractiveResize(bool active); // wjy: 拖拽期间冻结SwapChain尺寸但继续呈现新帧，松手后只按最终客户区调整一次并立即补画缓存帧。
     void reset();
     long lastDeviceRemovalReason() const; // wjy: 返回最近一次D3D11失败HRESULT，供窗口级诊断记录，不触发进程级异常。

@@ -526,17 +526,17 @@ bool D3D11FramePresenter::presentCompositorOverlay(
     const QRect requestedDirtyRect = dirtyPhysicalRect.intersected(surfaceBounds);
     const bool requestedPartialUpdate = !requestedDirtyRect.isEmpty()
         && requestedDirtyRect != surfaceBounds;
-    ComPtr<IDXGISwapChain1> targetSwapChain1;
-    bool partialPresent = !useCandidate
+    const bool partialUpload = !useCandidate
         && !reuseCurrentDuringResize
         && !m_impl->interactiveResize
         && m_impl->compositionOverlayFullPresentsRemaining == 0
         && requestedPartialUpdate
-        && targetSwapChain
-        && SUCCEEDED(targetSwapChain->QueryInterface(IID_PPV_ARGS(&targetSwapChain1))); // wjy: 只有稳定且两个BackBuffer都完整初始化后才允许局部Present。
+        && targetSwapChain; // wjy: 双BackBuffer完整初始化后仍只上传标题栏脏区，但不再使用Present1脏区翻转。
 
     // =====wjy====
-    m_impl->lastCompositionOverlayMode = partialPresent ? QStringLiteral("partial") : QStringLiteral("full"); // wjy: 保存实际呈现模式，而不是仅根据调用方传入的脏区猜测。
+    m_impl->lastCompositionOverlayMode = partialUpload
+        ? QStringLiteral("partial_upload_full_present")
+        : QStringLiteral("full"); // wjy: 日志明确区分局部GPU上传与完整Flip Present，避免再把两者混为同一个“partial”。
     m_impl->lastCompositionOverlayDirtyRect = requestedDirtyRect; // wjy: 记录经过表面边界裁剪后的真实物理脏区。
     m_impl->lastCompositionOverlayBackBufferIndex = -1; // wjy: 每次Present前重新查询，查询失败时保留明确的未知值。
     // ===end====
@@ -556,7 +556,7 @@ bool D3D11FramePresenter::presentCompositorOverlay(
     const uchar* sourceBits = converted.constBits();
     std::uint64_t uploadedBytes = static_cast<std::uint64_t>(converted.width())
         * static_cast<std::uint64_t>(converted.height()) * 4;
-    if (partialPresent) {
+    if (partialUpload) {
         uploadBox.left = static_cast<UINT>(requestedDirtyRect.left());
         uploadBox.top = static_cast<UINT>(requestedDirtyRect.top());
         uploadBox.front = 0;
@@ -585,19 +585,7 @@ bool D3D11FramePresenter::presentCompositorOverlay(
         m_impl->lastCompositionOverlayBackBufferIndex = static_cast<int>(targetSwapChain3->GetCurrentBackBufferIndex()); // wjy: 记录双缓冲当前索引，定位黑闪是否落在未补齐的BackBuffer。
     }
     // ===end====
-    if (partialPresent) {
-        RECT dirtyRect = {
-            requestedDirtyRect.left(),
-            requestedDirtyRect.top(),
-            requestedDirtyRect.right() + 1,
-            requestedDirtyRect.bottom() + 1};
-        DXGI_PRESENT_PARAMETERS parameters = {};
-        parameters.DirtyRectsCount = 1;
-        parameters.pDirtyRects = &dirtyRect;
-        presentResult = targetSwapChain1->Present1(0, 0, &parameters);
-    } else {
-        presentResult = targetSwapChain->Present(0, 0);
-    }
+    presentResult = targetSwapChain->Present(0, 0); // wjy: 透明整窗Overlay始终完整Flip，防止Present1脏区翻转把视频孔短暂合成为黑色；像素上传仍保持标题栏局部。
     m_impl->lastCompositionOverlayPresentResult = presentResult; // wjy: 成功与失败都写入最近一次HRESULT，供data时间线和现有汇总共同读取。
     if (FAILED(presentResult)) {
         ++m_impl->compositionOverlayPresentFailureCount;
@@ -610,7 +598,7 @@ bool D3D11FramePresenter::presentCompositorOverlay(
         return false;
     }
     m_impl->compositionOverlayUploadedBytes += uploadedBytes;
-    if (partialPresent) {
+    if (partialUpload) {
         ++m_impl->compositionOverlayPartialPresentCount;
     } else {
         ++m_impl->compositionOverlayFullPresentCount;
@@ -1362,7 +1350,7 @@ D3D11CompositorTelemetry D3D11FramePresenter::compositorTelemetry() const
     telemetry.overlayUploadedBytes = m_impl->compositionOverlayUploadedBytes;
     // =====wjy====
     telemetry.overlayPresentSequence = m_impl->compositionOverlayPresentSequence; // wjy: 向窗口级data时间线公开实际Overlay提交序号。
-    telemetry.lastOverlayMode = m_impl->lastCompositionOverlayMode; // wjy: 区分完整Present与Present1脏区提交。
+    telemetry.lastOverlayMode = m_impl->lastCompositionOverlayMode; // wjy: 区分完整上传与“局部上传、完整Flip Present”路径。
     telemetry.lastOverlayDirtyRect = m_impl->lastCompositionOverlayDirtyRect; // wjy: 暴露实际裁剪后的物理脏区。
     telemetry.lastOverlayBackBufferIndex = m_impl->lastCompositionOverlayBackBufferIndex; // wjy: 暴露最近一次双缓冲索引。
     telemetry.lastOverlayPresentResult = static_cast<long>(m_impl->lastCompositionOverlayPresentResult); // wjy: 保留最近一次Overlay HRESULT。

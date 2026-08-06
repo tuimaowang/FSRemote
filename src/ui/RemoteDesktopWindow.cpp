@@ -3301,10 +3301,10 @@ void RemoteDesktopWindow::presentCompositorOverlay(const QRect& dirtyLogicalRect
     const D3D11CompositorTelemetry telemetryAfter = m_texturePresenter->compositorTelemetry();
     const bool fullPresentAdvanced = telemetryAfter.overlayFullPresentCount
         > telemetryBefore.overlayFullPresentCount; // wjy: 整窗Overlay全部落盘，因为当前现场的异常增长正是重点嫌疑。
-    const bool partialPresentAdvanced = telemetryAfter.overlayPartialPresentCount
+    const bool partialUploadAdvanced = telemetryAfter.overlayPartialPresentCount
         > telemetryBefore.overlayPartialPresentCount;
     const qint64 timelineMs = m_sessionClock.isValid() ? m_sessionClock.elapsed() : 0;
-    const bool partialTimelineDue = partialPresentAdvanced
+    const bool partialTimelineDue = partialUploadAdvanced
         && timelineMs - m_lastCompositorPartialTimelineMs >= 500; // wjy: 正常秒级标题栏更新最多每500毫秒记录一次，避免日志IO反过来制造卡顿。
     if (!overlayPresented || fullPresentAdvanced || partialTimelineDue) {
         if (partialTimelineDue) {

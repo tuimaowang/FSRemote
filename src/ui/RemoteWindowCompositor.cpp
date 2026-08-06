@@ -30,7 +30,7 @@ QRect remoteCompositorPhysicalDirtyRect(
         logicalRect.width() * devicePixelRatio,
         logicalRect.height() * devicePixelRatio);
     return scaled.toAlignedRect().intersected(
-        QRect(0, 0, physicalSurfaceSize.width(), physicalSurfaceSize.height())); // wjy: Present1和UpdateSubresource共用同一物理脏区，透明视频孔不会被标题栏刷新覆盖。
+        QRect(0, 0, physicalSurfaceSize.width(), physicalSurfaceSize.height())); // wjy: 该物理脏区只限制UpdateSubresource上传范围；SwapChain仍完整Flip以保护透明视频孔。
 }
 
 bool RemoteWindowCompositorConfig::rolloutEnabled()

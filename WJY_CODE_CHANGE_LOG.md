@@ -10473,3 +10473,73 @@ appendRemoteCompositorTimelineLog(QStringLiteral(
 - 现场样本的负全局坐标与全黑截图一一对应，确认原探针结果无诊断价值。
 - `git diff --check -- src/ui/RemoteDesktopWindow.cpp`：通过，未发现空白错误。
 - 按用户此前要求未执行编译、链接和运行测试；需要更新控制端后重新采样。
+
+## 2026-08-06 17:29 - 用局部上传和完整Flip消除标题栏触发黑闪
+
+### Changed Location
+- `src/ui/D3D11FramePresenter.cpp:525-615`：保留标题栏物理脏区上传，但取消透明整窗Overlay的`Present1`脏区翻转，统一使用完整`Present`。
+- `src/ui/D3D11FramePresenter.h:58`：更新Overlay接口注释，明确“局部上传、完整Flip Present”。
+- `src/ui/RemoteWindowCompositor.cpp:33`：明确物理脏区只限制GPU上传范围，不再传给DXGI Present1。
+- `src/ui/RemoteDesktopWindow.cpp:3304-3308`：把诊断变量改名为`partialUploadAdvanced`，与新呈现语义一致。
+
+### Reason
+修正多显示器坐标后，像素探针在稳定视频期间真实抓到了15次完整黑屏样本。除一次发生在连接遮罩切换外，其余14次黑屏前最近一次Overlay事件都是`titlebar_dirty mode=partial`；多个典型样本在标题栏`Present1`后约100至230毫秒变为`black_ratio=1.0000`，下一次采样又恢复正常，而视频Present、Overlay HRESULT和DComp Commit始终成功。这表明透明整窗Overlay使用脏区Flip时，DWM会短暂把未标记的透明视频孔合成为黑色。
+
+### Original Code
+```cpp
+// src/ui/D3D11FramePresenter.cpp:529-539（修改前）
+ComPtr<IDXGISwapChain1> targetSwapChain1;
+bool partialPresent = !useCandidate
+    && !reuseCurrentDuringResize
+    && !m_impl->interactiveResize
+    && m_impl->compositionOverlayFullPresentsRemaining == 0
+    && requestedPartialUpdate
+    && targetSwapChain
+    && SUCCEEDED(targetSwapChain->QueryInterface(IID_PPV_ARGS(&targetSwapChain1)));
+```
+
+```cpp
+// src/ui/D3D11FramePresenter.cpp:588-600（修改前）
+if (partialPresent) {
+    DXGI_PRESENT_PARAMETERS parameters = {};
+    parameters.DirtyRectsCount = 1;
+    parameters.pDirtyRects = &dirtyRect;
+    presentResult = targetSwapChain1->Present1(0, 0, &parameters);
+} else {
+    presentResult = targetSwapChain->Present(0, 0);
+}
+```
+
+### Modified Code
+```cpp
+// src/ui/D3D11FramePresenter.cpp:529-541（修改后）
+const bool partialUpload = !useCandidate
+    && !reuseCurrentDuringResize
+    && !m_impl->interactiveResize
+    && m_impl->compositionOverlayFullPresentsRemaining == 0
+    && requestedPartialUpdate
+    && targetSwapChain;
+
+m_impl->lastCompositionOverlayMode = partialUpload
+    ? QStringLiteral("partial_upload_full_present")
+    : QStringLiteral("full");
+```
+
+```cpp
+// src/ui/D3D11FramePresenter.cpp:588（修改后）
+presentResult = targetSwapChain->Present(0, 0);
+```
+
+### Steps
+1. 统计2026-08-06 17:22:37之后的4689条真实可见像素样本。
+2. 排除首帧前连接界面，筛出15条`black_ratio>=0.98`且已有视频帧的完整黑屏样本。
+3. 对每条黑屏样本回溯同设备最近一次Overlay事件，确认14/15命中标题栏局部Present路径。
+4. 保留`UpdateSubresource`的标题栏脏区Box，使CPU到GPU上传量仍只覆盖约28像素高区域。
+5. 删除`IDXGISwapChain1::Present1`脏区参数，透明整窗Overlay始终进行完整Flip Present，确保视频孔沿用完整初始化过的BackBuffer透明像素。
+
+### Verification
+- 典型样本：`192.168.1.107`在17:23:07.415执行标题栏局部Present，17:23:07.548采样为全黑，17:23:07.697恢复正常。
+- 典型样本：`192.168.1.109`在17:23:50.467执行标题栏局部Present，17:23:50.696采样为全黑，17:23:50.847恢复正常。
+- 新版本中`comp_commit`稳定保持5至6，视频逐帧DComp提交修复继续生效。
+- `git diff --check`覆盖四个修改源码文件并通过。
+- 按用户此前要求未执行编译、链接和运行测试；需要更新控制端后确认日志模式为`partial_upload_full_present`且不再出现稳定期全黑样本。
