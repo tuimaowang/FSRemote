@@ -5051,12 +5051,20 @@ void RemoteDesktopWindow::sampleVisibleCompositorRegion()
             globalRect = QRect(mapToGlobal(imageRect.topLeft()), imageRect.size()); // wjy: 普通黑闪采样只覆盖真实视频区，排除标题栏和letterbox固有黑边。
         }
     }
+    const QRect screenGeometry = screen->geometry(); // wjy: QScreen抓取根窗口时坐标相对当前屏幕，不是虚拟桌面全局坐标。
+    const QRect visibleGlobalRect = globalRect.intersected(screenGeometry);
+    if (visibleGlobalRect.isEmpty()) {
+        return; // wjy: 窗口与当前屏幕没有可见交集时跳过采样，禁止把越界黑图误判为远控黑闪。
+    }
+    const QRect captureRect(
+        visibleGlobalRect.topLeft() - screenGeometry.topLeft(),
+        visibleGlobalRect.size()); // wjy: 左侧或上方显示器的负全局坐标转换为该QScreen内部的非负局部坐标。
     const QPixmap screenshot = screen->grabWindow(
         0,
-        globalRect.left(),
-        globalRect.top(),
-        globalRect.width(),
-        globalRect.height());
+        captureRect.left(),
+        captureRect.top(),
+        captureRect.width(),
+        captureRect.height());
     const QImage image = screenshot.toImage().convertToFormat(QImage::Format_RGB32);
     if (image.isNull() || image.width() <= 0 || image.height() <= 0) {
         return;
@@ -5113,15 +5121,23 @@ void RemoteDesktopWindow::sampleVisibleCompositorRegion()
             ? m_texturePresenter->compositorTelemetry()
             : D3D11CompositorTelemetry{};
         appendRemoteCompositorTimelineLog(QStringLiteral(
-            "host=%1 device=%2 event=%3 session_ms=%4 global_rect=%5,%6,%7,%8 overlay_seq=%9 overlay_mode=%10 buffer=%11 overlay_hr=0x%12 commit_hr=0x%13 commit_us=%14")
+            "host=%1 device=%2 event=%3 session_ms=%4 global_rect=%5,%6,%7,%8 screen_rect=%9,%10,%11,%12 capture_rect=%13,%14,%15,%16 overlay_seq=%17 overlay_mode=%18 buffer=%19 overlay_hr=0x%20 commit_hr=0x%21 commit_us=%22")
             .arg(m_hostIp)
             .arg(m_deviceName)
             .arg(sample)
             .arg(sessionElapsedMs)
-            .arg(globalRect.x())
-            .arg(globalRect.y())
-            .arg(globalRect.width())
-            .arg(globalRect.height())
+            .arg(visibleGlobalRect.x())
+            .arg(visibleGlobalRect.y())
+            .arg(visibleGlobalRect.width())
+            .arg(visibleGlobalRect.height())
+            .arg(screenGeometry.x())
+            .arg(screenGeometry.y())
+            .arg(screenGeometry.width())
+            .arg(screenGeometry.height())
+            .arg(captureRect.x())
+            .arg(captureRect.y())
+            .arg(captureRect.width())
+            .arg(captureRect.height())
             .arg(static_cast<qulonglong>(telemetry.overlayPresentSequence))
             .arg(telemetry.lastOverlayMode)
             .arg(telemetry.lastOverlayBackBufferIndex)

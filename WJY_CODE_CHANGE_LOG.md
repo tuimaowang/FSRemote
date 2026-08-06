@@ -10396,3 +10396,80 @@ if (FAILED(presentResult)) {
 - 现场所有`video.present`和`overlay.present`均为`ok=1`，`present_hr=0x0`、`commit_hr=0x0`，单次受控Commit约63至428微秒。
 - `git diff --check -- src/ui/D3D11FramePresenter.cpp`：通过，未发现空白错误。
 - 按用户此前要求未执行编译、链接和运行测试；需要更新控制端后复核`comp_commit`应不再跟随视频帧持续增长。
+
+## 2026-08-06 17:02 - 修正多显示器负坐标像素探针
+
+### Changed Location
+- `src/ui/RemoteDesktopWindow.cpp:5051-5070`：将远控视频区全局坐标裁剪并转换为目标QScreen局部坐标后再截图。
+- `src/ui/RemoteDesktopWindow.cpp:5121-5148`：在可见像素日志中补充屏幕全局矩形和实际局部抓取矩形。
+
+### Reason
+开启`FSREMOTE_COMPOSITOR_PIXEL_PROBE=1`后的9窗口日志全部持续显示`black_ratio=1.0000`和`avg_luma=0.0`，但用户实际能看到远控画面，因此不是持续黑屏。日志同时显示所有采样矩形位于负全局坐标，例如`global_rect=-3803,-1034`。`QScreen::grabWindow(0, ...)`使用当前屏幕局部坐标，原实现直接传入虚拟桌面全局负坐标，导致抓取屏幕范围外的纯黑区域。
+
+### Original Code
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:5051-5065（修改前）
+QRect globalRect = frameGeometry();
+if (runtimeProbeActive) {
+    const QRect imageRect = remoteImageRect();
+    if (imageRect.isValid()) {
+        globalRect = QRect(mapToGlobal(imageRect.topLeft()), imageRect.size());
+    }
+}
+const QPixmap screenshot = screen->grabWindow(
+    0,
+    globalRect.left(),
+    globalRect.top(),
+    globalRect.width(),
+    globalRect.height());
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:5121-5139（修改前）
+appendRemoteCompositorTimelineLog(QStringLiteral(
+    "host=%1 device=%2 event=%3 session_ms=%4 global_rect=%5,%6,%7,%8 "
+    "overlay_seq=%9 overlay_mode=%10 buffer=%11 overlay_hr=0x%12 "
+    "commit_hr=0x%13 commit_us=%14")
+    .arg(globalRect.x())
+    .arg(globalRect.y())
+    .arg(globalRect.width())
+    .arg(globalRect.height()));
+```
+
+### Modified Code
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:5051-5070（修改后）
+const QRect screenGeometry = screen->geometry();
+const QRect visibleGlobalRect = globalRect.intersected(screenGeometry);
+if (visibleGlobalRect.isEmpty()) {
+    return;
+}
+const QRect captureRect(
+    visibleGlobalRect.topLeft() - screenGeometry.topLeft(),
+    visibleGlobalRect.size());
+const QPixmap screenshot = screen->grabWindow(
+    0,
+    captureRect.left(),
+    captureRect.top(),
+    captureRect.width(),
+    captureRect.height());
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:5121-5148（修改后）
+appendRemoteCompositorTimelineLog(QStringLiteral(
+    "... global_rect=... screen_rect=... capture_rect=... overlay_seq=..."));
+```
+
+### Steps
+1. 确认新版本的`comp_commit`在约25秒内保持为4，上一轮去除逐帧DComp Commit的修复已经生效。
+2. 汇总所有`visible.sample`，确认9个窗口从首个样本起始终为纯黑，与实际显示不符。
+3. 根据日志中的负坐标定位多显示器坐标系错误。
+4. 将窗口视频区先与当前屏幕全局范围求交集，再减去屏幕左上角得到非负局部抓取坐标。
+5. 日志同时输出`global_rect`、`screen_rect`和`capture_rect`，下一轮可直接核对坐标转换。
+
+### Verification
+- 现场日志确认`pixel_probe=1`已在2026-08-06 17:00:31的新会话生效。
+- 现场样本的负全局坐标与全黑截图一一对应，确认原探针结果无诊断价值。
+- `git diff --check -- src/ui/RemoteDesktopWindow.cpp`：通过，未发现空白错误。
+- 按用户此前要求未执行编译、链接和运行测试；需要更新控制端后重新采样。
