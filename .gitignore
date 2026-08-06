@@ -32,6 +32,7 @@
 /outputs/
 /rustdesk/
 /.codex/
+/FakerInputDriverKit/
 
 # IDE / editor
 /.vs/
