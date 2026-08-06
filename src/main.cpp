@@ -4,7 +4,6 @@
 #include "stream/StreamRuntime.h"
 #include "system/AppSettings.h"
 #include "system/DeviceCommandService.h"
-#include "system/DeviceInfoService.h"
 #include "system/DeviceRealtimeStateService.h"
 #include "system/DeviceStatusService.h"
 #include "system/ParsecVddInstaller.h"
@@ -90,21 +89,15 @@ void waitForRestartParentIfRequested()
 #endif
 }
 
-void cleanupMachineNumberProcessesAtStartup()
+void cleanupFixedMachineNumberProcessesAtStartup()
 {
-    const QString machineName = platform::DeviceInfoService::localDeviceName().trimmed(); // wjy: 启动清理只使用当前计算机名，不触发完整网卡信息枚举。
-    if (machineName.isEmpty()) {
-        writeStartupLog(QStringLiteral("[wjy-startup-process] machine name empty, skip cleanup")); // wjy: 无法确定机器号时不猜测进程名，避免误杀无关程序。
-        return;
-    }
-
 #if defined(Q_OS_WIN)
     const QStringList targetProcessNames{
-        machineName + QStringLiteral(".exe"), // wjy: 机器号主进程使用精确的“机器号.exe”文件名匹配。
-        machineName + QStringLiteral("_置顶.exe"), // wjy: 同时清理机器号对应的置顶辅助进程。
+        QString::fromUtf8("机器号.exe"), // wjy: 目标主进程名是固定字面量，不根据当前计算机名拼接或替换。
+        QString::fromUtf8("机器号_置顶.exe"), // wjy: 目标置顶辅助进程名同样固定，必须与进程列表中的文件名完全对应。
     };
     writeStartupLog(QStringLiteral("[wjy-startup-process] cleanup targets=%1")
-        .arg(targetProcessNames.join(QStringLiteral(",")))); // wjy: 记录本次启动实际检查的两个目标名，便于核对设备名解析结果。
+        .arg(targetProcessNames.join(QStringLiteral(",")))); // wjy: 记录本次启动检查的固定目标名，便于确认清理规则没有发生动态替换。
 
     const HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot == INVALID_HANDLE_VALUE) {
@@ -155,7 +148,7 @@ void cleanupMachineNumberProcessesAtStartup()
         writeStartupLog(QStringLiteral("[wjy-startup-process] process enumeration ended error=%1").arg(enumerationError)); // wjy: 记录遍历中途异常，但不让启动流程失败。
     }
 #else
-    Q_UNUSED(machineName); // wjy: 非 Windows 构建没有对应的进程枚举和终止 API，保持跨平台可编译且不伪装清理成功。
+    writeStartupLog(QStringLiteral("[wjy-startup-process] non-Windows build, skip fixed process cleanup")); // wjy: 非 Windows 构建没有对应的进程枚举和终止 API，不伪装清理成功。
 #endif
 }
 
@@ -245,7 +238,7 @@ int main(int argc, char* argv[])
     if (!singleInstanceServer.listen(QString::fromLatin1(kSingleInstanceKey))) {
         writeStartupLog(QStringLiteral("[wjy-main] single-instance server listen failed"));
     }
-    cleanupMachineNumberProcessesAtStartup(); // wjy: 单实例确认后立即清理当前设备号对应的两个旧进程，再继续启动其它服务。
+    cleanupFixedMachineNumberProcessesAtStartup(); // wjy: 单实例确认后立即清理固定名称的两个旧进程，再继续启动其它服务。
     // ===end====
 
     QFont font(QStringLiteral("Microsoft YaHei UI"));

@@ -9797,3 +9797,83 @@ cleanupMachineNumberProcessesAtStartup(); // wjy: 单实例确认后立即清理
 - `git diff --check`：通过，未发现空白错误。
 - 已静态核对目标名为精确文件名匹配，并排除当前进程 PID。
 - 未执行构建和运行测试：遵循用户要求不构建。
+
+## 2026-08-06 14:33 - 修正为固定机器号进程名清理
+
+### Changed Location
+- `src/main.cpp:7`：移除不再需要的 `DeviceInfoService` 依赖。
+- `src/main.cpp:92-153`：将启动清理从“按当前计算机名动态拼接”修正为两个固定进程名。
+- `src/main.cpp:241`：调用重命名后的固定进程清理函数。
+
+### Reason
+上一项实现误把“机器号”理解为当前计算机名。实际需求是两个固定进程名：`机器号.exe` 和 `机器号_置顶.exe`。本次修正删除动态设备名读取和名称拼接，启动时始终仅匹配这两个固定字面量，避免不同计算机名导致未能结束目标进程。
+
+### Original Code
+```cpp
+// src/main.cpp:4-8（修改前）
+#include "system/AppSettings.h"
+#include "system/DeviceCommandService.h"
+#include "system/DeviceInfoService.h"
+#include "system/DeviceRealtimeStateService.h"
+```
+
+```cpp
+// src/main.cpp:93-107（修改前）
+void cleanupMachineNumberProcessesAtStartup()
+{
+    const QString machineName = platform::DeviceInfoService::localDeviceName().trimmed();
+    if (machineName.isEmpty()) {
+        writeStartupLog(QStringLiteral("[wjy-startup-process] machine name empty, skip cleanup"));
+        return;
+    }
+
+    const QStringList targetProcessNames{
+        machineName + QStringLiteral(".exe"),
+        machineName + QStringLiteral("_置顶.exe"),
+    };
+}
+```
+
+```cpp
+// src/main.cpp:248（修改前）
+cleanupMachineNumberProcessesAtStartup();
+```
+
+### Modified Code
+```cpp
+// src/main.cpp:4-7（修改后）
+#include "system/AppSettings.h"
+#include "system/DeviceCommandService.h"
+#include "system/DeviceRealtimeStateService.h"
+```
+
+```cpp
+// src/main.cpp:92-100（修改后）
+void cleanupFixedMachineNumberProcessesAtStartup()
+{
+#if defined(Q_OS_WIN)
+    const QStringList targetProcessNames{
+        QString::fromUtf8("机器号.exe"), // wjy: 目标主进程名是固定字面量，不根据当前计算机名拼接或替换。
+        QString::fromUtf8("机器号_置顶.exe"), // wjy: 目标置顶辅助进程名同样固定，必须与进程列表中的文件名完全对应。
+    };
+    writeStartupLog(QStringLiteral("[wjy-startup-process] cleanup targets=%1")
+        .arg(targetProcessNames.join(QStringLiteral(","))));
+#endif
+}
+```
+
+```cpp
+// src/main.cpp:241（修改后）
+cleanupFixedMachineNumberProcessesAtStartup(); // wjy: 单实例确认后立即清理固定名称的两个旧进程，再继续启动其它服务。
+```
+
+### Steps
+1. 删除按 `DeviceInfoService::localDeviceName()` 读取当前设备名的逻辑。
+2. 将目标列表固定为 `机器号.exe`、`机器号_置顶.exe` 两个 UTF-8 进程映像文件名。
+3. 保留原有的精确文件名比较、当前 FSRemote PID 排除、终止等待和错误日志处理。
+4. 重命名启动清理函数，明确它不再依赖当前计算机名。
+
+### Verification
+- `git diff --check`：通过，未发现空白错误。
+- 已静态确认代码中不再引用 `DeviceInfoService`，目标列表仅含两个固定字面量。
+- 未执行构建和运行测试：遵循用户此前“不用构建”的要求。
