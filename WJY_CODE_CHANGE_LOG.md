@@ -9695,3 +9695,105 @@ testDigitPrefixedDeviceNameEnablesRotationByDefault(); // wjy: 回归验证设�
 ### Verification
 - `git diff --check`：通过，未发现空白错误。
 - 未执行构建和测试：用户明确要求不构建，只完成变更记录和 Git 提交。
+
+## 2026-08-06 14:15 - 启动清理机器号辅助进程
+
+### Changed Location
+- `src/main.cpp:7,39`：引入设备名读取和 Windows 进程快照头文件。
+- `src/main.cpp:93-160`：新增启动阶段按当前设备名精确清理两个目标进程的逻辑。
+- `src/main.cpp:248`：在单实例确认后、其它服务启动前调用清理函数。
+
+### Reason
+部分设备会残留以机器号命名的主进程和置顶辅助进程。程序启动时需要先结束 `<机器名>.exe` 与 `<机器名>_置顶.exe`，避免旧进程继续占用资源或与新实例并行运行。实现只比较 Windows 进程快照提供的精确映像文件名，并排除当前 FSRemote 的 PID；无法打开或结束目标时只记录日志，不阻断主程序启动。
+
+### Original Code
+```cpp
+// src/main.cpp:4-15、33-38（修改前）
+#include "system/AppSettings.h"
+#include "system/DeviceCommandService.h"
+#include "system/DeviceRealtimeStateService.h"
+// ...
+#include <windows.h>
+```
+
+```cpp
+// src/main.cpp:240-247（修改前）
+QLocalServer::removeServer(QString::fromLatin1(kSingleInstanceKey));
+QLocalServer singleInstanceServer;
+if (!singleInstanceServer.listen(QString::fromLatin1(kSingleInstanceKey))) {
+    writeStartupLog(QStringLiteral("[wjy-main] single-instance server listen failed"));
+}
+```
+
+```cpp
+// src/main.cpp:93（修改前）
+// 此位置没有启动机器号进程清理函数。
+```
+
+### Modified Code
+```cpp
+// src/main.cpp:4-15、34-40（修改后）
+#include "system/AppSettings.h"
+#include "system/DeviceCommandService.h"
+#include "system/DeviceInfoService.h"
+#include "system/DeviceRealtimeStateService.h"
+// ...
+#include <windows.h>
+#include <tlhelp32.h>
+```
+
+```cpp
+// src/main.cpp:93-160（修改后，核心逻辑）
+void cleanupMachineNumberProcessesAtStartup()
+{
+    const QString machineName = platform::DeviceInfoService::localDeviceName().trimmed();
+    const QStringList targetProcessNames{
+        machineName + QStringLiteral(".exe"),
+        machineName + QStringLiteral("_置顶.exe"),
+    };
+    const HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    BOOL hasProcess = ::Process32FirstW(snapshot, &entry);
+    while (hasProcess) {
+        const DWORD processId = entry.th32ProcessID;
+        const QString processName = QString::fromWCharArray(entry.szExeFile);
+        if (processId != 0
+            && processId != ::GetCurrentProcessId()
+            && targetProcessNames.contains(processName, Qt::CaseInsensitive)) {
+            HANDLE process = ::OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, processId);
+            if (process && ::TerminateProcess(process, ERROR_PROCESS_ABORTED)) {
+                ::WaitForSingleObject(process, 2000);
+            }
+            if (process) {
+                ::CloseHandle(process);
+            }
+        }
+        hasProcess = ::Process32NextW(snapshot, &entry);
+    }
+    ::CloseHandle(snapshot);
+}
+```
+
+```cpp
+// src/main.cpp:243-249（修改后）
+QLocalServer::removeServer(QString::fromLatin1(kSingleInstanceKey));
+QLocalServer singleInstanceServer;
+if (!singleInstanceServer.listen(QString::fromLatin1(kSingleInstanceKey))) {
+    writeStartupLog(QStringLiteral("[wjy-main] single-instance server listen failed"));
+}
+cleanupMachineNumberProcessesAtStartup(); // wjy: 单实例确认后立即清理当前设备号对应的两个旧进程，再继续启动其它服务。
+```
+
+### Steps
+1. 复用 `DeviceInfoService::localDeviceName()` 获取当前 Windows 计算机名。
+2. 拼出两个精确目标名：`<机器名>.exe` 和 `<机器名>_置顶.exe`。
+3. 使用 `CreateToolhelp32Snapshot`、`Process32FirstW` 和 `Process32NextW` 枚举当前进程。
+4. 跳过 PID 0 和当前 FSRemote PID，仅对大小写不敏感匹配的目标调用 `TerminateProcess`。
+5. 每次终止后最多等待 2 秒，并将成功、权限失败和枚举异常写入启动日志。
+6. 将清理调用放在单实例确认之后，避免二次启动唤醒已有窗口时重复执行清理。
+
+### Verification
+- `git diff --check`：通过，未发现空白错误。
+- 已静态核对目标名为精确文件名匹配，并排除当前进程 PID。
+- 未执行构建和运行测试：遵循用户要求不构建。

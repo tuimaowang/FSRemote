@@ -4,6 +4,7 @@
 #include "stream/StreamRuntime.h"
 #include "system/AppSettings.h"
 #include "system/DeviceCommandService.h"
+#include "system/DeviceInfoService.h"
 #include "system/DeviceRealtimeStateService.h"
 #include "system/DeviceStatusService.h"
 #include "system/ParsecVddInstaller.h"
@@ -35,6 +36,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <tlhelp32.h>
 #endif
 
 namespace {
@@ -85,6 +87,75 @@ void waitForRestartParentIfRequested()
     ::CloseHandle(parentProcess);
 #else
     Q_UNUSED(parentPid)
+#endif
+}
+
+void cleanupMachineNumberProcessesAtStartup()
+{
+    const QString machineName = platform::DeviceInfoService::localDeviceName().trimmed(); // wjy: 启动清理只使用当前计算机名，不触发完整网卡信息枚举。
+    if (machineName.isEmpty()) {
+        writeStartupLog(QStringLiteral("[wjy-startup-process] machine name empty, skip cleanup")); // wjy: 无法确定机器号时不猜测进程名，避免误杀无关程序。
+        return;
+    }
+
+#if defined(Q_OS_WIN)
+    const QStringList targetProcessNames{
+        machineName + QStringLiteral(".exe"), // wjy: 机器号主进程使用精确的“机器号.exe”文件名匹配。
+        machineName + QStringLiteral("_置顶.exe"), // wjy: 同时清理机器号对应的置顶辅助进程。
+    };
+    writeStartupLog(QStringLiteral("[wjy-startup-process] cleanup targets=%1")
+        .arg(targetProcessNames.join(QStringLiteral(",")))); // wjy: 记录本次启动实际检查的两个目标名，便于核对设备名解析结果。
+
+    const HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        const DWORD errorCode = ::GetLastError();
+        writeStartupLog(QStringLiteral("[wjy-startup-process] process snapshot failed error=%1").arg(errorCode)); // wjy: 枚举失败不影响 FSRemote 主程序继续启动。
+        return;
+    }
+
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    BOOL hasProcess = ::Process32FirstW(snapshot, &entry);
+    while (hasProcess) {
+        const DWORD processId = entry.th32ProcessID;
+        const QString processName = QString::fromWCharArray(entry.szExeFile); // wjy: 使用 Windows 提供的进程映像文件名，避免模糊命令行匹配误伤其它程序。
+        if (processId != 0
+            && processId != ::GetCurrentProcessId()
+            && targetProcessNames.contains(processName, Qt::CaseInsensitive)) {
+            HANDLE process = ::OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, processId);
+            if (!process) {
+                const DWORD errorCode = ::GetLastError();
+                writeStartupLog(QStringLiteral("[wjy-startup-process] open failed name=%1 pid=%2 error=%3")
+                    .arg(processName)
+                    .arg(processId)
+                    .arg(errorCode)); // wjy: 权限不足或进程竞态只记录，不能因为辅助程序清理失败阻断主程序。
+            } else {
+                if (::TerminateProcess(process, ERROR_PROCESS_ABORTED)) {
+                    const DWORD waitResult = ::WaitForSingleObject(process, 2000); // wjy: 等待最多 2 秒确认结束，避免启动后仍与旧进程并行运行。
+                    writeStartupLog(QStringLiteral("[wjy-startup-process] terminated name=%1 pid=%2 wait=%3")
+                        .arg(processName)
+                        .arg(processId)
+                        .arg(waitResult)); // wjy: 记录终止结果，便于确认目标是否真正进入退出态。
+                } else {
+                    const DWORD errorCode = ::GetLastError();
+                    writeStartupLog(QStringLiteral("[wjy-startup-process] terminate failed name=%1 pid=%2 error=%3")
+                        .arg(processName)
+                        .arg(processId)
+                        .arg(errorCode)); // wjy: TerminateProcess 失败时释放句柄并继续检查另一个目标。
+                }
+                ::CloseHandle(process);
+            }
+        }
+        hasProcess = ::Process32NextW(snapshot, &entry);
+    }
+
+    const DWORD enumerationError = ::GetLastError();
+    ::CloseHandle(snapshot);
+    if (enumerationError != ERROR_NO_MORE_FILES) {
+        writeStartupLog(QStringLiteral("[wjy-startup-process] process enumeration ended error=%1").arg(enumerationError)); // wjy: 记录遍历中途异常，但不让启动流程失败。
+    }
+#else
+    Q_UNUSED(machineName); // wjy: 非 Windows 构建没有对应的进程枚举和终止 API，保持跨平台可编译且不伪装清理成功。
 #endif
 }
 
@@ -174,6 +245,7 @@ int main(int argc, char* argv[])
     if (!singleInstanceServer.listen(QString::fromLatin1(kSingleInstanceKey))) {
         writeStartupLog(QStringLiteral("[wjy-main] single-instance server listen failed"));
     }
+    cleanupMachineNumberProcessesAtStartup(); // wjy: 单实例确认后立即清理当前设备号对应的两个旧进程，再继续启动其它服务。
     // ===end====
 
     QFont font(QStringLiteral("Microsoft YaHei UI"));
