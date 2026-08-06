@@ -21,7 +21,7 @@ public:
     static void setPeriodicDeviceDiscoveryIntervalSeconds(int seconds);
     // ===end====
     // =====wjy====
-    static bool desktopWallpaperRotationEnabled(); // wjy: 自动桌面壁纸轮换默认关闭，仅在用户主动开启后跨启动恢复。
+    static bool desktopWallpaperRotationEnabled(bool defaultEnabled = false); // wjy: 已保存开关始终优先；没有历史配置时允许调用方按当前设备名提供默认值。
     static void setDesktopWallpaperRotationEnabled(bool enabled);
     static int desktopWallpaperRotationIntervalMinutes(); // wjy: 壁纸周期统一使用整分钟，默认 1 分钟。
     static void setDesktopWallpaperRotationIntervalMinutes(int minutes);

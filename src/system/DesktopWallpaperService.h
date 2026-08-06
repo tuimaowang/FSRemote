@@ -17,6 +17,7 @@ struct DesktopWallpaperApplyResult {
 class DesktopWallpaperService final {
 public:
     static QString sharedDirectoryPath(); // wjy: 测试阶段固定返回用户指定的共享图片目录。
+    static bool rotationEnabledByDefaultForDeviceName(const QString& deviceName); // wjy: 设备名以数字开头时为未配置设备提供自动壁纸默认开启策略。
     static QStringList supportedImageCandidates(const QString& directoryPath); // wjy: 只筛选顶层受支持图片并按文件名稳定排序，供生产逻辑和测试共同使用。
     static QString firstDecodableImage(const QString& directoryPath); // wjy: 跳过扩展名正确但内容损坏的文件，返回第一张真正可解码的图片。
     static QString nextDecodableImage(const QString& directoryPath, const QString& previousSourcePath); // wjy: 从上次成功图片之后继续查找，跳过坏图并在目录末尾回绕。

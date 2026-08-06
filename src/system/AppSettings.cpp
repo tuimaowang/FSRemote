@@ -170,9 +170,9 @@ void AppSettings::setPeriodicDeviceDiscoveryIntervalSeconds(int seconds)
 // ===end====
 
 // =====wjy====
-bool AppSettings::desktopWallpaperRotationEnabled()
+bool AppSettings::desktopWallpaperRotationEnabled(bool defaultEnabled)
 {
-    return settings().value(QStringLiteral("desktopWallpaperRotationEnabled"), false).toBool(); // wjy: 没有历史配置的新安装保持关闭，避免程序首次启动就修改用户桌面。
+    return settings().value(QStringLiteral("desktopWallpaperRotationEnabled"), defaultEnabled).toBool(); // wjy: 用户保存过的开关覆盖设备名默认值，未配置的新设备才采用调用方计算的默认状态。
 }
 
 void AppSettings::setDesktopWallpaperRotationEnabled(bool enabled)

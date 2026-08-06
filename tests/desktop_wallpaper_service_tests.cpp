@@ -143,6 +143,15 @@ void testOverlayPixelsFollowDeviceNameAndTrimWhitespace()
     assert(longName != sourceImage); // wjy: 超长名称经过缩小或居中省略后仍要成功烘焙，且不能扩展或裁切原图画布。
     assert(platform::DesktopWallpaperService::composeDeviceNameOverlay(sourceImage, QStringLiteral("   ")) == sourceImage); // wjy: 纯空白名称不绘制任何占位文字，更不会回退成旧数字。
 }
+
+void testDigitPrefixedDeviceNameEnablesRotationByDefault()
+{
+    assert(platform::DesktopWallpaperService::rotationEnabledByDefaultForDeviceName(QStringLiteral("99-DESKTOP"))); // wjy: 常见数字编号设备在没有历史设置时默认启动自动壁纸。
+    assert(platform::DesktopWallpaperService::rotationEnabledByDefaultForDeviceName(QStringLiteral("  7-PC  "))); // wjy: 防御性忽略名称首尾空白后仍按真实首字符判断。
+    assert(!platform::DesktopWallpaperService::rotationEnabledByDefaultForDeviceName(QStringLiteral("PC-99"))); // wjy: 数字不在首位时不能误开启默认轮换。
+    assert(!platform::DesktopWallpaperService::rotationEnabledByDefaultForDeviceName(QString::fromUtf8("设备99"))); // wjy: 中文或其它非数字首字符继续沿用默认关闭。
+    assert(!platform::DesktopWallpaperService::rotationEnabledByDefaultForDeviceName(QString())); // wjy: 无法读取设备名时保持安全的关闭默认值。
+}
 // ===end====
 
 } // namespace
@@ -157,5 +166,6 @@ int main(int argc, char** argv)
     testNextImageSkipsDamagedCandidate();
     testDeviceNameOverlayIsFlattenedIntoUpperRightPixels();
     testOverlayPixelsFollowDeviceNameAndTrimWhitespace();
+    testDigitPrefixedDeviceNameEnablesRotationByDefault(); // wjy: 回归验证设备名默认开启策略，不读取注册表也不修改真实桌面。
     return 0;
 }

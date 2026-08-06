@@ -86,6 +86,12 @@ QString DesktopWallpaperService::sharedDirectoryPath()
     return QString::fromUtf8(R"(\\192.168.1.100\广告部工具\远程软件_桌面)"); // wjy: 使用 UTF-8 原始字符串保存 UNC 路径，中文目录和反斜杠不会被错误转义。
 }
 
+bool DesktopWallpaperService::rotationEnabledByDefaultForDeviceName(const QString& deviceName)
+{
+    const QString normalizedDeviceName = deviceName.trimmed(); // wjy: 防御性移除首尾空白，确保默认策略判断的是实际设备名首字符。
+    return !normalizedDeviceName.isEmpty() && normalizedDeviceName.front().isDigit(); // wjy: 仅数字开头的设备默认启动自动壁纸，字母、中文或空名称仍保持默认关闭。
+}
+
 QStringList DesktopWallpaperService::supportedImageCandidates(const QString& directoryPath)
 {
     const QDir directory(directoryPath);

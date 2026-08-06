@@ -224,6 +224,13 @@ DeviceInfo currentDeviceInfo()
 }
 } // namespace
 
+// =====wjy====
+QString DeviceInfoService::localDeviceName()
+{
+    return currentComputerName(); // wjy: 复用与完整本机信息相同的宽字符计算机名来源，但跳过 GetAdaptersAddresses 等较重的网络枚举。
+}
+// ===end====
+
 DeviceInfo DeviceInfoService::local()
 {
     return currentDeviceInfo();

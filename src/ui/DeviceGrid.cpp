@@ -3640,8 +3640,10 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     // =====wjy====
     m_periodicDeviceDiscoveryEnabled = platform::AppSettings::periodicDeviceDiscoveryEnabled();
     m_periodicDeviceDiscoveryIntervalSeconds = platform::AppSettings::periodicDeviceDiscoveryIntervalSeconds(); // wjy: 恢复周期新增开关和秒数，新安装默认关闭且为 60 秒。
-    m_wallpaperRotationEnabled = platform::AppSettings::desktopWallpaperRotationEnabled();
-    m_wallpaperRotationIntervalMinutes = platform::AppSettings::desktopWallpaperRotationIntervalMinutes(); // wjy: 恢复自动壁纸开关和分钟数，新安装默认关闭且为 1 分钟。
+    const QString localWallpaperDeviceName = platform::DeviceInfoService::localDeviceName(); // wjy: 启动阶段只读取计算机名，不提前执行原本延迟的完整网卡枚举。
+    const bool defaultWallpaperRotationEnabled = platform::DesktopWallpaperService::rotationEnabledByDefaultForDeviceName(localWallpaperDeviceName); // wjy: 数字开头设备在没有历史开关配置时默认启动自动壁纸。
+    m_wallpaperRotationEnabled = platform::AppSettings::desktopWallpaperRotationEnabled(defaultWallpaperRotationEnabled); // wjy: 已保存的用户开关优先，用户明确关闭后不会被设备名规则重新打开。
+    m_wallpaperRotationIntervalMinutes = platform::AppSettings::desktopWallpaperRotationIntervalMinutes(); // wjy: 恢复自动壁纸分钟数，新安装仍使用 1 分钟默认周期。
     // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before PowerManager restore")); // wjy: 应用防睡眠前打点，便于区分设置读取和系统 API 调用。
     platform::PowerManager::setPreventSleepEnabled(m_preventSleepEnabled); // wjy: 根据保存的设置恢复防睡眠，保证重启程序后行为一致。

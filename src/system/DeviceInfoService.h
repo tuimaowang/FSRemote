@@ -27,6 +27,7 @@ struct DeviceInfo {
 
 class DeviceInfoService final {
 public:
+    static QString localDeviceName(); // wjy: 只读取当前 Windows 计算机名，不枚举网卡，供启动阶段快速计算设备专属默认策略。
     static DeviceInfo local();
 };
 
