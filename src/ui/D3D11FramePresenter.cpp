@@ -12,6 +12,7 @@
 #include <dcomp.h>
 #include <dxgi.h>
 #include <dxgi1_2.h>
+#include <dxgi1_4.h> // wjy: 读取Overlay翻转模型当前BackBuffer索引，黑闪诊断不修改SwapChain行为。
 #include <wrl/client.h>
 
 #include <QMouseEvent>
@@ -262,6 +263,15 @@ struct D3D11FramePresenter::Impl {
     std::uint64_t compositionOverlayPartialPresentCount = 0;
     std::uint64_t compositionOverlayPresentFailureCount = 0;
     std::uint64_t compositionOverlayUploadedBytes = 0;
+    // =====wjy====
+    std::uint64_t compositionOverlayPresentSequence = 0; // wjy: 记录实际进入Overlay Present的顺序，供黑闪时间线关联视频帧。
+    QString lastCompositionOverlayMode = QStringLiteral("none"); // wjy: 记录最近一次Overlay走完整提交还是脏区提交。
+    QRect lastCompositionOverlayDirtyRect; // wjy: 记录最近一次Overlay使用的物理脏区。
+    int lastCompositionOverlayBackBufferIndex = -1; // wjy: 记录Present前的BackBuffer索引，检查双缓冲初始内容是否完整。
+    HRESULT lastCompositionOverlayPresentResult = S_OK; // wjy: 记录最近一次Overlay Present HRESULT。
+    HRESULT lastCompositionCommitResult = S_OK; // wjy: 记录最近一次DComp Commit HRESULT。
+    std::uint64_t lastCompositionCommitTimeUs = 0; // wjy: 记录最近一次DComp Commit耗时。
+    // ===end====
     QString nativeLastMessage = QStringLiteral("none"); // wjy: 保存最近一次关键原生消息名称，和父窗口resize时序绑定输出。
     ComPtr<ID3D11Texture2D> resizeCacheTexture; // wjy: 交互缩放期间独占的最后一帧副本，不受共享纹理keyed mutex归还影响。
     int resizeCacheWidth = 0;
@@ -467,6 +477,7 @@ bool D3D11FramePresenter::presentCompositorOverlay(
     if (!m_impl || !m_impl->compositorMode || image.isNull()) {
         return false;
     }
+    m_impl->lastCompositionOverlayPresentResult = E_PENDING; // wjy: 在本次Overlay尚未真正Present前标记待定，避免时间线误读上一次成功HRESULT。
     const int requestedTargetWidth = image.width();
     const int requestedTargetHeight = image.height();
     const bool overlayTargetSizeChanged
@@ -518,6 +529,11 @@ bool D3D11FramePresenter::presentCompositorOverlay(
         && targetSwapChain
         && SUCCEEDED(targetSwapChain->QueryInterface(IID_PPV_ARGS(&targetSwapChain1))); // wjy: 只有稳定且两个BackBuffer都完整初始化后才允许局部Present。
 
+    // =====wjy====
+    m_impl->lastCompositionOverlayMode = partialPresent ? QStringLiteral("partial") : QStringLiteral("full"); // wjy: 保存实际呈现模式，而不是仅根据调用方传入的脏区猜测。
+    m_impl->lastCompositionOverlayDirtyRect = requestedDirtyRect; // wjy: 记录经过表面边界裁剪后的真实物理脏区。
+    m_impl->lastCompositionOverlayBackBufferIndex = -1; // wjy: 每次Present前重新查询，查询失败时保留明确的未知值。
+    // ===end====
     ComPtr<ID3D11Texture2D> backBuffer;
     if (!targetSwapChain
         || FAILED(targetSwapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer)))) {
@@ -556,6 +572,13 @@ bool D3D11FramePresenter::presentCompositorOverlay(
         0);
 
     HRESULT presentResult = S_OK;
+    // =====wjy====
+    ++m_impl->compositionOverlayPresentSequence; // wjy: 只在即将调用DXGI Present时递增，避免资源准备失败伪装成可见提交。
+    ComPtr<IDXGISwapChain3> targetSwapChain3;
+    if (targetSwapChain && SUCCEEDED(targetSwapChain->QueryInterface(IID_PPV_ARGS(&targetSwapChain3)))) {
+        m_impl->lastCompositionOverlayBackBufferIndex = static_cast<int>(targetSwapChain3->GetCurrentBackBufferIndex()); // wjy: 记录双缓冲当前索引，定位黑闪是否落在未补齐的BackBuffer。
+    }
+    // ===end====
     if (partialPresent) {
         RECT dirtyRect = {
             requestedDirtyRect.left(),
@@ -569,6 +592,7 @@ bool D3D11FramePresenter::presentCompositorOverlay(
     } else {
         presentResult = targetSwapChain->Present(0, 0);
     }
+    m_impl->lastCompositionOverlayPresentResult = presentResult; // wjy: 成功与失败都写入最近一次HRESULT，供data时间线和现有汇总共同读取。
     if (FAILED(presentResult)) {
         ++m_impl->compositionOverlayPresentFailureCount;
         if (useCandidate) {
@@ -740,9 +764,14 @@ bool D3D11FramePresenter::commitCompositionVisual()
     }
     const auto commitStarted = std::chrono::steady_clock::now();
     const HRESULT commitResult = m_impl->compositionDevice->Commit();
-    m_impl->compositionCommitTimeUs += static_cast<std::uint64_t>(
+    // =====wjy====
+    const std::uint64_t commitTimeUs = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - commitStarted).count());
+            std::chrono::steady_clock::now() - commitStarted).count()); // wjy: 单次计算同时服务累计平均值和最近一次时间线，避免重复读取时钟。
+    m_impl->compositionCommitTimeUs += commitTimeUs;
+    m_impl->lastCompositionCommitTimeUs = commitTimeUs; // wjy: 保存最近一次Commit耗时，黑闪现场可检查是否出现突发阻塞。
+    m_impl->lastCompositionCommitResult = commitResult; // wjy: Commit成功和失败都进入时间线，不再只依赖累计失败计数。
+    // ===end====
     ++m_impl->compositionCommitCount;
     if (FAILED(commitResult)) {
         ++m_impl->compositionCommitFailureCount;
@@ -1327,6 +1356,15 @@ D3D11CompositorTelemetry D3D11FramePresenter::compositorTelemetry() const
     telemetry.overlayPartialPresentCount = m_impl->compositionOverlayPartialPresentCount;
     telemetry.overlayPresentFailureCount = m_impl->compositionOverlayPresentFailureCount;
     telemetry.overlayUploadedBytes = m_impl->compositionOverlayUploadedBytes;
+    // =====wjy====
+    telemetry.overlayPresentSequence = m_impl->compositionOverlayPresentSequence; // wjy: 向窗口级data时间线公开实际Overlay提交序号。
+    telemetry.lastOverlayMode = m_impl->lastCompositionOverlayMode; // wjy: 区分完整Present与Present1脏区提交。
+    telemetry.lastOverlayDirtyRect = m_impl->lastCompositionOverlayDirtyRect; // wjy: 暴露实际裁剪后的物理脏区。
+    telemetry.lastOverlayBackBufferIndex = m_impl->lastCompositionOverlayBackBufferIndex; // wjy: 暴露最近一次双缓冲索引。
+    telemetry.lastOverlayPresentResult = static_cast<long>(m_impl->lastCompositionOverlayPresentResult); // wjy: 保留最近一次Overlay HRESULT。
+    telemetry.lastCompositionCommitResult = static_cast<long>(m_impl->lastCompositionCommitResult); // wjy: 保留最近一次DComp Commit HRESULT。
+    telemetry.lastCompositionCommitTimeUs = m_impl->lastCompositionCommitTimeUs; // wjy: 保留最近一次Commit耗时。
+    // ===end====
     return telemetry;
 }
 

@@ -24,6 +24,15 @@ struct D3D11CompositorTelemetry {
     std::uint64_t overlayPartialPresentCount = 0;
     std::uint64_t overlayPresentFailureCount = 0;
     std::uint64_t overlayUploadedBytes = 0; // wjy: 30秒诊断据此确认多窗口标题栏刷新是否仍在上传整窗像素。
+    // =====wjy====
+    std::uint64_t overlayPresentSequence = 0; // wjy: 按实际调用Present的顺序编号，用于把可疑整窗提交和视频帧时间线对齐。
+    QString lastOverlayMode = QStringLiteral("none"); // wjy: 记录最近一次Overlay是完整提交还是脏区提交。
+    QRect lastOverlayDirtyRect; // wjy: 保留最近一次Overlay请求的物理脏区，判断是否误走整窗上传。
+    int lastOverlayBackBufferIndex = -1; // wjy: 记录Present前的BackBuffer索引，定位双缓冲切换时是否出现未初始化画面。
+    long lastOverlayPresentResult = 0; // wjy: 保留最近一次Overlay Present的HRESULT，正常路径也能在时间线中对齐。
+    long lastCompositionCommitResult = 0; // wjy: 保留最近一次DComp Commit结果，和Overlay Present区分开。
+    std::uint64_t lastCompositionCommitTimeUs = 0; // wjy: 记录最近一次Commit耗时，不改变正常路径的提交次数。
+    // ===end====
 };
 
 class D3D11FramePresenter final : public QWidget {

@@ -392,6 +392,13 @@ private:
     bool m_resizePixelProbeEnabled = false; // wjy: 仅通过FSREMOTE_RESIZE_PIXEL_PROBE=1开启实际屏幕采样，正常运行不做截图。
     qint64 m_lastResizePixelProbeMs = -1000;
     quint64 m_resizeVisibleSampleCount = 0;
+    // =====wjy====
+    bool m_compositorPixelProbeEnabled = false; // wjy: 通过FSREMOTE_COMPOSITOR_PIXEL_PROBE=1开启普通运行期可见像素采样，默认关闭以保持零截图开销。
+    qint64 m_lastCompositorPixelProbeMs = -1000; // wjy: 普通运行期采样限制为每窗口最多10次/秒。
+    quint64 m_compositorVisibleSampleCount = 0; // wjy: 给普通运行期样本编号，便于按设备检索连续黑帧。
+    qint64 m_lastCompositorFrameTimelineMs = -1000; // wjy: 视频Present成功时每窗口最多每秒记录一次，失败不受限频影响。
+    qint64 m_lastCompositorPartialTimelineMs = -1000; // wjy: 标题栏脏区提交每窗口最多每500毫秒记录一次，整窗提交全部记录。
+    // ===end====
     QElapsedTimer m_sessionClock;
     QElapsedTimer m_frameStatsClock; // wjy: Measures one-second windows for the remote desktop title-bar statistics.
     int m_frameStatsCount = 0; // wjy: 统计当前窗口真正成功进入显示路径的BGRA或共享纹理帧数。

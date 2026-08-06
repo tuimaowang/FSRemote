@@ -10185,3 +10185,133 @@ bool riskThresholdsAndCounterResetAreStable();
 - `cmake --build temp/bandwidth-titlebar-build3 --target FSRemote`：主程序全部 84 个步骤编译和链接成功，新增 `LocalNetworkBandwidthMonitor.cpp` 与 `DeviceGrid.cpp` 均进入真实目标。
 - 未启动新构建产物进行界面目视测试：避免关闭或干扰用户当前正在运行的 FSRemote 实例；用户随后明确要求不再编译，因此后续只执行源码、日志和 Git 复核。
 - `git diff --check`：通过，未发现空白错误。
+
+## 2026-08-06 16:34 - 增加多窗口黑闪合成时间线与运行期像素探针
+
+### Changed Location
+- `src/ui/D3D11FramePresenter.h:19-36`：扩展Overlay和DComp最近一次提交遥测。
+- `src/ui/D3D11FramePresenter.cpp:12-15,255-276,476-596,761-778,1345-1368`：记录Overlay序号、实际提交模式、BackBuffer索引、Present结果和单次Commit耗时。
+- `src/ui/RemoteDesktopWindow.h:392-403`：增加普通运行期像素探针和时间线限频状态。
+- `src/ui/RemoteDesktopWindow.cpp:1169-1201,1758-1774,3156-3363,5018-5133,5200-5262`：把黑闪时间线写入程序`data`文件夹，并关联Overlay、视频Present、DComp Commit和真实屏幕像素。
+
+### Reason
+现有`remote_viewer_state.log`已经证明复现期间网络、D3D Present、Overlay Present和DComp Commit累计失败数均为零，但无法回答黑闪瞬间究竟发生在视频SwapChain、Overlay双缓冲翻转、DComp提交还是最终DWM可见结果。新增独立时间线后，可以按设备IP和毫秒时间戳对齐这些节点；普通屏幕像素采样采用显式环境开关，默认不产生截图性能开销。
+
+### Original Code
+```cpp
+// src/ui/D3D11FramePresenter.h:19-27（修改前）
+struct D3D11CompositorTelemetry {
+    std::uint64_t commitCount = 0;
+    std::uint64_t commitFailureCount = 0;
+    double averageCommitMs = 0.0;
+    std::uint64_t overlayFullPresentCount = 0;
+    std::uint64_t overlayPartialPresentCount = 0;
+    std::uint64_t overlayPresentFailureCount = 0;
+    std::uint64_t overlayUploadedBytes = 0;
+};
+```
+
+```cpp
+// src/ui/D3D11FramePresenter.cpp:556-571,740-770（修改前）
+HRESULT presentResult = S_OK;
+if (partialPresent) {
+    presentResult = targetSwapChain1->Present1(0, 0, &parameters);
+} else {
+    presentResult = targetSwapChain->Present(0, 0);
+}
+
+const auto commitStarted = std::chrono::steady_clock::now();
+const HRESULT commitResult = m_impl->compositionDevice->Commit();
+m_impl->compositionCommitTimeUs += elapsedCommitTime;
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.h:392-394（修改前）
+bool m_resizePixelProbeEnabled = false;
+qint64 m_lastResizePixelProbeMs = -1000;
+quint64 m_resizeVisibleSampleCount = 0;
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3253-3257,4912-4923,5059-5065（修改前）
+m_texturePresenter->presentCompositorOverlay(m_compositorOverlayCache, dirtyPhysicalRect);
+sampleVisibleCompositorRegion();
+
+if (!m_resizePixelProbeEnabled
+    || !m_resizingWindow
+    || !m_resizeDebugClock.isValid()) {
+    return;
+}
+
+texturePresented = m_texturePresenter->presentSharedTexture(
+    frame->sharedHandle, frame->width, frame->height);
+```
+
+### Modified Code
+```cpp
+// src/ui/D3D11FramePresenter.h:28-34（修改后）
+std::uint64_t overlayPresentSequence = 0;
+QString lastOverlayMode = QStringLiteral("none");
+QRect lastOverlayDirtyRect;
+int lastOverlayBackBufferIndex = -1;
+long lastOverlayPresentResult = 0;
+long lastCompositionCommitResult = 0;
+std::uint64_t lastCompositionCommitTimeUs = 0;
+```
+
+```cpp
+// src/ui/D3D11FramePresenter.cpp:576-596,764-778（修改后）
+++m_impl->compositionOverlayPresentSequence;
+ComPtr<IDXGISwapChain3> targetSwapChain3;
+if (targetSwapChain
+    && SUCCEEDED(targetSwapChain->QueryInterface(IID_PPV_ARGS(&targetSwapChain3)))) {
+    m_impl->lastCompositionOverlayBackBufferIndex =
+        static_cast<int>(targetSwapChain3->GetCurrentBackBufferIndex());
+}
+m_impl->lastCompositionOverlayPresentResult = presentResult;
+
+const std::uint64_t commitTimeUs = measureCommitTime();
+m_impl->lastCompositionCommitTimeUs = commitTimeUs;
+m_impl->lastCompositionCommitResult = commitResult;
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.h:396-400（修改后）
+bool m_compositorPixelProbeEnabled = false;
+qint64 m_lastCompositorPixelProbeMs = -1000;
+quint64 m_compositorVisibleSampleCount = 0;
+qint64 m_lastCompositorFrameTimelineMs = -1000;
+qint64 m_lastCompositorPartialTimelineMs = -1000;
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:1169-1201,3296-3360,5020-5131,5220-5260（修改后）
+const QString logPath = QDir(dataDir).filePath(
+    QStringLiteral("remote_compositor_timeline.log"));
+
+const bool overlayPresented = m_texturePresenter->presentCompositorOverlay(
+    m_compositorOverlayCache, dirtyPhysicalRect);
+// 整窗提交全部记录；局部提交每500毫秒最多一条。
+appendRemoteCompositorTimelineLog(timeline);
+
+const bool runtimeProbeActive = m_compositorPixelProbeEnabled
+    && m_sessionClock.isValid();
+// FSREMOTE_COMPOSITOR_PIXEL_PROBE=1时，每窗口最多每100毫秒采样真实视频可见区。
+
+const bool videoTimelineDue = texturePresented
+    && videoTimelineMs - m_lastCompositorFrameTimelineMs >= 1000;
+// 成功视频Present每秒一条，失败立即记录。
+```
+
+### Steps
+1. 扩展`D3D11CompositorTelemetry`，保存Overlay实际模式、提交序号、脏区、BackBuffer索引以及最近一次Present/Commit结果。
+2. 在Overlay调用前后比较累计计数，完整提交全部写入时间线，标题栏局部提交按每窗口500毫秒限频。
+3. 在视频共享纹理成功Present路径每秒记录一次帧号、设备IP、分辨率、Overlay和DComp快照；失败不限频并立即写入。
+4. 新增`FSREMOTE_COMPOSITOR_PIXEL_PROBE=1`，普通运行期从真实视频区域抓取可见像素，记录黑像素比例和平均亮度；默认关闭。
+5. 所有新日志固定写入`<程序目录>/data/remote_compositor_timeline.log`，文件不可写时不改变远控状态。
+
+### Verification
+- 已读取2026-08-06 16:02至16:03的16窗口现场日志，确认`overlay_fail=0`、`comp_fail=0`、`d3d=0x0`，新增字段针对现有诊断盲区。
+- `git diff --check -- src/ui/D3D11FramePresenter.h src/ui/D3D11FramePresenter.cpp src/ui/RemoteDesktopWindow.h src/ui/RemoteDesktopWindow.cpp`：通过，未发现空白错误。
+- 使用`rg`复核新环境开关、data日志文件名、Overlay提交序号和限频成员均已接入实际调用路径。
+- 按用户此前要求未执行编译、链接和运行测试；需要发布新控制端后进行多窗口复现验证。

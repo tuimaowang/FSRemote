@@ -1165,6 +1165,40 @@ void appendViewerDebugLog(const QString& line)
 }
 // ===end====
 
+// =====wjy====
+void appendRemoteCompositorTimelineLog(const QString& line)
+{
+    static QMutex logMutex;
+    static bool sizeChecked = false;
+    QMutexLocker locker(&logMutex); // wjy: 多个远控窗口串行写完整事件行，避免16路时间线互相穿插。
+    const QString dataDir = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("data"));
+    QDir().mkpath(dataDir); // wjy: 按用户要求把黑闪诊断固定放到发布目录的data文件夹。
+    const QString logPath = QDir(dataDir).filePath(QStringLiteral("remote_compositor_timeline.log"));
+    if (!sizeChecked) {
+        sizeChecked = true;
+        if (QFileInfo(logPath).size() > 16 * 1024 * 1024) {
+            QFile oversized(logPath);
+            oversized.open(QIODevice::WriteOnly | QIODevice::Truncate); // wjy: 每次进程启动最多检查一次，长期多窗口测试不会让时间线无限增长。
+        }
+    }
+    QFile file(logPath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
+        return; // wjy: 诊断文件不可写时只丢弃日志，绝不影响远控呈现。
+    }
+    QTextStream stream(&file);
+    stream << QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss.zzz"))
+           << QStringLiteral(" qt tid=")
+#if defined(Q_OS_WIN)
+           << static_cast<qulonglong>(::GetCurrentThreadId())
+#else
+           << 0
+#endif
+           << QLatin1Char(' ')
+           << line
+           << Qt::endl; // wjy: 可疑提交逐行落盘，程序异常退出后仍保留最后一个呈现节点。
+}
+// ===end====
+
 void appendInputDebugLog(const QString& line)
 {
     QFile file(QDir::temp().filePath(QStringLiteral("fsremote_input_debug.log")));
@@ -1728,9 +1762,15 @@ RemoteDesktopWindow::RemoteDesktopWindow(
         || pixelProbe == "true"
         || pixelProbe == "yes"
         || pixelProbe == "on"; // wjy: 采样开关独立于合成路径，便于旧路径与新路径做同屏对照。
-    appendViewerDebugLog(QStringLiteral("remote compositor path=%1 enabled=%2")
+    const QByteArray compositorPixelProbe = qgetenv("FSREMOTE_COMPOSITOR_PIXEL_PROBE").trimmed().toLower();
+    m_compositorPixelProbeEnabled = compositorPixelProbe == "1"
+        || compositorPixelProbe == "true"
+        || compositorPixelProbe == "yes"
+        || compositorPixelProbe == "on"; // wjy: 普通运行期像素采样必须显式开启，避免16窗口常态截图增加DWM和CPU压力。
+    appendViewerDebugLog(QStringLiteral("remote compositor path=%1 enabled=%2 pixel_probe=%3 timeline=data/remote_compositor_timeline.log")
         .arg(RemoteWindowCompositorConfig::activePathId())
-        .arg(m_unifiedCompositor->isEnabled() ? 1 : 0)); // wjy: 日志明确当前窗口使用旧多表面还是新保留式合成路径。
+        .arg(m_unifiedCompositor->isEnabled() ? 1 : 0)
+        .arg(m_compositorPixelProbeEnabled ? 1 : 0)); // wjy: 启动日志明确普通黑闪像素探针状态和data时间线文件名。
     commitCompositorLayout(); // wjy: 在首个子表面创建前提交初始几何，后续标题栏、输入和DPI都复用同一快照。
     // ===end====
     setWindowTitle(m_deviceName);
@@ -3253,7 +3293,73 @@ void RemoteDesktopWindow::presentCompositorOverlay(const QRect& dirtyLogicalRect
     const QRect dirtyPhysicalRect = partialUpdate
         ? remoteCompositorPhysicalDirtyRect(requestedDirtyRect, dpr, physicalSize)
         : QRect();
-    m_texturePresenter->presentCompositorOverlay(m_compositorOverlayCache, dirtyPhysicalRect);
+    // =====wjy====
+    const D3D11CompositorTelemetry telemetryBefore = m_texturePresenter->compositorTelemetry(); // wjy: 先取轻量计数快照，判断本次调用最终走完整、局部还是失败路径。
+    const bool overlayPresented = m_texturePresenter->presentCompositorOverlay(
+        m_compositorOverlayCache,
+        dirtyPhysicalRect); // wjy: 保留真实返回值，资源准备失败也必须进入黑闪时间线。
+    const D3D11CompositorTelemetry telemetryAfter = m_texturePresenter->compositorTelemetry();
+    const bool fullPresentAdvanced = telemetryAfter.overlayFullPresentCount
+        > telemetryBefore.overlayFullPresentCount; // wjy: 整窗Overlay全部落盘，因为当前现场的异常增长正是重点嫌疑。
+    const bool partialPresentAdvanced = telemetryAfter.overlayPartialPresentCount
+        > telemetryBefore.overlayPartialPresentCount;
+    const qint64 timelineMs = m_sessionClock.isValid() ? m_sessionClock.elapsed() : 0;
+    const bool partialTimelineDue = partialPresentAdvanced
+        && timelineMs - m_lastCompositorPartialTimelineMs >= 500; // wjy: 正常秒级标题栏更新最多每500毫秒记录一次，避免日志IO反过来制造卡顿。
+    if (!overlayPresented || fullPresentAdvanced || partialTimelineDue) {
+        if (partialTimelineDue) {
+            m_lastCompositorPartialTimelineMs = timelineMs;
+        }
+        const QString reason = !cacheMatches
+            ? QStringLiteral("cache_rebuild")
+            : remoteUpdateActive()
+                ? QStringLiteral("remote_update_overlay")
+                : !m_textureFrameActive
+                    ? (m_remoteFrame.isNull()
+                        ? QStringLiteral("connection_overlay")
+                        : QStringLiteral("software_frame"))
+                    : partialUpdate
+                        ? QStringLiteral("titlebar_dirty")
+                        : QStringLiteral("full_state_refresh"); // wjy: 不改动各业务调用点，用当前可见状态给整窗提交归类。
+        QString timeline = QStringLiteral(
+            "host=%1 device=%2 event=overlay.present reason=%3 ok=%4 session_ms=%5 mode=%6 seq=%7 buffer=%8 logical_dirty=%9,%10,%11,%12 physical_dirty=%13,%14,%15,%16")
+            .arg(m_hostIp)
+            .arg(m_deviceName)
+            .arg(reason)
+            .arg(overlayPresented ? 1 : 0)
+            .arg(timelineMs)
+            .arg(telemetryAfter.lastOverlayMode)
+            .arg(static_cast<qulonglong>(telemetryAfter.overlayPresentSequence))
+            .arg(telemetryAfter.lastOverlayBackBufferIndex)
+            .arg(requestedDirtyRect.x())
+            .arg(requestedDirtyRect.y())
+            .arg(requestedDirtyRect.width())
+            .arg(requestedDirtyRect.height())
+            .arg(telemetryAfter.lastOverlayDirtyRect.x())
+            .arg(telemetryAfter.lastOverlayDirtyRect.y())
+            .arg(telemetryAfter.lastOverlayDirtyRect.width())
+            .arg(telemetryAfter.lastOverlayDirtyRect.height());
+        timeline += QStringLiteral(
+            " present_hr=0x%1 commit_hr=0x%2 commit_us=%3 totals={full=%4 partial=%5 fail=%6 commit=%7 commit_fail=%8} state=%9 layout_rev=%10 frame=%11 texture_active=%12 software_fallback=%13 resizing=%14 update=%15 %16")
+            .arg(static_cast<qulonglong>(static_cast<unsigned long>(telemetryAfter.lastOverlayPresentResult)), 0, 16)
+            .arg(static_cast<qulonglong>(static_cast<unsigned long>(telemetryAfter.lastCompositionCommitResult)), 0, 16)
+            .arg(static_cast<qulonglong>(telemetryAfter.lastCompositionCommitTimeUs))
+            .arg(static_cast<qulonglong>(telemetryAfter.overlayFullPresentCount))
+            .arg(static_cast<qulonglong>(telemetryAfter.overlayPartialPresentCount))
+            .arg(static_cast<qulonglong>(telemetryAfter.overlayPresentFailureCount))
+            .arg(static_cast<qulonglong>(telemetryAfter.commitCount))
+            .arg(static_cast<qulonglong>(telemetryAfter.commitFailureCount))
+            .arg(m_unifiedCompositor ? static_cast<int>(m_unifiedCompositor->state()) : -1)
+            .arg(m_unifiedCompositor ? static_cast<qulonglong>(m_unifiedCompositor->layout().revision) : 0)
+            .arg(m_unifiedCompositor ? static_cast<qulonglong>(m_unifiedCompositor->lastFrameId()) : 0)
+            .arg(m_textureFrameActive ? 1 : 0)
+            .arg(m_softwareFallbackActive ? 1 : 0)
+            .arg(m_resizingWindow ? 1 : 0)
+            .arg(remoteUpdateActive() ? 1 : 0)
+            .arg(m_texturePresenter->resizeDebugSnapshot());
+        appendRemoteCompositorTimelineLog(timeline); // wjy: 单行绑定业务原因、DXGI、DComp、帧号和窗口状态，便于按毫秒排序定位黑闪。
+    }
+    // ===end====
     sampleVisibleCompositorRegion(); // wjy: 叠加层提交后按需采样真实屏幕像素，和本次resize状态绑定。
 }
 
@@ -4911,15 +5017,24 @@ void RemoteDesktopWindow::flushResizeDebugTrace()
 
 void RemoteDesktopWindow::sampleVisibleCompositorRegion()
 {
-    if (!m_resizePixelProbeEnabled
-        || !m_resizingWindow
-        || !m_resizeDebugClock.isValid()
+    // =====wjy====
+    const bool resizeProbeActive = m_resizePixelProbeEnabled
+        && m_resizingWindow
+        && m_resizeDebugClock.isValid(); // wjy: 旧开关继续只在交互缩放期间采样。
+    const bool runtimeProbeActive = m_compositorPixelProbeEnabled
+        && m_sessionClock.isValid(); // wjy: 新开关覆盖普通多窗口运行期，不要求进入缩放手势。
+    if ((!resizeProbeActive && !runtimeProbeActive)
         || !m_unifiedCompositor
         || !m_unifiedCompositor->isEnabled()) {
         return;
     }
-    const qint64 elapsedMs = m_resizeDebugClock.elapsed();
-    if (elapsedMs - m_lastResizePixelProbeMs < 100) {
+    const qint64 resizeElapsedMs = resizeProbeActive ? m_resizeDebugClock.elapsed() : 0;
+    const qint64 sessionElapsedMs = runtimeProbeActive ? m_sessionClock.elapsed() : 0;
+    const bool resizeProbeDue = resizeProbeActive
+        && resizeElapsedMs - m_lastResizePixelProbeMs >= 100;
+    const bool runtimeProbeDue = runtimeProbeActive
+        && sessionElapsedMs - m_lastCompositorPixelProbeMs >= 100;
+    if (!resizeProbeDue && !runtimeProbeDue) {
         return; // wjy: 截图采样限频，避免诊断本身抢占拖拽和Present线程。
     }
     QScreen* screen = windowHandle() ? windowHandle()->screen() : nullptr;
@@ -4929,7 +5044,13 @@ void RemoteDesktopWindow::sampleVisibleCompositorRegion()
     if (!screen) {
         return;
     }
-    const QRect globalRect = frameGeometry();
+    QRect globalRect = frameGeometry();
+    if (runtimeProbeActive) {
+        const QRect imageRect = remoteImageRect();
+        if (imageRect.isValid()) {
+            globalRect = QRect(mapToGlobal(imageRect.topLeft()), imageRect.size()); // wjy: 普通黑闪采样只覆盖真实视频区，排除标题栏和letterbox固有黑边。
+        }
+    }
     const QPixmap screenshot = screen->grabWindow(
         0,
         globalRect.left(),
@@ -4959,13 +5080,23 @@ void RemoteDesktopWindow::sampleVisibleCompositorRegion()
     if (sampleCount == 0) {
         return;
     }
-    m_lastResizePixelProbeMs = elapsedMs;
-    ++m_resizeVisibleSampleCount;
+    if (resizeProbeDue) {
+        m_lastResizePixelProbeMs = resizeElapsedMs;
+        ++m_resizeVisibleSampleCount;
+    }
+    if (runtimeProbeDue) {
+        m_lastCompositorPixelProbeMs = sessionElapsedMs;
+        ++m_compositorVisibleSampleCount;
+    }
     const double blackRatio = static_cast<double>(blackCount) / static_cast<double>(sampleCount);
     const double averageLuminance = static_cast<double>(luminanceSum) / static_cast<double>(sampleCount);
-    appendResizeDebugTrace(QStringLiteral(
-        "visible.sample index=%1 size=%2x%3 samples=%4 black_ratio=%5 avg_luma=%6 state=%7 layout_rev=%8 frame=%9")
-        .arg(static_cast<qulonglong>(m_resizeVisibleSampleCount))
+    const quint64 sampleIndex = runtimeProbeDue
+        ? m_compositorVisibleSampleCount
+        : m_resizeVisibleSampleCount;
+    const QString sample = QStringLiteral(
+        "visible.sample index=%1 scope=%2 size=%3x%4 samples=%5 black_ratio=%6 avg_luma=%7 state=%8 layout_rev=%9 frame=%10")
+        .arg(static_cast<qulonglong>(sampleIndex))
+        .arg(runtimeProbeDue ? QStringLiteral("runtime") : QStringLiteral("resize"))
         .arg(image.width())
         .arg(image.height())
         .arg(static_cast<qulonglong>(sampleCount))
@@ -4973,7 +5104,32 @@ void RemoteDesktopWindow::sampleVisibleCompositorRegion()
         .arg(averageLuminance, 0, 'f', 1)
         .arg(static_cast<int>(m_unifiedCompositor->state()))
         .arg(static_cast<qulonglong>(m_unifiedCompositor->layout().revision))
-        .arg(static_cast<qulonglong>(m_unifiedCompositor->lastFrameId()))); // wjy: 采样结果与同一时刻状态/布局/帧号关联，日志不再只记录WM_SIZE事件。
+        .arg(static_cast<qulonglong>(m_unifiedCompositor->lastFrameId())); // wjy: 采样结果与同一时刻状态/布局/帧号关联，日志不再只记录WM_SIZE事件。
+    if (resizeProbeDue) {
+        appendResizeDebugTrace(sample); // wjy: 缩放专项日志继续保留原有手势内存缓冲和一次性落盘方式。
+    }
+    if (runtimeProbeDue) {
+        const D3D11CompositorTelemetry telemetry = m_texturePresenter
+            ? m_texturePresenter->compositorTelemetry()
+            : D3D11CompositorTelemetry{};
+        appendRemoteCompositorTimelineLog(QStringLiteral(
+            "host=%1 device=%2 event=%3 session_ms=%4 global_rect=%5,%6,%7,%8 overlay_seq=%9 overlay_mode=%10 buffer=%11 overlay_hr=0x%12 commit_hr=0x%13 commit_us=%14")
+            .arg(m_hostIp)
+            .arg(m_deviceName)
+            .arg(sample)
+            .arg(sessionElapsedMs)
+            .arg(globalRect.x())
+            .arg(globalRect.y())
+            .arg(globalRect.width())
+            .arg(globalRect.height())
+            .arg(static_cast<qulonglong>(telemetry.overlayPresentSequence))
+            .arg(telemetry.lastOverlayMode)
+            .arg(telemetry.lastOverlayBackBufferIndex)
+            .arg(static_cast<qulonglong>(static_cast<unsigned long>(telemetry.lastOverlayPresentResult)), 0, 16)
+            .arg(static_cast<qulonglong>(static_cast<unsigned long>(telemetry.lastCompositionCommitResult)), 0, 16)
+            .arg(static_cast<qulonglong>(telemetry.lastCompositionCommitTimeUs))); // wjy: 可见像素与最后一次Overlay、DComp状态写入同一data时间线。
+    }
+    // ===end====
 }
 
 void RemoteDesktopWindow::enqueueRemoteFrame(QImage image, quint64 viewerGeneration)
@@ -5060,6 +5216,49 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
         } catch (...) {
             texturePresented = false; // wjy: D3D11共享设备创建中的分配异常也转换为本窗口软件回退，不允许异常逃出Qt队列任务。
         }
+        // =====wjy====
+        const qint64 videoTimelineMs = m_sessionClock.isValid() ? m_sessionClock.elapsed() : 0;
+        const bool videoTimelineDue = texturePresented
+            && videoTimelineMs - m_lastCompositorFrameTimelineMs >= 1000; // wjy: 正常视频Present每窗口每秒一条，失败则立即记录。
+        if (!texturePresented || videoTimelineDue) {
+            if (videoTimelineDue) {
+                m_lastCompositorFrameTimelineMs = videoTimelineMs;
+            }
+            const D3D11CompositorTelemetry telemetry = m_texturePresenter->compositorTelemetry();
+            QString timeline = QStringLiteral(
+                "host=%1 device=%2 event=video.present ok=%3 session_ms=%4 frame_id=%5 generation=%6 source=%7x%8 encoded_mbps=%9 texture_active_before=%10 failures_before=%11")
+                .arg(m_hostIp)
+                .arg(m_deviceName)
+                .arg(texturePresented ? 1 : 0)
+                .arg(videoTimelineMs)
+                .arg(static_cast<qulonglong>(frame->frameId))
+                .arg(static_cast<qulonglong>(frame->viewerGeneration))
+                .arg(frame->width)
+                .arg(frame->height)
+                .arg(frame->encodedMbps, 0, 'f', 2)
+                .arg(hadSuccessfulTexture ? 1 : 0)
+                .arg(m_textureFailureCount);
+            timeline += QStringLiteral(
+                " d3d_hr=0x%1 overlay={mode=%2 seq=%3 buffer=%4 present_hr=0x%5 full=%6 partial=%7 fail=%8} commit={hr=0x%9 us=%10 count=%11 fail=%12} %13")
+                .arg(static_cast<qulonglong>(static_cast<unsigned long>(m_texturePresenter->lastDeviceRemovalReason())), 0, 16)
+                .arg(telemetry.lastOverlayMode)
+                .arg(static_cast<qulonglong>(telemetry.overlayPresentSequence))
+                .arg(telemetry.lastOverlayBackBufferIndex)
+                .arg(static_cast<qulonglong>(static_cast<unsigned long>(telemetry.lastOverlayPresentResult)), 0, 16)
+                .arg(static_cast<qulonglong>(telemetry.overlayFullPresentCount))
+                .arg(static_cast<qulonglong>(telemetry.overlayPartialPresentCount))
+                .arg(static_cast<qulonglong>(telemetry.overlayPresentFailureCount))
+                .arg(static_cast<qulonglong>(static_cast<unsigned long>(telemetry.lastCompositionCommitResult)), 0, 16)
+                .arg(static_cast<qulonglong>(telemetry.lastCompositionCommitTimeUs))
+                .arg(static_cast<qulonglong>(telemetry.commitCount))
+                .arg(static_cast<qulonglong>(telemetry.commitFailureCount))
+                .arg(m_texturePresenter->resizeDebugSnapshot());
+            appendRemoteCompositorTimelineLog(timeline); // wjy: 视频与Overlay使用同一毫秒时间轴，复现后可直接检查黑闪前后最后一个GPU节点。
+        }
+        if (m_compositorPixelProbeEnabled) {
+            sampleVisibleCompositorRegion(); // wjy: 普通运行期探针跟随视频Present限频采样，Overlay不变化时仍能捕获视频层黑闪。
+        }
+        // ===end====
         if (!texturePresented) {
             if (m_unifiedCompositor && m_unifiedCompositor->isEnabled()) {
                 if (m_texturePresenter->lastFailureWasDeviceLost()) {
