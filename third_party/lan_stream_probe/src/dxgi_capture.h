@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include "dxgi_capture_policy.h"
 
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -65,7 +66,7 @@ private:
     std::vector<std::shared_ptr<FrameSlot>> frame_slots_; // wjy: 多槽纹理环允许采集与异步编码重叠，同时由每帧租约阻止提前复用。
     std::wstring preferred_device_name_;
     Size size_;
-    bool awaiting_recovery_frame_ = false; // wjy: Duplication 重建成功后仍等到真实新帧再恢复编码，避免把初始化空档当成正常静止桌面。
+    DxgiRecoveryFrameGate recovery_frame_gate_; // wjy: 重建后隔离第一张预热帧，第二张真实新帧到达前始终保留控制端最后成功画面。
     uint32_t consecutive_duplication_failures_ = 0;
     std::chrono::steady_clock::time_point next_duplication_retry_{};
 };

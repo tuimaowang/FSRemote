@@ -204,7 +204,7 @@ bool DxgiCapture::initialize(const std::wstring& preferredDeviceName, std::strin
     for (int index = 0; index < 4; ++index) {
         frame_slots_.push_back(std::make_shared<FrameSlot>()); // wjy: 四槽覆盖采集、WebRTC排队和NVENC工作帧，忙时仍保持最新帧优先。
     }
-    awaiting_recovery_frame_ = true; // wjy: 初次或完整设备初始化后必须等到真实桌面帧，不能把尚未出帧的空档当成可重复编码状态。
+    recovery_frame_gate_.begin(); // wjy: 初次 Duplication 也先隔离一张驱动预热帧，避免打开远控窗口时把初始化黑帧编码出去。
     consecutive_duplication_failures_ = 0; // wjy: 新设备代际初始化成功后清除旧 Duplication 失败次数，避免首次异常被立即升级为再次完整重建。
     next_duplication_retry_ = {};
     append_stream_capture_diagnostic_log(
@@ -263,8 +263,8 @@ DxgiCaptureResult DxgiCapture::capture_frame(CapturedFrame* frame, std::string* 
     HRESULT hr = duplication_->AcquireNextFrame(0, &info, &resource);
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
         if (error) *error = "timeout";
-        return {awaiting_recovery_frame_ ? DxgiCaptureStatus::DuplicationRecovering
-                                         : DxgiCaptureStatus::NoDesktopChange,
+        return {recovery_frame_gate_.awaitingFrame() ? DxgiCaptureStatus::DuplicationRecovering
+                                                     : DxgiCaptureStatus::NoDesktopChange,
                 hr}; // wjy: 重建后的首帧尚未到达时暂停编码；健康静止桌面仍沿用原来的最后帧策略。
     }
     if (FAILED(hr)) {
@@ -292,7 +292,7 @@ DxgiCaptureResult DxgiCapture::capture_frame(CapturedFrame* frame, std::string* 
                 ? hr
                 : removal_reason; // wjy: Acquire 表层错误与设备移除原因不同时，优先向上返回真实设备级 HRESULT。
             reset_resources(); // wjy: Device Removed/Reset/Hung 才销毁采集设备，旧 CapturedFrame 仍由自己的 COM 引用安全保留。
-            awaiting_recovery_frame_ = true;
+            recovery_frame_gate_.begin(); // wjy: 完整设备恢复同样隔离第一张驱动预热帧，禁止设备重建黑帧进入码流。
             next_duplication_retry_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(250);
             if (error) *error = win32_error("AcquireNextFrame device recovery", recovery_result);
             return {DxgiCaptureStatus::DeviceRecovering, recovery_result};
@@ -313,6 +313,17 @@ DxgiCaptureResult DxgiCapture::capture_frame(CapturedFrame* frame, std::string* 
 
     D3D11_TEXTURE2D_DESC desc = {};
     desktop_texture->GetDesc(&desc);
+    // =====wjy====
+    if (recovery_frame_gate_.discardWarmupFrame()) {
+        duplication_->ReleaseFrame(); // wjy: 第一张恢复帧不复制、不租用帧槽也不编码，常态热路径没有新增 GPU 开销。
+        append_stream_capture_diagnostic_log_rate_limited(
+            "dxgi",
+            "recovery warmup frame discarded; retained last good frame size="
+                + std::to_string(desc.Width) + "x" + std::to_string(desc.Height),
+            500); // wjy: 日志落在 data/stream_capture_debug.log，现场可确认黑帧已在被控端被拦截。
+        return {DxgiCaptureStatus::DuplicationRecovering, S_FALSE}; // wjy: 上层继续保留最后正常纹理，等待下一张真实新帧结束恢复。
+    }
+    // ===end====
     std::shared_ptr<FrameSlot> selected_slot;
     std::shared_ptr<void> selected_lease;
     for (const auto& slot : frame_slots_) {
@@ -342,7 +353,7 @@ DxgiCaptureResult DxgiCapture::capture_frame(CapturedFrame* frame, std::string* 
     frame->texture = selected_slot->texture;
     frame->size = {desc.Width, desc.Height};
     frame->lifetime = std::move(selected_lease); // wjy: 最后一份帧租约销毁时才归还槽位，支持多PeerConnection并发持有。
-    awaiting_recovery_frame_ = false; // wjy: 只有完成 GPU 复制并交付真实新纹理后才退出恢复态。
+    recovery_frame_gate_.complete(); // wjy: 预热帧已隔离，第二张成功复制并交付的帧才正式结束恢复态。
     consecutive_duplication_failures_ = 0;
     next_duplication_retry_ = {};
     return {DxgiCaptureStatus::FreshFrame, S_OK};
@@ -422,7 +433,7 @@ bool DxgiCapture::recreate_duplication(std::string* error, long* result)
     duplication_ = std::move(replacement); // wjy: 新对象完全创建成功后再原子式替换成员，失败过程不会破坏 D3D11 Device 和帧槽。
     size_.width = static_cast<uint32_t>(selected_desc.DesktopCoordinates.right - selected_desc.DesktopCoordinates.left);
     size_.height = static_cast<uint32_t>(selected_desc.DesktopCoordinates.bottom - selected_desc.DesktopCoordinates.top);
-    awaiting_recovery_frame_ = true;
+    recovery_frame_gate_.begin(); // wjy: 轻量重建成功后重新开启首帧隔离，避免 VDD 周期性 ACCESS_LOST 产生黑闪。
     if (result) *result = S_OK;
     append_stream_capture_diagnostic_log_rate_limited(
         "dxgi",
@@ -444,7 +455,7 @@ void DxgiCapture::schedule_duplication_recovery(long result)
 void DxgiCapture::reset_duplication()
 {
     duplication_.Reset(); // wjy: 轻量恢复只释放 Desktop Duplication，Device、Context、帧槽和已交付纹理全部保留。
-    awaiting_recovery_frame_ = true;
+    recovery_frame_gate_.begin(); // wjy: 在新 Duplication 到达前保持恢复门控，首张成功帧仍需预热隔离。
 }
 // ===end====
 
@@ -481,7 +492,7 @@ void DxgiCapture::reset()
 {
     reset_resources();
     preferred_device_name_.clear();
-    awaiting_recovery_frame_ = false;
+    recovery_frame_gate_.reset(); // wjy: 主动 reset 清除旧恢复轮次，下一次 initialize 会建立全新的预热门控。
     consecutive_duplication_failures_ = 0;
     next_duplication_retry_ = {};
 }

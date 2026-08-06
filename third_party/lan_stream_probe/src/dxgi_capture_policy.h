@@ -52,6 +52,41 @@ inline uint32_t dxgi_duplication_retry_delay_ms(uint32_t consecutiveFailures)
     if (consecutiveFailures == 3) return 100;
     return 250; // wjy: 恢复枚举最多每 250ms 一次，避免 60 FPS 循环持续创建 DXGI 对象，同时保持快速恢复。
 }
+
+class DxgiRecoveryFrameGate final {
+public:
+    void begin() noexcept
+    {
+        awaitingFrame_ = true; // wjy: Duplication 初建或重建后继续保持恢复态，禁止立即把未稳定画面送进编码器。
+        warmupFramePending_ = true; // wjy: 每轮恢复固定隔离第一张成功取得的桌面帧，继续保留上一次正常画面。
+    }
+
+    bool awaitingFrame() const noexcept { return awaitingFrame_; } // wjy: 超时分支据此区分正常静止桌面和仍在等待恢复画面的阶段。
+
+    bool discardWarmupFrame() noexcept
+    {
+        if (!awaitingFrame_ || !warmupFramePending_) return false; // wjy: 正常采集热路径不进入预热隔离，也不增加额外 GPU 操作。
+        warmupFramePending_ = false; // wjy: 每轮恢复只丢弃第一张帧，下一张真实新帧即可完成恢复。
+        return true;
+    }
+
+    void complete() noexcept
+    {
+        awaitingFrame_ = false; // wjy: 第二张成功复制并交付的帧才允许结束恢复态。
+        warmupFramePending_ = false;
+    }
+
+    void reset() noexcept
+    {
+        awaitingFrame_ = false; // wjy: 主动停止采集时清除全部门控状态，下一次初始化会重新 begin。
+        warmupFramePending_ = false;
+    }
+
+private:
+    bool awaitingFrame_ = false;
+    bool warmupFramePending_ = false;
+};
+
 class FrameSlotLeaseState final : public std::enable_shared_from_this<FrameSlotLeaseState> {
 public:
     bool try_acquire(std::shared_ptr<void>* token)

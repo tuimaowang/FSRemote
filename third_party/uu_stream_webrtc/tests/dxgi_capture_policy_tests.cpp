@@ -38,6 +38,18 @@ int main()
     assert(lsp::dxgi_duplication_retry_delay_ms(2) == 50);
     assert(lsp::dxgi_duplication_retry_delay_ms(3) == 100);
     assert(lsp::dxgi_duplication_retry_delay_ms(20) == 250); // wjy: 连续失败退避有固定上限，不会增长到数秒而让远控长期停在旧画面。
+    lsp::DxgiRecoveryFrameGate recoveryGate;
+    assert(!recoveryGate.awaitingFrame());
+    recoveryGate.begin();
+    assert(recoveryGate.awaitingFrame()); // wjy: Duplication 重建后必须保持恢复态，超时不能被当成正常静止桌面。
+    assert(recoveryGate.discardWarmupFrame()); // wjy: 第一张成功取得的恢复帧被隔离，防止 VDD 初始化黑帧进入编码链路。
+    assert(recoveryGate.awaitingFrame()); // wjy: 丢弃预热帧后仍保持恢复态，必须等下一张成功帧才能恢复编码。
+    assert(!recoveryGate.discardWarmupFrame()); // wjy: 同一轮恢复只隔离一张，避免周期性恢复造成可感知的画面冻结。
+    recoveryGate.complete();
+    assert(!recoveryGate.awaitingFrame()); // wjy: 第二张正常帧完成复制后恢复门控结束。
+    recoveryGate.begin();
+    recoveryGate.reset();
+    assert(!recoveryGate.awaitingFrame()); // wjy: 主动停止时不得把旧恢复状态带入下一次远控会话。
     // ===end====
     return 0;
 }

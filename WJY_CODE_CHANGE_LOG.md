@@ -10543,3 +10543,97 @@ presentResult = targetSwapChain->Present(0, 0);
 - 新版本中`comp_commit`稳定保持5至6，视频逐帧DComp提交修复继续生效。
 - `git diff --check`覆盖四个修改源码文件并通过。
 - 按用户此前要求未执行编译、链接和运行测试；需要更新控制端后确认日志模式为`partial_upload_full_present`且不再出现稳定期全黑样本。
+
+## 2026-08-06 18:35 - 隔离DXGI恢复预热帧消除周期黑闪
+
+### Changed Location
+- `third_party/lan_stream_probe/src/dxgi_capture_policy.h:56-88`：新增`DxgiRecoveryFrameGate`，为每轮Desktop Duplication初建或重建隔离第一张成功采集帧。
+- `third_party/lan_stream_probe/src/dxgi_capture.h:4,69`：引入恢复门控策略头，并用门控对象替换原有单布尔恢复状态。
+- `third_party/lan_stream_probe/src/dxgi_capture.cpp:207,246-248,289-295,317-323,356,436,458,495`：在初始化、轻量重建、完整设备恢复和主动重置路径接入门控；恢复首帧只释放不复制、不租用帧槽、不编码，下一张成功帧才恢复交付。
+- `third_party/uu_stream_webrtc/tests/dxgi_capture_policy_tests.cpp:41-52`：新增恢复门控状态转换测试，覆盖开始恢复、丢弃首帧、第二帧完成恢复和重置清理。
+
+### Reason
+本轮测试中控制端在稳定期捕获到6次完整黑帧（`.109`两次、`.161`两次、`.108`一次、`.127`一次），每次均为`black_ratio=1.0000 avg_luma=0.0`。通过同一session admission对齐控制端与被控端时钟后，6/6黑帧都紧跟被控端`DXGI_ERROR_ACCESS_LOST`后的Duplication恢复，间隔约117-156毫秒。黑帧前后采样均恢复正常，且D3D、Present、DComp Commit、KeyedMutex均无失败，说明不是控制端标题栏Overlay或Present失败，而是Duplication重建后的第一张API成功帧仍处于驱动/VDD预热阶段。原逻辑会立即CopyResource并送入编码器，覆盖控制端最后一张正常画面，因此产生黑屏闪烁。
+
+### Original Code
+```cpp
+// third_party/lan_stream_probe/src/dxgi_capture.h:3,68（修改前）
+#include "common.h"
+bool awaiting_recovery_frame_ = false; // Duplication重建后等待真实新帧
+```
+
+```cpp
+// third_party/lan_stream_probe/src/dxgi_capture.cpp:207,266-267,339-345（修改前）
+awaiting_recovery_frame_ = true;
+return {awaiting_recovery_frame_ ? DxgiCaptureStatus::DuplicationRecovering
+                                 : DxgiCaptureStatus::NoDesktopChange, hr};
+context_->CopyResource(selected_slot->texture.Get(), desktop_texture.Get());
+duplication_->ReleaseFrame();
+awaiting_recovery_frame_ = false;
+```
+
+### Modified Code
+```cpp
+// third_party/lan_stream_probe/src/dxgi_capture_policy.h:56-88（修改后）
+class DxgiRecoveryFrameGate final {
+public:
+    void begin() noexcept
+    {
+        awaitingFrame_ = true;       // 每轮恢复进入门控状态。
+        warmupFramePending_ = true;  // 只隔离第一张成功取得的预热帧。
+    }
+
+    bool awaitingFrame() const noexcept { return awaitingFrame_; }
+
+    bool discardWarmupFrame() noexcept
+    {
+        if (!awaitingFrame_ || !warmupFramePending_) return false;
+        warmupFramePending_ = false;
+        return true;
+    }
+
+    void complete() noexcept
+    {
+        awaitingFrame_ = false;
+        warmupFramePending_ = false;
+    }
+
+    void reset() noexcept
+    {
+        awaitingFrame_ = false;
+        warmupFramePending_ = false;
+    }
+};
+```
+
+```cpp
+// third_party/lan_stream_probe/src/dxgi_capture.cpp:289-295,317-323,356（修改后）
+if (recovery_frame_gate_.discardWarmupFrame()) {
+    duplication_->ReleaseFrame();
+    append_stream_capture_diagnostic_log_rate_limited(
+        "dxgi",
+        "recovery warmup frame discarded; retained last good frame size="
+            + std::to_string(desc.Width) + "x" + std::to_string(desc.Height),
+        500);
+    return {DxgiCaptureStatus::DuplicationRecovering, S_FALSE};
+}
+context_->CopyResource(selected_slot->texture.Get(), desktop_texture.Get());
+duplication_->ReleaseFrame();
+frame->texture = selected_slot->texture;
+frame->lifetime = std::move(selected_lease);
+recovery_frame_gate_.complete();
+```
+
+### Steps
+1. 将初次初始化、`ACCESS_LOST`轻量重建、设备移除/重置恢复和主动重置统一接入`DxgiRecoveryFrameGate`。
+2. 在完成`AcquireNextFrame`并获取纹理描述后，先判断是否为本轮首张预热帧；命中时立即`ReleaseFrame`并返回`DuplicationRecovering`。
+3. 保留控制端上一张已成功交付的画面，不租用帧槽、不执行`CopyResource`，避免黑色预热帧进入NVENC/WebRTC码流。
+4. 第二张成功帧按原流程复制、交付并调用`complete()`，恢复正常采集热路径；正常帧只增加一个轻量布尔分支，不调用`GetDeviceRemovedReason()`。
+5. 增加策略单元测试，并在被控端既有`data/stream_capture_debug.log`中加入`recovery warmup frame discarded; retained last good frame`诊断记录。
+
+### Verification
+- 已对齐控制端`remote_compositor_timeline.log`、`remote_viewer_state.log`与四台被控端`stream_capture_debug.log`；确认6/6稳定期黑帧均发生在Duplication恢复后117-156毫秒。
+- 已确认黑帧期间没有Overlay Present、D3D Present、DComp Commit、KeyedMutex失败，也没有`remote_presenter_diagnostic.log`同步超时记录。
+- `rg`复核确认源码中不再残留`awaiting_recovery_frame_`，门控覆盖初始化、轻量重建、完整恢复和重置路径。
+- `git diff --check`：通过。
+- 按用户要求未编译、未链接、未运行二进制测试；新增策略测试仅完成静态检查，需更新被控端后观察上述预热帧丢弃日志及黑帧样本是否消失。
