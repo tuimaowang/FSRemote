@@ -1,5 +1,9 @@
 #include "ui/RemoteWindowCompositor.h"
 
+#include <QByteArray>
+#include <QRectF>
+#include <QtGlobal>
+
 #include <utility>
 
 namespace ui {
@@ -12,14 +16,37 @@ bool RemoteWindowLayoutSnapshot::isValid() const
         && devicePixelRatio > 0.0;
 }
 
+QRect remoteCompositorPhysicalDirtyRect(
+    const QRect& logicalRect,
+    qreal devicePixelRatio,
+    const QSize& physicalSurfaceSize)
+{
+    if (logicalRect.isEmpty() || devicePixelRatio <= 0.0 || physicalSurfaceSize.isEmpty()) {
+        return {};
+    }
+    const QRectF scaled(
+        logicalRect.x() * devicePixelRatio,
+        logicalRect.y() * devicePixelRatio,
+        logicalRect.width() * devicePixelRatio,
+        logicalRect.height() * devicePixelRatio);
+    return scaled.toAlignedRect().intersected(
+        QRect(0, 0, physicalSurfaceSize.width(), physicalSurfaceSize.height())); // wjy: Present1和UpdateSubresource共用同一物理脏区，透明视频孔不会被标题栏刷新覆盖。
+}
+
 bool RemoteWindowCompositorConfig::rolloutEnabled()
 {
-    return true;
+    const QByteArray overrideValue = qgetenv("FSREMOTE_UNIFIED_COMPOSITOR").trimmed().toLower();
+    return overrideValue != "0"
+        && overrideValue != "false"
+        && overrideValue != "no"
+        && overrideValue != "off"; // wjy: 默认继续使用统一路径；现场可设为0回退旧多表面实现，便于直接确认驱动或DComp特异问题。
 }
 
 QString RemoteWindowCompositorConfig::activePathId()
 {
-    return QStringLiteral("unified-retained-surface");
+    return rolloutEnabled()
+        ? QStringLiteral("unified-retained-surface")
+        : QStringLiteral("legacy-multi-surface");
 }
 
 RemoteWindowCompositor::RemoteWindowCompositor(bool enabled)

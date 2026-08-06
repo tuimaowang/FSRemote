@@ -6,10 +6,10 @@
 #include <QByteArray>
 #include <QImage>
 #include <QPoint>
+#include <QRect>
 #include <QString>
 #include <QWidget>
 
-class QRect;
 class QMouseEvent;
 
 struct ID3D11Texture2D; // wjy: 只在私有实现里使用具体D3D类型，头文件保持前向声明不拉入d3d11.h。
@@ -20,6 +20,10 @@ struct D3D11CompositorTelemetry {
     std::uint64_t commitCount = 0;
     std::uint64_t commitFailureCount = 0;
     double averageCommitMs = 0.0;
+    std::uint64_t overlayFullPresentCount = 0;
+    std::uint64_t overlayPartialPresentCount = 0;
+    std::uint64_t overlayPresentFailureCount = 0;
+    std::uint64_t overlayUploadedBytes = 0; // wjy: 30秒诊断据此确认多窗口标题栏刷新是否仍在上传整窗像素。
 };
 
 class D3D11FramePresenter final : public QWidget {
@@ -42,7 +46,7 @@ public:
     bool hasCompositorOverlay() const; // wjy: 叠加SwapChain创建成功后才隐藏旧标题栏/性能层，创建失败保留可用回退表面。
     void setPresentationVisible(bool visible); // wjy: 统一控制旧子HWND或DComp视频视觉的可见性，更新遮罩不会露出旧帧。
     bool setCompositorOutputRect(const QRect& rect); // wjy: 提交统一内容矩形并返回结果；失败时实现会恢复上一份可见几何。
-    bool presentCompositorOverlay(const QImage& image); // 仅在候选叠加表面完成上传、Present和Commit后返回成功。
+    bool presentCompositorOverlay(const QImage& image, const QRect& dirtyPhysicalRect = QRect()); // 空脏区完整提交；标题栏变化只上传物理脏区并使用Present1。
     void setInteractiveResize(bool active); // wjy: 拖拽期间冻结SwapChain尺寸但继续呈现新帧，松手后只按最终客户区调整一次并立即补画缓存帧。
     void reset();
     long lastDeviceRemovalReason() const; // wjy: 返回最近一次D3D11失败HRESULT，供窗口级诊断记录，不触发进程级异常。

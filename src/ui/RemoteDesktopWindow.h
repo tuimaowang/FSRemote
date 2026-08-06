@@ -265,7 +265,7 @@ private:
     void updateTexturePresenterGeometry();
     RemoteWindowLayoutSnapshot compositorLayoutSnapshot() const; // wjy: 从当前顶层窗口一次性生成物理输出、内容和输入映射快照。
     void commitCompositorLayout(); // wjy: 统一把父窗口几何提交给新合成器，避免各表面各自推导尺寸。
-    void presentCompositorOverlay(); // wjy: 将标题栏和连接遮罩合成为一张预乘Alpha图层提交到DComp。
+    void presentCompositorOverlay(const QRect& dirtyLogicalRect = QRect()); // wjy: 空脏区完整合成；正常视频中的标题栏变化只更新缓存图层顶部区域。
     void beginResizeDebugTrace(); // wjy: 开始一次尺寸手势的内存追踪，不在高频事件期间写磁盘。
     void appendResizeDebugTrace(const QString& stage); // wjy: 记录父窗口、D3D子窗口和Present状态的同一时序节点。
     void flushResizeDebugTrace(); // wjy: 松手后一次性把本次追踪写入data/remote_resize_trace.log，避免日志改变拖拽时序。
@@ -462,8 +462,9 @@ private:
     QTimer* m_clipboardPollTimer = nullptr;
     // ===end====
     D3D11FramePresenter* m_texturePresenter = nullptr;
-    std::unique_ptr<RemoteWindowCompositor> m_unifiedCompositor; // wjy: 新路径默认关闭，启用后先接管状态/布局，再逐层迁移可见表面。
+    std::unique_ptr<RemoteWindowCompositor> m_unifiedCompositor; // wjy: 新路径默认开启，现场可通过环境开关回退；对象状态在窗口构造时固定。
     std::unique_ptr<NativeRemoteTitleBarSurface> m_nativeTitleBarSurface; // wjy: 独立Win32子窗口持有标题栏DIB，父Qt backing store不再负责可见标题栏像素。
+    QImage m_compositorOverlayCache; // wjy: 保留完整透明Overlay像素；秒级标题栏刷新只改顶部脏区，不再分配和上传整窗图像。
     quint64 m_titleBarVisualRevision = 1; // wjy: 只有标题栏可见状态变化才递增，远控视频帧不参与该版本。
     quint64 m_committedTitleBarVisualRevision = 0;
     QSize m_committedTitleBarLogicalSize; // wjy: 现在保存身份布局签名而不是窗口尺寸，普通缩放不会命中重绘条件。

@@ -32,7 +32,12 @@ struct RemoteWindowLayoutSnapshot {
     bool isValid() const;
 };
 
-// 发布运行时固定使用统一保留式合成路径，不再依赖用户或构建环境变量。
+QRect remoteCompositorPhysicalDirtyRect(
+    const QRect& logicalRect,
+    qreal devicePixelRatio,
+    const QSize& physicalSurfaceSize); // wjy: 标题栏局部更新统一向外取整并裁剪到Overlay物理边界，避免DPI缩放留下未更新像素缝。
+
+// 默认使用统一保留式合成路径；FSREMOTE_UNIFIED_COMPOSITOR=0保留一个发布周期的现场回退能力。
 class RemoteWindowCompositorConfig final {
 public:
     static bool rolloutEnabled();

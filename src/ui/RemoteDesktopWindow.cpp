@@ -2295,8 +2295,11 @@ QString RemoteDesktopWindow::remoteResourceDiagnosticSummary()
     QString quality = remoteQualityStatusSummary();
     quality.replace(QLatin1Char('\n'), QStringLiteral(" | "));
     const long d3dReason = m_texturePresenter ? m_texturePresenter->lastDeviceRemovalReason() : 0;
+    const D3D11CompositorTelemetry compositorTelemetry = m_texturePresenter
+        ? m_texturePresenter->compositorTelemetry()
+        : D3D11CompositorTelemetry{};
     const QString compositor = m_unifiedCompositor
-        ? QStringLiteral("%1/state=%2/layout_rev=%3/output=%4x%5 source=%6x%7 frame=%8 presented=%9 fallbacks=%10")
+        ? QStringLiteral("%1/state=%2/layout_rev=%3/output=%4x%5 source=%6x%7 frame=%8 presented=%9 fallbacks=%10 overlay_full=%11 overlay_partial=%12 overlay_fail=%13 overlay_mb=%14 comp_commit=%15 comp_fail=%16 comp_avg_ms=%17")
             .arg(RemoteWindowCompositorConfig::activePathId())
             .arg(static_cast<int>(m_unifiedCompositor->state()))
             .arg(static_cast<qulonglong>(m_unifiedCompositor->layout().revision))
@@ -2307,6 +2310,13 @@ QString RemoteDesktopWindow::remoteResourceDiagnosticSummary()
             .arg(static_cast<qulonglong>(m_unifiedCompositor->lastFrameId()))
             .arg(static_cast<qulonglong>(m_unifiedCompositor->presentedFrameCount()))
             .arg(static_cast<qulonglong>(m_unifiedCompositor->fallbackCount()))
+            .arg(static_cast<qulonglong>(compositorTelemetry.overlayFullPresentCount))
+            .arg(static_cast<qulonglong>(compositorTelemetry.overlayPartialPresentCount))
+            .arg(static_cast<qulonglong>(compositorTelemetry.overlayPresentFailureCount))
+            .arg(compositorTelemetry.overlayUploadedBytes / (1024.0 * 1024.0), 0, 'f', 1)
+            .arg(static_cast<qulonglong>(compositorTelemetry.commitCount))
+            .arg(static_cast<qulonglong>(compositorTelemetry.commitFailureCount))
+            .arg(compositorTelemetry.averageCommitMs, 0, 'f', 3)
         : QStringLiteral("none");
     return QStringLiteral("host=%1 connected=%2 generation=%3 status=%4 bgra_pending=%5 texture_pending=%6 drain=%7 presenter_pending_replace=%8 fallback=%9 d3d=0x%10 fps=%11 encoded_mbps=%12 compositor=%13 quality={%14} stale_generation_drop=%15")
         .arg(m_hostIp)
@@ -3103,7 +3113,7 @@ void RemoteDesktopWindow::updateNativeTitleBarSurface(bool forceRender)
     updateNativeTitleBarButtonBand(forceRender);
 }
 
-void RemoteDesktopWindow::presentCompositorOverlay()
+void RemoteDesktopWindow::presentCompositorOverlay(const QRect& dirtyLogicalRect)
 {
     if (!m_texturePresenter
         || !m_texturePresenter->usesCompositorSurface()
@@ -3116,48 +3126,67 @@ void RemoteDesktopWindow::presentCompositorOverlay()
     const QSize physicalSize(
         qMax(1, qRound(width() * dpr)),
         qMax(1, qRound(height() * dpr)));
-    QImage overlay(physicalSize, QImage::Format_ARGB32_Premultiplied);
-    overlay.fill(Qt::transparent);
-
-    QPainter painter(&overlay);
-    painter.setRenderHint(QPainter::Antialiasing, true);
-    painter.scale(dpr, dpr);
-    const QRect contentRect = remoteContentRect();
-    const QRect imageRect = remoteImageRect();
-    if (!contentRect.isEmpty()) {
-        painter.fillRect(contentRect, Qt::black); // wjy: 黑边按当前窗口内容区域重新生成，不再依赖旧硬件SwapChain中的黑色像素。
-        if (imageRect.isValid()) {
-            painter.setCompositionMode(QPainter::CompositionMode_Clear);
-            painter.fillRect(imageRect, Qt::transparent); // wjy: 清出当前真实视频区域，让DComp视频视觉只覆盖内容，不被叠加层黑底遮挡。
-            painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
-        }
+    const QRect logicalBounds(0, 0, width(), height());
+    const QRect requestedDirtyRect = dirtyLogicalRect.intersected(logicalBounds);
+    const bool cacheMatches = !m_compositorOverlayCache.isNull()
+        && m_compositorOverlayCache.size() == physicalSize
+        && m_compositorOverlayCache.format() == QImage::Format_ARGB32_Premultiplied
+        && qFuzzyCompare(m_compositorOverlayCache.devicePixelRatio(), dpr);
+    const bool partialUpdate = cacheMatches && !requestedDirtyRect.isEmpty();
+    if (!cacheMatches) {
+        m_compositorOverlayCache = QImage(physicalSize, QImage::Format_ARGB32_Premultiplied);
+        m_compositorOverlayCache.fill(Qt::transparent);
+    } else if (!partialUpdate) {
+        m_compositorOverlayCache.fill(Qt::transparent); // wjy: 完整状态变化复用现有分配，只重置像素，不重新申请整窗内存。
     }
 
-    if (!m_textureFrameActive && !m_remoteFrame.isNull()) {
-        painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
-        painter.drawImage(remoteImageRect(), m_remoteFrame); // wjy: 软件BGRA回退也进入同一DComp叠加SwapChain，不再依赖父backing store作为最终像素所有者。
-    } else if (!m_textureFrameActive && m_remoteFrame.isNull() && !remoteUpdateActive()) {
-        const QRect contentRect(0, isFullScreen() ? 0 : titleBarHeight(), width(),
-            qMax(0, height() - (isFullScreen() ? 0 : titleBarHeight())));
-        QFont titleFont(QStringLiteral("Microsoft YaHei UI"));
-        titleFont.setPixelSize(18);
-        titleFont.setWeight(QFont::DemiBold);
-        painter.setFont(titleFont);
-        painter.setPen(QColor(QStringLiteral("#FFFFFF")));
-        painter.drawText(
-            QRectF(contentRect.left(), contentRect.center().y() - 34, contentRect.width(), 26),
-            Qt::AlignCenter,
-            zh("正在连接 %1").arg(m_deviceName)); // wjy: DComp连接主标题使用固定中央文本行，与期望界面和Qt回退路径保持完全一致。
-        QFont statusFont(QStringLiteral("Microsoft YaHei UI"));
-        statusFont.setPixelSize(13);
-        painter.setFont(statusFont);
-        painter.setPen(m_connectionStatusCode == 90
-                ? QColor(QStringLiteral("#FFB4B4"))
-                : QColor(QStringLiteral("#B8C0CC")));
-        painter.drawText(
-            QRectF(contentRect.left() + 60, contentRect.center().y(), contentRect.width() - 120, 48),
-            Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap,
-            m_connectionStatus); // wjy: 副标题从中央主标题下方开始绘制，禁止再次使用内容区顶部导致文字跑到标题栏下方。
+    m_compositorOverlayCache.setDevicePixelRatio(1.0); // wjy: 沿用旧路径的物理像素画布加显式scale，避免缓存DPR与QPainter缩放重复生效。
+    QPainter painter(&m_compositorOverlayCache);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.scale(dpr, dpr);
+    if (partialUpdate) {
+        painter.setCompositionMode(QPainter::CompositionMode_Source);
+        painter.fillRect(requestedDirtyRect, Qt::transparent);
+        painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+        painter.setClipRect(requestedDirtyRect); // wjy: 局部路径只重画缓存标题栏，连接内容、透明视频孔和黑边像素保持上一份完整提交。
+    } else {
+        const QRect contentRect = remoteContentRect();
+        const QRect imageRect = remoteImageRect();
+        if (!contentRect.isEmpty()) {
+            painter.fillRect(contentRect, Qt::black); // wjy: 黑边按当前窗口内容区域重新生成，不再依赖旧硬件SwapChain中的黑色像素。
+            if (imageRect.isValid()) {
+                painter.setCompositionMode(QPainter::CompositionMode_Clear);
+                painter.fillRect(imageRect, Qt::transparent); // wjy: 清出当前真实视频区域，让DComp视频视觉只覆盖内容，不被叠加层黑底遮挡。
+                painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+            }
+        }
+
+        if (!m_textureFrameActive && !m_remoteFrame.isNull()) {
+            painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
+            painter.drawImage(remoteImageRect(), m_remoteFrame); // wjy: 软件BGRA回退也进入同一DComp叠加SwapChain，不再依赖父backing store作为最终像素所有者。
+        } else if (!m_textureFrameActive && m_remoteFrame.isNull() && !remoteUpdateActive()) {
+            const QRect connectionRect(0, isFullScreen() ? 0 : titleBarHeight(), width(),
+                qMax(0, height() - (isFullScreen() ? 0 : titleBarHeight())));
+            QFont titleFont(QStringLiteral("Microsoft YaHei UI"));
+            titleFont.setPixelSize(18);
+            titleFont.setWeight(QFont::DemiBold);
+            painter.setFont(titleFont);
+            painter.setPen(QColor(QStringLiteral("#FFFFFF")));
+            painter.drawText(
+                QRectF(connectionRect.left(), connectionRect.center().y() - 34, connectionRect.width(), 26),
+                Qt::AlignCenter,
+                zh("正在连接 %1").arg(m_deviceName)); // wjy: DComp连接主标题使用固定中央文本行，与期望界面和Qt回退路径保持完全一致。
+            QFont statusFont(QStringLiteral("Microsoft YaHei UI"));
+            statusFont.setPixelSize(13);
+            painter.setFont(statusFont);
+            painter.setPen(m_connectionStatusCode == 90
+                    ? QColor(QStringLiteral("#FFB4B4"))
+                    : QColor(QStringLiteral("#B8C0CC")));
+            painter.drawText(
+                QRectF(connectionRect.left() + 60, connectionRect.center().y(), connectionRect.width() - 120, 48),
+                Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap,
+                m_connectionStatus); // wjy: 副标题从中央主标题下方开始绘制，禁止再次使用内容区顶部导致文字跑到标题栏下方。
+        }
     }
 
     if (!isFullScreen()) {
@@ -3169,7 +3198,7 @@ void RemoteDesktopWindow::presentCompositorOverlay()
         }
     }
 
-    if (remoteUpdateActive()) {
+    if (!partialUpdate && remoteUpdateActive()) {
         const QRect contentRect(0, isFullScreen() ? 0 : titleBarHeight(), width(),
             qMax(0, height() - (isFullScreen() ? 0 : titleBarHeight())));
         painter.fillRect(contentRect, QColor(3, 10, 22, 196)); // wjy: DComp路径完整接管更新遮罩，父QWidget不再叠加第二套连接或更新文字。
@@ -3220,8 +3249,11 @@ void RemoteDesktopWindow::presentCompositorOverlay()
             Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap, remoteUpdateDetail());
     }
     painter.end();
-    overlay.setDevicePixelRatio(dpr); // wjy: 标记叠加图实际物理像素对应的顶层窗口DPR，供DComp按正确比例铺满整个客户区。
-    m_texturePresenter->presentCompositorOverlay(overlay);
+    m_compositorOverlayCache.setDevicePixelRatio(dpr); // wjy: 标记缓存图物理像素对应的顶层窗口DPR，DComp和脏区换算使用同一比例。
+    const QRect dirtyPhysicalRect = partialUpdate
+        ? remoteCompositorPhysicalDirtyRect(requestedDirtyRect, dpr, physicalSize)
+        : QRect();
+    m_texturePresenter->presentCompositorOverlay(m_compositorOverlayCache, dirtyPhysicalRect);
     sampleVisibleCompositorRegion(); // wjy: 叠加层提交后按需采样真实屏幕像素，和本次resize状态绑定。
 }
 
@@ -3271,11 +3303,16 @@ void RemoteDesktopWindow::requestTitleBarUpdate(const QRect& region)
 {
 #if !FSREMOTE_LEGACY_PARENT_TITLE_BAR
     if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
-        Q_UNUSED(region)
         ++m_titleBarVisualRevision;
-        if (!m_draggingWindow) {
-            presentCompositorOverlay(); // wjy: DComp路径只重新提交统一Alpha层，标题栏状态变化不会再触发独立HWND重绘。
-        }
+        if (!m_draggingWindow && !m_resizingWindow) {
+            const bool contentOverlayVisible = remoteUpdateActive()
+                || (!m_textureFrameActive && m_remoteFrame.isNull());
+            if (contentOverlayVisible) {
+                presentCompositorOverlay(); // wjy: 连接文字或更新遮罩可见时仍提交完整缓存，保证内容状态与标题栏一致。
+            } else if (!isFullScreen()) {
+                presentCompositorOverlay(QRect(0, 0, width(), titleBarHeight())); // wjy: 正常视频只更新标题栏物理脏区，九窗口秒级统计不再翻转整窗Overlay。
+            }
+        } // wjy: 移动或缩放期间延后秒级标题栏统计，手势结束已有一次最终刷新，不让动态文字参与高频几何提交。
         if (m_texturePresenter->hasCompositorOverlay()) {
             return;
         }

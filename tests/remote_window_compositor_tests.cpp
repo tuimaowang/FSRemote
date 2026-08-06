@@ -1,10 +1,15 @@
 #include "ui/RemoteWindowCompositor.h"
 
+#include <QByteArray>
+#include <QtGlobal>
+
 #include <cassert>
 
 using ui::RemoteWindowCompositor;
+using ui::RemoteWindowCompositorConfig;
 using ui::RemoteWindowCompositorState;
 using ui::RemoteWindowLayoutSnapshot;
+using ui::remoteCompositorPhysicalDirtyRect;
 
 namespace {
 
@@ -62,10 +67,38 @@ void runResizeScenarios()
     assert(compositor.state() == RemoteWindowCompositorState::Idle);
 }
 
+void runOverlayDirtyRectScenarios()
+{
+    assert(remoteCompositorPhysicalDirtyRect(
+        QRect(0, 0, 1280, 42), 1.25, QSize(1600, 900)) == QRect(0, 0, 1600, 53));
+    assert(remoteCompositorPhysicalDirtyRect(
+        QRect(-8, -4, 40, 20), 1.0, QSize(1280, 720)) == QRect(0, 0, 32, 16));
+    assert(remoteCompositorPhysicalDirtyRect(
+        QRect(), 1.0, QSize(1280, 720)).isEmpty()); // wjy: 空脏区表示完整Overlay提交，不能被误解释为零面积局部Present。
+}
+
+void runRolloutOverrideScenarios()
+{
+    const bool hadPreviousValue = qEnvironmentVariableIsSet("FSREMOTE_UNIFIED_COMPOSITOR");
+    const QByteArray previousValue = qgetenv("FSREMOTE_UNIFIED_COMPOSITOR");
+    qputenv("FSREMOTE_UNIFIED_COMPOSITOR", QByteArrayLiteral("0"));
+    assert(!RemoteWindowCompositorConfig::rolloutEnabled());
+    assert(RemoteWindowCompositorConfig::activePathId() == QStringLiteral("legacy-multi-surface"));
+    qputenv("FSREMOTE_UNIFIED_COMPOSITOR", QByteArrayLiteral("1"));
+    assert(RemoteWindowCompositorConfig::rolloutEnabled());
+    if (hadPreviousValue) {
+        qputenv("FSREMOTE_UNIFIED_COMPOSITOR", previousValue);
+    } else {
+        qunsetenv("FSREMOTE_UNIFIED_COMPOSITOR");
+    } // wjy: 测试结束恢复调用进程环境，避免后续用例误跑旧合成路径。
+}
+
 } // namespace
 
 int main()
 {
     runResizeScenarios();
+    runOverlayDirtyRectScenarios();
+    runRolloutOverrideScenarios();
     return 0;
 }

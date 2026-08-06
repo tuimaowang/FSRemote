@@ -218,6 +218,7 @@ struct D3D11FramePresenter::Impl {
     int compositionOverlayCandidateHeight = 0;
     int compositionOverlayTargetWidth = 0;
     int compositionOverlayTargetHeight = 0; // wjy: 保存调用方本次生成叠加图的真实物理尺寸，DComp不再依赖Win32/Qt是否启用DPI虚拟化来猜测目标大小。
+    int compositionOverlayFullPresentsRemaining = 0; // wjy: 双缓冲新表面先完整写入两个BackBuffer，之后才允许局部标题栏上传。
     HWND compositorHostWindow = nullptr;
     QRect compositorOutputRect;
     bool compositorMode = false;
@@ -257,6 +258,10 @@ struct D3D11FramePresenter::Impl {
     std::uint64_t compositionCommitCount = 0;
     std::uint64_t compositionCommitFailureCount = 0;
     std::uint64_t compositionCommitTimeUs = 0;
+    std::uint64_t compositionOverlayFullPresentCount = 0;
+    std::uint64_t compositionOverlayPartialPresentCount = 0;
+    std::uint64_t compositionOverlayPresentFailureCount = 0;
+    std::uint64_t compositionOverlayUploadedBytes = 0;
     QString nativeLastMessage = QStringLiteral("none"); // wjy: 保存最近一次关键原生消息名称，和父窗口resize时序绑定输出。
     ComPtr<ID3D11Texture2D> resizeCacheTexture; // wjy: 交互缩放期间独占的最后一帧副本，不受共享纹理keyed mutex归还影响。
     int resizeCacheWidth = 0;
@@ -455,7 +460,9 @@ bool D3D11FramePresenter::ensureCompositionOverlaySurface(int width, int height)
     return true;
 }
 
-bool D3D11FramePresenter::presentCompositorOverlay(const QImage& image)
+bool D3D11FramePresenter::presentCompositorOverlay(
+    const QImage& image,
+    const QRect& dirtyPhysicalRect)
 {
     if (!m_impl || !m_impl->compositorMode || image.isNull()) {
         return false;
@@ -468,7 +475,9 @@ bool D3D11FramePresenter::presentCompositorOverlay(const QImage& image)
     if (!ensureDevice() || !ensureCompositionTarget()) {
         return false;
     }
-    QImage converted = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    QImage converted = image.format() == QImage::Format_ARGB32_Premultiplied
+        ? image
+        : image.convertToFormat(QImage::Format_ARGB32_Premultiplied); // wjy: 缓存Overlay已经是目标格式时复用隐式共享像素，标题栏秒级更新不再复制整窗QImage。
     if (converted.isNull()) {
         return false;
     }
@@ -496,6 +505,19 @@ bool D3D11FramePresenter::presentCompositorOverlay(const QImage& image)
         ? m_impl->compositionOverlayCandidateSwapChain.Get()
         : m_impl->compositionOverlaySwapChain.Get();
 
+    const QRect surfaceBounds(0, 0, converted.width(), converted.height());
+    const QRect requestedDirtyRect = dirtyPhysicalRect.intersected(surfaceBounds);
+    const bool requestedPartialUpdate = !requestedDirtyRect.isEmpty()
+        && requestedDirtyRect != surfaceBounds;
+    ComPtr<IDXGISwapChain1> targetSwapChain1;
+    bool partialPresent = !useCandidate
+        && !reuseCurrentDuringResize
+        && !m_impl->interactiveResize
+        && m_impl->compositionOverlayFullPresentsRemaining == 0
+        && requestedPartialUpdate
+        && targetSwapChain
+        && SUCCEEDED(targetSwapChain->QueryInterface(IID_PPV_ARGS(&targetSwapChain1))); // wjy: 只有稳定且两个BackBuffer都完整初始化后才允许局部Present。
+
     ComPtr<ID3D11Texture2D> backBuffer;
     if (!targetSwapChain
         || FAILED(targetSwapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer)))) {
@@ -507,15 +529,48 @@ bool D3D11FramePresenter::presentCompositorOverlay(const QImage& image)
         || backBufferDesc.Height != static_cast<UINT>(converted.height())) {
         return false;
     }
+    D3D11_BOX uploadBox = {};
+    const D3D11_BOX* uploadBoxPointer = nullptr;
+    const uchar* sourceBits = converted.constBits();
+    std::uint64_t uploadedBytes = static_cast<std::uint64_t>(converted.width())
+        * static_cast<std::uint64_t>(converted.height()) * 4;
+    if (partialPresent) {
+        uploadBox.left = static_cast<UINT>(requestedDirtyRect.left());
+        uploadBox.top = static_cast<UINT>(requestedDirtyRect.top());
+        uploadBox.front = 0;
+        uploadBox.right = static_cast<UINT>(requestedDirtyRect.right() + 1);
+        uploadBox.bottom = static_cast<UINT>(requestedDirtyRect.bottom() + 1);
+        uploadBox.back = 1;
+        uploadBoxPointer = &uploadBox;
+        sourceBits += requestedDirtyRect.top() * converted.bytesPerLine()
+            + requestedDirtyRect.left() * 4;
+        uploadedBytes = static_cast<std::uint64_t>(requestedDirtyRect.width())
+            * static_cast<std::uint64_t>(requestedDirtyRect.height()) * 4; // wjy: 正常9窗口每秒只复制约42像素高标题栏，不再触碰透明视频孔和黑边。
+    }
     m_impl->sharedDevice->context->UpdateSubresource(
         backBuffer.Get(),
         0,
-        nullptr,
-        converted.constBits(),
+        uploadBoxPointer,
+        sourceBits,
         static_cast<UINT>(converted.bytesPerLine()),
         0);
-    const HRESULT presentResult = targetSwapChain->Present(0, 0);
+
+    HRESULT presentResult = S_OK;
+    if (partialPresent) {
+        RECT dirtyRect = {
+            requestedDirtyRect.left(),
+            requestedDirtyRect.top(),
+            requestedDirtyRect.right() + 1,
+            requestedDirtyRect.bottom() + 1};
+        DXGI_PRESENT_PARAMETERS parameters = {};
+        parameters.DirtyRectsCount = 1;
+        parameters.pDirtyRects = &dirtyRect;
+        presentResult = targetSwapChain1->Present1(0, 0, &parameters);
+    } else {
+        presentResult = targetSwapChain->Present(0, 0);
+    }
     if (FAILED(presentResult)) {
+        ++m_impl->compositionOverlayPresentFailureCount;
         if (useCandidate) {
             m_impl->compositionOverlayCandidateSwapChain.Reset();
             m_impl->compositionOverlayCandidateWidth = 0;
@@ -523,6 +578,18 @@ bool D3D11FramePresenter::presentCompositorOverlay(const QImage& image)
         }
         handleDeviceFailure(presentResult);
         return false;
+    }
+    m_impl->compositionOverlayUploadedBytes += uploadedBytes;
+    if (partialPresent) {
+        ++m_impl->compositionOverlayPartialPresentCount;
+    } else {
+        ++m_impl->compositionOverlayFullPresentCount;
+        if (!useCandidate && requestedPartialUpdate
+            && m_impl->compositionOverlayFullPresentsRemaining > 0) {
+            --m_impl->compositionOverlayFullPresentsRemaining; // wjy: 标题栏请求被迫完整写入第二个BackBuffer后，两份静态内容才重新一致。
+        } else if (!useCandidate && !requestedPartialUpdate) {
+            m_impl->compositionOverlayFullPresentsRemaining = 1; // wjy: 连接遮罩、软件帧或几何完整变化只写了当前BackBuffer，另一份必须在开放局部更新前补齐。
+        }
     }
 
     const int previousTargetWidth = m_impl->compositionOverlayTargetWidth;
@@ -533,6 +600,7 @@ bool D3D11FramePresenter::presentCompositorOverlay(const QImage& image)
         const ComPtr<IDXGISwapChain> previousSwapChain = m_impl->compositionOverlaySwapChain;
         const int previousOverlayWidth = m_impl->compositionOverlayWidth;
         const int previousOverlayHeight = m_impl->compositionOverlayHeight;
+        const int previousFullPresentsRemaining = m_impl->compositionOverlayFullPresentsRemaining;
         m_impl->compositionOverlayWidth = m_impl->compositionOverlayCandidateWidth;
         m_impl->compositionOverlayHeight = m_impl->compositionOverlayCandidateHeight;
         if (FAILED(m_impl->compositionOverlay->SetContent(targetSwapChain))
@@ -541,6 +609,7 @@ bool D3D11FramePresenter::presentCompositorOverlay(const QImage& image)
             m_impl->compositionOverlayTargetHeight = previousTargetHeight;
             m_impl->compositionOverlayWidth = previousOverlayWidth;
             m_impl->compositionOverlayHeight = previousOverlayHeight;
+            m_impl->compositionOverlayFullPresentsRemaining = previousFullPresentsRemaining;
             if (m_impl->compositionOverlay && m_impl->compositionDevice) {
                 m_impl->compositionOverlay->SetContent(previousSwapChain.Get());
                 commitCompositionVisual();
@@ -554,6 +623,7 @@ bool D3D11FramePresenter::presentCompositorOverlay(const QImage& image)
         m_impl->compositionOverlayCandidateSwapChain.Reset();
         m_impl->compositionOverlayCandidateWidth = 0;
         m_impl->compositionOverlayCandidateHeight = 0;
+        m_impl->compositionOverlayFullPresentsRemaining = 1; // wjy: 候选表面首个BackBuffer已经完整Present，下一次再完整写入另一个BackBuffer后开放局部更新。
     } else if (overlayTargetSizeChanged && !commitCompositionVisual()) {
         m_impl->compositionOverlayTargetWidth = previousTargetWidth;
         m_impl->compositionOverlayTargetHeight = previousTargetHeight;
@@ -580,6 +650,7 @@ void D3D11FramePresenter::resetCompositionResources()
         m_impl->compositionOverlayCandidateHeight = 0;
         m_impl->compositionOverlayTargetWidth = 0;
         m_impl->compositionOverlayTargetHeight = 0;
+        m_impl->compositionOverlayFullPresentsRemaining = 0;
         m_impl->compositionOverlay.Reset();
         m_impl->compositionVideo.Reset();
         m_impl->compositionRoot.Reset();
@@ -1252,6 +1323,10 @@ D3D11CompositorTelemetry D3D11FramePresenter::compositorTelemetry() const
         ? static_cast<double>(m_impl->compositionCommitTimeUs)
             / static_cast<double>(m_impl->compositionCommitCount) / 1000.0
         : 0.0;
+    telemetry.overlayFullPresentCount = m_impl->compositionOverlayFullPresentCount;
+    telemetry.overlayPartialPresentCount = m_impl->compositionOverlayPartialPresentCount;
+    telemetry.overlayPresentFailureCount = m_impl->compositionOverlayPresentFailureCount;
+    telemetry.overlayUploadedBytes = m_impl->compositionOverlayUploadedBytes;
     return telemetry;
 }
 
