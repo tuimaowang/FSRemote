@@ -431,6 +431,19 @@ if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_DEVICE_SYNC_TESTS) # wjy: 设备目�
     add_test(NAME fsremote_network_interface_policy_tests COMMAND fsremote_network_interface_policy_tests)
     # ===end====
 
+    # =====wjy====
+    add_executable(fsremote_local_network_bandwidth_monitor_tests EXCLUDE_FROM_ALL
+        tests/local_network_bandwidth_monitor_tests.cpp
+        src/system/LocalNetworkBandwidthMonitor.h
+    ) # wjy: 纯计算测试验证主标题栏 Mbps、余量和风险阈值，不枚举或修改开发机真实网卡。
+    target_include_directories(fsremote_local_network_bandwidth_monitor_tests PRIVATE src)
+    target_link_libraries(fsremote_local_network_bandwidth_monitor_tests PRIVATE Qt6::Core)
+    if(MSVC)
+        target_compile_options(fsremote_local_network_bandwidth_monitor_tests PRIVATE /utf-8) # wjy: 中文所有权说明统一按 UTF-8 编译。
+    endif()
+    add_test(NAME fsremote_local_network_bandwidth_monitor_tests COMMAND fsremote_local_network_bandwidth_monitor_tests)
+    # ===end====
+
     add_executable(fsremote_script_ui_state_store_tests EXCLUDE_FROM_ALL
         tests/script_ui_state_store_tests.cpp
         src/ui/ScriptUiStateStore.cpp
@@ -590,6 +603,8 @@ qt_add_executable(FSRemote WIN32
     # =====wjy====
     src/system/LocalSystemInfoService.cpp
     src/system/LocalSystemInfoService.h
+    src/system/LocalNetworkBandwidthMonitor.cpp
+    src/system/LocalNetworkBandwidthMonitor.h # wjy: 主窗口内置只读物理网卡采样器，为标题栏提供汇总接收 Mbps 与理论余量。
     # ===end====
     src/system/DeviceStatusService.cpp
     src/system/DeviceStatusService.h

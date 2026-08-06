@@ -239,6 +239,11 @@ QRect titlebarSettingsRect()
     return QRect(shellWidth() - 180, 0, 48, kTitleBarHeight); // wjy: 设置入口贴着刷新按钮左侧，窗口变宽时跟随右边缘移动。
 }
 
+QRect titlebarBandwidthUpdateRect()
+{
+    return QRect(132, 0, qMax(0, titlebarSettingsRect().x() - 132), kTitleBarHeight); // wjy: 一秒采样只重绘版本号到设置按钮之间的标题栏，不触碰设备列表和详情内容。
+}
+
 // =====wjy====
 QRect titlebarUpdateRect()
 {
@@ -3871,6 +3876,25 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     // ===end====
 
     // =====wjy====
+    m_titlebarBandwidthTimer = new QTimer(this);
+    m_titlebarBandwidthTimer->setTimerType(Qt::CoarseTimer); // wjy: 带宽是秒级诊断指标，不使用高精度唤醒增加多窗口场景主线程压力。
+    m_titlebarBandwidthTimer->setInterval(1000);
+    connect(m_titlebarBandwidthTimer, &QTimer::timeout, this, [this] {
+        m_titlebarBandwidthSample = m_titlebarBandwidthMonitor.sample(); // wjy: UI 定时器只读取本机累计计数差，不创建 socket 或额外局域网流量。
+        update(titlebarBandwidthUpdateRect()); // wjy: 新样本只刷新版本号右侧的网络文字和可能被覆盖的本机身份区域。
+    });
+    QTimer::singleShot(0, this, [this] {
+        if (m_shuttingDown || !m_titlebarBandwidthTimer) {
+            return;
+        }
+        m_titlebarBandwidthMonitor.reset(); // wjy: 进入事件循环后再建立网卡基线，避免窗口构造阶段同步枚举 Windows 接口。
+        m_titlebarBandwidthSample = m_titlebarBandwidthMonitor.sample();
+        m_titlebarBandwidthTimer->start(); // wjy: 第二次及后续每秒采样才拥有可计算的真实 Mbps。
+        update(titlebarBandwidthUpdateRect());
+    });
+    // ===end====
+
+    // =====wjy====
     m_periodicDeviceDiscoveryTimer = new QTimer(this);
     connect(m_periodicDeviceDiscoveryTimer, &QTimer::timeout, this, [this] {
         startBatchAddDevices(false); // wjy: 周期扫描复用手动批量新增，但新增后不切换当前页面或设备选择。
@@ -4192,6 +4216,11 @@ void DeviceGrid::prepareForApplicationExit()
     }
     if (m_remoteQualityTimer) {
         m_remoteQualityTimer->stop(); // wjy: 退出期间停止质量采样，不再向已经提交stop的窗口发送任何新协议请求。
+    }
+    if (m_titlebarBandwidthTimer) {
+        m_titlebarBandwidthTimer->stop(); // wjy: 退出准备阶段停止标题栏网卡枚举，不再投递一秒重绘。
+        m_titlebarBandwidthMonitor.reset();
+        m_titlebarBandwidthSample = {}; // wjy: 清空系统计数快照，析构期间 paintEvent 不会继续显示陈旧余量。
     }
     m_remoteQualityEvaluationQueued = false;
     if (m_remoteViewerLifecycleManager) {
@@ -9758,6 +9787,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
     painter.drawPixmap(titleWordmarkRect, uupix(QStringLiteral("titlebar/title_wordmark.png"))); // wjy: 实际绘制标题名时复用统一矩形，保证左上标题与右侧按钮同高。
     // =====wjy====
     // wjy: 版本号显示在“丰实远程控制”右侧，默认 1.1.1，每次发布 patch+1。
+    QRect versionRect;
     {
         QFont versionFont(QStringLiteral("Microsoft YaHei UI"));
         versionFont.setPixelSize(11);
@@ -9766,8 +9796,61 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
         const QString versionText = QStringLiteral("v%1").arg(platform::UpdateService::displayVersion());
         const QFontMetrics versionMetrics(versionFont);
         const int versionWidth = versionMetrics.horizontalAdvance(versionText) + 4;
-        const QRect versionRect(titleWordmarkRect.right() + 8, titleWordmarkRect.y(), versionWidth, titleWordmarkRect.height());
+        versionRect = QRect(titleWordmarkRect.right() + 8, titleWordmarkRect.y(), versionWidth, titleWordmarkRect.height()); // wjy: 保存版本号最终矩形，网络状态必须从它的右边开始布局。
         painter.drawText(QRectF(versionRect), Qt::AlignVCenter | Qt::AlignLeft, versionText);
+    }
+    {
+        constexpr int kMaximumIdentityReservation = 252; // wjy: 为右侧本机名、IP 和按钮保留现有最大宽度，网络文字不能覆盖身份信息。
+        const int networkLeft = versionRect.right() + 10; // wjy: 用户要求带宽监控紧跟在版本号右侧，并保留 10px 视觉间距。
+        const int identityBoundary = (m_updateAvailable ? titlebarUpdateRect().x() : titlebarSettingsRect().x())
+            - kMaximumIdentityReservation;
+        const QRect networkRect(
+            networkLeft,
+            titleWordmarkRect.y(),
+            qMax(0, identityBoundary - networkLeft - 8),
+            titleWordmarkRect.height()); // wjy: 窗口变窄或更新按钮出现时自动压缩可用宽度，紧凑态不会与窗口按钮重叠。
+        if (networkRect.width() >= 34) {
+            QFont networkFont(QStringLiteral("Microsoft YaHei UI"));
+            networkFont.setPixelSize(11);
+            painter.setFont(networkFont);
+            QColor networkColor(QStringLiteral("#6B7280"));
+            QString networkText = QString::fromUtf8("网 --"); // wjy: 第一次只有计数基线，明确显示采样中占位而不是错误的 0 Mbps。
+            if (m_titlebarBandwidthSample.valid) {
+                const auto formatMbps = [](double value) {
+                    return QString::number(value, 'f', value < 10.0 ? 1 : 0); // wjy: 低速保留一位小数，高速取整以节省标题栏宽度。
+                };
+                const QString receiveText = formatMbps(m_titlebarBandwidthSample.receive.currentMbps);
+                const QString headroomText = formatMbps(m_titlebarBandwidthSample.receive.headroomMbps);
+                networkText = m_titlebarBandwidthSample.receive.capacityMbps > 0.0
+                    ? QString::fromUtf8("↓%1M 余%2M").arg(receiveText, headroomText)
+                    : QString::fromUtf8("↓%1M").arg(receiveText); // wjy: 驱动没有容量时只展示真实速率，不伪造剩余带宽。
+                const bool adapterDropping = m_titlebarBandwidthSample.receiveDiscardsDelta > 0
+                    || m_titlebarBandwidthSample.receiveErrorsDelta > 0;
+                if (adapterDropping
+                    || m_titlebarBandwidthSample.receive.risk == platform::LocalNetworkBandwidthRisk::High
+                    || m_titlebarBandwidthSample.receive.risk == platform::LocalNetworkBandwidthRisk::Saturated) {
+                    networkColor = QColor(QStringLiteral("#DC2626")); // wjy: 高利用率或入站丢弃/错误使用红色，提示带宽或接收队列风险。
+                } else if (m_titlebarBandwidthSample.receive.risk == platform::LocalNetworkBandwidthRisk::Attention) {
+                    networkColor = QColor(QStringLiteral("#D97706")); // wjy: 70%-85% 使用琥珀色，提醒继续观察但不宣称已经拥塞。
+                } else {
+                    networkColor = QColor(QStringLiteral("#2563EB")); // wjy: 正常采样使用克制蓝色，与更新入口颜色体系保持一致。
+                }
+            }
+            const QFontMetrics networkMetrics(networkFont);
+            if (networkMetrics.horizontalAdvance(networkText) > networkRect.width()
+                && m_titlebarBandwidthSample.valid) {
+                networkText = QString::fromUtf8("↓%1M").arg(
+                    QString::number(
+                        m_titlebarBandwidthSample.receive.currentMbps,
+                        'f',
+                        m_titlebarBandwidthSample.receive.currentMbps < 10.0 ? 1 : 0)); // wjy: 宽度不足时优先保留当前接收速率，余量只在空间充足时显示。
+            }
+            painter.setPen(networkColor);
+            painter.drawText(
+                QRectF(networkRect),
+                Qt::AlignVCenter | Qt::AlignLeft,
+                networkMetrics.elidedText(networkText, Qt::ElideRight, networkRect.width())); // wjy: 极窄边界最终省略，绝不覆盖本机名称、更新或窗口控制按钮。
+        }
     }
     // ===end====
     if (!m_detailPanelCollapsed && m_settingsSelected) {

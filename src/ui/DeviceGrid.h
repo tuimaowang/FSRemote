@@ -1,6 +1,7 @@
 #pragma once
 
 #include "system/DeviceInfoService.h"
+#include "system/LocalNetworkBandwidthMonitor.h" // wjy: 主窗口直接持有只读网卡采样器，标题栏不启动独立监控进程。
 #include "system/LocalSystemInfoService.h"
 #include "system/DeviceRealtimeStateService.h"
 #include "system/DeviceStatusService.h"
@@ -303,6 +304,11 @@ private:
     std::unique_ptr<RemoteViewerLifecycleManager> m_remoteViewerLifecycleManager; // wjy: 生命周期晚于窗口批量stop，析构时再次兜底join固定工作线程。
     RemoteQualityCoordinator m_remoteQualityCoordinator; // wjy: 一个控制端按真实焦点统一授予唯一高质量角色，其余窗口沿用后台FPS策略。
     QTimer* m_remoteQualityTimer = nullptr; // wjy: 1秒采样接收FPS/码率，最小化和用户切换模式另走即时重算信号。
+    // =====wjy====
+    platform::LocalNetworkBandwidthMonitor m_titlebarBandwidthMonitor; // wjy: 主窗口内部只读采样物理网卡，不依赖或启动外部监控程序。
+    platform::LocalNetworkBandwidthSample m_titlebarBandwidthSample; // wjy: UI 线程保存最新完整样本，paintEvent 只格式化文字而不查询系统 API。
+    QTimer* m_titlebarBandwidthTimer = nullptr; // wjy: 每秒更新一次版本号右侧的接收 Mbps 与理论余量。
+    // ===end====
     bool m_remoteQualityEvaluationQueued = false; // wjy: 多窗口同时最小化或创建时合并为一个Qt任务，避免事件队列放大。
     qint64 m_lastRemoteResourceDiagnosticAtMs = 0; // wjy: 资源快照限制为30秒一次，避免稳定性诊断本身成为性能热点。
     QHash<RemoteDesktopWindow*, QString> m_realtimeControllerTargetSessionIds; // wjy: 每个普通/平铺窗口映射一个唯一目标租约，关闭时精确删除。

@@ -10012,3 +10012,176 @@ void testCounterResetAndZeroInterval();
 - `BandwidthCapacityMonitor.exe --duration 2 --csv build/monitor-smoke.csv`：完成两次真实网卡采样，输出接收/发送 Mbps、理论余量、FSRemote 进程资源和丢弃/错误计数，CSV 文件成功落盘。
 - `BandwidthCapacityMonitor.exe --help`：返回退出码 0；非法参数返回退出码 1。
 - `git diff --check`：已检查本次独立目录改动，未发现空白错误。
+
+## 2026-08-06 16:23 - 将带宽余量显示到主窗口版本号右侧
+
+### Changed Location
+- `CMakeLists.txt:435-444,604-608`：登记主程序内置网卡采样器和纯计算测试目标。
+- `src/system/LocalNetworkBandwidthMonitor.h:12-94`：新增网卡方向指标、风险阈值、累计计数差和只读采样器接口。
+- `src/system/LocalNetworkBandwidthMonitor.cpp:20-229`：新增 Windows 活动物理网卡枚举、相邻计数采样、主流量网卡选择和断线基线重置。
+- `src/ui/DeviceGrid.h:4,308-310`：主窗口持有标题栏带宽采样器、最新样本和一秒定时器。
+- `src/ui/DeviceGrid.cpp:242-245,3879-3895,4220-4224,9790-9853`：新增标题栏局部刷新、采样生命周期和版本号右侧带宽文字绘制。
+- `tests/local_network_bandwidth_monitor_tests.cpp:1-61`：新增 Mbps、理论余量、风险阈值和计数器复位测试。
+
+### Reason
+用户希望在丰实远程控制主窗口中直接观察多台远控带来的汇总网络压力，并要求监控文字位于版本号右侧。实现不启动之前的独立监控 EXE，而是在 FSRemote UI 线程中每秒读取一次 Windows 物理网卡累计计数；标题栏显示接收 Mbps 和基于协商链路速率计算的理论余量，并通过蓝、琥珀、红三类颜色提示利用率或入站丢弃风险。多张物理网卡时优先选择接收流量最大的接口，空闲时回到默认路由接口，避免 VMware、隧道或广播流量造成误选。
+
+### Original Code
+```cmake
+// CMakeLists.txt:420-431（修改前）
+add_executable(fsremote_network_interface_policy_tests EXCLUDE_FROM_ALL
+    tests/network_interface_policy_tests.cpp
+    src/system/NetworkInterfacePolicy.h
+)
+add_test(NAME fsremote_network_interface_policy_tests COMMAND fsremote_network_interface_policy_tests)
+
+// 此处原来没有标题栏带宽计算测试目标。
+```
+
+```cmake
+// CMakeLists.txt:589-593（修改前）
+src/system/LocalSystemInfoService.cpp
+src/system/LocalSystemInfoService.h
+
+// 此处原来没有 LocalNetworkBandwidthMonitor 生产源码。
+```
+
+```text
+// src/system/LocalNetworkBandwidthMonitor.h:1-97
+新增文件，原位置无旧代码。
+
+// src/system/LocalNetworkBandwidthMonitor.cpp:1-232
+新增文件，原位置无旧代码。
+
+// tests/local_network_bandwidth_monitor_tests.cpp:1-61
+新增文件，原位置无旧代码。
+```
+
+```cpp
+// src/ui/DeviceGrid.h:1-6、304-307（修改前）
+#include "system/DeviceInfoService.h"
+#include "system/LocalSystemInfoService.h"
+
+RemoteQualityCoordinator m_remoteQualityCoordinator;
+QTimer* m_remoteQualityTimer = nullptr;
+bool m_remoteQualityEvaluationQueued = false;
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:3870-3873（修改前）
+m_remoteQualityTimer->setInterval(1000);
+connect(m_remoteQualityTimer, &QTimer::timeout, this, &DeviceGrid::evaluateRemoteQuality);
+m_remoteQualityTimer->start();
+
+// 此处原来没有标题栏网络采样定时器。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:9760-9772（修改前）
+{
+    QFont versionFont(QStringLiteral("Microsoft YaHei UI"));
+    versionFont.setPixelSize(11);
+    painter.setFont(versionFont);
+    painter.setPen(QColor(QStringLiteral("#6B7280")));
+    const QString versionText = QStringLiteral("v%1").arg(platform::UpdateService::displayVersion());
+    const QFontMetrics versionMetrics(versionFont);
+    const int versionWidth = versionMetrics.horizontalAdvance(versionText) + 4;
+    const QRect versionRect(titleWordmarkRect.right() + 8, titleWordmarkRect.y(), versionWidth, titleWordmarkRect.height());
+    painter.drawText(QRectF(versionRect), Qt::AlignVCenter | Qt::AlignLeft, versionText);
+}
+```
+
+### Modified Code
+```cmake
+// CMakeLists.txt:435-444、604-608（修改后）
+add_executable(fsremote_local_network_bandwidth_monitor_tests EXCLUDE_FROM_ALL
+    tests/local_network_bandwidth_monitor_tests.cpp
+    src/system/LocalNetworkBandwidthMonitor.h
+)
+add_test(NAME fsremote_local_network_bandwidth_monitor_tests COMMAND fsremote_local_network_bandwidth_monitor_tests)
+
+src/system/LocalSystemInfoService.cpp
+src/system/LocalSystemInfoService.h
+src/system/LocalNetworkBandwidthMonitor.cpp
+src/system/LocalNetworkBandwidthMonitor.h
+```
+
+```cpp
+// src/system/LocalNetworkBandwidthMonitor.h:48-94（新增）
+inline LocalNetworkDirectionMetrics calculateLocalNetworkDirectionMetrics(
+    quint64 byteDelta,
+    double elapsedSeconds,
+    quint64 linkBitsPerSecond);
+
+class LocalNetworkBandwidthMonitor final {
+public:
+    LocalNetworkBandwidthSample sample();
+    void reset();
+};
+```
+
+```cpp
+// src/system/LocalNetworkBandwidthMonitor.cpp:136-229（新增，核心流程）
+LocalNetworkBandwidthSample LocalNetworkBandwidthMonitor::sample()
+{
+    const std::vector<LocalAdapterCounter> currentAdapters = queryPhysicalAdapterCounters();
+    // 首次建立基线；后续按相邻累计字节差计算收发 Mbps。
+    // 多网卡优先选择接收流量最大接口，低流量时使用默认路由并保持接口稳定。
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.h:4,308-310（修改后）
+#include "system/LocalNetworkBandwidthMonitor.h"
+
+platform::LocalNetworkBandwidthMonitor m_titlebarBandwidthMonitor;
+platform::LocalNetworkBandwidthSample m_titlebarBandwidthSample;
+QTimer* m_titlebarBandwidthTimer = nullptr;
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:3879-3895（修改后）
+m_titlebarBandwidthTimer = new QTimer(this);
+m_titlebarBandwidthTimer->setTimerType(Qt::CoarseTimer);
+m_titlebarBandwidthTimer->setInterval(1000);
+connect(m_titlebarBandwidthTimer, &QTimer::timeout, this, [this] {
+    m_titlebarBandwidthSample = m_titlebarBandwidthMonitor.sample();
+    update(titlebarBandwidthUpdateRect());
+});
+QTimer::singleShot(0, this, [this] {
+    m_titlebarBandwidthMonitor.reset();
+    m_titlebarBandwidthSample = m_titlebarBandwidthMonitor.sample();
+    m_titlebarBandwidthTimer->start();
+});
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:9790-9853（修改后，核心布局）
+QRect versionRect;
+// 先绘制版本号并保存 versionRect。
+const int networkLeft = versionRect.right() + 10;
+// 空间充足时显示“↓200M 余800M”，不足时优先保留“↓200M”。
+// 正常为蓝色，70%-85% 为琥珀色，85% 以上或出现入站丢弃/错误为红色。
+```
+
+```cpp
+// tests/local_network_bandwidth_monitor_tests.cpp:20-59（新增）
+bool directionMetricsUseDecimalMbpsAndClampHeadroom();
+bool riskThresholdsAndCounterResetAreStable();
+```
+
+### Steps
+1. 新增 `LocalNetworkBandwidthMonitor`，通过 `GetIfTable2` 每秒只读活动物理网卡的协商速率、累计字节、丢弃和错误计数。
+2. 排除断开、回环、隧道和可识别的虚拟接口；多张物理网卡按接收流量选择当前代表接口，并保留 75% 稳定门槛避免每秒跳动。
+3. 在 `DeviceGrid` 事件循环开始后建立首个基线，后续一秒定时采样并只重绘标题栏局部区域。
+4. 保存版本号矩形，把网络文字从其右侧 10px 开始布局；为本机名、IP、更新按钮和窗口按钮预留现有空间。
+5. 完整宽度显示接收 Mbps 与理论余量，空间不足时只显示接收 Mbps，紧凑标题栏自动隐藏以避免重叠。
+6. 增加纯计算测试，锁定十进制 Mbps、零余量钳制、70/85/95 风险阈值和计数器复位行为。
+
+### Verification
+- `cmake -S . -B temp/bandwidth-titlebar-build3 -G Ninja ...`：使用 MSVC 19.44 和 Qt 6.11.1 配置成功。
+- `cmake --build temp/bandwidth-titlebar-build3 --target fsremote_local_network_bandwidth_monitor_tests`：目标测试编译成功。
+- `ctest --test-dir temp/bandwidth-titlebar-build3 -R ^fsremote_local_network_bandwidth_monitor_tests$ --output-on-failure`：1/1 测试通过。
+- `cmake --build temp/bandwidth-titlebar-build3 --target FSRemote`：主程序全部 84 个步骤编译和链接成功，新增 `LocalNetworkBandwidthMonitor.cpp` 与 `DeviceGrid.cpp` 均进入真实目标。
+- 未启动新构建产物进行界面目视测试：避免关闭或干扰用户当前正在运行的 FSRemote 实例；用户随后明确要求不再编译，因此后续只执行源码、日志和 Git 复核。
+- `git diff --check`：通过，未发现空白错误。
