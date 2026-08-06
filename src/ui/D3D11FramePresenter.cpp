@@ -338,6 +338,9 @@ void D3D11FramePresenter::setPresentationVisible(bool visible)
         return;
     }
     if (!m_impl->compositorMode) {
+        if (visible == !isHidden()) {
+            return; // wjy: 使用显式隐藏状态去重；父窗口暂时隐藏时仍能正确保存子窗口下次显示意图。
+        }
         if (visible) {
             show();
         } else {
@@ -345,11 +348,14 @@ void D3D11FramePresenter::setPresentationVisible(bool visible)
         }
         return;
     }
+    if (m_impl->compositorVisible == visible) {
+        return; // wjy: 正常视频帧会反复请求visible=true；状态未变化时禁止重复DComp Commit。
+    }
     m_impl->compositorVisible = visible;
     if (!visible && isVisible()) {
         hide(); // wjy: DComp模式只隐藏备用控件本身，真正视频由视觉树的透明度控制。
     }
-    commitCompositionVisual();
+    commitCompositionVisual(); // wjy: 仅可见状态真正变化时提交视觉树，视频SwapChain帧不再触发这里。
 }
 
 bool D3D11FramePresenter::setCompositorOutputRect(const QRect& rect)
@@ -1169,9 +1175,7 @@ bool D3D11FramePresenter::blitAndPresent(ID3D11Texture2D* sourceTexture, int fra
     if (FAILED(presentResult)) {
         return handleDeviceFailure(presentResult); // wjy: Present失败不抛异常；当前窗口转软件回退并由定时器稍后重试共享设备。
     }
-    if (m_impl->compositorMode && m_impl->compositionDevice) {
-        m_impl->compositionDevice->Commit(); // wjy: 视频SwapChain Present后立即提交当前视觉树，避免DComp继续显示旧的视觉属性。
-    }
+    // wjy: 视频SwapChain的Present会自行通知DirectComposition消费新缓冲；视觉属性未变化时禁止额外Commit。
     if (m_impl->interactiveResize) {
         ++m_impl->interactivePresentCount; // wjy: 只统计缩放期间真正完成的网络帧Present，区分“无新帧”和“新帧提交后仍闪烁”。
     }

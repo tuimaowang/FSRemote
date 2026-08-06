@@ -10315,3 +10315,84 @@ const bool videoTimelineDue = texturePresented
 - `git diff --check -- src/ui/D3D11FramePresenter.h src/ui/D3D11FramePresenter.cpp src/ui/RemoteDesktopWindow.h src/ui/RemoteDesktopWindow.cpp`：通过，未发现空白错误。
 - 使用`rg`复核新环境开关、data日志文件名、Overlay提交序号和限频成员均已接入实际调用路径。
 - 按用户此前要求未执行编译、链接和运行测试；需要发布新控制端后进行多窗口复现验证。
+
+## 2026-08-06 16:54 - 去除视频帧重复DirectComposition提交
+
+### Changed Location
+- `src/ui/D3D11FramePresenter.cpp:335-358`：可见状态未变化时跳过重复show/hide和DComp视觉树提交。
+- `src/ui/D3D11FramePresenter.cpp:1173-1182`：视频SwapChain成功Present后不再额外调用`IDCompositionDevice::Commit()`。
+
+### Reason
+新时间线显示9个窗口的网络、视频Present、Overlay Present和DComp Commit均无失败，稳定期完整Overlay提交也已经停止；但每个窗口的`comp_commit`仍以约30次/秒增长，几乎等于视频帧率。代码复核确认每帧都会再次请求`setPresentationVisible(true)`并提交视觉树，随后`blitAndPresent()`又直接执行一次未计数的DComp Commit。视频SwapChain的内容翻转不需要重复提交未变化的视觉属性，多窗口下这些提交会放大DWM合成压力并可能造成周期黑闪。
+
+### Original Code
+```cpp
+// src/ui/D3D11FramePresenter.cpp:338-356（修改前）
+if (!m_impl->compositorMode) {
+    if (visible) {
+        show();
+    } else {
+        hide();
+    }
+    return;
+}
+m_impl->compositorVisible = visible;
+if (!visible && isVisible()) {
+    hide();
+}
+commitCompositionVisual();
+```
+
+```cpp
+// src/ui/D3D11FramePresenter.cpp:1169-1180（修改前）
+const HRESULT presentResult = m_impl->swapChain->Present(0, 0);
+if (FAILED(presentResult)) {
+    return handleDeviceFailure(presentResult);
+}
+if (m_impl->compositorMode && m_impl->compositionDevice) {
+    m_impl->compositionDevice->Commit();
+}
+```
+
+### Modified Code
+```cpp
+// src/ui/D3D11FramePresenter.cpp:338-358（修改后）
+if (!m_impl->compositorMode) {
+    if (visible == !isHidden()) {
+        return;
+    }
+    if (visible) {
+        show();
+    } else {
+        hide();
+    }
+    return;
+}
+if (m_impl->compositorVisible == visible) {
+    return;
+}
+m_impl->compositorVisible = visible;
+commitCompositionVisual();
+```
+
+```cpp
+// src/ui/D3D11FramePresenter.cpp:1173-1182（修改后）
+const HRESULT presentResult = m_impl->swapChain->Present(0, 0);
+if (FAILED(presentResult)) {
+    return handleDeviceFailure(presentResult);
+}
+// 视频SwapChain的Present会自行通知DirectComposition消费新缓冲；
+// 视觉属性未变化时禁止额外Commit。
+```
+
+### Steps
+1. 解析`remote_compositor_timeline.log`，确认9个窗口共计没有任何非零HRESULT、Overlay失败或Commit失败。
+2. 对比视频帧和`comp_commit`增长速度，定位到每窗口约30次/秒的重复视觉树提交。
+3. 给旧子窗口和DComp路径增加可见状态去重，只有true/false真正切换时才改变显示状态。
+4. 删除视频Present后的逐帧DComp Commit，保留几何、视觉内容和可见状态变化时的受控`commitCompositionVisual()`。
+
+### Verification
+- 现场时间线共覆盖9个设备；稳定期`overlay_full`固定在14至16次，后续只执行标题栏局部提交。
+- 现场所有`video.present`和`overlay.present`均为`ok=1`，`present_hr=0x0`、`commit_hr=0x0`，单次受控Commit约63至428微秒。
+- `git diff --check -- src/ui/D3D11FramePresenter.cpp`：通过，未发现空白错误。
+- 按用户此前要求未执行编译、链接和运行测试；需要更新控制端后复核`comp_commit`应不再跟随视频帧持续增长。
