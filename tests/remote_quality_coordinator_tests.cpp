@@ -288,10 +288,16 @@ int main()
         configuration, {debounceFirst, debounceSecond}, 1100);
     assert(!debounceDecisions[0].requestRemoteProfile);
     assert(!debounceDecisions[1].requestRemoteProfile);
+    assert(!ui::shouldDispatchRemoteQualityDecision(debounceDecisions[0], true, false));
+    assert(!ui::shouldDispatchRemoteQualityDecision(debounceDecisions[1], true, false)); // wjy: 焦点抖动期即使Viewer在线也不得绕过门禁下发Host改参。
     debounceDecisions = debounceCoordinator.evaluate(
         configuration, {debounceFirst, debounceSecond}, 1500);
     assert(debounceDecisions[0].requestRemoteProfile);
     assert(debounceDecisions[1].requestRemoteProfile); // wjy: 焦点稳定超过350毫秒后才允许远端编码器切换档位。
+    assert(ui::shouldDispatchRemoteQualityDecision(debounceDecisions[0], true, false));
+    assert(ui::shouldDispatchRemoteQualityDecision(debounceDecisions[1], true, false));
+    assert(!ui::shouldDispatchRemoteQualityDecision(debounceDecisions[1], false, false));
+    assert(!ui::shouldDispatchRemoteQualityDecision(debounceDecisions[1], true, true)); // wjy: 未创建Viewer或窗口关闭时仍保持原有安全门禁。
 
     // ===end====
 

@@ -8,6 +8,15 @@
 #include <cstddef>
 
 namespace ui {
+
+bool shouldDispatchRemoteQualityDecision(
+    const RemoteQualityDecision& decision,
+    bool viewerAvailable,
+    bool closing)
+{
+    return decision.requestRemoteProfile && viewerAvailable && !closing; // wjy: 焦点未稳定时仅更新本地角色，禁止Host连续切分辨率、FPS和关键帧。
+}
+
 namespace {
 
 // =====wjy====

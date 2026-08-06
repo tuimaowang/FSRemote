@@ -112,6 +112,11 @@ struct RemoteQualityDecision {
     bool audioEnabled = false; // wjy: 音频由远控窗口自身按钮独立控制，不再由画质协调器抢占。
 };
 
+bool shouldDispatchRemoteQualityDecision(
+    const RemoteQualityDecision& decision,
+    bool viewerAvailable,
+    bool closing); // wjy: 统一消费焦点防抖门禁；新Viewer补发和在线评估都不能绕过requestRemoteProfile。
+
 class RemoteQualityCoordinator final {
 public:
     std::vector<RemoteQualityDecision> evaluate(

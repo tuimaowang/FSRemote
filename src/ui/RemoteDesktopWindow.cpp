@@ -348,6 +348,7 @@ bool sameQualityDecision(const RemoteQualityDecision& left, const RemoteQualityD
         && left.fullScreen == right.fullScreen
         && left.minimized == right.minimized
         && left.softwareFallback == right.softwareFallback
+        && left.requestRemoteProfile == right.requestRemoteProfile
         && left.audioEnabled == right.audioEnabled; // wjy: 独立音频按钮状态作为真实决策变化处理，不能被相同画质参数去重。
 }
 // ===end====
@@ -2102,7 +2103,6 @@ void RemoteDesktopWindow::setGlobalQualityConfiguration(const stream::RemoteQual
         return;
     }
     m_globalQualityConfiguration = normalized; // wjy: 每个窗口立即接收同一默认模式；局部覆盖继续直接使用自身固定预设。
-    requestTitleBarUpdate(); // wjy: 全局策略反馈只存在于标题栏，不再让全屏或移动状态触发整窗重画。
     emit remoteQualityInputsChanged(); // wjy: 主设置保存后立即重算全部窗口，无需关闭重连或等待周期轮询。
 }
 
@@ -2179,29 +2179,33 @@ void RemoteDesktopWindow::applyRemoteQualityDecision(const RemoteQualityDecision
         || !sameQualityDecision(m_remoteQualityDecision, decision);
     m_remoteQualityDecision = decision; // wjy: 无论Viewer是否已创建都保存最新值，连接成功后只补发这一份。
     m_hasRemoteQualityDecision = true;
-    sendCurrentRemoteQualityDecision();
+    if (decision.requestRemoteProfile) {
+        sendCurrentRemoteQualityDecision(); // wjy: 350毫秒焦点防抖真正控制Host改参；本地临时角色不触发分辨率和FPS反转。
+    }
     sendCurrentViewerAudioDecision(); // wjy: 质量请求变化时顺带补发本窗口独立音频状态，二者不共享所有权判定。
     if (feedbackChanged) {
         const bool backgroundRole = decision.effectiveMode != stream::RemoteQualityMode::HighQualityLocked; // wjy: 日志按实际质量角色判断后台，单窗口无焦点保持高清时不再误报background=1。
-        appendViewerDebugLog(QStringLiteral("quality role host=%1 active=%2 fullscreen=%3 background=%4 audio=%5 resolution=%6 target=%7x%8 fps=%9 priority=%10 reason=%11")
+        appendViewerDebugLog(QStringLiteral("quality role host=%1 active=%2 fullscreen=%3 background=%4 audio=%5 remote_request=%6 resolution=%7 target=%8x%9 fps=%10 priority=%11 reason=%12")
             .arg(m_hostIp)
             .arg(decision.active ? 1 : 0)
             .arg(decision.fullScreen ? 1 : 0)
             .arg(backgroundRole ? 1 : 0)
             .arg(decision.audioEnabled ? 1 : 0)
+            .arg(decision.requestRemoteProfile ? 1 : 0)
             .arg(static_cast<int>(decision.resolution))
             .arg(decision.targetWidth)
             .arg(decision.targetHeight)
             .arg(decision.targetFps)
             .arg(decision.priority)
-            .arg(static_cast<int>(decision.reason))); // wjy: 只在角色/档位状态变化时写data日志，额外记录目标尺寸和原因便于确认单窗口/焦点后台策略。
-        requestTitleBarUpdate();
+            .arg(static_cast<int>(decision.reason))); // wjy: 明确记录防抖门禁，现场可区分本地角色变化与真正交给Host的质量请求。
     }
 }
 
 void RemoteDesktopWindow::sendCurrentRemoteQualityDecision()
 {
-    if (!m_hasRemoteQualityDecision || !m_viewerHandle || m_closeInProgress) {
+    if (!m_hasRemoteQualityDecision
+        || !shouldDispatchRemoteQualityDecision(
+            m_remoteQualityDecision, m_viewerHandle != nullptr, m_closeInProgress)) {
         return;
     }
 
@@ -2229,7 +2233,6 @@ void RemoteDesktopWindow::sendCurrentRemoteQualityDecision()
     if (!stream::StreamRuntime::instance().setViewerQuality(m_viewerHandle, config)) {
         m_qualityRequestPending = false;
         m_qualityProtocolUnavailable = true; // wjy: 旧运行库没有可选导出时只显示不支持，绝不停止当前视频和输入会话。
-        requestTitleBarUpdate();
         return;
     }
 
@@ -2280,7 +2283,6 @@ void RemoteDesktopWindow::refreshAppliedRemoteQualityStatus()
     m_qualityRequestPending = false;
     m_qualityProtocolUnavailable = status.supported == 0
         || status.limitation == FSREMOTE_VIEWER_QUALITY_LIMIT_UNSUPPORTED; // wjy: Host不支持仅作为非致命反馈，远控流保持原样继续运行。
-    requestTitleBarUpdate();
 }
 
 QString RemoteDesktopWindow::remoteResourceDiagnosticSummary()
