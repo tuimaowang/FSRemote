@@ -11229,3 +11229,63 @@ if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE && display_index_ >= 0
 - `ctest --test-dir build-video-webrtc-msvc -C Release -R "uu_(host_display_selection_policy|host_media_pipeline|dxgi_capture_policy)_tests" --output-on-failure`：3/3 测试通过，0 失败。
 - `git diff --check`：通过。
 - 变更范围复核：未修改 Viewer、WebRTC 信令、输入协议或 Qt 远控窗口代码。
+# 2026-08-07 - 修复真实显示源无首帧时无法回退的问题
+
+## 修改位置
+
+- `third_party/uu_stream_webrtc/src/host_media_pipeline.cpp:238-277`：为 DXGI 捕获源增加首帧等待通知和有界探测。
+- `third_party/uu_stream_webrtc/src/host_media_pipeline.cpp:394-402`：首个新帧到达时唤醒等待方。
+- `third_party/uu_stream_webrtc/src/host_media_pipeline.cpp:809-828`：DXGI 初始化成功但 2.5 秒内无首帧时停止该源并继续 DesktopCapturer/VDD 回退。
+
+## 原因
+
+A12 等无实体显示器设备在 Windows 枚举出活动显示设备后，DXGI 初始化可能表面成功，但随后持续 `DXGI_ERROR_ACCESS_LOST`、发布帧率为 0。旧逻辑会一直保留 `physical-dxgi`，控制端只能等待首帧，必须先由 UU 创建可用虚拟显示器才能恢复。本次增加启动期首帧健康检查，让失效的 DXGI 路径及时让出给后续捕获回退。
+
+## 原始代码
+
+```cpp
+// third_party/uu_stream_webrtc/src/host_media_pipeline.cpp:804-818
+if (!native->start(&nativeError)) {
+    ...
+    return false;
+}
+dxgi_source = native;
+source = native;
+activate_target_locked(mode, deviceName, monitorId);
+return true;
+```
+
+## 修改后代码
+
+```cpp
+// third_party/uu_stream_webrtc/src/host_media_pipeline.cpp:809-828
+constexpr auto kFirstFrameProbeTimeout = std::chrono::milliseconds(2500);
+if (!native->wait_for_first_frame(kFirstFrameProbeTimeout)) {
+    native->stop();
+    if (failure) {
+        *failure = nativeError.empty()
+            ? "DXGI source produced no first frame within probe window"
+            : nativeError + "; no first frame within probe window";
+    }
+    append_stream_capture_diagnostic_log(
+        "display-select",
+        std::string(targetLabel) + " DXGI no first frame; falling back after probe_ms="
+            + std::to_string(kFirstFrameProbeTimeout.count()));
+    return false;
+}
+dxgi_source = native;
+source = native;
+activate_target_locked(mode, deviceName, monitorId);
+return true;
+```
+
+## 修改步骤
+
+1. 在 DXGI 源中增加条件变量，等待首个新帧而不是只等待线程启动成功。
+2. 首帧到达后通知共享媒体管线；停止源时同步唤醒等待线程，避免退出阻塞。
+3. 真实屏和虚拟屏的 DXGI 启动统一使用 2.5 秒首帧探测，超时后返回失败，让既有 DesktopCapturer/VDD 顺序继续执行。
+
+## 验证
+
+- 已执行目标构建命令，但当前环境缺少 MSVC 标准头 `stddef.h`，`fsremote_stream` 构建未完成；未修改其它用户文件。
+- 目标 A12 日志已确认原问题表现为 `physical-dxgi` 初始化后持续 `DXGI_ERROR_ACCESS_LOST` 与 `publish_fps=0`。

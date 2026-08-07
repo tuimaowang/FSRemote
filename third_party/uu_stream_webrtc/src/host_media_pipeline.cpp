@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cctype>
 #include <exception>
 #include <iostream>
@@ -237,6 +238,10 @@ public:
             return false; // wjy: VDD输出不能原生复制时由SharedState立即创建CPU DesktopCapturer，连接和输入协议不受影响。
         }
         running_ = true;
+        {
+            std::lock_guard<std::mutex> lock(first_frame_mutex_);
+            first_frame_seen_ = false;
+        }
         report_started_ = std::chrono::steady_clock::now();
         thread_ = std::thread([this] {
             try {
@@ -259,12 +264,21 @@ public:
         return true;
     }
 
+    bool wait_for_first_frame(std::chrono::milliseconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(first_frame_mutex_);
+        return first_frame_cv_.wait_for(lock, timeout, [this] {
+            return first_frame_seen_ || !running_.load(std::memory_order_acquire);
+        }) && first_frame_seen_;
+    }
+
     void stop()
     {
         append_stream_capture_diagnostic_log(
             "capture",
             "native-source stop begin"); // wjy: 会话释放和应用退出都记录采集线程停止边界。
         running_ = false;
+        first_frame_cv_.notify_all();
         if (thread_.joinable()) thread_.join();
         last_frame_ = {}; // wjy: 先释放最后帧租约再销毁采集器，使环形槽位按正常生命周期归还。
         capture_.reset();
@@ -380,6 +394,11 @@ private:
             if (fresh) {
                 last_frame_ = std::move(captured); // wjy: 新桌面图像替换源端最后帧，旧租约由下游引用决定何时归还。
                 ++new_frames_;
+                {
+                    std::lock_guard<std::mutex> lock(first_frame_mutex_);
+                    first_frame_seen_ = true;
+                }
+                first_frame_cv_.notify_all();
                 if (capture_recovering_) {
                     capture_recovering_ = false;
                     append_stream_capture_diagnostic_log(
@@ -470,6 +489,9 @@ private:
     bool capture_recovering_ = false;
     bool first_fresh_frame_logged_ = false; // wjy: 首张DXGI新帧只记录一次，避免正常60 FPS路径产生磁盘压力。
     bool first_published_frame_logged_ = false; // wjy: 首张送入WebRTC的源帧单独标记，用于与NVENC首帧配对。
+    std::mutex first_frame_mutex_;
+    std::condition_variable first_frame_cv_;
+    bool first_frame_seen_ = false;
 };
 // ===end====
 
@@ -785,6 +807,20 @@ struct HostMediaPipeline::SharedState {
                 "pipeline",
                 std::string(targetLabel) + " DXGI failed device='" + deviceName
                     + "' error=" + nativeError); // wjy: 真实屏失败将继续CPU捕获，VDD失败将继续VDD CPU回退，原因保持独立。
+            return false;
+        }
+        constexpr auto kFirstFrameProbeTimeout = std::chrono::milliseconds(2500);
+        if (!native->wait_for_first_frame(kFirstFrameProbeTimeout)) {
+            native->stop();
+            if (failure) {
+                *failure = nativeError.empty()
+                    ? "DXGI source produced no first frame within probe window"
+                    : nativeError + "; no first frame within probe window";
+            }
+            append_stream_capture_diagnostic_log(
+                "display-select",
+                std::string(targetLabel) + " DXGI no first frame; falling back after probe_ms="
+                    + std::to_string(kFirstFrameProbeTimeout.count()));
             return false;
         }
         dxgi_source = native;
