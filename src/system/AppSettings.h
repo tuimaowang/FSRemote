@@ -19,6 +19,8 @@ public:
     static void setPeriodicDeviceDiscoveryEnabled(bool enabled);
     static int periodicDeviceDiscoveryIntervalSeconds();
     static void setPeriodicDeviceDiscoveryIntervalSeconds(int seconds);
+    static bool hideLocalDeviceEnabled(); // wjy: 隐藏本机属于当前电脑自己的设备列表偏好，默认关闭并跨启动恢复。
+    static void setHideLocalDeviceEnabled(bool enabled);
     // ===end====
     // =====wjy====
     static bool desktopWallpaperRotationEnabled(bool defaultEnabled = false); // wjy: 已保存开关始终优先；没有历史配置时允许调用方按当前设备名提供默认值。

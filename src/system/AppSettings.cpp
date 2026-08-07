@@ -167,6 +167,17 @@ void AppSettings::setPeriodicDeviceDiscoveryIntervalSeconds(int seconds)
     QSettings appSettings = settings();
     appSettings.setValue(QStringLiteral("periodicDeviceDiscoveryIntervalSeconds"), seconds > 0 ? seconds : 60);
 }
+
+bool AppSettings::hideLocalDeviceEnabled()
+{
+    return settings().value(QStringLiteral("hideLocalDeviceEnabled"), false).toBool(); // wjy: 新安装继续显示本机，只有用户主动开启后才过滤本机设备。
+}
+
+void AppSettings::setHideLocalDeviceEnabled(bool enabled)
+{
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("hideLocalDeviceEnabled"), enabled); // wjy: 开关只写当前用户 QSettings，不修改共享设备快照。
+}
 // ===end====
 
 // =====wjy====

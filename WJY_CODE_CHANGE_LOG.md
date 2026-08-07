@@ -10637,3 +10637,277 @@ recovery_frame_gate_.complete();
 - `rg`复核确认源码中不再残留`awaiting_recovery_frame_`，门控覆盖初始化、轻量重建、完整恢复和重置路径。
 - `git diff --check`：通过。
 - 按用户要求未编译、未链接、未运行二进制测试；新增策略测试仅完成静态检查，需更新被控端后观察上述预热帧丢弃日志及黑帧样本是否消失。
+
+## 2026-08-07 09:20 - 设备界面新增隐藏本机开关
+
+### Changed Location
+- `src/system/AppSettings.h:22-23`：声明隐藏本机设置的读取与保存接口。
+- `src/system/AppSettings.cpp:171-180`：使用当前用户 `QSettings` 持久化开关，默认关闭。
+- `src/ui/DeviceGrid.h:246,420`：增加开关应用函数和窗口状态字段。
+- `src/ui/DeviceGrid.cpp:1376-1443`：增加本机设备名、IPv4、MAC 的统一身份识别与过滤策略。
+- `src/ui/DeviceGrid.cpp:1564-1701`：设备列表、分组排序和初始详情选择跳过隐藏本机。
+- `src/ui/DeviceGrid.cpp:3083-3120,3448-3558`：常规设置页增加“隐藏本机设备”卡片、图标、开关，并顺延后续卡片布局。
+- `src/ui/DeviceGrid.cpp:3746-4084,4177-4225`：启动恢复开关，完整本机信息到位后重新核对身份，并在共享快照与实时状态白名单中保持过滤。
+- `src/ui/DeviceGrid.cpp:6599-7006`：关闭开关时立即恢复目录中的本机；目录缺失时用本机信息补回。
+- `src/ui/DeviceGrid.cpp:7059-7140,7445-7462`：批量、周期和手动新增均在写入目录前跳过本机。
+- `src/ui/DeviceGrid.cpp:8049-8069,9083-9086`：分组批量脚本、电源、终端和远控操作排除隐藏本机。
+- `src/ui/DeviceGrid.cpp:10647-10844`：搜索结果排除本机，并清理本机占用的主选择、多选、拖拽和 Shift 锚点。
+- `src/ui/DeviceGrid.cpp:11535-11542,12511-12516`：补齐开关悬停命中、点击切换、即时应用和持久化。
+
+### Reason
+设备界面原来始终显示本机，批量或周期发现也可能再次把本机加入列表。新增默认关闭的本机可见性偏好：开启后仅在当前电脑的界面层过滤本机，不从共享 `DeviceCatalog` 快照物理删除，避免其它电脑同步后也失去这台设备；关闭时立即复用已有记录，确实不存在才补回本机。过滤同时覆盖搜索、选择状态和分组批量动作，避免隐藏设备仍被后台操作。
+
+### Original Code
+```cpp
+// src/system/AppSettings.h:18-24（修改前）
+static bool periodicDeviceDiscoveryEnabled();
+static void setPeriodicDeviceDiscoveryEnabled(bool enabled);
+static int periodicDeviceDiscoveryIntervalSeconds();
+static void setPeriodicDeviceDiscoveryIntervalSeconds(int seconds);
+// 此处没有隐藏本机设置接口。
+```
+
+```cpp
+// src/system/AppSettings.cpp:163-170（修改前）
+void AppSettings::setPeriodicDeviceDiscoveryIntervalSeconds(int seconds)
+{
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("periodicDeviceDiscoveryIntervalSeconds"), seconds > 0 ? seconds : 60);
+}
+// 此处没有隐藏本机设置读写逻辑。
+```
+
+```cpp
+// src/ui/DeviceGrid.h:243-248,416-421（修改前）
+void applyPeriodicDeviceDiscoverySetting(bool scanImmediately);
+void startBatchAddDevices(bool userInitiated = true);
+// 此处没有 applyHideLocalDeviceSetting。
+
+bool m_periodicDeviceDiscoveryEnabled = false;
+bool m_statusRefreshInProgress = false;
+// 此处没有 m_hideLocalDeviceEnabled。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:1496-1504,1555-1565（修改前）
+for (const DeviceEntry& device : g_devices) {
+    names.append(deviceDisplayName(device));
+}
+
+for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+    if (groupIndex < 0) {
+        // 所有目录设备都会进入列表或分组排序。
+    }
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:2991-3028,3351-3354（修改前）
+QRect settingsPeriodicDeviceDiscoverySwitchRect();
+QRect settingsPublishUpdateButtonRect();
+QRect settingsRollbackVersionComboRect();
+QRect settingsWallpaperRotationSwitchRect();
+
+const QRect periodicDiscoveryCard(contentLeft(), 512 + settingsYShift, contentWidth(), 71);
+const QRect wallpaperTestCard(contentLeft(), 588 + settingsYShift, contentWidth(), 71);
+const QRect rollbackCard(contentLeft(), 664 + settingsYShift, contentWidth(), 71);
+const QRect updateCard(contentLeft(), 740 + settingsYShift, contentWidth(), 56);
+// 周期发现与壁纸卡片之间没有隐藏本机开关。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:3678-3690,3970-3975（修改前）
+if (g_devices.isEmpty()) {
+    m_settingsSelected = true;
+} else {
+    m_selectedDeviceIndex = 0;
+    m_selectedDeviceIndexes.insert(0);
+    m_currentDeviceName = deviceDisplayName(g_devices.first());
+}
+
+refreshLocalDeviceInfo();
+updateLocalInfoControls();
+// 启动选择和延迟本机信息读取都没有应用本机过滤状态。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:6891-6970,7279-7288（修改前）
+QMetaObject::invokeMethod(self, [self, results = std::move(results), userInitiated]() mutable {
+    for (const BatchAddResult& result : results) {
+        const QString ip = result.ip.trimmed();
+        // 批量结果未判断是否为本机。
+    }
+});
+
+const bool addingFirstDevice = g_devices.isEmpty();
+DeviceEntry newDevice;
+// 手动新增也未判断是否为本机。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:7873-7884,10462-10475（修改前）
+return platform::DeviceActionTargetResolver::indexesForDeviceIds(
+    g_deviceCatalog,
+    platform::DeviceActionTargetResolver::deviceIdsForGroup(g_deviceCatalog, groupId));
+
+for (const DeviceEntry& device : g_devices) {
+    searchItems.append(DeviceSearchItem{ /* ... */ });
+}
+// 分组批量动作和搜索都会包含本机。
+```
+
+### Modified Code
+```cpp
+// src/system/AppSettings.h:22-23（修改后）
+static bool hideLocalDeviceEnabled(); // wjy: 隐藏本机属于当前电脑自己的设备列表偏好，默认关闭并跨启动恢复。
+static void setHideLocalDeviceEnabled(bool enabled);
+```
+
+```cpp
+// src/system/AppSettings.cpp:171-180（修改后）
+bool AppSettings::hideLocalDeviceEnabled()
+{
+    return settings().value(QStringLiteral("hideLocalDeviceEnabled"), false).toBool();
+}
+
+void AppSettings::setHideLocalDeviceEnabled(bool enabled)
+{
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("hideLocalDeviceEnabled"), enabled);
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.h:246,420（修改后）
+void applyHideLocalDeviceSetting(bool revealLocalDeviceIfMissing); // wjy: 同步本机过滤状态，关闭开关时按需立即补回本机记录。
+bool m_hideLocalDeviceEnabled = false; // wjy: 默认显示本机；开启后只在当前电脑界面隐藏，不向共享目录传播删除。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:1391-1432（修改后）
+bool deviceIdentityMatchesLocal(
+    const QString& candidateName,
+    const QString& candidateIp,
+    const QString& candidateMac,
+    const platform::DeviceInfo& localInfo)
+{
+    // 依次比较 IPv4、规范化 MAC、忽略大小写的设备名。
+    // 任一稳定身份一致即判定为本机。
+}
+
+bool deviceHiddenByLocalPreference(const DeviceEntry& device)
+{
+    return g_hideLocalDeviceFromList && deviceRecordMatchesLocal(device);
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:1564-1573,1624-1632,1694-1701（修改后）
+for (const DeviceEntry& device : g_devices) {
+    if (deviceHiddenByLocalPreference(device)) continue;
+    names.append(deviceDisplayName(device));
+}
+
+for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+    if (deviceHiddenByLocalPreference(g_devices.at(deviceIndex))) continue;
+    // 未隐藏设备继续进入原有分组和自然排序。
+}
+
+int firstUnhiddenDeviceIndex(); // 启动、同步和新增回退只跳过本机过滤，不改变折叠分组语义。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:3083-3088,3448-3454,3497,3557（修改后）
+QRect settingsHideLocalDeviceSwitchRect()
+{
+    return QRect(contentLeft() + contentWidth() - 90, 607 + (kDetailScriptPanelTop - 120), 82, 32);
+}
+
+const QRect hideLocalDeviceCard(contentLeft(), 588 + settingsYShift, contentWidth(), 71);
+const QRect wallpaperTestCard(contentLeft(), 664 + settingsYShift, contentWidth(), 71);
+painter.drawText(/* ... */, QString::fromUtf8("隐藏本机设备"));
+drawSwitchWithLabel(settingsHideLocalDeviceSwitchRect(), hideLocalDeviceEnabled);
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:3746-3754,4077-4084（修改后）
+m_hideLocalDeviceEnabled = platform::AppSettings::hideLocalDeviceEnabled();
+g_hideLocalDeviceFromList = m_hideLocalDeviceEnabled;
+g_localDeviceIdentityForList.name = platform::DeviceInfoService::localDeviceName();
+
+refreshLocalDeviceInfo();
+if (m_hideLocalDeviceEnabled) {
+    applyHideLocalDeviceSetting(false); // 完整 IP/MAC 到位后只在开启状态重新过滤。
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:6961-7006（修改后）
+void DeviceGrid::applyHideLocalDeviceSetting(bool revealLocalDeviceIfMissing)
+{
+    g_hideLocalDeviceFromList = m_hideLocalDeviceEnabled;
+    if (!m_hideLocalDeviceEnabled && revealLocalDeviceIfMissing) {
+        // 优先复用目录中的本机；确实缺失时使用本机名称、IP、MAC、广播地址补回并保存。
+    }
+    pruneHiddenDeviceSelections();
+    updateRealtimeConfiguredDevices();
+    update();
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:7131-7140,7456-7462（修改后）
+if (grid->m_hideLocalDeviceEnabled
+    && (batchAddResultMatchesLocal(result, localDeviceIdentity)
+        || batchAddResultMatchesLocal(result, grid->m_localDeviceInfo))) {
+    continue; // 批量或周期发现命中本机时不写入目录。
+}
+
+if (m_hideLocalDeviceEnabled
+    && deviceIdentityMatchesLocal(name, ip, mac, g_localDeviceIdentityForList)) {
+    return; // 手动新增本机同样跳过。
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:8049-8069,10651-10656（修改后）
+for (const int deviceIndex : catalogIndexes) {
+    if (deviceHiddenByLocalPreference(g_devices.at(deviceIndex))) continue;
+    result.append(deviceIndex); // 分组批量动作只保留未隐藏设备。
+}
+
+for (const DeviceEntry& device : g_devices) {
+    if (deviceHiddenByLocalPreference(device)) continue;
+    searchItems.append(DeviceSearchItem{ /* ... */ });
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:10767-10844,12511-12516（修改后）
+void DeviceGrid::pruneHiddenDeviceSelections()
+{
+    // 从主选择、多选、拖拽和 Shift 锚点中删除本机，并回退到第一台未隐藏设备。
+    // 没有未隐藏设备时清空详情并保持设置页可操作。
+}
+
+if (settingsLayout.containsPoint(settingsHideLocalDeviceSwitchRect(), event->pos())) {
+    m_hideLocalDeviceEnabled = !m_hideLocalDeviceEnabled;
+    platform::AppSettings::setHideLocalDeviceEnabled(m_hideLocalDeviceEnabled);
+    applyHideLocalDeviceSetting(!m_hideLocalDeviceEnabled);
+}
+```
+
+### Steps
+1. 在 `AppSettings` 中增加默认关闭的持久化开关，并在设备界面启动阶段优先恢复设置。
+2. 用 IPv4、规范化 MAC 和设备名建立统一的本机身份判断，供列表、搜索、新增和同步路径复用。
+3. 在常规设置页插入独立开关卡片，补齐图标、说明文字、悬停与点击命中，并将后续壁纸、回撤、发布、本机信息和新增设备区域整体下移。
+4. 开启后立即从左侧列表和搜索中隐藏本机，清理本机选择状态，同时从实时状态白名单和分组批量目标中排除本机。
+5. 批量新增、周期发现和手动新增在目录写入前跳过本机，避免开关开启期间重新出现。
+6. 关闭后优先显示目录已有本机；目录确实缺失时读取本机信息创建记录并立即保存、显示。
+7. 启动延迟读取完整网卡信息时只在开关开启状态重新过滤，避免开关关闭时影响折叠分组的当前详情选择。
+
+### Verification
+- `git diff --check`：通过。
+- `rg` 静态复核：设置页绘制参数只有一个调用点，开关矩形已同时接入绘制、悬停和点击命中。
+- `rg` 静态复核：列表排序、搜索、批量/周期新增、手动新增、同步快照、实时状态白名单、分组批量动作均接入本机过滤。
+- 按用户要求未构建、未链接、未运行程序或二进制测试。

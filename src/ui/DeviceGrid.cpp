@@ -1373,6 +1373,74 @@ const auto& g_devices = g_deviceCatalog.devices(); // wjy: 绘制和命中测试
 const auto& g_deviceGroupNames = g_deviceCatalog.groupNames(); // wjy: 分组名称通过目录只读视图提供，写操作必须携带稳定 groupId 调用目录方法。
 const auto& g_deviceGroupExpandedStates = g_deviceCatalog.groupExpandedStates(); // wjy: 展开状态只读消费，切换操作统一交给目录校验分组身份。
 const auto& g_deviceGroupIds = g_deviceCatalog.groupIds(); // wjy: 稳定 groupId 与展示顺序仍保持同位，但匿名命名空间不再拥有可写容器。
+bool g_hideLocalDeviceFromList = false; // wjy: 本机隐藏是当前窗口进程的展示策略，不写入共享 DeviceCatalog 快照。
+platform::DeviceInfo g_localDeviceIdentityForList; // wjy: 保存设备名/IP/MAC 三种本机身份，供列表、搜索和批量新增使用同一判定。
+// ===end====
+
+// =====wjy====
+QString normalizedDeviceMac(QString value)
+{
+    value = value.trimmed().toUpper();
+    value.remove(QLatin1Char(':'));
+    value.remove(QLatin1Char('-'));
+    value.remove(QLatin1Char('.'));
+    value.remove(QLatin1Char(' '));
+    return value; // wjy: 不同来源可能使用冒号、横线或无分隔格式，去除分隔符后再比较物理地址。
+}
+
+bool deviceIdentityMatchesLocal(
+    const QString& candidateName,
+    const QString& candidateIp,
+    const QString& candidateMac,
+    const platform::DeviceInfo& localInfo)
+{
+    const QString normalizedCandidateIp = candidateIp.trimmed();
+    const QString normalizedLocalIp = localInfo.ip.trimmed();
+    if (!normalizedCandidateIp.isEmpty()
+        && !normalizedLocalIp.isEmpty()
+        && normalizedCandidateIp.compare(normalizedLocalIp, Qt::CaseInsensitive) == 0) {
+        return true; // wjy: 当前本机 IPv4 完全一致时可以直接确认是本机设备。
+    }
+
+    const QString normalizedCandidateMac = normalizedDeviceMac(candidateMac);
+    const QString normalizedLocalMac = normalizedDeviceMac(localInfo.mac);
+    if (!normalizedCandidateMac.isEmpty()
+        && !normalizedLocalMac.isEmpty()
+        && normalizedCandidateMac == normalizedLocalMac) {
+        return true; // wjy: IP 变化后仍通过稳定 MAC 识别原来的本机记录。
+    }
+
+    const QString normalizedCandidateName = candidateName.trimmed();
+    const QString normalizedLocalName = localInfo.name.trimmed();
+    return !normalizedCandidateName.isEmpty()
+        && !normalizedLocalName.isEmpty()
+        && normalizedCandidateName.compare(normalizedLocalName, Qt::CaseInsensitive) == 0; // wjy: 启动早期尚未读取网卡时使用 Windows 设备名兜底，保证列表不会短暂显示本机。
+}
+
+bool deviceRecordMatchesLocal(const DeviceEntry& device)
+{
+    return deviceIdentityMatchesLocal(device.name, device.ip, device.mac, g_localDeviceIdentityForList); // wjy: 目录记录和批量扫描结果共享同一身份判定规则。
+}
+
+bool batchAddResultMatchesLocal(const BatchAddResult& result, const platform::DeviceInfo& localInfo)
+{
+    return deviceIdentityMatchesLocal(result.name, result.ip, result.mac, localInfo); // wjy: 批量新增回调在写目录前过滤本机，不依赖列表当前是否已有对应记录。
+}
+
+bool deviceHiddenByLocalPreference(const DeviceEntry& device)
+{
+    return g_hideLocalDeviceFromList && deviceRecordMatchesLocal(device); // wjy: 开关关闭时所有记录照常显示，开启时只隐藏确认属于本机的设备。
+}
+
+int localDeviceCatalogIndex()
+{
+    for (int index = 0; index < g_devices.size(); ++index) {
+        if (deviceRecordMatchesLocal(g_devices.at(index))) {
+            return index; // wjy: 关闭隐藏开关时优先复用目录中已有本机实体，避免重复添加相同设备。
+        }
+    }
+    return -1;
+}
 // ===end====
 
 // =====wjy====
@@ -1498,6 +1566,9 @@ QStringList deviceNames()
     QStringList names;
     names.reserve(g_devices.size());
     for (const DeviceEntry& device : g_devices) {
+        if (deviceHiddenByLocalPreference(device)) {
+            continue; // wjy: 所有基于设备名称数量的旧布局入口也必须排除隐藏本机。
+        }
         names.append(deviceDisplayName(device));
     }
     return names;
@@ -1553,6 +1624,9 @@ QVector<int> sortedDeviceIndexesForGroup(
         : QString();
 
     for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+        if (deviceHiddenByLocalPreference(g_devices.at(deviceIndex))) {
+            continue; // wjy: 本机在进入分组、在线优先和自然排序之前就被过滤，不产生任何可见设备行。
+        }
         if (groupIndex < 0) {
             if (deviceGroupIndexByName(g_devices.at(deviceIndex).group) < 0) {
                 deviceIndexes.append(deviceIndex);
@@ -1615,6 +1689,16 @@ QVector<DeviceListRow> visibleDeviceRows()
 {
     static const QHash<QString, platform::DevicePresenceState> emptyDeviceStatuses; // wjy: 行数和几何只关心元素数量，不依赖在线排序结果。
     return visibleDeviceRows(emptyDeviceStatuses);
+}
+
+int firstUnhiddenDeviceIndex()
+{
+    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+        if (!deviceHiddenByLocalPreference(g_devices.at(deviceIndex))) {
+            return deviceIndex; // wjy: 初始选择、同步回退和关闭隐藏开关只跳过本机过滤，不改变折叠分组原有的详情选择行为。
+        }
+    }
+    return -1;
 }
 // ===end====
 
@@ -1723,8 +1807,8 @@ QRect localInfoCopyButtonRect(int index)
 QRect settingsLocalInfoHeaderRect()
 {
     // =====wjy====
-    const int top = (platform::UpdateService::canPublishCurrentBuild() ? 816 : 740)
-        + (kDetailScriptPanelTop - 120); // wjy: 回撤版本卡片始终占一行；构建版本再保留发布卡片，普通运行包只跳过发布区域。
+    const int top = (platform::UpdateService::canPublishCurrentBuild() ? 892 : 816)
+        + (kDetailScriptPanelTop - 120); // wjy: 新增隐藏本机卡片后，壁纸、回撤、发布和本机信息整体下移一行并继续保持连续布局。
     return QRect(contentLeft(), top, contentWidth(), 44);
     // ===end====
 }
@@ -2996,9 +3080,16 @@ QRect settingsPeriodicDeviceDiscoverySwitchRect()
 // ===end====
 
 // =====wjy====
+QRect settingsHideLocalDeviceSwitchRect()
+{
+    return QRect(contentLeft() + contentWidth() - 90, 607 + (kDetailScriptPanelTop - 120), 82, 32); // wjy: 隐藏本机开关独占周期发现下方的新卡片，并与其它常规开关右对齐。
+}
+// ===end====
+
+// =====wjy====
 QRect settingsPublishUpdateButtonRect()
 {
-    return QRect(contentLeft() + contentWidth() - 118, 752 + (kDetailScriptPanelTop - 120), 100, 28); // wjy: 发布卡片位于版本回撤下方，按钮继续保持卡片内右侧对齐。
+    return QRect(contentLeft() + contentWidth() - 118, 828 + (kDetailScriptPanelTop - 120), 100, 28); // wjy: 隐藏本机卡片插入后发布按钮随发布卡片下移一行。
 }
 // ===end====
 
@@ -3007,24 +3098,24 @@ QRect settingsRollbackVersionComboRect()
 {
     const int buttonX = contentLeft() + contentWidth() - 118;
     const int comboWidth = qBound(132, contentWidth() / 4, 180);
-    return QRect(buttonX - comboWidth - 12, 683 + (kDetailScriptPanelTop - 120), comboWidth, 32); // wjy: 下拉框和回撤按钮位于同一行，窗口变窄时优先压缩下拉框但保留可读宽度。
+    return QRect(buttonX - comboWidth - 12, 759 + (kDetailScriptPanelTop - 120), comboWidth, 32); // wjy: 新卡片加入后回撤控件整体下移一行，窄窗口宽度策略保持不变。
 }
 
 QRect settingsRollbackButtonRect()
 {
-    return QRect(contentLeft() + contentWidth() - 118, 683 + (kDetailScriptPanelTop - 120), 100, 32); // wjy: 回撤按钮固定贴近卡片右边，与发布按钮保持同一右边界。
+    return QRect(contentLeft() + contentWidth() - 118, 759 + (kDetailScriptPanelTop - 120), 100, 32); // wjy: 回撤按钮与下移后的回撤卡片保持同一行和右边界。
 }
 // ===end====
 
 // =====wjy====
 QRect settingsWallpaperRotationSwitchRect()
 {
-    return QRect(contentLeft() + contentWidth() - 90, 607 + (kDetailScriptPanelTop - 120), 82, 32); // wjy: 壁纸开关与其它常规设置开关右对齐，整张卡片点击命中保持一致。
+    return QRect(contentLeft() + contentWidth() - 90, 683 + (kDetailScriptPanelTop - 120), 82, 32); // wjy: 隐藏本机卡片占用原位置后，壁纸开关下移一行并保持右对齐。
 }
 
 QRect settingsWallpaperRotationIntervalInputRect()
 {
-    return QRect(contentLeft() + contentWidth() - 224, 607 + (kDetailScriptPanelTop - 120), 78, 32); // wjy: 分钟输入框位于开关左侧，并为“分钟”单位文字预留固定宽度。
+    return QRect(contentLeft() + contentWidth() - 224, 683 + (kDetailScriptPanelTop - 120), 78, 32); // wjy: 壁纸分钟输入框跟随开关下移，二者仍共用同一行。
 }
 // ===end====
 
@@ -3146,6 +3237,10 @@ void drawSettingsOptionIcon(QPainter& painter, const QRect& rect, int iconKind)
         painter.drawRoundedRect(QRectF(c.x() - 6, c.y() - 5, 12, 12), 1, 1); // wjy: 简单垃圾桶图标对应删除设备。
         painter.drawLine(QPointF(c.x() - 8, c.y() - 7), QPointF(c.x() + 8, c.y() - 7));
         painter.drawLine(QPointF(c.x() - 3, c.y() - 9), QPointF(c.x() + 3, c.y() - 9));
+    } else if (iconKind == 11) {
+        painter.drawEllipse(QRectF(c.x() - 8, c.y() - 5, 16, 10)); // wjy: 眼睛轮廓表达设备列表可见性设置。
+        painter.drawEllipse(QRectF(c.x() - 2, c.y() - 2, 4, 4));
+        painter.drawLine(QPointF(c.x() - 9, c.y() + 8), QPointF(c.x() + 9, c.y() - 8)); // wjy: 斜线明确表示开启后隐藏本机设备。
     } else {
         painter.drawRoundedRect(QRectF(c.x() - 9, c.y() - 7, 18, 14), 2, 2); // wjy: 壁纸测试项使用横向图片框图标，与本机信息文档图标区分。
         painter.drawEllipse(QRectF(c.x() + 3, c.y() - 4, 3, 3)); // wjy: 右上圆点表示图片中的太阳。
@@ -3177,6 +3272,7 @@ void drawSettingsPage(
     bool remoteWakeupEnabled,
     bool preventSleepEnabled,
     bool periodicDeviceDiscoveryEnabled,
+    bool hideLocalDeviceEnabled,
     bool wallpaperRotationEnabled,
     const QString& wallpaperRotationStatusText,
     bool rollbackVersionAvailable,
@@ -3349,9 +3445,10 @@ void drawSettingsPage(
     const QRect batchCard(contentLeft(), 420 + settingsYShift, contentWidth(), 88);
     // =====wjy====
     const QRect periodicDiscoveryCard(contentLeft(), 512 + settingsYShift, contentWidth(), 71); // wjy: 周期检查新增设备紧跟在批量新增设备下面。
-    const QRect wallpaperTestCard(contentLeft(), 588 + settingsYShift, contentWidth(), 71); // wjy: 自动壁纸轮换独占一张设置卡片，清楚标明共享来源且不混入设备扫描功能。
-    const QRect rollbackCard(contentLeft(), 664 + settingsYShift, contentWidth(), 71); // wjy: 所有运行版本都显示回撤卡片，历史版本为空时仅禁用操作而不改变页面结构。
-    const QRect updateCard(contentLeft(), 740 + settingsYShift, contentWidth(), 56); // wjy: 开发构建的发布卡片排在回撤卡片下方，普通运行包仍完全隐藏发布功能。
+    const QRect hideLocalDeviceCard(contentLeft(), 588 + settingsYShift, contentWidth(), 71); // wjy: 本机可见性紧跟发现设置，用户可以直观看到它会影响设备列表和批量新增。
+    const QRect wallpaperTestCard(contentLeft(), 664 + settingsYShift, contentWidth(), 71); // wjy: 自动壁纸卡片在新增本机可见性卡片后顺延一行。
+    const QRect rollbackCard(contentLeft(), 740 + settingsYShift, contentWidth(), 71); // wjy: 所有运行版本继续显示回撤卡片，并随新增设置顺延。
+    const QRect updateCard(contentLeft(), 816 + settingsYShift, contentWidth(), 56); // wjy: 开发构建发布卡片保持位于回撤下方，普通运行包仍完全隐藏。
     // ===end====
     const bool canPublishUpdates = platform::UpdateService::canPublishCurrentBuild(); // wjy: 绘制、命中测试和服务层统一使用构建目录身份。
     painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
@@ -3361,6 +3458,7 @@ void drawSettingsPage(
     painter.drawRoundedRect(QRectF(refreshCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
     painter.drawRoundedRect(QRectF(batchCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
     painter.drawRoundedRect(QRectF(periodicDiscoveryCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4); // wjy: 新设置项始终显示，开关关闭时仅隐藏秒数输入框。
+    painter.drawRoundedRect(QRectF(hideLocalDeviceCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4); // wjy: 隐藏本机开关使用独立卡片，避免与周期发现的秒数输入混淆。
     painter.drawRoundedRect(QRectF(wallpaperTestCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4); // wjy: 手绘卡片始终随常规页内容滚动，真实分钟输入框只覆盖右侧编辑区。
     painter.drawRoundedRect(QRectF(rollbackCard).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4); // wjy: 回撤版本沿用常规设置白底细边卡片，不引入新的视觉体系。
     if (canPublishUpdates) {
@@ -3379,6 +3477,7 @@ void drawSettingsPage(
     drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, refreshCard.y() + 22, 28, 28), 3);
     drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, batchCard.y() + 30, 28, 28), 4);
     drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, periodicDiscoveryCard.y() + 22, 28, 28), 3); // wjy: 周期检查复用刷新类图标，与功能语义一致。
+    drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, hideLocalDeviceCard.y() + 22, 28, 28), 11); // wjy: 带斜线的眼睛图标表示开启后从设备界面隐藏本机。
     drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, wallpaperTestCard.y() + 22, 28, 28), 6); // wjy: 横向图片图标帮助用户快速识别自动桌面壁纸入口。
     drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, rollbackCard.y() + 22, 28, 28), 3); // wjy: 回撤同样属于版本切换动作，复用刷新类图标提示程序会重新启动。
     drawSettingsOptionIcon(painter, QRect(contentLeft() + 18, settingsLocalInfoHeaderRect().y() + 8, 28, 28), 5);
@@ -3395,6 +3494,7 @@ void drawSettingsPage(
     painter.drawText(QRectF(contentLeft() + 60, refreshCard.y() + 16, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("实时状态同步")); // wjy: 旧“列表自动刷新”改为只读实时广播说明，不再暗示周期 TCP 轮询。
     painter.drawText(QRectF(contentLeft() + 60, batchCard.y() + 24, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("批量新增设备"));
     painter.drawText(QRectF(contentLeft() + 60, periodicDiscoveryCard.y() + 16, 220, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("周期检查新增设备"));
+    painter.drawText(QRectF(contentLeft() + 60, hideLocalDeviceCard.y() + 16, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("隐藏本机设备")); // wjy: 标题明确该开关只控制当前电脑在设备界面的可见性。
     painter.drawText(QRectF(contentLeft() + 60, wallpaperTestCard.y() + 16, 160, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("自动切换桌面壁纸")); // wjy: 标题明确表示开关控制的是持续自动轮换，并为右侧运行状态留出空间。
     painter.drawText(
         QRectF(contentLeft() + 60, rollbackCard.y() + 16, qMax(80, settingsRollbackVersionComboRect().left() - contentLeft() - 76), 20),
@@ -3434,6 +3534,7 @@ void drawSettingsPage(
     painter.drawText(QRectF(contentLeft() + 60, refreshCard.y() + 37, qMax(260, contentWidth() - 260), 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("状态变化立即同步，心跳仅用于识别异常退出和离线")); // wjy: 明确业务变化是事件驱动，1/5 秒心跳不是全设备轮询。
     painter.drawText(QRectF(contentLeft() + 60, batchCard.y() + 45, 220, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("可输入多个网段，用空格、逗号或换行分隔"));
     painter.drawText(QRectF(contentLeft() + 60, periodicDiscoveryCard.y() + 37, qMax(260, contentWidth() - 340), 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("按批量新增网段自动发现并加入新设备"));
+    painter.drawText(QRectF(contentLeft() + 60, hideLocalDeviceCard.y() + 37, qMax(260, contentWidth() - 220), 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("开启后设备列表和批量新增不再显示当前电脑")); // wjy: 直接说明开启、批量发现和当前列表三者的关系。
     painter.drawText(
         QRectF(contentLeft() + 60, wallpaperTestCard.y() + 37, qMax(120, settingsWallpaperRotationIntervalInputRect().left() - contentLeft() - 76), 20),
         Qt::AlignVCenter | Qt::AlignLeft,
@@ -3453,6 +3554,7 @@ void drawSettingsPage(
     drawSwitchWithLabel(settingsRemoteWakeupSwitchRect(), remoteWakeupEnabled);
     drawSwitchWithLabel(settingsPreventSleepSwitchRect(), preventSleepEnabled);
     drawSwitchWithLabel(settingsPeriodicDeviceDiscoverySwitchRect(), periodicDeviceDiscoveryEnabled); // wjy: 开关绘制与列表自动刷新完全一致。
+    drawSwitchWithLabel(settingsHideLocalDeviceSwitchRect(), hideLocalDeviceEnabled); // wjy: 本机可见性复用统一开关样式，并和点击命中使用同一矩形。
     drawSwitchWithLabel(settingsWallpaperRotationSwitchRect(), wallpaperRotationEnabled); // wjy: 壁纸轮换复用统一“开/关 + 蓝色滑块”视觉。
     painter.setFont(textFont);
     painter.setPen(QColor(QStringLiteral("#16A34A")));
@@ -3645,7 +3747,11 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     // =====wjy====
     m_periodicDeviceDiscoveryEnabled = platform::AppSettings::periodicDeviceDiscoveryEnabled();
     m_periodicDeviceDiscoveryIntervalSeconds = platform::AppSettings::periodicDeviceDiscoveryIntervalSeconds(); // wjy: 恢复周期新增开关和秒数，新安装默认关闭且为 60 秒。
+    m_hideLocalDeviceEnabled = platform::AppSettings::hideLocalDeviceEnabled(); // wjy: 在加载设备目录前恢复本机过滤状态，避免启动首帧先显示再隐藏。
     const QString localWallpaperDeviceName = platform::DeviceInfoService::localDeviceName(); // wjy: 启动阶段只读取计算机名，不提前执行原本延迟的完整网卡枚举。
+    g_hideLocalDeviceFromList = m_hideLocalDeviceEnabled; // wjy: 可见行构建发生在构造函数后续阶段，先发布当前窗口的隐藏策略。
+    g_localDeviceIdentityForList = platform::DeviceInfo{};
+    g_localDeviceIdentityForList.name = localWallpaperDeviceName; // wjy: 启动早期先用轻量计算机名过滤，500ms 后再补齐本机 IP/MAC。
     const bool defaultWallpaperRotationEnabled = platform::DesktopWallpaperService::rotationEnabledByDefaultForDeviceName(localWallpaperDeviceName); // wjy: 数字开头设备在没有历史开关配置时默认启动自动壁纸。
     m_wallpaperRotationEnabled = platform::AppSettings::desktopWallpaperRotationEnabled(defaultWallpaperRotationEnabled); // wjy: 已保存的用户开关优先，用户明确关闭后不会被设备名规则重新打开。
     m_wallpaperRotationIntervalMinutes = platform::AppSettings::desktopWallpaperRotationIntervalMinutes(); // wjy: 恢复自动壁纸分钟数，新安装仍使用 1 分钟默认周期。
@@ -3666,7 +3772,8 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     }
     // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] defer DeviceInfoService::local")); // wjy: Release 堆损坏诊断：构造函数里先不读取网卡信息，避免窗口创建阶段触发 GetAdaptersAddresses。
-    if (g_devices.isEmpty()) {
+    const int initialUnhiddenDeviceIndex = firstUnhiddenDeviceIndex(); // wjy: 初始详情选择第一台未被本机过滤的设备，折叠分组仍沿用原有选择语义。
+    if (initialUnhiddenDeviceIndex < 0) {
         m_settingsSelected = true;
         m_remoteAssistSelected = false;
         m_settingsAddDeviceExpanded = true;
@@ -3675,12 +3782,12 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
         m_selectedDeviceIndexes.clear();
         m_selectionAnchorDeviceIndex = -1;
     } else {
-        m_selectedDeviceIndex = 0;
-        m_selectedDeviceIndexes.insert(0);
-        m_selectionAnchorDeviceIndex = 0;
+        m_selectedDeviceIndex = initialUnhiddenDeviceIndex;
+        m_selectedDeviceIndexes.insert(initialUnhiddenDeviceIndex);
+        m_selectionAnchorDeviceIndex = initialUnhiddenDeviceIndex;
 
         m_currentDeviceName =
-            deviceDisplayName(g_devices.first());
+            deviceDisplayName(g_devices.at(initialUnhiddenDeviceIndex)); // wjy: 目录中排在前面的隐藏本机不会成为启动详情目标。
     }
     m_previousDeviceName = m_currentDeviceName;
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after current device init")); // wjy: 记录当前设备选择状态初始化完成。
@@ -3970,6 +4077,9 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     QTimer::singleShot(500, this, [this] { // wjy: 窗口创建后再读取本机 IP/MAC，隔离 DeviceInfoService::local 是否导致 Release 启动阶段堆损坏。
         writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] delayed before DeviceInfoService::local")); // wjy: 延迟读取本机信息前打点。
         refreshLocalDeviceInfo();
+        if (m_hideLocalDeviceEnabled) {
+            applyHideLocalDeviceSetting(false); // wjy: 只有隐藏开关已开启时才按完整 IP/MAC 再过滤，关闭状态不改动折叠分组中的当前选择。
+        }
         updateLocalInfoControls();
         update();
         writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] delayed after DeviceInfoService::local")); // wjy: 延迟读取本机信息完成。
@@ -4064,10 +4174,15 @@ void DeviceGrid::applySyncedDeviceSnapshot(const QJsonObject& snapshot)
     if (m_selectedDeviceIndex < 0 && !m_selectedDeviceIndexes.isEmpty()) {
         m_selectedDeviceIndex = *std::min_element(m_selectedDeviceIndexes.cbegin(), m_selectedDeviceIndexes.cend());
     }
-    if (m_selectedDeviceIndex < 0 && !g_devices.isEmpty()) {
-        m_selectedDeviceIndex = 0;
-        m_selectedDeviceIndexes.insert(0);
+    if (m_selectedDeviceIndex < 0) {
+        const int unhiddenFallbackIndex = firstUnhiddenDeviceIndex();
+        if (unhiddenFallbackIndex >= 0) {
+            m_selectedDeviceIndex = unhiddenFallbackIndex;
+            m_selectedDeviceIndexes.insert(unhiddenFallbackIndex); // wjy: 同步快照重新加入本机时，隐藏开关仍只回退到未隐藏设备。
+        }
     }
+
+    pruneHiddenDeviceSelections(); // wjy: 共享快照可能重新带回本机记录，本机隐藏偏好必须在每次同步后重新应用。
 
     if (m_selectedDeviceIndex >= 0 && m_selectedDeviceIndex < g_devices.size()) {
         m_selectionAnchorDeviceIndex = m_selectedDeviceIndex;
@@ -4099,6 +4214,9 @@ void DeviceGrid::updateRealtimeConfiguredDevices()
     }
     QSet<QString> configuredIps;
     for (const DeviceEntry& device : std::as_const(g_devices)) {
+        if (deviceHiddenByLocalPreference(device)) {
+            continue; // wjy: 隐藏本机时不接收它的实时状态，避免不可见记录继续积累会话和更新缓存。
+        }
         const QString ip = device.ip.trimmed();
         if (!ip.isEmpty()) {
             configuredIps.insert(ip);
@@ -5948,12 +6066,8 @@ void DeviceGrid::stopDeviceGroupScripts(int groupIndex)
         return;
     }
 
-    const QString groupName = g_deviceGroupNames.at(groupIndex).trimmed();
     int stoppedCount = 0;
-    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
-        if (g_devices.at(deviceIndex).group.trimmed() != groupName) {
-            continue;
-        }
+    for (const int deviceIndex : deviceIndexesForGroup(groupIndex)) { // wjy: 分组批量停止复用可见目标集合，隐藏本机不会收到停止脚本命令。
         if (stopDeviceScriptForDeviceIndex(deviceIndex, false)) {
             ++stoppedCount; // wjy: 只停止组内确实正在运行脚本的设备，未运行的设备静默跳过。
         }
@@ -6485,6 +6599,10 @@ void DeviceGrid::updateLocalInfoControls()
 void DeviceGrid::refreshLocalDeviceInfo()
 {
     m_localDeviceInfo = platform::DeviceInfoService::local();
+    if (m_localDeviceInfo.name.trimmed().isEmpty()) {
+        m_localDeviceInfo.name = platform::DeviceInfoService::localDeviceName(); // wjy: 完整枚举异常时仍保留 Windows 计算机名作为本机身份兜底。
+    }
+    g_localDeviceIdentityForList = m_localDeviceInfo; // wjy: 列表、搜索和批量新增从此使用完整本机 IP/MAC/名称统一判断。
 }
 
 // =====wjy====
@@ -6839,6 +6957,55 @@ void DeviceGrid::applyPeriodicDeviceDiscoverySetting(bool scanImmediately)
 }
 // ===end====
 
+// =====wjy====
+void DeviceGrid::applyHideLocalDeviceSetting(bool revealLocalDeviceIfMissing)
+{
+    g_hideLocalDeviceFromList = m_hideLocalDeviceEnabled; // wjy: 所有可见行入口在下一次计算时立即使用最新开关值。
+    if (g_localDeviceIdentityForList.name.trimmed().isEmpty()) {
+        g_localDeviceIdentityForList.name = platform::DeviceInfoService::localDeviceName(); // wjy: 500ms 本机信息尚未完成时仍可按计算机名即时隐藏。
+    }
+
+    bool localDeviceAdded = false;
+    if (!m_hideLocalDeviceEnabled && revealLocalDeviceIfMissing) {
+        if (m_localDeviceInfo.ip.trimmed().isEmpty()) {
+            refreshLocalDeviceInfo(); // wjy: 用户明确关闭隐藏时同步读取本机 IP/MAC，确保能够立即创建可显示记录。
+        }
+        if (localDeviceCatalogIndex() < 0 && !m_localDeviceInfo.ip.trimmed().isEmpty()) {
+            DeviceEntry localDevice;
+            localDevice.name = m_localDeviceInfo.name.trimmed().isEmpty()
+                ? m_localDeviceInfo.ip.trimmed()
+                : m_localDeviceInfo.name.trimmed(); // wjy: 本机名称不可用时沿用目录统一的 IP 展示兜底。
+            localDevice.ip = m_localDeviceInfo.ip.trimmed();
+            localDevice.mac = m_localDeviceInfo.mac.trimmed();
+            localDevice.broadcastIp = m_localDeviceInfo.broadcastIp.trimmed();
+            localDevice.remark = QString::fromUtf8("本机");
+            localDeviceAdded = g_deviceCatalog.addDevice(std::move(localDevice)); // wjy: 只有目录中确实没有本机实体时才补回，重复 IP 仍由 DeviceCatalog 拒绝。
+            if (localDeviceAdded) {
+                saveDevices(); // wjy: 用户关闭隐藏后补回的本机记录需要跨启动保留，下一次启动无需重新发现。
+            }
+        }
+    }
+
+    pruneHiddenDeviceSelections(); // wjy: 开启时移除隐藏本机选择，关闭时把无主选择恢复到第一台未隐藏设备。
+    if (firstUnhiddenDeviceIndex() < 0) {
+        m_settingsSelected = true;
+        m_remoteAssistSelected = false;
+        m_localInfoSelected = false;
+        m_currentDeviceName.clear();
+        m_previousDeviceName.clear(); // wjy: 本机是唯一设备且被隐藏时保持设置页可操作，不让详情页引用不可见设备。
+    }
+    m_deviceListScrollOffset = qBound(0, m_deviceListScrollOffset, maxDeviceListScrollOffset());
+    updateRealtimeConfiguredDevices(); // wjy: 隐藏本机后实时状态来源白名单同步排除它，关闭时立即恢复。
+    if (localDeviceAdded) {
+        m_deviceStatuses.remove(m_localDeviceInfo.ip.trimmed()); // wjy: 新补回本机等待后续实时快照，不继承历史缓存状态。
+    }
+    updateSettingsControls();
+    updateAddDeviceControls();
+    updateLocalInfoControls();
+    update();
+}
+// ===end====
+
 void DeviceGrid::startBatchAddDevices(bool userInitiated)
 {
 // =====wjy====
@@ -6889,8 +7056,12 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
         .arg(subnetText)
         .arg(scanIps.size());
 
+    platform::DeviceInfo localDeviceIdentity = m_localDeviceInfo;
+    if (localDeviceIdentity.name.trimmed().isEmpty()) {
+        localDeviceIdentity.name = platform::DeviceInfoService::localDeviceName(); // wjy: 扫描可能早于延迟网卡枚举，至少携带本机设备名供结果过滤。
+    }
     QPointer<DeviceGrid> self(this);
-    runBackgroundTask([self, scanIps, userInitiated] {
+    runBackgroundTask([self, scanIps, userInitiated, localDeviceIdentity] {
         QVector<BatchAddResult> results;
         std::mutex resultMutex;
         std::atomic_int nextIndex = 0;
@@ -6945,13 +7116,13 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
             return; // wjy: 窗口关闭后不再回到 UI 线程追加设备。
         }
 
-        QMetaObject::invokeMethod(self, [self, results = std::move(results), userInitiated]() mutable {
+        QMetaObject::invokeMethod(self, [self, results = std::move(results), userInitiated, localDeviceIdentity]() mutable {
             if (!self) {
                 return; // wjy: queued 回调执行前窗口可能已经销毁。
             }
 
             DeviceGrid* grid = self.data();
-            const bool wasEmpty = g_devices.isEmpty();
+            const bool wasEmpty = firstUnhiddenDeviceIndex() < 0; // wjy: 目录中只有隐藏本机时，新增第一台远端仍按首个未隐藏设备初始化详情。
             int firstAddedIndex = -1;
             int addedCount = 0;
             int updatedCount = 0;
@@ -6961,6 +7132,11 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
                 const QString ip = result.ip.trimmed();
                 if (ip.isEmpty() || addedIps.contains(ip)) {
                     continue; // wjy: UI 线程最终追加前再次去重，防止扫描期间用户手动新增同一 IP。
+                }
+                if (grid->m_hideLocalDeviceEnabled
+                    && (batchAddResultMatchesLocal(result, localDeviceIdentity)
+                        || batchAddResultMatchesLocal(result, grid->m_localDeviceInfo))) {
+                    continue; // wjy: 开关开启期间批量或周期发现命中本机时直接跳过，不写入目录也不显示在列表中。
                 }
 
                 const int existingIndex = deviceIndexForIp(ip);
@@ -7277,8 +7453,13 @@ void DeviceGrid::saveNewDevice()
         updateAddDeviceControls();
         return;
     }
+    if (m_hideLocalDeviceEnabled
+        && deviceIdentityMatchesLocal(name, ip, mac, g_localDeviceIdentityForList)) {
+        updateAddDeviceControls();
+        return; // wjy: 隐藏本机开启时手动新增同样不能把本机重新带回列表，关闭开关后由统一补回逻辑处理。
+    }
 
-    const bool addingFirstDevice = g_devices.isEmpty(); // wjy: First device has no previous detail page, so switching animation would draw the same device twice.
+    const bool addingFirstDevice = firstUnhiddenDeviceIndex() < 0; // wjy: 目录中只有隐藏本机时，手动添加远端仍属于第一台未隐藏设备。
     DeviceEntry newDevice;
     newDevice.name = name;
     newDevice.ip = ip;
@@ -7873,9 +8054,19 @@ QVector<int> DeviceGrid::deviceIndexesForGroup(int groupIndex) const
         return result;
     }
     const QString groupId = g_deviceGroupIds.at(groupIndex);
-    return platform::DeviceActionTargetResolver::indexesForDeviceIds(
+    const QVector<int> catalogIndexes = platform::DeviceActionTargetResolver::indexesForDeviceIds(
         g_deviceCatalog,
         platform::DeviceActionTargetResolver::deviceIdsForGroup(g_deviceCatalog, groupId)); // wjy: 分组批量操作先按稳定 groupId 收集，再恢复当前展示下标，避免名称和旧位置漂移。
+    result.reserve(catalogIndexes.size());
+    for (const int deviceIndex : catalogIndexes) {
+        if (deviceIndex < 0
+            || deviceIndex >= g_devices.size()
+            || deviceHiddenByLocalPreference(g_devices.at(deviceIndex))) {
+            continue; // wjy: 隐藏本机时，分组右键的脚本、电源、终端和远控动作都只作用于界面可见设备。
+        }
+        result.append(deviceIndex);
+    }
+    return result;
 // ===end====
 }
 
@@ -8889,10 +9080,8 @@ void DeviceGrid::openDeviceGroupTiledWindows(int groupIndex)
     }
 
     QVector<QString> groupDeviceIds;
-    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
-        if (g_devices.at(deviceIndex).group.trimmed() == groupName) {
-            groupDeviceIds.append(g_devices.at(deviceIndex).id); // wjy: 授权等待期间只保留稳定 ID，设备列表重新排序不会改变平铺目标。
-        }
+    for (const int deviceIndex : deviceIndexesForGroup(groupIndex)) {
+        groupDeviceIds.append(g_devices.at(deviceIndex).id); // wjy: 平铺只收集当前界面可见设备，隐藏本机不会在后台被重新打开远控窗口。
     }
     if (groupDeviceIds.isEmpty()) {
         return; // wjy: 空分组暂时不弹提示，点击设备平铺没有可打开目标就静默返回。
@@ -9493,6 +9682,7 @@ void DeviceGrid::deleteDeviceForIndex(int deviceIndex)
     setDesktopHoverActive(false);
     clearBottomActionHover();
     m_deviceListScrollOffset = qBound(0, m_deviceListScrollOffset, maxDeviceListScrollOffset()); // wjy: 删除设备后列表变短，立即把滚动位置限制回有效范围。
+    pruneHiddenDeviceSelections(); // wjy: 删除最后一台远端后若目录只剩隐藏本机，立即清空主选择并保持设置页可用。
     update();
     // ===end====
 }
@@ -10121,6 +10311,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             m_remoteWakeupEnabled,
             m_preventSleepEnabled,
             m_periodicDeviceDiscoveryEnabled,
+            m_hideLocalDeviceEnabled,
             m_wallpaperRotationEnabled,
             m_wallpaperRotationStatusText,
             m_rollbackVersionCombo && !m_rollbackVersionCombo->currentData().toString().isEmpty(), // wjy: 手绘按钮可用状态直接取真实下拉框目标数据，视觉与点击条件保持一致。
@@ -10460,6 +10651,9 @@ void DeviceGrid::showDeviceSearchPanel()
     QVector<DeviceSearchItem> searchItems;
     searchItems.reserve(g_devices.size()); // wjy: 每次进入查找页都复制当前展示字段，面板过滤不持有目录引用也不修改设备数据。
     for (const DeviceEntry& device : g_devices) {
+        if (deviceHiddenByLocalPreference(device)) {
+            continue; // wjy: 隐藏本机后搜索面板也不能通过名称或 IP 找到并重新选择本机。
+        }
         const int groupIndex = g_deviceCatalog.groupIndexForId(device.groupId);
         const QString groupName = groupIndex >= 0 && groupIndex < g_deviceGroupNames.size()
             ? g_deviceGroupNames.at(groupIndex).trimmed()
@@ -10572,79 +10766,80 @@ void DeviceGrid::startDeviceSwitchAnimation(int newIndex, const QString& newName
 // =====wjy====
 void DeviceGrid::pruneHiddenDeviceSelections()
 {
-    const QVector<DeviceListRow> rows = visibleDeviceRows(m_deviceStatuses); // wjy: 以当前展开/折叠及在线优先排序后的可见行作为唯一可信的选择范围。
-    QSet<int> visibleDeviceIndexes; // wjy: 保存当前左侧列表里真实可见的设备下标，用来过滤隐藏设备。
-    int firstVisibleDeviceIndex = -1; // wjy: 当前主设备被隐藏时，用第一个可见设备作为详情页兜底目标。
-    int firstSelectedVisibleDeviceIndex = -1; // wjy: 如果多选里还有可见设备，优先用它作为新的主设备。
+    QSet<int> unhiddenDeviceIndexes; // wjy: 这里只排除本机隐藏策略，不把折叠分组误判成需要清除的选择。
+    int fallbackDeviceIndex = -1; // wjy: 当前主设备是本机时，用第一台未隐藏设备作为详情页兜底目标。
+    int firstSelectedUnhiddenDeviceIndex = -1; // wjy: 如果多选里还有未隐藏设备，优先用它作为新的主设备。
 
-    for (const DeviceListRow& row : rows) {
-        if (row.type != DeviceListRow::Type::Device
-            || row.deviceIndex < 0
-            || row.deviceIndex >= g_devices.size()) {
-            continue; // wjy: 分组行和异常下标不参与选择集合计算。
+    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+        if (deviceHiddenByLocalPreference(g_devices.at(deviceIndex))) {
+            continue; // wjy: 开关开启后，本机不能继续留在主选择、多选或拖拽快照中。
         }
 
-        visibleDeviceIndexes.insert(row.deviceIndex); // wjy: 记录当前仍显示在左侧列表里的真实设备。
-        if (firstVisibleDeviceIndex < 0) {
-            firstVisibleDeviceIndex = row.deviceIndex; // wjy: 保留视觉顺序里的第一台可见设备作为兜底。
+        unhiddenDeviceIndexes.insert(deviceIndex);
+        if (fallbackDeviceIndex < 0) {
+            fallbackDeviceIndex = deviceIndex; // wjy: 保留目录中的第一台未隐藏设备作为兜底，兼容折叠分组仍可保持详情的旧行为。
         }
-        if (firstSelectedVisibleDeviceIndex < 0
-            && m_selectedDeviceIndexes.contains(row.deviceIndex)) {
-            firstSelectedVisibleDeviceIndex = row.deviceIndex; // wjy: 保留视觉顺序里的第一台仍可见已选设备。
+        if (firstSelectedUnhiddenDeviceIndex < 0
+            && m_selectedDeviceIndexes.contains(deviceIndex)) {
+            firstSelectedUnhiddenDeviceIndex = deviceIndex; // wjy: 保留第一台仍未隐藏的已选设备。
         }
     }
 
     for (auto it = m_selectedDeviceIndexes.begin(); it != m_selectedDeviceIndexes.end();) {
-        if (!visibleDeviceIndexes.contains(*it)) {
-            it = m_selectedDeviceIndexes.erase(it); // wjy: 设备被折叠隐藏后，不再保留在多选集合里。
+        if (!unhiddenDeviceIndexes.contains(*it)) {
+            it = m_selectedDeviceIndexes.erase(it); // wjy: 本机被隐藏或下标失效后，不再保留在多选集合里。
         } else {
             ++it;
         }
     }
 
     for (auto it = m_draggingDeviceIndexes.begin(); it != m_draggingDeviceIndexes.end();) {
-        if (!visibleDeviceIndexes.contains(*it)) {
-            it = m_draggingDeviceIndexes.erase(it); // wjy: 隐藏设备也不能留在后续批量拖拽快照里。
+        if (!unhiddenDeviceIndexes.contains(*it)) {
+            it = m_draggingDeviceIndexes.erase(it); // wjy: 隐藏本机也不能留在后续批量拖拽快照里。
         } else {
             ++it;
         }
     }
 
     if (m_selectionAnchorDeviceIndex >= 0
-        && !visibleDeviceIndexes.contains(m_selectionAnchorDeviceIndex)) {
-        m_selectionAnchorDeviceIndex = firstSelectedVisibleDeviceIndex; // wjy: Shift 锚点被折叠隐藏时，改成可见选中设备；没有则清空。
+        && !unhiddenDeviceIndexes.contains(m_selectionAnchorDeviceIndex)) {
+        m_selectionAnchorDeviceIndex = firstSelectedUnhiddenDeviceIndex; // wjy: Shift 锚点是隐藏本机时，改成仍未隐藏的选中设备；没有则清空。
     }
 
     if (m_selectedDeviceIndex >= 0
         && m_selectedDeviceIndex < g_devices.size()
-        && visibleDeviceIndexes.contains(m_selectedDeviceIndex)) {
-        return; // wjy: 右侧详情主设备仍可见时，只需要完成上面的集合清理。
+        && unhiddenDeviceIndexes.contains(m_selectedDeviceIndex)) {
+        return; // wjy: 右侧详情主设备未被本机策略隐藏时，只需要完成上面的集合清理。
     }
 
-    const int nextDeviceIndex = firstSelectedVisibleDeviceIndex >= 0
-        ? firstSelectedVisibleDeviceIndex
-        : firstVisibleDeviceIndex; // wjy: 主设备被隐藏时，优先切到可见选中设备，否则切到第一台可见设备。
+    const int nextDeviceIndex = firstSelectedUnhiddenDeviceIndex >= 0
+        ? firstSelectedUnhiddenDeviceIndex
+        : fallbackDeviceIndex; // wjy: 主设备是隐藏本机时，优先切到未隐藏的选中设备，否则切到第一台未隐藏设备。
     if (nextDeviceIndex < 0) {
-        saveCurrentScriptUiState(); // wjy: 没有可见设备前先保存当前脚本 UI，避免折叠分组清空详情时丢掉该设备状态。
-        m_selectedDeviceIndexes.clear(); // wjy: 当前没有任何可见设备时，清空左侧选择，避免隐藏设备继续高亮或被拖拽。
+        saveCurrentScriptUiState(); // wjy: 没有未隐藏设备前先保存当前脚本 UI，避免清空详情时丢掉本机状态。
+        m_selectedDeviceIndexes.clear(); // wjy: 当前没有任何未隐藏设备时，清空左侧选择，避免本机继续高亮或被拖拽。
         m_draggingDeviceIndexes.clear();
+        m_selectedDeviceIndex = -1; // wjy: 隐藏本机可能让目录仍有记录但列表没有可见设备，主选择必须显式清空。
+        m_previousDeviceIndex = -1;
         m_selectionAnchorDeviceIndex = -1;
+        m_currentDeviceName.clear();
+        m_previousDeviceName.clear();
         loadScriptUiStateForDevice(QString());
         return;
     }
 
-    saveCurrentScriptUiState(); // wjy: 主设备被折叠隐藏时也属于设备切换，需要保存旧设备脚本 UI。
-    m_selectedDeviceIndex = nextDeviceIndex; // wjy: 将右侧详情主设备同步到仍可见的设备，避免详情指向折叠隐藏项。
+    saveCurrentScriptUiState(); // wjy: 主设备是隐藏本机时先保存旧设备脚本 UI，再切换到未隐藏设备。
+    m_selectedDeviceIndex = nextDeviceIndex; // wjy: 将右侧详情主设备同步到未隐藏设备，避免详情继续指向本机。
     m_previousDeviceIndex = nextDeviceIndex;
     m_currentDeviceName = deviceDisplayName(g_devices.at(nextDeviceIndex));
     m_previousDeviceName = m_currentDeviceName;
-    loadScriptUiStateForDevice(currentScriptUiDeviceIp()); // wjy: 折叠后恢复新主设备自己的脚本 UI，避免沿用被隐藏设备的面板。
+    loadScriptUiStateForDevice(currentScriptUiDeviceIp()); // wjy: 恢复新主设备自己的脚本 UI，避免沿用隐藏本机的面板。
     m_selectedDeviceIndexes.insert(nextDeviceIndex); // wjy: 新主设备必须在左侧多选集合里，保证视觉选中态一致。
     if (m_selectionAnchorDeviceIndex < 0) {
         m_selectionAnchorDeviceIndex = nextDeviceIndex; // wjy: 没有可用 Shift 锚点时，用新主设备作为下一次范围选择起点。
     }
     if (m_detailAnimationTimer) {
-        m_detailAnimationTimer->stop(); // wjy: 分组折叠引发的主设备兜底切换不播放详情页切换动画，避免隐藏项参与过渡。
+        m_detailAnimationTimer->stop(); // wjy: 隐藏本机引发的主设备兜底切换不播放详情页切换动画。
     }
 }
 // ===end====
@@ -11343,6 +11538,8 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
             || settingsLayout.containsPoint(settingsRemoteWakeupSwitchRect(), event->pos())
             || settingsLayout.containsPoint(settingsPreventSleepSwitchRect(), event->pos())
             || settingsLayout.containsPoint(settingsPeriodicDeviceDiscoverySwitchRect(), event->pos())
+            || settingsLayout.containsPoint(settingsHideLocalDeviceSwitchRect(), event->pos())
+            || settingsLayout.containsPoint(settingsWallpaperRotationSwitchRect(), event->pos()) // wjy: 本机隐藏和壁纸开关都提供与其它设置一致的手型反馈。
             || (m_rollbackVersionCombo
                 && !m_rollbackPreparing
                 && !m_updatePreparing
@@ -12000,7 +12197,6 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                     }
                     const QString groupId = g_deviceGroupIds.at(groupIndex);
                     g_deviceCatalog.setGroupExpanded(groupId, !g_deviceGroupExpandedStates.at(groupIndex)); // wjy: 点击分组行按稳定 groupId 切换展开状态，数组下标只负责当前命中行。
-                    pruneHiddenDeviceSelections(); // wjy: 分组折叠后立即移除隐藏设备选择，避免后续 Shift/拖拽继续带着不可见设备。
                     saveDevices(); // wjy: 保存分组展开状态，重启后箭头方向保持一致。
                     update();
                     event->accept();
@@ -12312,6 +12508,13 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 return;
             }
             // =====wjy====
+            if (settingsLayout.containsPoint(settingsHideLocalDeviceSwitchRect(), event->pos())) {
+                m_hideLocalDeviceEnabled = !m_hideLocalDeviceEnabled;
+                platform::AppSettings::setHideLocalDeviceEnabled(m_hideLocalDeviceEnabled); // wjy: 先持久化用户选择，进程异常退出后下次启动仍使用相同可见性策略。
+                applyHideLocalDeviceSetting(!m_hideLocalDeviceEnabled); // wjy: 开启立即隐藏并修正选择；关闭时目录缺少本机则立即补回。
+                event->accept();
+                return;
+            }
             if (settingsLayout.containsPoint(settingsPeriodicDeviceDiscoverySwitchRect(), event->pos())) {
                 m_periodicDeviceDiscoveryEnabled = !m_periodicDeviceDiscoveryEnabled;
                 platform::AppSettings::setPeriodicDeviceDiscoveryEnabled(m_periodicDeviceDiscoveryEnabled);

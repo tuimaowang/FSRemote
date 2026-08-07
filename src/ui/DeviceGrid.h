@@ -243,6 +243,7 @@ private:
     // =====wjy====
     void applyPeriodicDeviceDiscoverySetting(bool scanImmediately);
     void startBatchAddDevices(bool userInitiated = true); // wjy: 手动按钮和周期定时器复用同一网段扫描；周期触发时不跳转当前页面或选择新设备。
+    void applyHideLocalDeviceSetting(bool revealLocalDeviceIfMissing); // wjy: 同步本机过滤状态，关闭开关时按需立即补回本机记录。
     // ===end====
     // =====wjy====
     QString nextDefaultDeviceGroupName() const; // wjy: 为所有新建分组入口生成不重复的“默认分组N”名称。
@@ -416,6 +417,7 @@ private:
     bool m_wolDetectionInProgress = false;
     bool m_preventSleepEnabled = true;
     bool m_periodicDeviceDiscoveryEnabled = false; // wjy: 默认关闭，开启后按批量新增输入框中的网段周期扫描。
+    bool m_hideLocalDeviceEnabled = false; // wjy: 默认显示本机；开启后只在当前电脑界面隐藏，不向共享目录传播删除。
     bool m_statusRefreshInProgress = false;
     bool m_wakeProbeInProgress = false;
     bool m_batchAddInProgress = false; // wjy: 标记批量新增扫描是否正在后台执行。
