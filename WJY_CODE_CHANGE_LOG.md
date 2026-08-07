@@ -11459,3 +11459,59 @@ decision.resolution = stream::kFocusedRemoteVideoProfile.resolution;
 
 - 已执行 `git diff --check` 前置检查。
 - 未编译；按用户要求本次不编译。
+
+## 2026-08-07 - 角色配置改为只填写分辨率档位
+
+### 修改位置
+
+- `src/stream/RemoteVideoPolicy.h:48-68`：删除角色配置中的重复宽高字段，改为第一个字段直接填写 `RemoteResolutionTier`，并为焦点、后台、最小化配置补充中文修改说明。
+- `src/stream/RemoteVideoRenderWorker.cpp:311-316`：角色配置变更比较改为比较 `resolution` 档位，避免引用已删除的宽高字段。
+- `tests/remote_video_policy_tests.cpp:7-28`：更新策略测试，验证配置只使用分辨率档位。
+
+### 修改原因
+
+用户希望后续只修改 `P1080`、`P720`、`P360` 等档位，而不再同时填写 `1920, 1080`。现在配置中的分辨率唯一来源是 `RemoteResolutionTier`，宽高由既有 `resolutionTierHeight()` 和 `targetSize()` 根据源画面比例计算。
+
+### 原始代码
+
+```cpp
+struct RemoteVideoProfile {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t targetFps = 0;
+    std::uint32_t priority = 0;
+    bool requestsRemoteQuality = false;
+    std::uint32_t maxBitrateKbps = 0;
+    RemoteResolutionTier resolution = RemoteResolutionTier::Native;
+};
+
+inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile =
+    {1920, 1080, 60, 100, true, 48000, RemoteResolutionTier::P1080};
+```
+
+### 修改后代码
+
+```cpp
+struct RemoteVideoProfile {
+    RemoteResolutionTier resolution = RemoteResolutionTier::Native; // wjy: 只填写P1080/P720/P360等档位，宽高由统一换算逻辑生成。
+    std::uint32_t targetFps = 0;
+    std::uint32_t priority = 0;
+    bool requestsRemoteQuality = false;
+    std::uint32_t maxBitrateKbps = 0;
+};
+
+inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile =
+    {RemoteResolutionTier::P1080, 60, 100, true, 48000}; // wjy: 修改P1080即可切换焦点分辨率。
+```
+
+### 修改步骤
+
+1. 将 `resolution` 移到角色配置第一个字段，删除重复的 `width`、`height`。
+2. 焦点、后台、最小化分别使用 `P1080`、`P720`、`P360`，并在代码旁写明修改方式。
+3. RenderWorker 的变更检测改为比较分辨率档位。
+4. 更新策略测试，确保不再依赖角色配置中的宽高字段。
+
+### 验证
+
+- 已执行静态搜索，确认源码和测试不再引用 `profile.width/profile.height`。
+- 未编译；按用户要求本次不编译。

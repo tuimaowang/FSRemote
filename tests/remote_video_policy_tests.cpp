@@ -4,7 +4,7 @@
 
 int main()
 {
-    const stream::RemoteVideoProfile focused{1920, 1080, 60, 100, true, 48000, stream::RemoteResolutionTier::P1080}; // wjy: 测试焦点配置同步包含统一分辨率档位字段。
+    const stream::RemoteVideoProfile focused{stream::RemoteResolutionTier::P1080, 60, 100, true, 48000}; // wjy: 测试焦点配置只填写分辨率档位，不重复填写宽高。
     std::vector<stream::RemoteVideoWindowState> states = {
         {1, true, true, false, true, true},
         {2, true, true, false, true, false},
@@ -21,8 +21,7 @@ int main()
     assert(healthy[0].profile.resolution == stream::RemoteResolutionTier::P1080);
     assert(healthy[0].profile.targetFps == 60);
     assert(healthy[1].role == stream::RemoteVideoWindowRole::VisibleBackground);
-    assert(healthy[1].profile.width == 1280);
-    assert(healthy[1].profile.height == 720);
+    assert(healthy[1].profile.resolution == stream::RemoteResolutionTier::P720);
     assert(healthy[1].profile.targetFps == 30);
     assert(healthy[1].profile.resolution == stream::RemoteResolutionTier::P720);
     assert(healthy[2].role == stream::RemoteVideoWindowRole::Minimized);
