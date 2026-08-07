@@ -1,5 +1,7 @@
 #pragma once
 
+#include "stream/RemoteQualityPolicy.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +52,7 @@ struct RemoteVideoProfile {
     std::uint32_t priority = 0;
     bool requestsRemoteQuality = false;
     std::uint32_t maxBitrateKbps = 0; // wjy: 角色默认码率与分辨率、FPS放在同一配置源，避免协调器再维护第二套码率表。
+    RemoteResolutionTier resolution = RemoteResolutionTier::Native; // wjy: 角色分辨率档位也纳入统一配置，修改一处即可改变最终下发尺寸。
 };
 
 struct RemoteVideoDecision {
@@ -60,9 +63,9 @@ struct RemoteVideoDecision {
 
 // =====wjy====
 // 画质总开关集中在这里，后续只改常量即可调整所有窗口的角色画质。
-inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile = {1920, 1080, 60, 100, true, 48000}; // wjy: 单窗口和多窗口焦点统一使用1080p/60/48Mbps。
-inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile = {1280, 720, 30, 40, true, 24000}; // wjy: 可见后台固定720p/30/24Mbps，不按窗口数量降帧。
-inline constexpr RemoteVideoProfile kMinimizedRemoteVideoProfile = {640, 360, 1, 5, true, 7000}; // wjy: 最小化只保留360p/1FPS保活。
+inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile = {1920, 1080, 60, 100, true, 48000, RemoteResolutionTier::P1080}; // wjy: 单窗口和多窗口焦点统一使用1080p/60/48Mbps。
+inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile = {1280, 720, 30, 40, true, 24000, RemoteResolutionTier::P720}; // wjy: 可见后台固定720p/30/24Mbps，不按窗口数量降帧。
+inline constexpr RemoteVideoProfile kMinimizedRemoteVideoProfile = {640, 360, 1, 5, true, 7000, RemoteResolutionTier::P360}; // wjy: 最小化只保留360p/1FPS保活。
 inline constexpr std::uint32_t kRemoteProfileFocusDebounceMs = 350;
 inline constexpr std::uint32_t kRemotePressureEnterHoldMs = 1000;
 inline constexpr std::uint32_t kRemotePressureRecoveryHoldMs = 3000;

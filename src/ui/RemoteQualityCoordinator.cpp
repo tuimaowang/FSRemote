@@ -189,9 +189,7 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
             const auto roleProfile = decision.minimized
                 ? stream::RemoteVideoPolicy::minimizedProfile()
                 : stream::RemoteVideoPolicy::backgroundProfile(); // wjy: 角色画质统一从RemoteVideoPolicy读取。
-            decision.resolution = decision.minimized
-                ? stream::RemoteResolutionTier::P360
-                : stream::RemoteResolutionTier::P720; // wjy: 最小化和可见后台都从唯一角色配置选择固定分辨率。
+            decision.resolution = roleProfile.resolution; // wjy: 最小化和可见后台直接读取统一角色配置的分辨率档位。
             decision.targetFps = static_cast<int>(roleProfile.targetFps); // wjy: 最小化1FPS、后台30FPS均由唯一策略配置提供。
             decision.reason = decision.minimized
                 ? RemoteQualityDegradationReason::Minimized
@@ -209,7 +207,7 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
             state.pressureSinceMs = 0;
             state.recoverySinceMs = 0;
             state.degradationReason = RemoteQualityDegradationReason::None;
-            decision.resolution = stream::RemoteResolutionTier::P1080; // wjy: 单窗口和多窗口焦点统一使用1080p。
+            decision.resolution = stream::kFocusedRemoteVideoProfile.resolution; // wjy: 单窗口和多窗口焦点直接读取统一配置的分辨率档位。
             decision.targetFps = static_cast<int>(stream::kFocusedRemoteVideoProfile.targetFps); // wjy: 高质量焦点统一使用60FPS。
             if (decision.effectiveMode == stream::RemoteQualityMode::Balanced
                 || decision.effectiveMode == stream::RemoteQualityMode::Smooth) {

@@ -11397,3 +11397,65 @@ decision.targetFps = static_cast<int>(roleProfile.targetFps);
 ### 补充修改位置
 
 - `tests/remote_quality_coordinator_tests.cpp:34-273`：更新单窗口、多窗口、6/11/20/21 窗口和压力场景的帧率断言，验证窗口数量不会再改变后台 FPS。
+
+## 2026-08-07 - 让统一角色配置直接控制分辨率
+
+### 修改位置
+
+- `src/stream/RemoteVideoPolicy.h:3,46-67`：为 `RemoteVideoProfile` 增加 `RemoteResolutionTier resolution` 字段，并为焦点、后台、最小化常量填写对应档位。
+- `src/ui/RemoteQualityCoordinator.cpp:199-215`：焦点、后台和最小化决策改为直接读取角色配置中的分辨率档位，不再写死 `P1080/P720/P360`。
+- `tests/remote_video_policy_tests.cpp:7-28`：补充分辨率档位回归断言。
+
+### 修改原因
+
+此前统一配置中的宽高字段只是描述信息，协调器仍然把分辨率枚举写死，因此修改配置宽高不会可靠改变最终编码分辨率。本次将 `RemoteResolutionTier` 直接放入角色配置，确保以后只修改一组角色配置即可同步控制分辨率、FPS 和码率。
+
+### 原始代码
+
+```cpp
+// src/stream/RemoteVideoPolicy.h
+struct RemoteVideoProfile {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t targetFps = 0;
+    std::uint32_t priority = 0;
+    bool requestsRemoteQuality = false;
+    std::uint32_t maxBitrateKbps = 0;
+};
+
+// src/ui/RemoteQualityCoordinator.cpp
+decision.resolution = stream::RemoteResolutionTier::P1080;
+```
+
+### 修改后代码
+
+```cpp
+// src/stream/RemoteVideoPolicy.h
+struct RemoteVideoProfile {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t targetFps = 0;
+    std::uint32_t priority = 0;
+    bool requestsRemoteQuality = false;
+    std::uint32_t maxBitrateKbps = 0;
+    RemoteResolutionTier resolution = RemoteResolutionTier::Native; // wjy: 修改一处即可改变最终分辨率档位。
+};
+
+inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile =
+    {1920, 1080, 60, 100, true, 48000, RemoteResolutionTier::P1080};
+
+// src/ui/RemoteQualityCoordinator.cpp
+decision.resolution = stream::kFocusedRemoteVideoProfile.resolution;
+```
+
+### 修改步骤
+
+1. 将 `RemoteResolutionTier` 加入统一角色配置结构。
+2. 为三种角色配置分别绑定 `P1080`、`P720`、`P360`。
+3. 协调器读取配置档位计算目标宽高，避免硬编码分辨率。
+4. 更新策略测试，确认角色结果带有正确分辨率档位。
+
+### 验证
+
+- 已执行 `git diff --check` 前置检查。
+- 未编译；按用户要求本次不编译。
