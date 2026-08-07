@@ -11460,6 +11460,30 @@ decision.resolution = stream::kFocusedRemoteVideoProfile.resolution;
 - 已执行 `git diff --check` 前置检查。
 - 未编译；按用户要求本次不编译。
 
+## 2026-08-07 - 将统一画质配置加入 Qt 工程文件列表
+
+### 修改位置
+
+- `CMakeLists.txt:251`：将 `src/stream/RemoteVideoPolicy.h` 加入远控质量协调器测试目标。
+- `CMakeLists.txt:567`：将 `src/stream/RemoteVideoPolicy.h` 加入主程序源文件列表，使 Qt Creator 项目树显示该配置文件。
+
+### 修改原因
+
+文件实际存在于 `src/stream/RemoteVideoPolicy.h`，但此前只通过头文件间接包含，没有出现在 CMake 源文件列表中，因此 Qt Creator 项目树可能看不到。补入 CMake 后，重新加载 CMake 项目即可直接浏览和修改统一角色配置。
+
+### 修改后代码
+
+```cmake
+src/stream/RemoteQualityPolicy.h
+src/stream/RemoteVideoPolicy.h # wjy: Qt Creator可见的统一角色画质配置。
+```
+
+### 验证
+
+- 已确认目标文件存在且路径正确。
+- 已执行静态文件列表检查。
+- 未编译；按用户要求本次不编译。
+
 ## 2026-08-07 - 角色配置改为只填写分辨率档位
 
 ### 修改位置

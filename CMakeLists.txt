@@ -249,6 +249,7 @@ if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_VIEWER_STABILITY_TESTS) # wjy: 多窗
         src/ui/RemoteQualityCoordinator.cpp
         src/ui/RemoteQualityCoordinator.h
         src/stream/RemoteQualityPolicy.h
+        src/stream/RemoteVideoPolicy.h # wjy: 将统一角色画质配置加入Qt/CMake项目树，便于直接修改P1080/P720/P360档位。
     ) # wjy: 纯C++验证最小化立即降FPS、可见先降分辨率、恢复先升FPS和高质量最后降级。
     target_include_directories(fsremote_remote_quality_coordinator_tests PRIVATE src)
     if(MSVC)
@@ -564,6 +565,7 @@ qt_add_executable(FSRemote WIN32
     src/stream/StreamRuntime.cpp
     src/stream/StreamRuntime.h
     src/stream/RemoteQualityPolicy.h
+    src/stream/RemoteVideoPolicy.h # wjy: 主程序显式列出统一角色画质配置，Qt Creator重新加载后可见。
     src/system/AppSettings.cpp
     src/system/AppSettings.h
     src/system/PowerManager.cpp
