@@ -1,6 +1,7 @@
 #include "host_media_pipeline.h"
 
 #include "d3d11_native_frame_buffer.h"
+#include "host_display_selection_policy.h"
 #include "parsec_vdd_session.h"
 #include "dxgi_capture.h"
 #include "stream_capture_diagnostics.h"
@@ -72,6 +73,119 @@ uint32_t display_refresh_hz(const std::string& deviceName)
 }
 
 // =====wjy====
+std::string narrow_display_name(const wchar_t* value)
+{
+    if (!value || value[0] == L'\0') return {}; // wjy: 空设备名不能成为精确 DXGI 或 DesktopCapturer 目标。
+    const int required = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
+    if (required <= 1) return {};
+    std::string result(static_cast<size_t>(required), '\0'); // wjy: 先为转换结果和终止符分配完整容量，禁止WideCharToMultiByte越界写入。
+    WideCharToMultiByte(CP_UTF8, 0, value, -1, result.data(), required, nullptr, nullptr); // wjy: 使用Win32 UTF-8转换避免宽字符直接截断警告，同时保持设备名和诊断日志可读。
+    result.resize(static_cast<size_t>(required - 1)); // wjy: 转换完成后移除字符串长度中的终止符，返回标准UTF-8文本。
+    return result;
+}
+
+bool is_parsec_display_adapter(const wchar_t* adapterDeviceName)
+{
+    if (!adapterDeviceName || adapterDeviceName[0] == L'\0') return false;
+    for (DWORD monitorIndex = 0;; ++monitorIndex) {
+        DISPLAY_DEVICEW monitor = {};
+        monitor.cb = sizeof(monitor);
+        if (!EnumDisplayDevicesW(adapterDeviceName, monitorIndex, &monitor, EDD_GET_DEVICE_INTERFACE_NAME)) break;
+        if (monitor.DeviceID[0] != L'\0' && wcsstr(monitor.DeviceID, L"PSCCDD0") != nullptr) {
+            return true; // wjy: Parsec VDD 的监视器硬件身份包含 PSCCDD0，不能被自动策略当成真实主屏。
+        }
+    }
+    return false;
+}
+
+BOOL CALLBACK find_host_monitor_callback(HMONITOR monitor, HDC, LPRECT, LPARAM user)
+{
+    auto* context = reinterpret_cast<std::pair<const std::wstring*, HMONITOR*>*>(user);
+    MONITORINFOEXW info = {};
+    info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) return TRUE;
+    if (_wcsicmp(info.szDevice, context->first->c_str()) != 0) return TRUE;
+    *context->second = monitor; // wjy: 把 Windows 设备名解析成同一主屏的 HMONITOR，供 CPU 捕获精确匹配 source id。
+    return FALSE;
+}
+
+HMONITOR host_monitor_for_device_name(const std::wstring& deviceName)
+{
+    if (deviceName.empty()) return nullptr;
+    HMONITOR monitor = nullptr;
+    std::pair<const std::wstring*, HMONITOR*> context(&deviceName, &monitor);
+    EnumDisplayMonitors(nullptr, nullptr, find_host_monitor_callback, reinterpret_cast<LPARAM>(&context));
+    return monitor;
+}
+
+std::vector<HostDisplayCandidate> enumerate_host_display_candidates()
+{
+    std::vector<HostDisplayCandidate> candidates;
+    for (DWORD adapterIndex = 0;; ++adapterIndex) {
+        DISPLAY_DEVICEW adapter = {};
+        adapter.cb = sizeof(adapter);
+        if (!EnumDisplayDevicesW(nullptr, adapterIndex, &adapter, 0)) break;
+
+        HostDisplayCandidate candidate;
+        candidate.device_name = narrow_display_name(adapter.DeviceName); // wjy: 同一设备名贯穿策略、DXGI 和刷新率查询，禁止不同阶段重新猜测目标。
+        candidate.active = (adapter.StateFlags & DISPLAY_DEVICE_ACTIVE) != 0;
+        candidate.primary = (adapter.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
+        candidate.remote = (adapter.StateFlags & DISPLAY_DEVICE_REMOTE) != 0;
+        candidate.mirroring = (adapter.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER) != 0;
+        candidate.parsec = is_parsec_display_adapter(adapter.DeviceName);
+
+        DEVMODEW mode = {};
+        mode.dmSize = sizeof(mode);
+        if (EnumDisplaySettingsW(adapter.DeviceName, ENUM_CURRENT_SETTINGS, &mode)) {
+            candidate.width = mode.dmPelsWidth;
+            candidate.height = mode.dmPelsHeight;
+            candidate.refresh_hz = mode.dmDisplayFrequency; // wjy: 当前模式只作为候选有效性和最终刷新率快照，不修改真实屏配置。
+        }
+        candidate.monitor_id = reinterpret_cast<int64_t>(
+            host_monitor_for_device_name(adapter.DeviceName)); // wjy: 无 HMONITOR 的残留适配器由纯策略统一排除。
+        candidates.push_back(candidate);
+
+        append_stream_capture_diagnostic_log(
+            "display-select",
+            "candidate device='" + candidate.device_name + "'"
+                + " active=" + std::to_string(candidate.active ? 1 : 0)
+                + " primary=" + std::to_string(candidate.primary ? 1 : 0)
+                + " parsec=" + std::to_string(candidate.parsec ? 1 : 0)
+                + " remote=" + std::to_string(candidate.remote ? 1 : 0)
+                + " mirroring=" + std::to_string(candidate.mirroring ? 1 : 0)
+                + " size=" + std::to_string(candidate.width) + "x" + std::to_string(candidate.height)
+                + " hz=" + std::to_string(candidate.refresh_hz)
+                + " monitor_id=" + std::to_string(candidate.monitor_id)); // wjy: 每轮首订阅完整记录决策输入，实机可直接解释为何创建或跳过 VDD。
+    }
+    return candidates;
+}
+
+enum class HostCaptureMode {
+    None,
+    Custom,
+    PhysicalDxgi,
+    PhysicalDesktop,
+    VirtualDxgi,
+    VirtualDesktop,
+    GenericDesktop,
+};
+
+const char* host_capture_mode_name(HostCaptureMode mode)
+{
+    switch (mode) {
+    case HostCaptureMode::Custom: return "custom";
+    case HostCaptureMode::PhysicalDxgi: return "physical-dxgi";
+    case HostCaptureMode::PhysicalDesktop: return "physical-desktop";
+    case HostCaptureMode::VirtualDxgi: return "virtual-dxgi";
+    case HostCaptureMode::VirtualDesktop: return "virtual-desktop";
+    case HostCaptureMode::GenericDesktop: return "generic-desktop";
+    case HostCaptureMode::None: break;
+    }
+    return "none"; // wjy: 统一的可读模式名同时服务启动、停止和错误诊断。
+}
+// ===end====
+
+// =====wjy====
 const char* desktop_capture_result_name(webrtc::DesktopCapturer::Result result)
 {
     switch (result) {
@@ -107,7 +221,7 @@ public:
         append_stream_capture_diagnostic_log(
             "capture",
             "native-source start begin preferred_device='"
-                + std::string(preferred_device_name_.begin(), preferred_device_name_.end())
+                + narrow_display_name(preferred_device_name_.c_str())
                 + "' fps=" + std::to_string(fps_.load(std::memory_order_acquire))); // wjy: 原生采集启动前记录目标输出和帧率，确认Host实际进入哪条媒体路径。
         if (preferred_device_name_.empty()) {
             if (error) *error = "DXGI native capture requires a selected display device";
@@ -363,11 +477,13 @@ private:
 class DesktopVideoSource : public webrtc::AdaptedVideoTrackSource,
                            public webrtc::DesktopCapturer::Callback { // wjy: WebRTC 的 RefCountedObject 需要从该类型派生，因此这里不能使用 final。
 public:
-    DesktopVideoSource(uint32_t fps, int64_t preferredSourceId, std::string preferredDeviceName, bool preferVirtualDisplayPath)
+    DesktopVideoSource(uint32_t fps, int64_t preferredSourceId, std::string preferredDeviceName,
+                       bool preferVirtualDisplayPath, bool requireExactTarget)
         : fps_(fps ? fps : 60)
         , preferred_source_id_(preferredSourceId)
         , preferred_device_name_(to_lower_copy(std::move(preferredDeviceName)))
         , prefer_virtual_display_path_(preferVirtualDisplayPath)
+        , require_exact_target_(requireExactTarget) // wjy: 真实屏和VDD目标都必须精确命中，只有显式紧急兼容路径允许首项回退。
     {
     }
 
@@ -384,7 +500,8 @@ public:
             "capture-fallback",
             "DesktopCapturer start begin preferred_id=" + std::to_string(preferred_source_id_)
                 + " preferred_name='" + preferred_device_name_ + "'"
-                + " prefer_virtual=" + std::to_string(prefer_virtual_display_path_ ? 1 : 0)); // wjy: 仅原生DXGI失败后进入CPU回退，记录其输入身份和后端偏好。
+                + " prefer_virtual=" + std::to_string(prefer_virtual_display_path_ ? 1 : 0)
+                + " require_exact=" + std::to_string(require_exact_target_ ? 1 : 0)); // wjy: 记录目标类型和精确匹配门禁，排查是否存在误抓其他屏幕。
         auto options = webrtc::DesktopCaptureOptions::CreateDefault();
 #if defined(WEBRTC_WIN)
         options.set_allow_directx_capturer(true);
@@ -414,14 +531,14 @@ public:
             std::cout << "\n";
 
             auto chosen = sources.front();
-            const auto choose_parsec_fallback = [&sources]() -> webrtc::DesktopCapturer::Source {
+            const auto choose_parsec_fallback = [&sources]() -> std::optional<webrtc::DesktopCapturer::Source> {
                 for (const auto& source : sources) {
                     const std::string title = to_lower_copy(source.title);
                     if (title.find("parsec") != std::string::npos || title.find("psccdd0") != std::string::npos) {
                         return source;
                     }
                 }
-                return sources.front();
+                return std::nullopt; // wjy: 找不到 Parsec 身份时禁止静默退化到物理屏，避免虚拟路径泄露错误画面。
             };
 
             bool matched = false;
@@ -445,8 +562,20 @@ public:
                     }
                 }
             }
-            if (!matched && (preferred_source_id_ != 0 || !preferred_device_name_.empty())) {
-                chosen = choose_parsec_fallback();
+            if (!matched && prefer_virtual_display_path_) {
+                const auto parsecFallback = choose_parsec_fallback();
+                if (parsecFallback) {
+                    chosen = *parsecFallback;
+                    matched = true; // wjy: WebRTC 未暴露 HMONITOR 时仅允许通过明确的 Parsec 标题完成 VDD 兼容匹配。
+                }
+            }
+            if (!matched && require_exact_target_) {
+                if (error) *error = "DesktopCapturer target display was not found";
+                append_stream_capture_diagnostic_log(
+                    "capture-fallback",
+                    "exact target not found preferred_id=" + std::to_string(preferred_source_id_)
+                        + " preferred_name='" + preferred_device_name_ + "'"); // wjy: 精确目标缺失必须返回上层继续 VDD 回退，不能选择 sources.front。
+                return false;
             }
 
             if (!capturer_->SelectSource(chosen.id)) {
@@ -469,6 +598,8 @@ public:
             append_stream_capture_diagnostic_log(
                 "capture-fallback",
                 "GetSourceList returned no sources"); // wjy: 无活动桌面时WebRTC可能创建捕获器成功但枚举为空，必须在启动日志中显式可见。
+            if (error) *error = "DesktopCapturer returned no display sources";
+            return false; // wjy: 无可选源时启动线程只会永久等待空帧，因此直接交给下一层 VDD 或会话错误处理。
         }
 
         capturer_->SetMaxFrameRate(fps_.load(std::memory_order_acquire));
@@ -608,6 +739,7 @@ private:
     int64_t preferred_source_id_ = 0;
     std::string preferred_device_name_;
     bool prefer_virtual_display_path_ = false;
+    bool require_exact_target_ = false; // wjy: 目标化捕获必须命中同一屏幕，通用兼容路径才允许使用枚举首项。
     std::atomic_bool running_ = false;
     std::unique_ptr<webrtc::DesktopCapturer> capturer_;
     std::thread thread_;
@@ -629,6 +761,61 @@ struct HostMediaPipeline::SharedState {
             "target fps updated fps=" + std::to_string(fps));
     }
 
+    // =====wjy====
+    void activate_target_locked(HostCaptureMode mode, const std::string& deviceName, int64_t monitorId)
+    {
+        active_capture_mode = mode; // wjy: 最终模式与 source 同时提交，刷新率和停止日志不会再从 VDD 是否存在反推状态。
+        active_device_name = deviceName;
+        active_monitor_id = monitorId;
+        append_stream_capture_diagnostic_log(
+            "pipeline",
+            "capture target active mode=" + std::string(host_capture_mode_name(mode))
+                + " device='" + active_device_name + "'"
+                + " monitor_id=" + std::to_string(active_monitor_id)); // wjy: 单行记录最终选择，现场日志可直接判断本轮是否创建了虚拟屏。
+    }
+
+    bool start_dxgi_locked(const std::string& deviceName, int64_t monitorId,
+                           HostCaptureMode mode, const char* targetLabel, std::string* failure)
+    {
+        auto native = webrtc::make_ref_counted<DxgiVideoSource>(fps, deviceName);
+        std::string nativeError;
+        if (!native->start(&nativeError)) {
+            if (failure) *failure = nativeError;
+            append_stream_capture_diagnostic_log(
+                "pipeline",
+                std::string(targetLabel) + " DXGI failed device='" + deviceName
+                    + "' error=" + nativeError); // wjy: 真实屏失败将继续CPU捕获，VDD失败将继续VDD CPU回退，原因保持独立。
+            return false;
+        }
+        dxgi_source = native;
+        source = native;
+        activate_target_locked(mode, deviceName, monitorId); // wjy: 只有 DuplicateOutput 初始化成功后才公布目标，失败对象不会污染共享状态。
+        return true;
+    }
+
+    bool start_desktop_locked(int64_t monitorId, const std::string& deviceName,
+                              bool preferVirtualDisplayPath, bool requireExactTarget,
+                              HostCaptureMode mode, const char* targetLabel, std::string* failure)
+    {
+        auto desktop = webrtc::make_ref_counted<DesktopVideoSource>(
+            fps, monitorId, deviceName, preferVirtualDisplayPath, requireExactTarget);
+        std::string desktopError;
+        if (!desktop->start(&desktopError)) {
+            if (failure) *failure = desktopError;
+            append_stream_capture_diagnostic_log(
+                "pipeline",
+                std::string(targetLabel) + " DesktopCapturer failed device='" + deviceName
+                    + "' monitor_id=" + std::to_string(monitorId)
+                    + " error=" + desktopError); // wjy: 精确选屏失败向上返回，真实屏路径才会继续创建VDD。
+            return false;
+        }
+        desktop_source = desktop;
+        source = desktop;
+        activate_target_locked(mode, deviceName, monitorId); // wjy: CPU兼容源成功后仍保存同一个目标身份，输入与刷新率语义不变。
+        return true;
+    }
+    // ===end====
+
     bool start_locked(std::string* error)
     {
         if (source) return true;
@@ -641,17 +828,78 @@ struct HostMediaPipeline::SharedState {
             source = hooks.start(error); // wjy: 单元测试通过假 source 验证计数，不启动真实显示驱动或捕获线程。
             custom_backend_started = source != nullptr;
             if (!source && error && error->empty()) *error = "host media test backend returned null source";
+            if (source) activate_target_locked(HostCaptureMode::Custom, {}, 0); // wjy: 测试后端也进入统一状态机，停止时能验证模式被完整清空。
             return source != nullptr;
         }
 
-        virtual_display = std::make_unique<ParsecVddSession>(); // wjy: VDD 所有权从 WebrtcSession 上移到主机共享媒体管线。
+        // =====wjy====
+        const auto physicalTarget = select_existing_primary_display(
+            enumerate_host_display_candidates()); // wjy: 每个空闲到活跃的首订阅都重新读取当前拓扑，断线期间插拔屏幕后下次连接可重新决策。
+        if (physicalTarget) {
+            append_stream_capture_diagnostic_log(
+                "display-select",
+                "selected existing primary device='" + physicalTarget->device_name
+                    + "' monitor_id=" + std::to_string(physicalTarget->monitor_id));
+
+            std::string physicalDxgiError;
+            if (start_dxgi_locked(
+                    physicalTarget->device_name,
+                    physicalTarget->monitor_id,
+                    HostCaptureMode::PhysicalDxgi,
+                    "physical",
+                    &physicalDxgiError)) {
+                return true; // wjy: 真实主屏原生纹理成功时不创建、设置或删除任何 Parsec 显示器。
+            }
+
+            std::string physicalDesktopError;
+            if (start_desktop_locked(
+                    physicalTarget->monitor_id,
+                    physicalTarget->device_name,
+                    false,
+                    true,
+                    HostCaptureMode::PhysicalDesktop,
+                    "physical",
+                    &physicalDesktopError)) {
+                return true; // wjy: 原生捕获不可用但精确CPU源可用时仍保留真实主屏，避免无必要VDD。
+            }
+
+            append_stream_capture_diagnostic_log(
+                "display-select",
+                "existing primary unusable device='" + physicalTarget->device_name
+                    + "' dxgi_error=" + physicalDxgiError
+                    + " desktop_error=" + physicalDesktopError
+                    + "; fallback=virtual-display"); // wjy: 两级真实屏捕获都失败后才允许进入VDD创建阶段。
+        } else {
+            append_stream_capture_diagnostic_log(
+                "display-select",
+                "no eligible existing primary; fallback=virtual-display"); // wjy: 无头、远程、镜像或仅Parsec拓扑统一走受控VDD生命周期。
+        }
+
+        virtual_display = std::make_unique<ParsecVddSession>(); // wjy: 只有真实主屏不存在或无法捕获时才分配 VDD 会话。
         std::string vdd_error;
         if (!virtual_display->start(&vdd_error)) {
             std::cout << "host media: parsec-vdd unavailable: " << vdd_error << "\n";
-            virtual_display.reset(); // wjy: VDD 不可用时保持原有行为，回退到系统已有屏幕源。
+            virtual_display.reset(); // wjy: VDD句柄未就绪时立即释放局部所有权，再尝试原有通用DesktopCapturer紧急回退。
             append_stream_capture_diagnostic_log(
                 "pipeline",
-                "VDD start failed error=" + vdd_error); // wjy: 记录回退CPU桌面之前的VDD真实错误。
+                "VDD start failed error=" + vdd_error); // wjy: 记录紧急通用CPU回退之前的VDD真实错误。
+
+            std::string genericDesktopError;
+            if (start_desktop_locked(
+                    0,
+                    {},
+                    false,
+                    false,
+                    HostCaptureMode::GenericDesktop,
+                    "generic",
+                    &genericDesktopError)) {
+                return true; // wjy: 驱动缺失时保留旧版可用性，但该路径明确标记为紧急通用捕获而非真实主屏命中。
+            }
+            if (error) {
+                *error = "parsec-vdd failed: " + vdd_error
+                    + "; generic desktop failed: " + genericDesktopError;
+            }
+            return false;
         } else {
             std::cout << "host media: parsec-vdd source prepared id="
                       << virtual_display->preferred_source_id()
@@ -662,46 +910,42 @@ struct HostMediaPipeline::SharedState {
                     + " device='" + virtual_display->preferred_device_name() + "'"); // wjy: 管线保存最终收到的VDD身份，随后可与DXGI选择结果逐行核对。
         }
 
-        if (virtual_display) {
-            auto native = webrtc::make_ref_counted<DxgiVideoSource>(
-                fps, virtual_display->preferred_device_name());
-            std::string native_error;
-            if (native->start(&native_error)) {
-                dxgi_source = native;
-                source = native;
-                std::cout << "host media: DXGI native texture path active for '"
-                          << virtual_display->preferred_device_name() << "'\n"; // wjy: 原生路径成功后不再创建CPU DesktopCapturer和ARGBToI420转换链。
-                append_stream_capture_diagnostic_log(
-                    "pipeline",
-                    "native DXGI source active"); // wjy: 明确标记生产环境最终选择原生纹理路径。
-                return true;
-            }
-            std::cout << "host media: DXGI native capture unavailable: " << native_error
-                      << "; falling back to CPU DesktopCapturer\n";
-            append_stream_capture_diagnostic_log(
-                "pipeline",
-                "native DXGI source failed error=" + native_error
-                    + "; fallback=DesktopCapturer"); // wjy: 回退原因写入文件，避免只存在不可见控制台输出。
+        const int64_t virtualMonitorId = virtual_display->preferred_source_id();
+        const std::string virtualDeviceName = virtual_display->preferred_device_name();
+        std::string virtualDxgiError;
+        if (start_dxgi_locked(
+                virtualDeviceName,
+                virtualMonitorId,
+                HostCaptureMode::VirtualDxgi,
+                "virtual",
+                &virtualDxgiError)) {
+            return true; // wjy: 无头兜底仍优先保持现有D3D11纹理到NVENC的高性能链路。
         }
 
-        auto desktop = webrtc::make_ref_counted<DesktopVideoSource>(
-            fps,
-            virtual_display ? virtual_display->preferred_source_id() : 0,
-            virtual_display ? virtual_display->preferred_device_name() : std::string(),
-            virtual_display != nullptr);
-        if (!desktop->start(error)) {
-            append_stream_capture_diagnostic_log(
-                "pipeline",
-                "DesktopCapturer source failed error=" + (error ? *error : std::string())); // wjy: 两种采集后端都失败时保存最终错误。
-            virtual_display.reset();
-            return false;
+        std::string virtualDesktopError;
+        if (start_desktop_locked(
+                virtualMonitorId,
+                virtualDeviceName,
+                true,
+                true,
+                HostCaptureMode::VirtualDesktop,
+                "virtual",
+                &virtualDesktopError)) {
+            return true; // wjy: DXGI失败时只允许精确命中本轮VDD，不得静默捕获其他物理屏幕。
         }
-        desktop_source = desktop;
-        source = desktop;
+
         append_stream_capture_diagnostic_log(
             "pipeline",
-            "DesktopCapturer source active"); // wjy: 标记CPU回退最终成为共享source。
-        return true;
+            "virtual display capture failed dxgi_error=" + virtualDxgiError
+                + " desktop_error=" + virtualDesktopError); // wjy: VDD两条捕获路径都失败时保留完整因果链后终止本次订阅。
+        if (error) {
+            *error = "virtual display capture failed: dxgi=" + virtualDxgiError
+                + "; desktop=" + virtualDesktopError;
+        }
+        virtual_display->stop();
+        virtual_display.reset();
+        return false;
+        // ===end====
     }
 
     void stop_locked()
@@ -711,7 +955,10 @@ struct HostMediaPipeline::SharedState {
             "stop begin subscribers=" + std::to_string(subscribers)
                 + " native=" + std::to_string(dxgi_source ? 1 : 0)
                 + " fallback=" + std::to_string(desktop_source ? 1 : 0)
-                + " vdd=" + std::to_string(virtual_display ? 1 : 0)); // wjy: 停止前记录实际活跃后端和订阅数，确认重连是否完整释放系统资源。
+                + " vdd=" + std::to_string(virtual_display ? 1 : 0)
+                + " mode=" + host_capture_mode_name(active_capture_mode)
+                + " device='" + active_device_name + "'"
+                + " monitor_id=" + std::to_string(active_monitor_id)); // wjy: 停止前保存最终真实/虚拟模式，确认重连是否完整释放并重新决策。
         if (dxgi_source) dxgi_source->stop(); // wjy: 先等待原生采集线程退出再移除VDD，避免DuplicateOutput继续访问已删除显示器。
         if (custom_backend_started && hooks.stop) hooks.stop(); // wjy: 测试后端与生产后端遵循相同的最后订阅者停止时机。
         custom_backend_started = false;
@@ -721,6 +968,9 @@ struct HostMediaPipeline::SharedState {
         desktop_source = nullptr;
         if (virtual_display) virtual_display->stop();
         virtual_display.reset();
+        active_capture_mode = HostCaptureMode::None; // wjy: 最后订阅者离开后清空决策结果，下次首订阅必须重新枚举当前显示拓扑。
+        active_device_name.clear();
+        active_monitor_id = 0;
         append_stream_capture_diagnostic_log(
             "pipeline",
             "stop end"); // wjy: DXGI、CPU source和VDD全部释放后写入统一终点。
@@ -732,6 +982,9 @@ struct HostMediaPipeline::SharedState {
     bool shutting_down = false;
     bool custom_backend_started = false;
     size_t subscribers = 0;
+    HostCaptureMode active_capture_mode = HostCaptureMode::None; // wjy: 保存共享管线本轮最终后端，不按单个PeerConnection重复选择。
+    std::string active_device_name; // wjy: 真实屏与VDD共用的最终设备身份，供刷新率和诊断读取。
+    int64_t active_monitor_id = 0; // wjy: 与最终设备配对的HMONITOR快照，停止日志可核对CPU选屏。
     std::unique_ptr<ParsecVddSession> virtual_display;
     webrtc::scoped_refptr<DxgiVideoSource> dxgi_source; // wjy: 多个会话共享同一DXGI采集源，避免每个PeerConnection重复抓屏。
     webrtc::scoped_refptr<DesktopVideoSource> desktop_source;
@@ -818,8 +1071,7 @@ uint32_t HostMediaPipeline::source_refresh_hz() const
     const std::shared_ptr<SharedState> state = state_;
     if (!state) return 60;
     std::lock_guard lock(state->mutex);
-    if (!state->virtual_display) return 60;
-    return display_refresh_hz(state->virtual_display->preferred_device_name());
+    return display_refresh_hz(state->active_device_name); // wjy: 真实主屏和VDD都从最终目标设备读取刷新率，通用/测试源继续安全回退60Hz。
 }
 
 void HostMediaPipeline::shutdown()

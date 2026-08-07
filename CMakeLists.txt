@@ -38,6 +38,7 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
         third_party/uu_stream_webrtc/src/d3d11_native_frame_buffer.cpp
         third_party/uu_stream_webrtc/src/d3d11_native_frame_buffer.h # wjy: 原生WebRTC帧在采集与自定义H265编码器之间保持D3D11纹理，不强制往返CPU。
         third_party/uu_stream_webrtc/src/latest_encode_frame_slot.h # wjy: 编码器单槽最新帧策略独立成可测试头文件，过载时覆盖旧帧并继承关键帧请求。
+        third_party/uu_stream_webrtc/src/host_display_selection_policy.h # wjy: 真实主屏资格判断拆成无显卡纯策略，生产枚举与测试共享同一自动选屏规则。
         third_party/uu_stream_webrtc/src/host_media_pipeline.cpp
         third_party/uu_stream_webrtc/src/host_media_pipeline.h
     ) # wjy: 子项目 CMake 含历史非 UTF-8 字节，顶层显式登记共享媒体管线可避免整文件转码破坏既有配置。
@@ -121,6 +122,19 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
             set_property(TARGET uu_host_media_pipeline_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
         endif()
         add_test(NAME uu_host_media_pipeline_tests COMMAND uu_host_media_pipeline_tests)
+
+        # =====wjy====
+        add_executable(uu_host_display_selection_policy_tests EXCLUDE_FROM_ALL
+            third_party/uu_stream_webrtc/tests/host_display_selection_policy_tests.cpp
+            third_party/uu_stream_webrtc/src/host_display_selection_policy.h
+        ) # wjy: 无需显卡或 Parsec 驱动即可验证真实主屏资格、排除条件和稳定选择顺序。
+        target_include_directories(uu_host_display_selection_policy_tests PRIVATE third_party/uu_stream_webrtc/src)
+        if(MSVC)
+            target_compile_options(uu_host_display_selection_policy_tests PRIVATE /utf-8) # wjy: 测试与策略头包含中文维护注释，MSVC 统一按 UTF-8 读取。
+            set_property(TARGET uu_host_display_selection_policy_tests PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+        endif()
+        add_test(NAME uu_host_display_selection_policy_tests COMMAND uu_host_display_selection_policy_tests) # wjy: CTest 通过断言锁定主屏优先且不接管 Parsec/远程/镜像输出。
+        # ===end====
 
         add_executable(uu_latest_encode_frame_slot_tests EXCLUDE_FROM_ALL
             third_party/uu_stream_webrtc/tests/latest_encode_frame_slot_tests.cpp

@@ -10911,3 +10911,245 @@ if (settingsLayout.containsPoint(settingsHideLocalDeviceSwitchRect(), event->pos
 - `rg` 静态复核：设置页绘制参数只有一个调用点，开关矩形已同时接入绘制、悬停和点击命中。
 - `rg` 静态复核：列表排序、搜索、批量/周期新增、手动新增、同步快照、实时状态白名单、分组批量动作均接入本机过滤。
 - 按用户要求未构建、未链接、未运行程序或二进制测试。
+
+## 2026-08-07 10:01 - 真实主屏优先与虚拟屏智能兜底
+
+### Changed Location
+- `openspec/changes/auto-select-remote-display/.openspec.yaml:1-2`：登记本次变更使用 `spec-driven` 工作流及创建日期。
+- `openspec/changes/auto-select-remote-display/proposal.md:1-28`：新增本次自动选屏变更的动机、范围、能力和影响说明。
+- `openspec/changes/auto-select-remote-display/design.md:1-74`：确定真实主屏 DXGI/CPU 两级捕获、VDD 兜底、稳定共享目标和所有权边界。
+- `openspec/changes/auto-select-remote-display/specs/automatic-host-display-selection/spec.md:1-67`：新增可验证的 Host 自动显示选择行为规格。
+- `openspec/changes/auto-select-remote-display/tasks.md:1-21`：记录十项实现、验证和文档任务及完成状态。
+- `third_party/uu_stream_webrtc/src/host_display_selection_policy.h:1-49`：新增无显卡可测试的主屏候选模型和确定性资格策略。
+- `third_party/uu_stream_webrtc/tests/host_display_selection_policy_tests.cpp:1-65`：新增物理主屏、Parsec、非活动、副屏、远程、镜像和无效模式回归测试。
+- `CMakeLists.txt:41,126-137`：登记生产策略头和新的独立测试目标。
+- `third_party/uu_stream_webrtc/src/host_media_pipeline.cpp:76-181,480-742,753-991,1069-1075`：增加 Windows 显示枚举、精确 DesktopCapturer 选屏、真实屏优先启动顺序、活动目标状态和统一刷新率读取。
+- `third_party/uu_stream_webrtc/src/parsec_vdd_session.cpp:358-363,519-521`：停止跨进程删除全部 Parsec 显示器，只创建并释放本会话持有的索引。
+
+### Reason
+原共享媒体管线在首个远控订阅建立时无条件创建 Parsec VDD，即使 Windows 已连接并可捕获真实主屏。这样会反复改变显示拓扑和主屏，也可能在创建前删除其他进程持有的 Parsec 显示实例。本次改为在同一个首订阅边界内优先捕获真实主屏，只有真实主屏不存在或 DXGI、DesktopCapturer 都无法精确使用时才创建 VDD，同时保持多 Viewer 共享一个视频源、最后订阅者统一清理的现有架构。
+
+### Original Code
+```cmake
+# CMakeLists.txt:40-42（修改前）
+third_party/uu_stream_webrtc/src/latest_encode_frame_slot.h
+third_party/uu_stream_webrtc/src/host_media_pipeline.cpp
+third_party/uu_stream_webrtc/src/host_media_pipeline.h
+
+# CMakeLists.txt:123-125（修改前）
+add_test(NAME uu_host_media_pipeline_tests COMMAND uu_host_media_pipeline_tests)
+
+add_executable(uu_latest_encode_frame_slot_tests EXCLUDE_FROM_ALL
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/host_display_selection_policy.h（新增文件，无原代码）
+// new code, no old code at this location
+```
+
+```cpp
+// third_party/uu_stream_webrtc/tests/host_display_selection_policy_tests.cpp（新增文件，无原代码）
+// new code, no old code at this location
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/host_media_pipeline.cpp:416-450（修改前）
+auto chosen = sources.front();
+const auto choose_parsec_fallback = [&sources]() -> webrtc::DesktopCapturer::Source {
+    for (const auto& source : sources) {
+        const std::string title = to_lower_copy(source.title);
+        if (title.find("parsec") != std::string::npos || title.find("psccdd0") != std::string::npos) {
+            return source;
+        }
+    }
+    return sources.front();
+};
+
+if (!matched && (preferred_source_id_ != 0 || !preferred_device_name_.empty())) {
+    chosen = choose_parsec_fallback();
+}
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/host_media_pipeline.cpp:632-704（修改前）
+bool start_locked(std::string* error)
+{
+    if (source) return true;
+    if (hooks.start) {
+        source = hooks.start(error);
+        return source != nullptr;
+    }
+
+    virtual_display = std::make_unique<ParsecVddSession>();
+    virtual_display->start(&vdd_error);
+    if (virtual_display) {
+        // 仅 VDD 成功后尝试 DXGI。
+    }
+    // 最后创建一个可能回退到 sources.front 的 DesktopCapturer。
+}
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/host_media_pipeline.cpp:816-823（修改前）
+uint32_t HostMediaPipeline::source_refresh_hz() const
+{
+    const std::shared_ptr<SharedState> state = state_;
+    if (!state) return 60;
+    std::lock_guard lock(state->mutex);
+    if (!state->virtual_display) return 60;
+    return display_refresh_hz(state->virtual_display->preferred_device_name());
+}
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/parsec_vdd_session.cpp:214-264,412-415（修改前）
+std::vector<int> enumerate_parsec_display_indexes();
+void remove_existing_parsec_displays(HANDLE handle)
+{
+    // 枚举并删除驱动中的全部 Parsec 显示索引。
+}
+
+remove_existing_parsec_displays(handle_);
+std::this_thread::sleep_for(std::chrono::milliseconds(300));
+display_index_ = parsec_vdd::VddAddDisplay(handle_);
+```
+
+### Modified Code
+```cmake
+# CMakeLists.txt:40-42,126-137（修改后）
+third_party/uu_stream_webrtc/src/latest_encode_frame_slot.h
+third_party/uu_stream_webrtc/src/host_display_selection_policy.h # wjy: 生产枚举与测试共享自动选屏规则。
+third_party/uu_stream_webrtc/src/host_media_pipeline.cpp
+
+add_executable(uu_host_display_selection_policy_tests EXCLUDE_FROM_ALL
+    third_party/uu_stream_webrtc/tests/host_display_selection_policy_tests.cpp
+    third_party/uu_stream_webrtc/src/host_display_selection_policy.h
+)
+add_test(NAME uu_host_display_selection_policy_tests COMMAND uu_host_display_selection_policy_tests)
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/host_display_selection_policy.h:11-46（修改后）
+struct HostDisplayCandidate {
+    std::string device_name;
+    int64_t monitor_id = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t refresh_hz = 0;
+    bool active = false;
+    bool primary = false;
+    bool parsec = false;
+    bool remote = false;
+    bool mirroring = false;
+};
+
+inline bool is_eligible_existing_primary(const HostDisplayCandidate& candidate)
+{
+    return candidate.active
+        && candidate.primary
+        && !candidate.parsec
+        && !candidate.remote
+        && !candidate.mirroring
+        && !candidate.device_name.empty()
+        && candidate.monitor_id != 0
+        && candidate.width > 0
+        && candidate.height > 0;
+}
+```
+
+```cpp
+// third_party/uu_stream_webrtc/tests/host_display_selection_policy_tests.cpp:25-63（修改后）
+const auto selected = uu::select_existing_primary_display({valid_primary()});
+assert(selected.has_value());
+
+parsec.parsec = true;
+assert(!uu::select_existing_primary_display({parsec}));
+inactive.active = false;
+assert(!uu::select_existing_primary_display({inactive}));
+secondary.primary = false;
+assert(!uu::select_existing_primary_display({secondary}));
+remote.remote = true;
+assert(!uu::select_existing_primary_display({remote}));
+mirroring.mirroring = true;
+assert(!uu::select_existing_primary_display({mirroring}));
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/host_media_pipeline.cpp:121-160（修改后）
+std::vector<HostDisplayCandidate> enumerate_host_display_candidates()
+{
+    // 枚举 Windows 适配器，保存活动、主屏、Parsec、远程、镜像、模式和 HMONITOR 状态。
+    // 每个候选都写入 display-select 诊断日志，再交给纯策略选择。
+}
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/host_media_pipeline.cpp:533-580（修改后）
+const auto choose_parsec_fallback = [&sources]()
+    -> std::optional<webrtc::DesktopCapturer::Source> {
+    // 只返回明确带有 Parsec 身份的源。
+    return std::nullopt;
+};
+
+if (!matched && require_exact_target_) {
+    if (error) *error = "DesktopCapturer target display was not found";
+    return false; // 精确目标缺失时交给下一层回退，不再选择 sources.front。
+}
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/host_media_pipeline.cpp:819-944（修改后）
+const auto physicalTarget = select_existing_primary_display(
+    enumerate_host_display_candidates());
+if (physicalTarget) {
+    if (start_dxgi_locked(/* physical */)) return true;
+    if (start_desktop_locked(/* physical, exact */)) return true;
+}
+
+virtual_display = std::make_unique<ParsecVddSession>();
+if (!virtual_display->start(&vdd_error)) {
+    // 保留旧版通用 DesktopCapturer 紧急兼容路径。
+}
+if (start_dxgi_locked(/* virtual */)) return true;
+if (start_desktop_locked(/* virtual, exact */)) return true;
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/host_media_pipeline.cpp:1069-1075（修改后）
+uint32_t HostMediaPipeline::source_refresh_hz() const
+{
+    const std::shared_ptr<SharedState> state = state_;
+    if (!state) return 60;
+    std::lock_guard lock(state->mutex);
+    return display_refresh_hz(state->active_device_name);
+}
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/parsec_vdd_session.cpp:358-363,519-521（修改后）
+append_stream_capture_diagnostic_log(
+    "vdd",
+    "preserve-existing displays; add owned display only");
+display_index_ = parsec_vdd::VddAddDisplay(handle_);
+
+if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE && display_index_ >= 0) {
+    parsec_vdd::VddRemoveDisplay(handle_, display_index_); // 仅释放本会话保存的索引。
+}
+```
+
+### Steps
+1. 创建 `auto-select-remote-display` OpenSpec 变更，完成 proposal、design、行为规格和十项可追踪任务。
+2. 新增 `HostDisplayCandidate` 纯策略，限定只有活动、有效、非 Parsec、非远程、非镜像的 Windows 主屏可以绕过 VDD。
+3. 在首个媒体订阅启动时枚举当前显示拓扑，并记录每个候选的设备名、模式、标志和 HMONITOR。
+4. 将生产启动顺序调整为真实主屏 DXGI、真实主屏精确 DesktopCapturer、VDD DXGI、VDD 精确 DesktopCapturer；VDD 驱动本身不可用时保留旧通用 CPU 紧急回退。
+5. 为 `DesktopVideoSource` 增加精确目标门禁，物理屏或 VDD 身份无法匹配时返回失败，不再静默抓取其他屏幕。
+6. 保存最终捕获模式、设备名和监视器 ID，并让刷新率查询同时支持真实屏和虚拟屏；最后订阅者退出时清空状态供下次重新判断。
+7. 删除 VDD 创建前的全局 Parsec 索引枚举和删除，只移除当前 `VddAddDisplay` 返回并由本会话持有的索引。
+8. 新增并登记无显卡显示选择策略测试，重新配置 CMake，构建生产流媒体库和相关测试目标。
+
+### Verification
+- `cmake -S . -B build-video-webrtc-msvc -DFSREMOTE_BUILD_TESTS=ON`：配置成功；仅保留项目已有的 FakerInput 安装包缺失和 Qt AUTOGEN 开发警告。
+- `cmake --build build-video-webrtc-msvc --config Release --target uu_stream_common fsremote_stream uu_host_display_selection_policy_tests uu_host_media_pipeline_tests uu_dxgi_capture_policy_tests -- /m`：全部目标构建成功；仅有 WebRTC 外部头中的未知 clang pragma 警告。
+- `ctest --test-dir build-video-webrtc-msvc -C Release -R "uu_(host_display_selection_policy|host_media_pipeline|dxgi_capture_policy)_tests" --output-on-failure`：3/3 测试通过，0 失败。
+- `git diff --check`：通过。
+- 变更范围复核：未修改 Viewer、WebRTC 信令、输入协议或 Qt 远控窗口代码。

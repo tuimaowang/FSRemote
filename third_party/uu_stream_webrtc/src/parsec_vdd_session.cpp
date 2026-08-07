@@ -13,8 +13,6 @@
 
 #include <chrono>
 #include <cstdint>
-#include <vector>
-#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <sstream>
@@ -211,58 +209,6 @@ bool enumerate_parsec_display_by_index(int display_index, DisplayInfo* out)
     return false;
 }
 
-std::vector<int> enumerate_parsec_display_indexes()
-{
-    std::vector<int> indexes;
-    DISPLAY_DEVICEW adapter = {};
-    adapter.cb = sizeof(adapter);
-    for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &adapter, 0); ++i) {
-        DISPLAY_DEVICEW monitor = {};
-        monitor.cb = sizeof(monitor);
-        for (DWORD j = 0; EnumDisplayDevicesW(adapter.DeviceName, j, &monitor, EDD_GET_DEVICE_INTERFACE_NAME); ++j) {
-            if (!is_parsec_display_device(monitor)) {
-                continue;
-            }
-
-            const int address = parse_display_address(monitor.DeviceID);
-            if (address >= 0x100) {
-                indexes.push_back(address - 0x100);
-            }
-        }
-    }
-
-    std::sort(indexes.begin(), indexes.end());
-    indexes.erase(std::unique(indexes.begin(), indexes.end()), indexes.end());
-    return indexes;
-}
-
-void remove_existing_parsec_displays(HANDLE handle)
-{
-    if (handle == nullptr || handle == INVALID_HANDLE_VALUE) {
-        return;
-    }
-
-    auto indexes = enumerate_parsec_display_indexes();
-    std::sort(indexes.rbegin(), indexes.rend());
-    {
-        std::ostringstream line;
-        line << "remove-existing count=" << indexes.size() << " indexes=";
-        for (size_t position = 0; position < indexes.size(); ++position) {
-            if (position > 0) line << ",";
-            line << indexes[position];
-        }
-        append_stream_capture_diagnostic_log(
-            "vdd",
-            line.str()); // wjy: 删除前记录驱动中全部Parsec显示索引，确认ToDesk或旧FSRemote是否留下共享VDD实例。
-    }
-    for (const int index : indexes) {
-        append_stream_capture_diagnostic_log(
-            "vdd",
-            "remove-existing index=" + std::to_string(index)); // wjy: 每个实际移除动作单独记录，复现后可核对是否误删外部远控拥有的显示器。
-        parsec_vdd::VddRemoveDisplay(handle, index);
-    }
-}
-
 bool wait_for_display_ready(int display_index, DisplayInfo* out)
 {
     append_stream_capture_diagnostic_log(
@@ -409,10 +355,12 @@ public:
             "vdd",
             "open-device success handle=" + std::to_string(reinterpret_cast<uintptr_t>(handle_))); // wjy: 句柄值仅用于同一日志内核对生命周期，不包含认证或用户隐私信息。
 
-        remove_existing_parsec_displays(handle_);
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-
+        // =====wjy====
+        append_stream_capture_diagnostic_log(
+            "vdd",
+            "preserve-existing displays; add owned display only"); // wjy: 不再枚举和删除其他进程的Parsec索引，本会话只管理VddAddDisplay返回的所有权。
         display_index_ = parsec_vdd::VddAddDisplay(handle_);
+        // ===end====
         append_stream_capture_diagnostic_log(
             "vdd",
             "add-display result index=" + std::to_string(display_index_)); // wjy: 记录驱动返回的显示索引，后续Windows枚举和停止阶段都用同一值核对。
