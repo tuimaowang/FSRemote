@@ -3,7 +3,6 @@
 #include "stream/RemoteVideoPolicy.h"
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstddef>
 
@@ -18,38 +17,6 @@ bool shouldDispatchRemoteQualityDecision(
 }
 
 namespace {
-
-// =====wjy====
-struct RemoteQualityPreset {
-    stream::RemoteResolutionTier resolution; // wjy: 当前角色请求的固定分辨率档位，Native 表示沿用远端原始分辨率。
-    int targetFps; // wjy: 当前角色请求的FPS上限，调低它可以直接减少解码、呈现和网络压力。
-    int maxBitrateKbps; // wjy: 当前角色请求的码率上限，设为0时回退到按分辨率计算的默认值。
-};
-
-struct RemoteSelectionQualityProfile {
-    RemoteQualityPreset foreground; // wjy: 单选或多选场景中当前焦点/唯一窗口使用的质量。
-    RemoteQualityPreset background; // wjy: 多选场景中其它可见窗口使用的质量。
-    std::array<int, 5> backgroundFpsTiers; // wjy: 按可见窗口数量选择后台FPS，顺序对应 <=5、<=10、<=16、<=20、>20。
-};
-
-// wjy: 单选远控质量总开关；后续只需修改这里的分辨率、FPS或码率即可调整单窗口体验。
-constexpr RemoteSelectionQualityProfile kSingleSelectionQuality = {
-    {stream::RemoteResolutionTier::P1080, 60, 48000},
-    {stream::RemoteResolutionTier::P720, 30, 24000},
-    {30, 30, 30, 30, 30},
-};
-
-// wjy: 多选远控质量总开关；焦点窗口默认1080p/45，后台窗口按数量快速降到15/10/5/3/1 FPS。
-constexpr RemoteSelectionQualityProfile kMultiSelectionQuality = {
-    {stream::RemoteResolutionTier::P1080, 45, 48000},
-    {stream::RemoteResolutionTier::P720, 15, 24000},
-    {15, 10, 5, 3, 1},
-};
-
-const RemoteSelectionQualityProfile& selectionQualityProfile(bool singleRemoteWindow)
-{
-    return singleRemoteWindow ? kSingleSelectionQuality : kMultiSelectionQuality; // wjy: 根据实际远控窗口数量选择单选或多选质量变量。
-}
 
 int baselineTargetFps(stream::RemoteQualityMode mode)
 {
@@ -70,37 +37,6 @@ int priorityForRole(bool highPerformance)
     return highPerformance ? 100 : 10; // wjy: 真实获得焦点的可见窗口获得最高资源优先级，其余窗口统一使用最低优先级保活。
 }
 
-int backgroundFpsForVisibleWindowCount(
-    int visibleWindowCount,
-    const std::array<int, 5>& backgroundFpsTiers)
-{
-    if (visibleWindowCount <= 5) return backgroundFpsTiers[0];
-    if (visibleWindowCount <= 10) return backgroundFpsTiers[1];
-    if (visibleWindowCount <= 16) return backgroundFpsTiers[2];
-    if (visibleWindowCount <= 20) return backgroundFpsTiers[3];
-    return backgroundFpsTiers[4];
-}
-
-int reduceBackgroundFpsForPresenterPressure(
-    int baseFps,
-    double maxPresenterDropRatio,
-    const std::array<int, 5>& backgroundFpsTiers)
-{
-    if (maxPresenterDropRatio >= 0.20) {
-        return backgroundFpsTiers.back();
-    }
-    if (maxPresenterDropRatio < 0.03) {
-        return baseFps;
-    }
-
-    for (std::size_t index = 0; index < backgroundFpsTiers.size(); ++index) {
-        if (baseFps >= backgroundFpsTiers[index]) {
-            const std::size_t nextIndex = std::min(index + 1, backgroundFpsTiers.size() - 1);
-            return backgroundFpsTiers[nextIndex];
-        }
-    }
-    return backgroundFpsTiers.back();
-}
 // ===end====
 
 } // namespace
@@ -177,11 +113,8 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
     const int validWindowCount = static_cast<int>(std::count_if(
         windows.begin(),
         windows.end(),
-        [](const RemoteQualityWindowMetrics& window) { return window.windowId != 0; })); // wjy: 按实际注册的远控窗口数量判断单窗口模式，隐藏或最小化仍由后续安全档覆盖。
-    const bool singleRemoteWindow = validWindowCount == 1; // wjy: 只有一个远控窗口时不要求Qt焦点，避免用户切到主界面后唯一画面被无意义降质。
-
-    const RemoteSelectionQualityProfile& selectionQuality =
-        selectionQualityProfile(singleRemoteWindow); // wjy: 单选和多选只在这里切换质量变量，后续决策逻辑复用同一套生命周期与回退规则。
+        [](const RemoteQualityWindowMetrics& window) { return window.windowId != 0; })); // wjy: 仅用于保留单窗口失焦时的高质量行为，不再选择第二套画质配置。
+    const bool singleRemoteWindow = validWindowCount == 1; // wjy: 单窗口保持高质量，多窗口只给真实焦点窗口高质量。
     uintptr_t focusedVisibleWindowId = 0;
     for (const RemoteQualityWindowMetrics& window : windows) {
         if (window.windowId == 0 || !window.visible || window.minimized || !window.active) {
@@ -193,22 +126,6 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
         break;
     }
 
-    int visibleWindowCount = 0;
-    double maxPresenterDropRatio = 0.0;
-    for (const RemoteQualityWindowMetrics& window : windows) {
-        if (window.windowId == 0 || !window.visible || window.minimized) {
-            continue;
-        }
-        ++visibleWindowCount;
-        maxPresenterDropRatio = std::max(maxPresenterDropRatio, window.presenterDropRatio);
-    }
-    const int baseBackgroundFps = backgroundFpsForVisibleWindowCount(
-        visibleWindowCount,
-        selectionQuality.backgroundFpsTiers); // wjy: 多选后台FPS由可见窗口数量和顶部质量变量共同决定，避免所有后台窗口长期占用30 FPS。
-    const int backgroundFps = reduceBackgroundFpsForPresenterPressure(
-        baseBackgroundFps,
-        maxPresenterDropRatio,
-        selectionQuality.backgroundFpsTiers);
 
     for (const RemoteQualityWindowMetrics& window : windows) {
         RemoteQualityDecision decision;
@@ -221,7 +138,7 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
         const bool focusedWindowEligible = eligibleVisibleWindow
             && window.windowId == focusedVisibleWindowId;
         const bool highPerformance = eligibleVisibleWindow
-            && (singleRemoteWindow || focusedWindowEligible); // wjy: 单窗口只要可见且未最小化就使用单选质量变量，多窗口只给真实焦点窗口使用多选前台变量。
+            && (singleRemoteWindow || focusedWindowEligible); // wjy: 单窗口或真实焦点窗口统一使用同一个高质量配置。
         decision.audioEnabled = false; // wjy: 音频不再由协调器控制，RemoteDesktopWindow按自己的标题栏按钮独立下发。
         decision.effectiveMode = highPerformance
             ? stream::RemoteQualityMode::HighQualityLocked
@@ -269,12 +186,13 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
             state.pressureSinceMs = 0;
             state.recoverySinceMs = 0;
             state.degradationReason = RemoteQualityDegradationReason::None;
+            const auto roleProfile = decision.minimized
+                ? stream::RemoteVideoPolicy::minimizedProfile()
+                : stream::RemoteVideoPolicy::backgroundProfile(); // wjy: 角色画质统一从RemoteVideoPolicy读取。
             decision.resolution = decision.minimized
-                ? configuration.minimizedResolution
-                : selectionQuality.background.resolution;
-            decision.targetFps = decision.minimized
-                ? configuration.minimizedFps
-                : backgroundFps; // wjy: 普通可见窗口按全局数量和Presenter压力动态降帧，最小化继续使用配置的后台档。
+                ? stream::RemoteResolutionTier::P360
+                : stream::RemoteResolutionTier::P720; // wjy: 最小化和可见后台都从唯一角色配置选择固定分辨率。
+            decision.targetFps = static_cast<int>(roleProfile.targetFps); // wjy: 最小化1FPS、后台30FPS均由唯一策略配置提供。
             decision.reason = decision.minimized
                 ? RemoteQualityDegradationReason::Minimized
                 : RemoteQualityDegradationReason::Background; // wjy: 非焦点可见窗口统一进入后台策略，不再读取窗口面积阈值。
@@ -291,8 +209,8 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
             state.pressureSinceMs = 0;
             state.recoverySinceMs = 0;
             state.degradationReason = RemoteQualityDegradationReason::None;
-            decision.resolution = selectionQuality.foreground.resolution;
-            decision.targetFps = selectionQuality.foreground.targetFps; // wjy: 单选/多选焦点窗口直接使用顶部质量变量，不再把原始/60写死在分支里。
+            decision.resolution = stream::RemoteResolutionTier::P1080; // wjy: 单窗口和多窗口焦点统一使用1080p。
+            decision.targetFps = static_cast<int>(stream::kFocusedRemoteVideoProfile.targetFps); // wjy: 高质量焦点统一使用60FPS。
             if (decision.effectiveMode == stream::RemoteQualityMode::Balanced
                 || decision.effectiveMode == stream::RemoteQualityMode::Smooth) {
                 decision.reason = RemoteQualityDegradationReason::ModePreference; // wjy: 1080p或720p是用户主动预设，不显示成性能降级。
@@ -362,46 +280,18 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
         }
 
         targetSize(decision.resolution, window.sourceWidth, window.sourceHeight, &decision.targetWidth, &decision.targetHeight);
-        const RemoteQualityPreset& selectedPreset = highPerformance
-            ? selectionQuality.foreground
-            : selectionQuality.background;
-        const bool usePresetBitrate = !window.softwareFallback
-            && !decision.minimized
-            && selectedPreset.maxBitrateKbps > 0; // wjy: 最小化和软件回退沿用分辨率安全码率，避免后台低帧仍保留前台码率上限。
-        decision.maxBitrateKbps = usePresetBitrate
-            ? selectedPreset.maxBitrateKbps
-            : bitrateForDecision(decision.resolution, decision.targetFps, decision.effectiveMode); // wjy: 质量变量可直接覆盖码率；设为0时保留旧的按分辨率兜底计算。
+        const auto roleProfile = decision.minimized
+            ? stream::RemoteVideoPolicy::minimizedProfile()
+            : highPerformance
+                ? stream::kFocusedRemoteVideoProfile
+                : stream::RemoteVideoPolicy::backgroundProfile(); // wjy: 角色码率与分辨率、FPS来自同一配置源。
+        decision.maxBitrateKbps = window.softwareFallback
+            ? bitrateForDecision(stream::RemoteResolutionTier::P540, 24, decision.effectiveMode)
+            : static_cast<int>(roleProfile.maxBitrateKbps); // wjy: 软件回退保留540p安全码率，正常角色不再走第二套码率表。
         decisions.push_back(decision);
     }
     // =====wjy====
-    // 正常后台档位固定为720p/30；只有跨组件的双信号压力成立后，才进入15/10/5/3/1 FPS梯度。
-    stream::RemoteVideoPressureSignals pipelinePressure;
-    for (const auto& window : windows) {
-        pipelinePressure.workerBacklog = pipelinePressure.workerBacklog || window.workerBacklog;
-        pipelinePressure.presentDrops = pipelinePressure.presentDrops || window.presenterDropRatio >= 0.08;
-        pipelinePressure.frameAgeHigh = pipelinePressure.frameAgeHigh || window.frameAgeP95Ms >= 120.0;
-        pipelinePressure.syncBusy = pipelinePressure.syncBusy || window.syncBusy;
-        pipelinePressure.renderUtilizationHigh = pipelinePressure.renderUtilizationHigh || window.renderUtilizationHigh;
-        pipelinePressure.decodeQueueAgeHigh = pipelinePressure.decodeQueueAgeHigh || window.decodeQueueAgeHigh;
-        pipelinePressure.deviceFailure = pipelinePressure.deviceFailure || window.deviceFailure;
-    }
-    const auto emergency = m_pipelinePressureController.update(pipelinePressure, nowMs); // wjy: 双信号持续1秒才进入降级，健康3秒后逐级恢复。
-    for (auto& decision : decisions) {
-        if (decision.reason == RemoteQualityDegradationReason::Background) {
-            decision.targetFps = 30;
-            if (emergency != stream::RemoteVideoEmergencyTier::None) {
-                const auto profile = stream::RemoteVideoPolicy::profileFor(
-                    stream::RemoteVideoWindowRole::VisibleBackground,
-                    {},
-                    emergency);
-                decision.targetFps = static_cast<int>(profile.targetFps);
-                decision.reason = RemoteQualityDegradationReason::PipelinePressure;
-            }
-        } else if (decision.reason == RemoteQualityDegradationReason::None
-            || decision.reason == RemoteQualityDegradationReason::ModePreference) {
-            decision.targetFps = 60;
-        }
-    }
+    // 角色分辨率和FPS在上面的唯一配置源中一次决定，函数末尾不再进行第二次覆盖。
     // ===end====
     return decisions;
 }

@@ -31,7 +31,7 @@ int main()
     assert(decisions[0].effectiveMode == stream::RemoteQualityMode::HighQualityLocked);
     assert(decisions[0].resolution == stream::RemoteResolutionTier::P1080);
     assert(decisions[0].targetWidth == 1920 && decisions[0].targetHeight == 1080);
-    assert(decisions[0].targetFps == 45); // wjy: 存在多个远控窗口时焦点窗口使用多选变量1080p/45。
+    assert(decisions[0].targetFps == 60); // wjy: 单窗口和多窗口焦点统一使用1080p/60。
     assert(!decisions[0].audioEnabled);
     assert(decisions[0].priority == 100); // wjy: 单选质量变量默认请求1080p/60并获得最高可见优先级。
     // 音频由标题栏按钮独立控制，不由质量协调器按焦点授予。
@@ -39,14 +39,14 @@ int main()
     assert(decisions[1].effectiveMode == stream::RemoteQualityMode::Smooth);
     assert(decisions[1].resolution == stream::RemoteResolutionTier::P720);
     assert(decisions[1].targetWidth == 1280 && decisions[1].targetHeight == 720);
-    assert(decisions[1].targetFps == 15);
+    assert(decisions[1].targetFps == 30); // wjy: 可见后台固定720p/30，不按窗口数量降帧。
     assert(decisions[1].priority == 10);
     assert(!decisions[1].audioEnabled); // wjy: 其它普通可见窗口统一降到最低保活档且没有音频。
 
     assert(decisions[2].effectiveMode == stream::RemoteQualityMode::Smooth);
     assert(decisions[2].resolution == stream::RemoteResolutionTier::P720);
     assert(decisions[2].targetWidth == 1280 && decisions[2].targetHeight == 720);
-    assert(decisions[2].targetFps == 15);
+    assert(decisions[2].targetFps == 30); // wjy: 失焦全屏窗口按统一后台配置运行。
     assert(!decisions[2].audioEnabled); // wjy: 全屏窗口失焦时使用后台FPS，音频仍由标题栏按钮独立控制。
 
     activeWindow.active = false;
@@ -54,11 +54,11 @@ int main()
     decisions = coordinator.evaluate(configuration, {activeWindow, backgroundWindow}, 1100);
     assert(decisions[0].effectiveMode == stream::RemoteQualityMode::Smooth);
     assert(decisions[0].resolution == stream::RemoteResolutionTier::P720);
-    assert(decisions[0].targetFps == 15);
+    assert(decisions[0].targetFps == 30);
     assert(!decisions[0].audioEnabled);
     assert(decisions[1].effectiveMode == stream::RemoteQualityMode::HighQualityLocked);
     assert(decisions[1].resolution == stream::RemoteResolutionTier::P1080);
-    assert(decisions[1].targetFps == 45);
+    assert(decisions[1].targetFps == 60);
     assert(decisions[1].priority == 100);
     assert(!decisions[1].audioEnabled);
 
@@ -115,10 +115,10 @@ int main()
     assert(decisions.size() == 2);
     assert(decisions[0].effectiveMode == stream::RemoteQualityMode::Smooth);
     assert(decisions[0].resolution == stream::RemoteResolutionTier::P720);
-    assert(decisions[0].targetFps == 15);
+    assert(decisions[0].targetFps == 30);
     assert(decisions[1].effectiveMode == stream::RemoteQualityMode::Smooth);
     assert(decisions[1].resolution == stream::RemoteResolutionTier::P720);
-    assert(decisions[1].targetFps == 15); // wjy: 存在两个远控窗口且都无焦点时，两者都使用多选后台720p/15。
+    assert(decisions[1].targetFps == 30); // wjy: 存在两个远控窗口且都无焦点时，两者都使用统一后台720p/30。
 
     ui::RemotePerformanceSignalSampler sampler;
     ui::RemotePerformanceCounters firstSample;
@@ -222,9 +222,9 @@ int main()
         configuration,
         std::vector<ui::RemoteQualityWindowMetrics>(manyWindows.begin(), manyWindows.begin() + 6),
         30000);
-    assert(sixWindowDecisions.front().targetFps == 45);
+    assert(sixWindowDecisions.front().targetFps == 60);
     for (std::size_t index = 1; index < sixWindowDecisions.size(); ++index) {
-        assert(sixWindowDecisions[index].targetFps == 10); // wjy: 6个可见窗口命中多选后台第二档10 FPS。
+        assert(sixWindowDecisions[index].targetFps == 30); // wjy: 6个可见窗口仍使用统一后台30 FPS。
     }
 
     manyWindows.front().presenterDropRatio = 0.03;
@@ -232,9 +232,9 @@ int main()
         configuration,
         std::vector<ui::RemoteQualityWindowMetrics>(manyWindows.begin(), manyWindows.begin() + 6),
         30500);
-    assert(sixWindowPressureDecisions.front().targetFps == 45);
+    assert(sixWindowPressureDecisions.front().targetFps == 60);
     for (std::size_t index = 1; index < sixWindowPressureDecisions.size(); ++index) {
-        assert(sixWindowPressureDecisions[index].targetFps == 10); // wjy: 单一Presenter噪声不额外降级，仍保持窗口数量对应的10 FPS。
+        assert(sixWindowPressureDecisions[index].targetFps == 30); // wjy: Presenter噪声不再触发旧数量FPS梯度。
     }
     manyWindows.front().presenterDropRatio = 0.0;
 
@@ -242,35 +242,35 @@ int main()
         configuration,
         std::vector<ui::RemoteQualityWindowMetrics>(manyWindows.begin(), manyWindows.begin() + 11),
         31000);
-    assert(elevenWindowDecisions.front().targetFps == 45);
+    assert(elevenWindowDecisions.front().targetFps == 60);
     for (std::size_t index = 1; index < elevenWindowDecisions.size(); ++index) {
-        assert(elevenWindowDecisions[index].targetFps == 5); // wjy: 11个可见窗口命中第三档5 FPS。
+        assert(elevenWindowDecisions[index].targetFps == 30); // wjy: 11个可见窗口仍使用统一后台30 FPS。
     }
 
     auto twentyWindowDecisions = countCoordinator.evaluate(configuration, manyWindows, 32000);
-    assert(twentyWindowDecisions.front().targetFps == 45);
+    assert(twentyWindowDecisions.front().targetFps == 60);
     for (std::size_t index = 1; index < twentyWindowDecisions.size(); ++index) {
-        assert(twentyWindowDecisions[index].targetFps == 3); // wjy: 20个可见窗口命中第四档3 FPS。
+        assert(twentyWindowDecisions[index].targetFps == 30); // wjy: 20个可见窗口仍使用统一后台30 FPS。
     }
 
     manyWindows.push_back(manyWindows.back());
     manyWindows.back().windowId = 21;
     auto twentyOneWindowDecisions = countCoordinator.evaluate(configuration, manyWindows, 32500);
-    assert(twentyOneWindowDecisions.front().targetFps == 45);
+    assert(twentyOneWindowDecisions.front().targetFps == 60);
     for (std::size_t index = 1; index < twentyOneWindowDecisions.size(); ++index) {
-        assert(twentyOneWindowDecisions[index].targetFps == 1); // wjy: 超过20个可见窗口进入多选后台最低1 FPS档。
+        assert(twentyOneWindowDecisions[index].targetFps == 30); // wjy: 超过20个可见窗口也不再按数量降帧。
     }
 
     manyWindows.front().presenterDropRatio = 0.20;
     manyWindows.front().workerBacklog = true;
     auto severePresenterDecisions = countCoordinator.evaluate(configuration, manyWindows, 33000);
-    assert(severePresenterDecisions.front().targetFps == 45);
+    assert(severePresenterDecisions.front().targetFps == 60);
     for (std::size_t index = 1; index < severePresenterDecisions.size(); ++index) {
-        assert(severePresenterDecisions[index].targetFps == 1); // wjy: 双信号持有期内仍保持21窗口本来的1 FPS安全档。
+        assert(severePresenterDecisions[index].targetFps == 30); // wjy: 压力只记录，不改写统一后台FPS。
     }
     severePresenterDecisions = countCoordinator.evaluate(configuration, manyWindows, 34100);
     for (std::size_t index = 1; index < severePresenterDecisions.size(); ++index) {
-        assert(severePresenterDecisions[index].targetFps == 1); // wjy: 已在最低档时压力策略不能继续降到0或产生无效档位。
+        assert(severePresenterDecisions[index].targetFps == 30); // wjy: 恢复期间仍保持统一后台FPS。
     }
 
     ui::RemoteQualityCoordinator debounceCoordinator;

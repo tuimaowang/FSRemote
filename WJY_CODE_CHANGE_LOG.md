@@ -11323,3 +11323,77 @@ return true;
 
 - 已执行目标构建命令，但当前环境缺少 MSVC 标准头 `stddef.h`，`fsremote_stream` 构建未完成；未修改其它用户文件。
 - 目标 A12 日志已确认原问题表现为 `physical-dxgi` 初始化后持续 `DXGI_ERROR_ACCESS_LOST` 与 `publish_fps=0`。
+
+## 2026-08-07 - 收敛远控角色画质配置
+
+### 修改位置
+
+- `src/stream/RemoteVideoPolicy.h:46-66`：为角色配置增加统一码率字段，并将焦点、后台、最小化的分辨率、FPS、码率集中到同一组常量。
+- `src/stream/RemoteVideoPolicy.h:139-148`：压力状态不再通过旧的 `15/10/5/3/1 FPS` 梯度改写正常后台配置。
+- `src/ui/RemoteQualityCoordinator.cpp:18-40`：删除单选/多选两套重复预设及按窗口数量计算后台 FPS 的函数。
+- `src/ui/RemoteQualityCoordinator.cpp:186-222`：改为从 `RemoteVideoPolicy` 读取角色分辨率和 FPS。
+- `src/ui/RemoteQualityCoordinator.cpp:284-292`：改为从统一角色配置读取正常码率，软件回退保留独立安全码率。
+- `tests/remote_video_policy_tests.cpp:35-40`：更新压力场景断言，确认压力等级可记录但不再改写正常后台 FPS。
+
+### 修改原因
+
+原实现同时维护 `RemoteQualityCoordinator.cpp` 和 `RemoteVideoPolicy.h` 两套角色画质配置，并在后台 FPS 上叠加窗口数量梯度、Presenter 压力和函数末尾二次覆盖，导致同一窗口的最终分辨率和 FPS 难以预测。本次将角色配置收敛到 `RemoteVideoPolicy`，移除设备数量 FPS 梯度，避免“45 FPS 后又被改成 60 FPS”等重复覆盖。
+
+### 原始代码
+
+```cpp
+// src/ui/RemoteQualityCoordinator.cpp:23-47
+struct RemoteQualityPreset { /* 单选/多选各自维护分辨率、FPS、码率 */ };
+constexpr RemoteSelectionQualityProfile kSingleSelectionQuality = { /* ... */ };
+constexpr RemoteSelectionQualityProfile kMultiSelectionQuality = { /* ... */ };
+
+// src/stream/RemoteVideoPolicy.h:62-64
+inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile = {1920, 1080, 60, 100, true};
+inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile = {1280, 720, 30, 40, true};
+inline constexpr RemoteVideoProfile kMinimizedRemoteVideoProfile = {640, 360, 1, 5, true};
+```
+
+### 修改后代码
+
+```cpp
+// src/stream/RemoteVideoPolicy.h:46-66
+struct RemoteVideoProfile {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t targetFps = 0;
+    std::uint32_t priority = 0;
+    bool requestsRemoteQuality = false;
+    std::uint32_t maxBitrateKbps = 0; // wjy: 角色默认码率与分辨率、FPS统一保存。
+};
+
+inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile = {1920, 1080, 60, 100, true, 48000};
+inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile = {1280, 720, 30, 40, true, 24000};
+inline constexpr RemoteVideoProfile kMinimizedRemoteVideoProfile = {640, 360, 1, 5, true, 7000};
+
+// src/ui/RemoteQualityCoordinator.cpp:186-222
+const auto roleProfile = decision.minimized
+    ? stream::RemoteVideoPolicy::minimizedProfile()
+    : stream::RemoteVideoPolicy::backgroundProfile();
+decision.resolution = decision.minimized
+    ? stream::RemoteResolutionTier::P360
+    : stream::RemoteResolutionTier::P720;
+decision.targetFps = static_cast<int>(roleProfile.targetFps);
+```
+
+### 修改步骤
+
+1. 将角色默认码率加入 `RemoteVideoProfile`，统一保存分辨率、FPS 和码率。
+2. 删除 `kSingleSelectionQuality`、`kMultiSelectionQuality` 及其后台 FPS 数量梯度函数。
+3. 让协调器直接使用焦点、后台、最小化角色配置；保留软件回退的 540p/24 安全档。
+4. 移除协调器函数末尾对后台和前台 FPS 的二次覆盖。
+5. 更新远程视频策略测试，验证压力状态不再恢复旧数量降帧逻辑。
+
+### 验证
+
+- 已执行 `git diff --check`，通过。
+- 已使用 `rg` 确认 `RemoteQualityCoordinator.cpp` 中不再存在 `selectionQuality`、`backgroundFps`、`RemoteQualityPreset` 和 `RemoteSelectionQualityProfile`。
+- 未编译；用户此前要求本次不编译，且当前环境曾存在 MSVC 标准头缺失问题。
+
+### 补充修改位置
+
+- `tests/remote_quality_coordinator_tests.cpp:34-273`：更新单窗口、多窗口、6/11/20/21 窗口和压力场景的帧率断言，验证窗口数量不会再改变后台 FPS。

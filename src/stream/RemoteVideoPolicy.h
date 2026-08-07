@@ -49,6 +49,7 @@ struct RemoteVideoProfile {
     std::uint32_t targetFps = 0;
     std::uint32_t priority = 0;
     bool requestsRemoteQuality = false;
+    std::uint32_t maxBitrateKbps = 0; // wjy: 角色默认码率与分辨率、FPS放在同一配置源，避免协调器再维护第二套码率表。
 };
 
 struct RemoteVideoDecision {
@@ -58,10 +59,10 @@ struct RemoteVideoDecision {
 };
 
 // =====wjy====
-// 画质总开关集中在这里，后续只改常量即可调整单窗口/多窗口策略。
-inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile = {1920, 1080, 60, 100, true};
-inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile = {1280, 720, 30, 40, true};
-inline constexpr RemoteVideoProfile kMinimizedRemoteVideoProfile = {640, 360, 1, 5, true};
+// 画质总开关集中在这里，后续只改常量即可调整所有窗口的角色画质。
+inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile = {1920, 1080, 60, 100, true, 48000}; // wjy: 单窗口和多窗口焦点统一使用1080p/60/48Mbps。
+inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile = {1280, 720, 30, 40, true, 24000}; // wjy: 可见后台固定720p/30/24Mbps，不按窗口数量降帧。
+inline constexpr RemoteVideoProfile kMinimizedRemoteVideoProfile = {640, 360, 1, 5, true, 7000}; // wjy: 最小化只保留360p/1FPS保活。
 inline constexpr std::uint32_t kRemoteProfileFocusDebounceMs = 350;
 inline constexpr std::uint32_t kRemotePressureEnterHoldMs = 1000;
 inline constexpr std::uint32_t kRemotePressureRecoveryHoldMs = 3000;
@@ -138,18 +139,8 @@ public:
         switch (role) {
         case RemoteVideoWindowRole::Focused:
             return focusedProfile; // wjy: 焦点窗口优先保持用户选择的尺寸和60 FPS预算。
-        case RemoteVideoWindowRole::VisibleBackground: {
-            RemoteVideoProfile profile = backgroundProfile();
-            switch (emergency) {
-            case RemoteVideoEmergencyTier::Fps15: profile.targetFps = 15; break;
-            case RemoteVideoEmergencyTier::Fps10: profile.targetFps = 10; break;
-            case RemoteVideoEmergencyTier::Fps5: profile.targetFps = 5; break;
-            case RemoteVideoEmergencyTier::Fps3: profile.targetFps = 3; break;
-            case RemoteVideoEmergencyTier::Fps1: profile.targetFps = 1; break;
-            case RemoteVideoEmergencyTier::None: break;
-            }
-            return profile; // wjy: 紧急压力只先改变后台帧率，正常档位仍固定720p/30。
-        }
+        case RemoteVideoWindowRole::VisibleBackground:
+            return backgroundProfile(); // wjy: 压力状态不再改写正常后台FPS，避免恢复旧的设备数量降帧策略。
         case RemoteVideoWindowRole::Minimized:
             return minimizedProfile();
         case RemoteVideoWindowRole::Hidden:
