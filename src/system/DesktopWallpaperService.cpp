@@ -130,71 +130,12 @@ QString DesktopWallpaperService::nextDecodableImage(const QString& directoryPath
     return loadNextDecodableImage(directoryPath, previousSourcePath, &sourcePath, nullptr) ? sourcePath : QString(); // wjy: 无副作用选择接口只做目录枚举和解码，不写缓存也不修改真实桌面。
 }
 
-QImage DesktopWallpaperService::composeDeviceNameOverlay(const QImage& sourceImage, const QString& deviceName)
+DesktopWallpaperApplyResult DesktopWallpaperService::applyFirstSharedImage()
 {
-    if (sourceImage.isNull()) {
-        return sourceImage; // wjy: 防御性保留空图语义，调用方可以继续按原有解码失败流程处理。
-    }
-
-    const QString normalizedDeviceName = deviceName.trimmed(); // wjy: 去掉设备名首尾空白，避免右上角出现无意义留白或把纯空格当作有效名称。
-    if (normalizedDeviceName.isEmpty()) {
-        return sourceImage; // wjy: 名称确实不可用时保持原图，不绘制旧的固定“99”或空白占位图形。
-    }
-
-    QImage composedImage = sourceImage.convertToFormat(QImage::Format_ARGB32_Premultiplied); // wjy: 只修改解码后的内存副本，绝不覆盖共享目录中的源文件。
-    const int shorterSide = qMin(composedImage.width(), composedImage.height());
-    const int margin = qMax(12, qRound(shorterSide * 0.025)); // wjy: 右上角边距按图片比例计算，并保留至少 12 像素避免贴边。
-    int fontPixelSize = qBound(24, qRound(shorterSide * 0.13), 180); // wjy: 初始字号沿用数字测试的醒目比例，普通长度机器名仍清晰可见。
-    const int minimumFontPixelSize = qBound(16, qRound(shorterSide * 0.045), 40); // wjy: 长名称允许缩小但保留可读下限，避免为了完整显示而变成细小文字。
-    const qreal availableWidth = qMax<qreal>(1.0, composedImage.width() - margin * 2.0); // wjy: 无论图片多窄都保留左右安全边距，文字路径不能超出画布。
-    const qreal maximumLabelWidth = qMin<qreal>(availableWidth, composedImage.width() * 0.70); // wjy: 名称最多占七成宽度，使它仍然保持右上角标识而不是横跨整张壁纸。
-
-    QFont deviceNameFont(QStringLiteral("Segoe UI"));
-    deviceNameFont.setWeight(QFont::Bold); // wjy: 使用 Windows 常见粗体字体绘制设备名，Qt 会为中文等缺失字形自动选择回退字体。
-
-    QString renderedDeviceName = normalizedDeviceName;
-    QPainterPath deviceNamePath;
-    QRectF deviceNameBounds;
-    auto rebuildDeviceNamePath = [&] {
-        deviceNameFont.setPixelSize(fontPixelSize); // wjy: 每次调整字号后重新生成字形路径，宽度判断与最终绘制使用完全相同的字体状态。
-        deviceNamePath = QPainterPath();
-        deviceNamePath.addText(0, 0, deviceNameFont, renderedDeviceName); // wjy: 设备名先转成矢量路径，后续白色填充和深色描边会一起烘焙进壁纸像素。
-        deviceNameBounds = deviceNamePath.boundingRect();
-    };
-    rebuildDeviceNamePath();
-    while (deviceNameBounds.width() > maximumLabelWidth && fontPixelSize > minimumFontPixelSize) {
-        --fontPixelSize; // wjy: 优先逐级缩小并保留完整设备名，只有到达可读下限仍放不下时才省略中间内容。
-        rebuildDeviceNamePath();
-    }
-    if (deviceNameBounds.width() > maximumLabelWidth) {
-        const QFontMetrics metrics(deviceNameFont);
-        renderedDeviceName = metrics.elidedText(renderedDeviceName, Qt::ElideMiddle, qFloor(maximumLabelWidth)); // wjy: 超长名称保留首尾辨识信息，中间用省略号收紧到右上角安全宽度。
-        rebuildDeviceNamePath();
-    }
-    if (deviceNameBounds.isEmpty()) {
-        return composedImage;
-    }
-
-    const qreal targetLeft = composedImage.width() - margin - deviceNameBounds.width();
-    const qreal targetTop = margin;
-    deviceNamePath.translate(targetLeft - deviceNameBounds.left(), targetTop - deviceNameBounds.top()); // wjy: 用真实字形边界对齐右上角，避免字体基线导致设备名上下偏移。
-
-    QPainter painter(&composedImage);
-    painter.setRenderHints(QPainter::Antialiasing | QPainter::TextAntialiasing);
-    const qreal outlineWidth = qMax<qreal>(2.0, fontPixelSize * 0.075);
-    painter.setPen(QPen(QColor(0, 0, 0, 220), outlineWidth, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin)); // wjy: 深色圆角描边保证白色设备名在浅色照片区域仍可辨认。
-    painter.setBrush(QColor(255, 255, 255));
-    painter.drawPath(deviceNamePath); // wjy: 一次绘制同时生成白色填充和深色外轮廓，结果成为目标设备自己的本地壁纸像素。
-    painter.end();
-    return composedImage;
+    return applyNextSharedImage(QString()); // wjy: 首次调用采用排序后的第一张可解码共享原图。
 }
 
-DesktopWallpaperApplyResult DesktopWallpaperService::applyFirstSharedImage(const QString& deviceName)
-{
-    return applyNextSharedImage(QString(), deviceName); // wjy: 首次调用采用排序后的第一张可解码图片，并使用调用端确认的目标机器名。
-}
-
-DesktopWallpaperApplyResult DesktopWallpaperService::applyNextSharedImage(const QString& previousSourcePath, const QString& deviceName)
+DesktopWallpaperApplyResult DesktopWallpaperService::applyNextSharedImage(const QString& previousSourcePath)
 {
     DesktopWallpaperApplyResult result;
     const QString sourceDirectory = sharedDirectoryPath();
@@ -209,8 +150,6 @@ DesktopWallpaperApplyResult DesktopWallpaperService::applyNextSharedImage(const 
         result.errorMessage = QString::fromUtf8("目录中没有可用图片：%1").arg(sourceDirectory); // wjy: 空目录、扩展名不支持和全部图片损坏统一给出可操作提示。
         return result;
     }
-    image = composeDeviceNameOverlay(image, deviceName); // wjy: 在创建 current.bmp 前把目标设备名合成为右上角像素，共享源图、图片数量和轮换顺序均保持不变。
-
     const QString dataRoot = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
     if (dataRoot.isEmpty()) {
         result.errorMessage = QString::fromUtf8("无法确定本地壁纸缓存目录。");

@@ -21,9 +21,8 @@ public:
     static QStringList supportedImageCandidates(const QString& directoryPath); // wjy: 只筛选顶层受支持图片并按文件名稳定排序，供生产逻辑和测试共同使用。
     static QString firstDecodableImage(const QString& directoryPath); // wjy: 跳过扩展名正确但内容损坏的文件，返回第一张真正可解码的图片。
     static QString nextDecodableImage(const QString& directoryPath, const QString& previousSourcePath); // wjy: 从上次成功图片之后继续查找，跳过坏图并在目录末尾回绕。
-    static QImage composeDeviceNameOverlay(const QImage& sourceImage, const QString& deviceName); // wjy: 把目标机器名绘制到图片副本右上角，返回可直接写入壁纸缓存的完整像素图。
-    static DesktopWallpaperApplyResult applyFirstSharedImage(const QString& deviceName); // wjy: 使用目标机器名完成首张共享图片选择、本地 BMP 缓存和当前 Windows 桌面切换。
-    static DesktopWallpaperApplyResult applyNextSharedImage(const QString& previousSourcePath, const QString& deviceName); // wjy: 自动轮换携带目标机器名，同时复用稳定 BMP 缓存与 Windows API。
+    static DesktopWallpaperApplyResult applyFirstSharedImage(); // wjy: 使用共享原图完成首张图片选择、本地 BMP 缓存和当前 Windows 桌面切换。
+    static DesktopWallpaperApplyResult applyNextSharedImage(const QString& previousSourcePath); // wjy: 自动轮换直接使用共享原图，复用稳定 BMP 缓存与 Windows API。
 };
 // ===end====
 

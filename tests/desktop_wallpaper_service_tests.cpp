@@ -96,54 +96,6 @@ void testNextImageSkipsDamagedCandidate()
     assert(platform::DesktopWallpaperService::nextDecodableImage(directory.path(), lastPath) == firstPath);
 }
 
-void testDeviceNameOverlayIsFlattenedIntoUpperRightPixels()
-{
-    QImage sourceImage(640, 360, QImage::Format_ARGB32);
-    sourceImage.fill(qRgb(36, 94, 150));
-    const QImage originalImage = sourceImage.copy();
-
-    const QImage composedImage = platform::DesktopWallpaperService::composeDeviceNameOverlay(sourceImage, QStringLiteral("TARGET-PC-99"));
-    assert(!composedImage.isNull());
-    assert(composedImage.size() == sourceImage.size()); // wjy: 设备名合成不能改变壁纸尺寸，否则 Windows 原有填充/适应策略会出现额外缩放。
-    assert(sourceImage == originalImage); // wjy: 合成函数只返回新像素图，输入图像及其对应共享源文件保持不变。
-
-    bool upperRightChanged = false;
-    for (int y = 0; y < composedImage.height() / 2 && !upperRightChanged; ++y) {
-        for (int x = composedImage.width() / 2; x < composedImage.width(); ++x) {
-            if (composedImage.pixel(x, y) != originalImage.pixel(x, y)) {
-                upperRightChanged = true;
-                break;
-            }
-        }
-    }
-    assert(upperRightChanged); // wjy: 设备名的填充或描边必须真实改变右上角像素，证明它不是独立悬浮控件。
-
-    for (int y = composedImage.height() / 2; y < composedImage.height(); ++y) {
-        for (int x = 0; x < composedImage.width() / 2; ++x) {
-            assert(composedImage.pixel(x, y) == originalImage.pixel(x, y)); // wjy: 左下区域应完全保留原图，防止绘制坐标或画布转换污染整张图片。
-        }
-    }
-}
-
-void testOverlayPixelsFollowDeviceNameAndTrimWhitespace()
-{
-    QImage sourceImage(800, 450, QImage::Format_ARGB32);
-    sourceImage.fill(qRgb(24, 60, 96));
-
-    const QImage firstName = platform::DesktopWallpaperService::composeDeviceNameOverlay(sourceImage, QStringLiteral("DEVICE-A"));
-    const QImage paddedFirstName = platform::DesktopWallpaperService::composeDeviceNameOverlay(sourceImage, QStringLiteral("  DEVICE-A  "));
-    const QImage secondName = platform::DesktopWallpaperService::composeDeviceNameOverlay(sourceImage, QStringLiteral("DEVICE-B"));
-    const QImage longName = platform::DesktopWallpaperService::composeDeviceNameOverlay(
-        sourceImage,
-        QStringLiteral("VERY-LONG-TARGET-DEVICE-NAME-THAT-MUST-STAY-INSIDE-THE-WALLPAPER"));
-
-    assert(firstName == paddedFirstName); // wjy: 设备名首尾空白不应改变最终壁纸，避免同一目标产生视觉上不同的缓存图。
-    assert(firstName != secondName); // wjy: 不同目标设备名必须生成不同像素，确认实现已不再固定绘制“99”。
-    assert(longName.size() == sourceImage.size());
-    assert(longName != sourceImage); // wjy: 超长名称经过缩小或居中省略后仍要成功烘焙，且不能扩展或裁切原图画布。
-    assert(platform::DesktopWallpaperService::composeDeviceNameOverlay(sourceImage, QStringLiteral("   ")) == sourceImage); // wjy: 纯空白名称不绘制任何占位文字，更不会回退成旧数字。
-}
-
 void testDigitPrefixedDeviceNameEnablesRotationByDefault()
 {
     assert(platform::DesktopWallpaperService::rotationEnabledByDefaultForDeviceName(QStringLiteral("99-DESKTOP"))); // wjy: 常见数字编号设备在没有历史设置时默认启动自动壁纸。
@@ -164,8 +116,6 @@ int main(int argc, char** argv)
     testDamagedImageIsSkipped();
     testNextImageAdvancesAndWraps();
     testNextImageSkipsDamagedCandidate();
-    testDeviceNameOverlayIsFlattenedIntoUpperRightPixels();
-    testOverlayPixelsFollowDeviceNameAndTrimWhitespace();
     testDigitPrefixedDeviceNameEnablesRotationByDefault(); // wjy: 回归验证设备名默认开启策略，不读取注册表也不修改真实桌面。
     return 0;
 }

@@ -10912,6 +10912,82 @@ if (settingsLayout.containsPoint(settingsHideLocalDeviceSwitchRect(), event->pos
 - `rg` 静态复核：列表排序、搜索、批量/周期新增、手动新增、同步快照、实时状态白名单、分组批量动作均接入本机过滤。
 - 按用户要求未构建、未链接、未运行程序或二进制测试。
 
+## 2026-08-07 09:35 - 壁纸改为直接使用共享原图
+
+### Changed Location
+- `src/system/DesktopWallpaperService.h:24-25`：移除带设备名参数的壁纸接口，改为直接处理共享原图。
+- `src/system/DesktopWallpaperService.cpp:133-153`：删除设备名绘制、字体缩放和右上角描边合成代码；缓存前不再修改图片像素。
+- `src/ui/DeviceGrid.cpp:6379`：壁纸后台任务不再读取本机名称或传入设备名，仅按共享图片轮换。
+- `tests/desktop_wallpaper_service_tests.cpp:99-146,178-179`：删除依赖设备名像素合成的测试，保留图片枚举、坏图跳过、轮换顺序和数字设备默认开关测试。
+
+### Reason
+后续共享文件夹中的图片本身就是最终桌面素材，不需要再把目标设备名写到右上角。删除合成逻辑后，每台设备会直接使用共享目录中的原图，避免本地 `current.bmp` 出现额外字符像素。
+
+### Original Code
+```cpp
+// src/system/DesktopWallpaperService.cpp:133-190（修改前）
+QImage DesktopWallpaperService::composeDeviceNameOverlay(const QImage& sourceImage, const QString& deviceName)
+{
+    // 根据设备名创建字体路径，并将白字黑边绘制到图片右上角。
+    return composedImage;
+}
+```
+
+```cpp
+// src/system/DesktopWallpaperService.cpp:192-212（修改前）
+DesktopWallpaperApplyResult DesktopWallpaperService::applyFirstSharedImage(const QString& deviceName);
+DesktopWallpaperApplyResult DesktopWallpaperService::applyNextSharedImage(
+    const QString& previousSourcePath,
+    const QString& deviceName);
+image = composeDeviceNameOverlay(image, deviceName);
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:6379-6387（修改前）
+const platform::DeviceInfo targetDeviceInfo = platform::DeviceInfoService::local();
+QString targetDeviceName = targetDeviceInfo.name.trimmed();
+// 读取设备名/IP并传入壁纸合成函数。
+const platform::DesktopWallpaperApplyResult result =
+    platform::DesktopWallpaperService::applyNextSharedImage(previousSourcePath, targetDeviceName);
+```
+
+### Modified Code
+```cpp
+// src/system/DesktopWallpaperService.h:24-25（修改后）
+static DesktopWallpaperApplyResult applyFirstSharedImage(); // wjy: 使用共享原图完成首张图片选择、本地 BMP 缓存和当前 Windows 桌面切换。
+static DesktopWallpaperApplyResult applyNextSharedImage(const QString& previousSourcePath); // wjy: 自动轮换直接使用共享原图，复用稳定 BMP 缓存与 Windows API。
+```
+
+```cpp
+// src/system/DesktopWallpaperService.cpp:133-153（修改后）
+DesktopWallpaperApplyResult DesktopWallpaperService::applyFirstSharedImage()
+{
+    return applyNextSharedImage(QString()); // wjy: 首次调用采用排序后的第一张可解码共享原图。
+}
+
+DesktopWallpaperApplyResult DesktopWallpaperService::applyNextSharedImage(const QString& previousSourcePath)
+{
+    // 选择共享图片后直接写入本地 current.bmp，不再执行设备名像素合成。
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:6379（修改后）
+const platform::DesktopWallpaperApplyResult result =
+    platform::DesktopWallpaperService::applyNextSharedImage(previousSourcePath); // wjy: 壁纸任务直接使用共享原图，不再读取本机名称或合成字符。
+```
+
+### Steps
+1. 删除 `composeDeviceNameOverlay` 声明及实现，移除设备名字体、路径和描边绘制逻辑。
+2. 收窄 `applyFirstSharedImage`、`applyNextSharedImage` 接口，不再携带设备名参数。
+3. 删除壁纸后台任务中的本机信息读取，改为直接轮换共享原图。
+4. 删除依赖字符像素变化的回归测试，保留共享图片选择和默认开关测试。
+
+### Verification
+- `git diff --check`：通过。
+- `rg` 复核：源码和壁纸测试中不再引用 `composeDeviceNameOverlay` 或 `targetDeviceName`。
+- 按用户要求未构建、未链接、未运行程序或二进制测试。
+
 ## 2026-08-07 10:01 - 真实主屏优先与虚拟屏智能兜底
 
 ### Changed Location

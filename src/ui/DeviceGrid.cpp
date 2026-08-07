@@ -6376,15 +6376,7 @@ void DeviceGrid::performDesktopWallpaperRotation(bool userInitiated)
     const QString previousSourcePath = m_lastWallpaperSourcePath;
     QPointer<DeviceGrid> self(this);
     runBackgroundTask([self, previousSourcePath, userInitiated] {
-        const platform::DeviceInfo targetDeviceInfo = platform::DeviceInfoService::local(); // wjy: 在壁纸工作线程读取当前目标机器信息，避免网络适配器枚举阻塞设置界面，也不会误用控制端设备名。
-        QString targetDeviceName = targetDeviceInfo.name.trimmed();
-        if (targetDeviceName.isEmpty()) {
-            targetDeviceName = targetDeviceInfo.ip.trimmed(); // wjy: 极少数取不到 Windows 计算机名的环境使用本机 IP，与设备自动发现的兜底语义保持一致。
-        }
-        if (targetDeviceName.isEmpty()) {
-            targetDeviceName = QString::fromUtf8("未知设备"); // wjy: 名称和 IP 都不可用时仍生成明确标识，绝不退回固定“99”。
-        }
-        const platform::DesktopWallpaperApplyResult result = platform::DesktopWallpaperService::applyNextSharedImage(previousSourcePath, targetDeviceName); // wjy: 共享原图只读取一次，目标名只合成到本机唯一 current.bmp，不复制上百张源图片。
+        const platform::DesktopWallpaperApplyResult result = platform::DesktopWallpaperService::applyNextSharedImage(previousSourcePath); // wjy: 壁纸任务直接使用共享原图，不再读取本机名称或合成字符。
         if (!self) {
             return;
         }
