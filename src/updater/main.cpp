@@ -366,7 +366,7 @@ bool restartFsRemote(const UpdateTask& task, bool updated)
     const fs::path executable = task.targetDir / task.restartExecutable;
     std::wstring command = L"\"" + executable.wstring() + L"\" ";
     command += updated
-        ? L"--updated-from \"" + task.fromVersion + L"\" --updated-to \"" + task.toVersion + L"\""
+        ? L"--updated-from \"" + task.fromVersion + L"\" --updated-to \"" + task.toVersion + L"\" --minimized" // wjy: 更新成功后的新主程序直接进入托盘，避免更新重启打断用户当前桌面。
         : L"--update-rollback \"" + task.toVersion + L"\""; // wjy: 成功参数仅记录已安装版本并静默启动，回滚参数继续触发主程序失败警告。
     STARTUPINFOW startup{sizeof(startup)};
     PROCESS_INFORMATION process{};

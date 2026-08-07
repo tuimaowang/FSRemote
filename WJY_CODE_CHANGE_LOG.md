@@ -10912,6 +10912,40 @@ if (settingsLayout.containsPoint(settingsHideLocalDeviceSwitchRect(), event->pos
 - `rg` 静态复核：列表排序、搜索、批量/周期新增、手动新增、同步快照、实时状态白名单、分组批量动作均接入本机过滤。
 - 按用户要求未构建、未链接、未运行程序或二进制测试。
 
+## 2026-08-07 15:43 - 更新成功重启时最小化到托盘
+
+### Changed Location
+- `src/updater/main.cpp:364-370`：更新成功后的重启命令追加 `--minimized` 参数；回撤重启参数保持不变。
+
+### Reason
+更新器替换文件完成后会自动重启 FSRemote。用户希望更新重启不要直接弹出完整主窗口，因此仅对正常更新成功路径增加最小化参数，主程序现有参数处理会让它进入托盘；回撤仍保留原来的失败提示行为。
+
+### Original Code
+```cpp
+// src/updater/main.cpp:364-370（修改前）
+command += updated
+    ? L"--updated-from \"" + task.fromVersion + L"\" --updated-to \"" + task.toVersion + L"\""
+    : L"--update-rollback \"" + task.toVersion + L"\"";
+```
+
+### Modified Code
+```cpp
+// src/updater/main.cpp:364-370（修改后）
+command += updated
+    ? L"--updated-from \"" + task.fromVersion + L"\" --updated-to \"" + task.toVersion + L"\" --minimized" // wjy: 更新成功后的新主程序直接进入托盘，避免更新重启打断用户当前桌面。
+    : L"--update-rollback \"" + task.toVersion + L"\"";
+```
+
+### Steps
+1. 确认 `src/main.cpp` 已支持 `--minimized` 并调用 `hideToTray()`。
+2. 在独立更新器正常更新成功的重启命令中追加 `--minimized`。
+3. 保持回撤重启参数不变，避免改变回撤失败提示逻辑。
+
+### Verification
+- `git diff --check`：通过。
+- 静态确认主程序会将 `--minimized` 转换为托盘启动。
+- 按用户要求未构建、未链接、未运行程序或二进制测试。
+
 ## 2026-08-07 09:35 - 壁纸改为直接使用共享原图
 
 ### Changed Location
