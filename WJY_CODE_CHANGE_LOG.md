@@ -11643,3 +11643,31 @@ for (const auto& group : desktopGroups) {
 
 ### Verification
 - 已执行差异静态检查准备工作，未构建，符合用户要求。
+## 2026-08-08 修复虚拟桌面 GUID 字符串编译错误
+
+### Changed Location
+- `src/ui/DeviceGrid.cpp:152`：修正 `GUID::Data4` 转十六进制字符串的 Qt 类型调用。
+
+### Reason
+原实现把 `QString::fromLatin1()` 的返回值继续调用 `toHex()`，但 `toHex()` 属于 `QByteArray`，导致 Qt 编译器报 `QString` 没有 `toHex` 以及 `QString::arg` 无匹配重载。现在先用 `QByteArray::fromRawData(...).toHex()` 完成字节转换，再转成 `QString`。
+
+### Original Code
+```cpp
+// src/ui/DeviceGrid.cpp:152
+.arg(QString::fromLatin1(reinterpret_cast<const char*>(desktopId.Data4), 8).toHex());
+```
+
+### Modified Code
+```cpp
+// src/ui/DeviceGrid.cpp:152
+.arg(QString::fromLatin1(QByteArray::fromRawData(
+    reinterpret_cast<const char*>(desktopId.Data4), 8).toHex()));
+```
+
+### Steps
+1. 将 GUID 尾部 8 字节包装为 `QByteArray`。
+2. 在 `QByteArray` 上调用 `toHex()`，再转换为 `QString` 传给 `arg()`。
+
+### Verification
+- 已进行静态差异检查。
+- 未构建；用户反馈的 Qt 编译错误已针对性修复。

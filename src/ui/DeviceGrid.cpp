@@ -149,7 +149,7 @@ QString virtualDesktopKey(const RemoteDesktopWindow* window)
         .arg(QString::number(desktopId.Data1, 16))
         .arg(QString::number(desktopId.Data2, 16))
         .arg(QString::number(desktopId.Data3, 16))
-        .arg(QString::fromLatin1(reinterpret_cast<const char*>(desktopId.Data4), 8).toHex()); // wjy: GUID 转为稳定字符串作为分组键。
+.arg(QString::fromLatin1(QByteArray::fromRawData(reinterpret_cast<const char*>(desktopId.Data4), 8).toHex())); // wjy: 先将 GUID 尾部字节转为 QByteArray 十六进制，再转换为 QString 分组键。
 }
 #endif
 
