@@ -454,6 +454,11 @@ private:
     int m_inputScriptPlaybackLoopIntervalMs = 0; // wjy: 保存 F10 设置的两轮完整脚本之间等待时间，0 表示连续执行。
     bool m_inputScriptPlaybackWaitingForLoopInterval = false; // wjy: 复用可取消的播放定时器等待下一轮，F10 停止时无需处理遗留 singleShot 回调。
     double m_inputScriptPlaybackSpeedMultiplier = 1.0;
+    bool m_inputScriptPasteRandomSuffixEnabled = false; // wjy: F10 播放时仅对脚本内 Ctrl+V 追加随机后缀。
+    QString m_inputScriptPasteRandomSeparator = QStringLiteral("......");
+    int m_inputScriptPasteRandomLength = 3;
+    int m_inputScriptPasteRandomMode = 0;
+    bool m_inputScriptPlaybackCtrlDown = false;
     QVector<RemoteInputScriptEvent> m_inputScriptPlaybackEvents;
     qsizetype m_inputScriptPlaybackIndex = 0;
     QSet<int> m_inputScriptPlaybackHeldKeys;

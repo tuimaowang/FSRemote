@@ -11671,3 +11671,57 @@ for (const auto& group : desktopGroups) {
 ### Verification
 - 已进行静态差异检查。
 - 未构建；用户反馈的 Qt 编译错误已针对性修复。
+## 2026-08-08 F10 脚本 Ctrl+V 随机字符串配置
+
+### Changed Location
+- `src/ui/RemoteDesktopWindow.cpp`：F10 播放设置新增随机后缀配置，并在播放脚本检测到 Ctrl+V 时先发送带随机后缀的剪贴板文本。
+- `src/ui/RemoteDesktopWindow.h`：新增播放配置和 Ctrl 状态字段。
+
+### Reason
+用户要求 F9 录制的脚本在 F10 播放时，遇到脚本内 Ctrl+V 才追加随机字符串；人工 Ctrl+V 和录制过程不受影响。随机字符串支持开关、间隔符、长度以及混合/纯数字/纯字母三种模式。
+
+### Original Code
+```cpp
+// src/ui/RemoteDesktopWindow.cpp（原播放选项）
+struct RemoteInputPlaybackOptions {
+    QString filePath;
+    int loopCount = 1;
+    int loopIntervalMs = 0;
+    double speedMultiplier = 1.0;
+};
+```
+
+```cpp
+// 原播放循环仅直接发送脚本事件
+const RemoteInputEvent event = m_inputScriptPlaybackEvents.at(m_inputScriptPlaybackIndex).input;
+sent = dispatchRemoteInputEvent(event);
+```
+
+### Modified Code
+```cpp
+// 新增 F10 配置
+bool pasteRandomSuffixEnabled = false;
+QString pasteRandomSeparator = QStringLiteral("......");
+int pasteRandomLength = 3;
+int pasteRandomMode = 0;
+```
+
+```cpp
+// 播放遇到 Ctrl+V 时先向目标设备发送随机化剪贴板
+if (m_inputScriptPasteRandomSuffixEnabled
+    && event.type == RemoteInputEventType::KeyDown
+    && event.virtualKey == 'V'
+    && m_inputScriptPlaybackCtrlDown) {
+    // 原剪贴板 + 间隔符 + 随机字符串，再发送 V Down。
+}
+```
+
+### Steps
+1. 在 F10 播放对话框增加开关、间隔符、长度和随机模式控件。
+2. 播放器跟踪脚本中的 Ctrl 按下状态，仅识别脚本内 Ctrl+V。
+3. 发送 V Down 前读取本机当前剪贴板，生成随机后缀并通过现有 `cb ` 数据通道推送到目标设备。
+4. 保留原脚本事件顺序，人工键鼠和 F9 录制流程不进入该逻辑。
+
+### Verification
+- 已执行 `git diff --check` 静态检查。
+- 未构建；按用户要求仅静态检查并提交。

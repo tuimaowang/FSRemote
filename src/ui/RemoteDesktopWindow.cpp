@@ -15,6 +15,7 @@
 #include <QByteArray>
 #include <QApplication>
 #include <QClipboard>
+#include <QCheckBox>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QCoreApplication>
@@ -35,6 +36,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QRandomGenerator>
 #include <QMetaObject>
 #include <QMouseEvent>
 #include <QMutexLocker>
@@ -158,6 +160,10 @@ struct RemoteInputPlaybackOptions {
     int loopCount = 1; // wjy: 0表示无限循环，正数表示包含第一次播放在内的总执行次数。
     int loopIntervalMs = 0; // wjy: 仅作用于两轮完整脚本之间；0表示上一轮结束后立即进入下一轮。
     double speedMultiplier = 1.0;
+    bool pasteRandomSuffixEnabled = false;
+    QString pasteRandomSeparator = QStringLiteral("......");
+    int pasteRandomLength = 3;
+    int pasteRandomMode = 0; // 0 混合，1 纯数字，2 纯字母。
 };
 
 class RemoteInputPlaybackDialog final : public QDialog {
@@ -168,6 +174,10 @@ public:
         int initialLoopCount,
         int initialLoopIntervalMs,
         double initialSpeedMultiplier,
+        bool initialPasteRandomSuffixEnabled,
+        const QString& initialPasteRandomSeparator,
+        int initialPasteRandomLength,
+        int initialPasteRandomMode,
         QWidget* parent)
         : QDialog(parent)
     {
@@ -226,12 +236,29 @@ public:
         m_speedSpin->setSuffix(QString::fromUtf8(" 倍"));
         m_speedSpin->setValue(std::clamp(initialSpeedMultiplier, 0.10, 10.00)); // wjy: 小于1倍减速，大于1倍加速，1倍严格沿用原录制时间。
 
+        m_pasteRandomSuffixCheck = new QCheckBox(QString::fromUtf8("Ctrl+V 粘贴时追加随机字符串"), this);
+        m_pasteRandomSuffixCheck->setChecked(initialPasteRandomSuffixEnabled);
+        m_pasteRandomSeparatorEdit = new QLineEdit(this);
+        m_pasteRandomSeparatorEdit->setText(initialPasteRandomSeparator);
+        m_pasteRandomLengthSpin = new QSpinBox(this);
+        m_pasteRandomLengthSpin->setRange(1, 64);
+        m_pasteRandomLengthSpin->setValue(std::clamp(initialPasteRandomLength, 1, 64));
+        m_pasteRandomModeCombo = new QComboBox(this);
+        m_pasteRandomModeCombo->addItem(QString::fromUtf8("混合模式"), 0);
+        m_pasteRandomModeCombo->addItem(QString::fromUtf8("纯数字"), 1);
+        m_pasteRandomModeCombo->addItem(QString::fromUtf8("纯字母"), 2);
+        m_pasteRandomModeCombo->setCurrentIndex(std::clamp(initialPasteRandomMode, 0, 2));
+
         auto* form = new QFormLayout();
         form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
         form->addRow(QString::fromUtf8("脚本文件："), m_fileCombo);
         form->addRow(QString::fromUtf8("循环次数："), m_loopCountSpin);
         form->addRow(QString::fromUtf8("循环间隔："), m_loopIntervalSpin);
         form->addRow(QString::fromUtf8("执行速度："), m_speedSpin);
+        form->addRow(QString::fromUtf8("随机字符串："), m_pasteRandomSuffixCheck);
+        form->addRow(QString::fromUtf8("间隔符："), m_pasteRandomSeparatorEdit);
+        form->addRow(QString::fromUtf8("随机长度："), m_pasteRandomLengthSpin);
+        form->addRow(QString::fromUtf8("随机模式："), m_pasteRandomModeCombo);
 
         auto* hint = new QLabel(
             QString::fromUtf8("循环次数填 0 时持续播放；循环间隔只在一轮完整脚本结束后等待，不影响脚本内部事件速度，也不会在第一次执行前等待。"), this);
@@ -272,6 +299,10 @@ public:
         result.loopCount = m_loopCountSpin->value();
         result.loopIntervalMs = m_loopIntervalSpin->value();
         result.speedMultiplier = m_speedSpin->value();
+        result.pasteRandomSuffixEnabled = m_pasteRandomSuffixCheck->isChecked();
+        result.pasteRandomSeparator = m_pasteRandomSeparatorEdit->text();
+        result.pasteRandomLength = m_pasteRandomLengthSpin->value();
+        result.pasteRandomMode = m_pasteRandomModeCombo->currentData().toInt();
         return result;
     }
 
@@ -280,6 +311,10 @@ private:
     QSpinBox* m_loopCountSpin = nullptr;
     QSpinBox* m_loopIntervalSpin = nullptr;
     QDoubleSpinBox* m_speedSpin = nullptr;
+    QCheckBox* m_pasteRandomSuffixCheck = nullptr;
+    QLineEdit* m_pasteRandomSeparatorEdit = nullptr;
+    QSpinBox* m_pasteRandomLengthSpin = nullptr;
+    QComboBox* m_pasteRandomModeCombo = nullptr;
 };
 // ===end====
 
@@ -3979,6 +4014,10 @@ void RemoteDesktopWindow::chooseAndStartInputScriptPlayback()
         m_inputScriptPlaybackLoopCount,
         m_inputScriptPlaybackLoopIntervalMs,
         m_inputScriptPlaybackSpeedMultiplier,
+        m_inputScriptPasteRandomSuffixEnabled,
+        m_inputScriptPasteRandomSeparator,
+        m_inputScriptPasteRandomLength,
+        m_inputScriptPasteRandomMode,
         this);
     setInputScriptDialogActive(true);
     if (playbackDialog.exec() != QDialog::Accepted) {
@@ -3991,6 +4030,10 @@ void RemoteDesktopWindow::chooseAndStartInputScriptPlayback()
     m_inputScriptPlaybackLoopCount = options.loopCount;
     m_inputScriptPlaybackLoopIntervalMs = options.loopIntervalMs;
     m_inputScriptPlaybackSpeedMultiplier = options.speedMultiplier; // wjy: 文件、循环次数、轮间隔和速度由同一个F10设置窗口一次性提交。
+    m_inputScriptPasteRandomSuffixEnabled = options.pasteRandomSuffixEnabled;
+    m_inputScriptPasteRandomSeparator = options.pasteRandomSeparator;
+    m_inputScriptPasteRandomLength = options.pasteRandomLength;
+    m_inputScriptPasteRandomMode = options.pasteRandomMode;
 
     RemoteInputScript script;
     QString errorMessage;
@@ -4027,6 +4070,7 @@ void RemoteDesktopWindow::chooseAndStartInputScriptPlayback()
     m_inputScriptPlaybackHeldButtons.clear();
     m_inputScriptPlaybackX = 32768;
     m_inputScriptPlaybackY = 32768;
+    m_inputScriptPlaybackCtrlDown = false;
     m_inputScriptPlaybackClock.start();
     m_inputScriptPlaying = true;
     requestTitleBarUpdate();
@@ -4086,6 +4130,31 @@ void RemoteDesktopWindow::processInputScriptPlaybackEvents()
                 m_inputScriptPlaybackSpeedMultiplier) <= elapsedMs
         && processedThisTick < kMaximumInputScriptEventsPerPlaybackTick) {
         const RemoteInputEvent event = m_inputScriptPlaybackEvents.at(m_inputScriptPlaybackIndex).input;
+        if (m_inputScriptPasteRandomSuffixEnabled
+            && event.type == RemoteInputEventType::KeyDown
+            && event.virtualKey == 'V'
+            && m_inputScriptPlaybackCtrlDown) {
+            QClipboard* clipboard = QGuiApplication::clipboard();
+            const QString sourceText = clipboard ? clipboard->text() : QString();
+            if (!sourceText.isEmpty()) {
+                const QString alphabet = m_inputScriptPasteRandomMode == 1
+                    ? QStringLiteral("0123456789")
+                    : (m_inputScriptPasteRandomMode == 2
+                        ? QStringLiteral("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+                        : QStringLiteral("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+                QString randomText;
+                randomText.reserve(m_inputScriptPasteRandomLength);
+                for (int i = 0; i < m_inputScriptPasteRandomLength; ++i) {
+                    randomText.append(alphabet.at(QRandomGenerator::global()->bounded(alphabet.size())));
+                }
+                const QByteArray encoded = RemoteClipboardCodec::encode(
+                    sourceText + m_inputScriptPasteRandomSeparator + randomText);
+                if (encoded.isEmpty() || !sendInputMessage(QByteArray("cb ") + encoded)) {
+                    stopInputScriptPlayback(QStringLiteral("paste_clipboard_send_failed"), true);
+                    return;
+                }
+            }
+        }
         bool sent = false;
         {
             QScopedValueRollback<bool> playbackDispatch(m_dispatchingInputScriptPlayback, true);
@@ -4101,6 +4170,14 @@ void RemoteDesktopWindow::processInputScriptPlaybackEvents()
         }
         ++m_inputScriptPlaybackIndex;
         ++processedThisTick;
+        const bool isControlKey = event.virtualKey == 0x11
+            || event.virtualKey == 0xA2
+            || event.virtualKey == 0xA3; // wjy: 兼容通用 Ctrl、左 Ctrl 和右 Ctrl 三种 Windows 虚拟键码。
+        if (event.type == RemoteInputEventType::KeyDown && isControlKey) {
+            m_inputScriptPlaybackCtrlDown = true;
+        } else if (event.type == RemoteInputEventType::KeyUp && isControlKey) {
+            m_inputScriptPlaybackCtrlDown = false;
+        }
         elapsedMs = m_inputScriptPlaybackClock.elapsed(); // wjy: 一批同时间事件发送后重新取时钟，及时追上处理期间已经到期的后续事件。
     }
 
@@ -4169,6 +4246,7 @@ void RemoteDesktopWindow::stopInputScriptPlayback(const QString& reason, bool re
     m_inputScriptPlaybackEvents.clear();
     m_inputScriptPlaybackIndex = 0;
     m_inputScriptPlaybackClock.invalidate();
+    m_inputScriptPlaybackCtrlDown = false;
     if (wasPlaying) {
         requestTitleBarUpdate();
         appendViewerDebugLog(QStringLiteral("input script playback stopped host=%1 event_index=%2 event_total=%3 completed_loops=%4 configured_loops=%5 loop_interval_ms=%6 speed=%7 reason=%8")
