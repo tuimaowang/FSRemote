@@ -439,11 +439,11 @@ int main(int argc, char* argv[])
         });
     }
     // ===end====
-    // wjy: 仅开机自启带 --minimized 时进托盘；手动双击启动仍显示主窗口。
+    // wjy: 仅开机自启或更新重启带 --minimized 时静默进入托盘；手动双击启动仍显示主窗口。
     if (args.contains(QStringLiteral("--minimized"), Qt::CaseInsensitive)) {
         // =====wjy====
-        window.hideToTray(); // wjy: v1.1.187 实机证明“先普通显示再最小化”既未让更新重启可靠最小化，也未恢复客户区输入，回到原有启动最小化入口。
-        writeStartupLog(QStringLiteral("[wjy-main] started minimized to tray")); // wjy: 恢复既有日志文字，避免把已证伪的初始化顺序误判成成功路径。
+        window.hide(); // wjy: 静默启动时主窗口保持从未创建/从未显示状态，避免 Qt 的 showMinimized 路径在更新重启后把窗口重新弹到桌面。
+        writeStartupLog(QStringLiteral("[wjy-main] started hidden to tray")); // wjy: 记录本次明确走隐藏托盘而非系统最小化，便于与用户手动最小化路径区分。
         // ===end====
     } else {
         window.show();

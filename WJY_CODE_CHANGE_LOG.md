@@ -11991,3 +11991,52 @@ const BOOL created = CreateProcessW(executable.c_str(), command.data(), nullptr,
 - 已执行 `git diff --check`，未发现空白错误。
 - 已核对修改只涉及 `src/updater/main.cpp` 和本次变更记录。
 - 按用户要求未构建、未链接、未运行程序或二进制测试；需发布新版本后验证更新完成时窗口是否保持最小化。
+
+## 2026-08-08 17:15 - 更新重启改为主窗口完全隐藏进托盘
+
+### Changed Location
+- `src/main.cpp:442-452`：将 `--minimized` 启动从 `showMinimized()` 路径改为保持主窗口隐藏。
+
+### Reason
+用户重新构建并更新到 `v1.1.189` 后确认，更新完成仍会自动弹出主窗口，并且该窗口只能显示、无法点击。说明即使更新器指定 `SW_SHOWMINNOACTIVE`，主程序启动阶段调用 `hideToTray()` 内部的 `showMinimized()` 仍会创建主窗口，无法保证更新重启时窗口不出现在桌面。
+
+本次将静默启动与运行期间的普通最小化彻底分开：带 `--minimized` 时主窗口保持隐藏，只保留托盘图标；用户正常运行中点击最小化、关闭按钮或托盘切换仍沿用原有系统最小化逻辑，不改变日常操作。
+
+### Original Code
+```cpp
+// src/main.cpp:442-451（修改前）
+// wjy: 仅开机自启带 --minimized 时进托盘；手动双击启动仍显示主窗口。
+if (args.contains(QStringLiteral("--minimized"), Qt::CaseInsensitive)) {
+    // =====wjy====
+    window.hideToTray();
+    writeStartupLog(QStringLiteral("[wjy-main] started minimized to tray"));
+    // ===end====
+} else {
+    window.show();
+}
+```
+
+### Modified Code
+```cpp
+// src/main.cpp:442-452
+// wjy: 仅开机自启或更新重启带 --minimized 时静默进入托盘；手动双击启动仍显示主窗口。
+if (args.contains(QStringLiteral("--minimized"), Qt::CaseInsensitive)) {
+    // =====wjy====
+    window.hide(); // wjy: 静默启动时主窗口保持从未创建/从未显示状态，避免 Qt 的 showMinimized 路径在更新重启后把窗口重新弹到桌面。
+    writeStartupLog(QStringLiteral("[wjy-main] started hidden to tray")); // wjy: 记录本次明确走隐藏托盘而非系统最小化，便于与用户手动最小化路径区分。
+    // ===end====
+} else {
+    window.show();
+}
+```
+
+### Steps
+1. 保留更新器传递的 `--minimized` 和 Windows `SW_SHOWMINNOACTIVE` 双重启动意图。
+2. 主程序收到 `--minimized` 后不再调用会创建窗口的 `showMinimized()`。
+3. 主窗口保持隐藏，托盘图标仍由构造阶段的 `setupTrayIcon()` 创建并显示。
+4. 不修改 `MainWindow::hideToTray()`，正常运行期间的任务栏最小化行为保持不变。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已核对修改只涉及 `src/main.cpp` 的静默启动分支和本次变更记录。
+- 按用户要求未构建、未链接、未运行程序或二进制测试；需发布下一版本验证更新后桌面不再出现主窗口，程序仍可从托盘手动打开。
