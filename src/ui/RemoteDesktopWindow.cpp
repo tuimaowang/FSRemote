@@ -93,6 +93,180 @@ RemoteDesktopWindow* g_rawInputMouseTarget = nullptr; // wjy: Windows 每类 Raw
 
 // =====wjy====
 using DwmSetWindowAttributeFunction = HRESULT(WINAPI*)(HWND, DWORD, LPCVOID, DWORD);
+using DwmGetWindowAttributeFunction = HRESULT(WINAPI*)(HWND, DWORD, PVOID, DWORD); // wjy: 动态读取窗口扩展边界和虚拟桌面隐藏状态，不增加dwmapi静态链接依赖。
+
+DwmGetWindowAttributeFunction nativeDwmGetWindowAttribute()
+{
+    static const DwmGetWindowAttributeFunction getWindowAttribute = [] {
+        HMODULE module = ::GetModuleHandleW(L"dwmapi.dll");
+        if (!module) module = ::LoadLibraryW(L"dwmapi.dll"); // wjy: 与圆角属性共用系统DWM模块，旧系统缺少导出时安全回退Win32矩形。
+        return module
+            ? reinterpret_cast<DwmGetWindowAttributeFunction>(::GetProcAddress(module, "DwmGetWindowAttribute"))
+            : nullptr;
+    }();
+    return getWindowAttribute;
+}
+
+bool nativeWindowIsCloaked(HWND window)
+{
+    constexpr DWORD kDwmWindowAttributeCloaked = 14; // wjy: DWMWA_CLOAKED；非当前虚拟桌面窗口通常由DWM标记为不可见。
+    DWORD cloaked = 0;
+    const DwmGetWindowAttributeFunction getWindowAttribute = nativeDwmGetWindowAttribute();
+    return getWindowAttribute
+        && SUCCEEDED(getWindowAttribute(window, kDwmWindowAttributeCloaked, &cloaked, sizeof(cloaked)))
+        && cloaked != 0; // wjy: 当前虚拟桌面之外的远控窗口没有真实可见像素，直接按完全遮挡处理。
+}
+
+bool nativeWindowVisualBounds(HWND window, RECT* bounds)
+{
+    if (!window || !bounds) {
+        return false;
+    }
+    RECT resolved{};
+    constexpr DWORD kDwmWindowAttributeExtendedFrameBounds = 9; // wjy: DWMWA_EXTENDED_FRAME_BOUNDS 排除不可见缩放边框和阴影。
+    const DwmGetWindowAttributeFunction getWindowAttribute = nativeDwmGetWindowAttribute();
+    if ((!getWindowAttribute
+            || FAILED(getWindowAttribute(
+                window,
+                kDwmWindowAttributeExtendedFrameBounds,
+                &resolved,
+                sizeof(resolved))))
+        && !::GetWindowRect(window, &resolved)) {
+        return false; // wjy: DWM和普通窗口矩形都不可用时保守视为未遮挡，不能误降正常窗口画质。
+    }
+    if (resolved.right <= resolved.left || resolved.bottom <= resolved.top) {
+        return false;
+    }
+    *bounds = resolved;
+    return true;
+}
+
+bool nativeLayeredWindowIsPartiallyTransparent(HWND window)
+{
+    const LONG_PTR extendedStyle = ::GetWindowLongPtrW(window, GWL_EXSTYLE);
+    if (extendedStyle & WS_EX_TRANSPARENT) {
+        return true; // wjy: 鼠标穿透工具层通常只绘制提示或轮廓，不应把下面的远控窗口误判成完全不可见。
+    }
+    if (!(extendedStyle & WS_EX_LAYERED)) {
+        return false;
+    }
+    COLORREF colorKey = 0;
+    BYTE alpha = 255;
+    DWORD flags = 0;
+    if (!::GetLayeredWindowAttributes(window, &colorKey, &alpha, &flags)) {
+        return false; // wjy: 按像素透明窗口无法从该接口读取全局Alpha，继续按其真实窗口区域参与遮挡。
+    }
+    return (flags & LWA_COLORKEY) != 0
+        || ((flags & LWA_ALPHA) != 0 && alpha < 255); // wjy: 半透明或色键工具窗不能证明下面窗口完全不可见，因此不用于扣减可见区域。
+}
+
+HRGN nativeWindowVisualRegion(HWND window, const RECT& visualBounds)
+{
+    HRGN windowRegion = ::CreateRectRgn(0, 0, 0, 0);
+    if (!windowRegion) {
+        return nullptr;
+    }
+    const int regionType = ::GetWindowRgn(window, windowRegion);
+    if (regionType == NULLREGION) {
+        return windowRegion; // wjy: 显式空窗口区域没有任何可见像素；目标窗口按完全遮挡处理，候选窗口则不会扣减其它区域。
+    }
+    RECT windowBounds{};
+    if (regionType != ERROR && ::GetWindowRect(window, &windowBounds)) {
+        ::OffsetRgn(windowRegion, windowBounds.left, windowBounds.top); // wjy: GetWindowRgn返回窗口局部坐标，转为屏幕坐标后才能与目标窗口做区域运算。
+        HRGN frameRegion = ::CreateRectRgn(
+            visualBounds.left,
+            visualBounds.top,
+            visualBounds.right,
+            visualBounds.bottom);
+        if (frameRegion) {
+            ::CombineRgn(windowRegion, windowRegion, frameRegion, RGN_AND); // wjy: 自定义圆角区域再与DWM真实边界相交，排除阴影和不可见边框。
+            ::DeleteObject(frameRegion);
+        }
+        return windowRegion;
+    }
+    ::DeleteObject(windowRegion);
+    return ::CreateRectRgn(
+        visualBounds.left,
+        visualBounds.top,
+        visualBounds.right,
+        visualBounds.bottom); // wjy: 未设置窗口Region时使用DWM可见矩形，覆盖普通矩形和Qt透明顶层窗口。
+}
+
+bool nativeWindowFullyOccluded(HWND targetWindow)
+{
+    if (!targetWindow || !::IsWindowVisible(targetWindow) || ::IsIconic(targetWindow)) {
+        return false; // wjy: 隐藏和最小化已有独立状态，本函数只判断普通显示窗口的真实遮挡。
+    }
+    if (nativeWindowIsCloaked(targetWindow)) {
+        return true; // wjy: 非当前虚拟桌面没有任何屏幕可见区域，与被其它窗口完全盖住使用相同资源策略。
+    }
+
+    RECT targetBounds{};
+    if (!nativeWindowVisualBounds(targetWindow, &targetBounds)) {
+        return false;
+    }
+    HRGN remainingRegion = nativeWindowVisualRegion(targetWindow, targetBounds);
+    if (!remainingRegion) {
+        return false;
+    }
+
+    const int virtualLeft = ::GetSystemMetrics(SM_XVIRTUALSCREEN);
+    const int virtualTop = ::GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int virtualWidth = ::GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    const int virtualHeight = ::GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    HRGN desktopRegion = ::CreateRectRgn(
+        virtualLeft,
+        virtualTop,
+        virtualLeft + qMax(0, virtualWidth),
+        virtualTop + qMax(0, virtualHeight));
+    if (desktopRegion) {
+        ::CombineRgn(remainingRegion, remainingRegion, desktopRegion, RGN_AND); // wjy: 屏幕外部分不是用户可见区域，不能阻止完全遮挡降级。
+        ::DeleteObject(desktopRegion);
+    }
+    if (::GetRgnBox(remainingRegion, &targetBounds) == NULLREGION) {
+        ::DeleteObject(remainingRegion);
+        return true; // wjy: 窗口完全移出所有显示器时同样没有可见像素，直接使用最小化档。
+    }
+
+    for (HWND candidate = ::GetWindow(targetWindow, GW_HWNDPREV);
+         candidate;
+         candidate = ::GetWindow(candidate, GW_HWNDPREV)) {
+        if (!::IsWindow(candidate)
+            || !::IsWindowVisible(candidate)
+            || ::IsIconic(candidate)
+            || nativeWindowIsCloaked(candidate)
+            || nativeLayeredWindowIsPartiallyTransparent(candidate)) {
+            continue; // wjy: 只用当前虚拟桌面上真正显示且足以完全遮挡内容的不透明顶层窗口扣减区域。
+        }
+
+        RECT candidateBounds{};
+        RECT intersection{};
+        if (!nativeWindowVisualBounds(candidate, &candidateBounds)
+            || !::IntersectRect(&intersection, &targetBounds, &candidateBounds)) {
+            continue;
+        }
+        HRGN candidateRegion = nativeWindowVisualRegion(candidate, candidateBounds);
+        if (!candidateRegion) {
+            continue;
+        }
+        const int remainingType = ::CombineRgn(
+            remainingRegion,
+            remainingRegion,
+            candidateRegion,
+            RGN_DIFF); // wjy: 按Windows真实Z序逐层减去更高窗口，多个窗口拼接覆盖也能判定为完全遮挡。
+        ::DeleteObject(candidateRegion);
+        if (remainingType == NULLREGION) {
+            ::DeleteObject(remainingRegion);
+            return true; // wjy: 目标窗口已没有任何未覆盖区域，下一次画质决策立即复用最小化安全档。
+        }
+        if (remainingType == ERROR) {
+            break; // wjy: 区域运算失败时保守保持当前画质，避免系统异常导致全部窗口误降级。
+        }
+    }
+
+    ::DeleteObject(remainingRegion);
+    return false;
+}
 
 bool applyNativeWindowCorners(HWND window, bool rounded)
 {
@@ -351,6 +525,7 @@ QString remoteQualityReasonText(RemoteQualityDegradationReason reason)
     case RemoteQualityDegradationReason::ModePreference: return QString::fromUtf8("模式预设");
     case RemoteQualityDegradationReason::Background: return QString::fromUtf8("后台低性能保活");
     case RemoteQualityDegradationReason::Minimized: return QString::fromUtf8("最小化保活");
+    case RemoteQualityDegradationReason::FullyOccluded: return QString::fromUtf8("完全遮挡，按最小化保活"); // wjy: 明确区分用户主动最小化与窗口仍存在但完全不可见。
     case RemoteQualityDegradationReason::LargestWindowBelowThreshold: return QString::fromUtf8("最大窗口未达到高清阈值");
     case RemoteQualityDegradationReason::PipelinePressure: return QString::fromUtf8("接收管线持续压力");
     case RemoteQualityDegradationReason::SeverePipelinePressure: return QString::fromUtf8("接收管线严重压力");
@@ -382,6 +557,7 @@ bool sameQualityDecision(const RemoteQualityDecision& left, const RemoteQualityD
         && left.active == right.active
         && left.fullScreen == right.fullScreen
         && left.minimized == right.minimized
+        && left.fullyOccluded == right.fullyOccluded // wjy: 遮挡来源变化即使质量数值暂时相同也要刷新诊断状态。
         && left.softwareFallback == right.softwareFallback
         && left.requestRemoteProfile == right.requestRemoteProfile
         && left.audioEnabled == right.audioEnabled; // wjy: 独立音频按钮状态作为真实决策变化处理，不能被相同画质参数去重。
@@ -2198,6 +2374,13 @@ RemoteQualityWindowMetrics RemoteDesktopWindow::remoteQualityMetrics()
     metrics.effectiveMode = effectiveQualityMode();
     metrics.visible = isVisible() && !m_closeInProgress;
     metrics.minimized = isMinimized();
+    // =====wjy====
+#if defined(Q_OS_WIN)
+    metrics.fullyOccluded = metrics.visible
+        && !metrics.minimized
+        && nativeWindowFullyOccluded(reinterpret_cast<HWND>(winId())); // wjy: 每秒按原生Z序确认是否仍有可见区域，完全遮挡才进入最小化档。
+#endif
+    // ===end====
     metrics.fullScreen = isFullScreen(); // wjy: 保留全屏状态用于标题栏/诊断；视频高性能现在只由真实焦点决定。
     metrics.softwareFallback = m_softwareFallbackActive; // wjy: 重试开放期间也保持BGRA回退硬上限，必须等纹理实际成功后才恢复。
     const QSize sourceSize = remoteFrameSize().isValid() ? remoteFrameSize() : QSize(1920, 1080);
@@ -2265,10 +2448,11 @@ void RemoteDesktopWindow::applyRemoteQualityDecision(const RemoteQualityDecision
     sendCurrentViewerAudioDecision(); // wjy: 质量请求变化时顺带补发本窗口独立音频状态，二者不共享所有权判定。
     if (feedbackChanged) {
         const bool backgroundRole = decision.effectiveMode != stream::RemoteQualityMode::HighQualityLocked; // wjy: 日志按实际质量角色判断后台，单窗口无焦点保持高清时不再误报background=1。
-        appendViewerDebugLog(QStringLiteral("quality role host=%1 active=%2 fullscreen=%3 background=%4 audio=%5 remote_request=%6 resolution=%7 target=%8x%9 fps=%10 priority=%11 reason=%12")
+        appendViewerDebugLog(QStringLiteral("quality role host=%1 active=%2 fullscreen=%3 occluded=%4 background=%5 audio=%6 remote_request=%7 resolution=%8 target=%9x%10 fps=%11 priority=%12 reason=%13")
             .arg(m_hostIp)
             .arg(decision.active ? 1 : 0)
             .arg(decision.fullScreen ? 1 : 0)
+            .arg(decision.fullyOccluded ? 1 : 0) // wjy: 日志可直接确认窗口是否因为完全遮挡进入最小化资源档。
             .arg(backgroundRole ? 1 : 0)
             .arg(decision.audioEnabled ? 1 : 0)
             .arg(decision.requestRemoteProfile ? 1 : 0)
@@ -3637,6 +3821,7 @@ bool RemoteDesktopWindow::remoteQualityIsDegraded() const
     }
     if (m_remoteQualityDecision.reason == RemoteQualityDegradationReason::Background
         || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::Minimized
+        || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::FullyOccluded
         || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::PipelinePressure
         || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::SeverePipelinePressure
         || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::SoftwareFallback

@@ -15,6 +15,7 @@ enum class RemoteQualityDegradationReason {
     ModePreference,
     Background,
     Minimized,
+    FullyOccluded, // wjy: 窗口仍处于普通显示状态但屏幕区域被更高层窗口完全覆盖，画质与最小化共用安全档。
     LargestWindowBelowThreshold,
     PipelinePressure,
     SeverePipelinePressure,
@@ -65,6 +66,7 @@ struct RemoteQualityWindowMetrics {
     stream::RemoteQualityMode effectiveMode = stream::RemoteQualityMode::Automatic;
     bool visible = true;
     bool minimized = false;
+    bool fullyOccluded = false; // wjy: Windows 可见区域计算结果；只要仍露出任意像素就保持 false。
     bool active = false;
     bool fullScreen = false;
     bool softwareFallback = false;
@@ -107,6 +109,7 @@ struct RemoteQualityDecision {
     bool active = false;
     bool fullScreen = false;
     bool minimized = false;
+    bool fullyOccluded = false; // wjy: 保留遮挡来源供标题栏诊断显示，资源角色仍通过 minimized 复用最小化策略。
     bool softwareFallback = false;
     bool requestRemoteProfile = true; // wjy: 本地调度立即应用；快速焦点切换期间可延迟远端编码器改参。
     bool audioEnabled = false; // wjy: 音频由远控窗口自身按钮独立控制，不再由画质协调器抢占。

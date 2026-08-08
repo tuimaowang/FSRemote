@@ -71,6 +71,19 @@ int main()
     assert(!decisions.front().audioEnabled);
     assert(decisions.front().reason == ui::RemoteQualityDegradationReason::Minimized); // wjy: 活动窗口一旦最小化，后台安全档优先于高质量身份。
 
+    // =====wjy====
+    backgroundWindow.minimized = false;
+    backgroundWindow.fullyOccluded = true; // wjy: 模拟普通显示窗口被更高层窗口完全覆盖，协调器无需依赖真实Windows句柄即可验证角色映射。
+    decisions = coordinator.evaluate(configuration, {backgroundWindow}, 1250);
+    assert(decisions.front().minimized); // wjy: 完全遮挡直接复用最小化资源角色。
+    assert(decisions.front().fullyOccluded); // wjy: 决策保留遮挡来源，诊断文字不会误报为用户主动最小化。
+    assert(decisions.front().resolution == stream::RemoteResolutionTier::P360);
+    assert(decisions.front().targetFps == configuration.minimizedFps); // wjy: 遮挡窗口与最小化窗口严格使用同一1 FPS配置。
+    assert(decisions.front().priority == 10);
+    assert(decisions.front().reason == ui::RemoteQualityDegradationReason::FullyOccluded);
+    backgroundWindow.fullyOccluded = false; // wjy: 后续测试恢复普通可见窗口状态，避免遮挡标记污染其它策略断言。
+    // ===end====
+
     fullScreenWindow.active = true;
     fullScreenWindow.softwareFallback = true;
     decisions = coordinator.evaluate(configuration, {fullScreenWindow}, 1300);

@@ -6900,7 +6900,8 @@ void DeviceGrid::evaluateRemoteQuality()
         for (const QPointer<RemoteDesktopWindow>& window : windows) {
             if (window) {
                 RemoteQualityWindowMetrics snapshot = window->remoteQualityMetrics();
-                snapshot.active = snapshot.visible && !snapshot.minimized && window->isActiveWindow(); // wjy: 只把Qt确认的真实焦点窗口标记为active，协调器据此授予唯一高质量角色。
+                snapshot.active = snapshot.visible && !snapshot.minimized && !snapshot.fullyOccluded
+                    && window->isActiveWindow(); // wjy: 完全遮挡窗口即使Windows仍保留激活状态也不能继续占用唯一高质量角色。
                 metrics.push_back(snapshot); // wjy: 只在Qt线程附加真实焦点身份，不跨线程访问原生WebRTC对象。
             }
         }

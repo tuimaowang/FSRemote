@@ -12040,3 +12040,175 @@ if (args.contains(QStringLiteral("--minimized"), Qt::CaseInsensitive)) {
 - 已执行 `git diff --check`，未发现空白错误。
 - 已核对修改只涉及 `src/main.cpp` 的静默启动分支和本次变更记录。
 - 按用户要求未构建、未链接、未运行程序或二进制测试；需发布下一版本验证更新后桌面不再出现主窗口，程序仍可从托盘手动打开。
+
+## 2026-08-08 17:35 - 远控窗口完全遮挡时使用最小化画质
+
+### Changed Location
+- `src/ui/RemoteDesktopWindow.cpp:95-270`：新增 Windows 顶层窗口可见区域与完全遮挡检测。
+- `src/ui/RemoteDesktopWindow.cpp:521-563`：增加完全遮挡状态文案和决策变化比较。
+- `src/ui/RemoteDesktopWindow.cpp:2370-2464`：每秒采集遮挡状态并写入画质决策日志。
+- `src/ui/RemoteQualityCoordinator.h:13-116`：新增完全遮挡指标、决策字段和降级原因。
+- `src/ui/RemoteQualityCoordinator.cpp:118-203`：完全遮挡窗口复用最小化资源角色。
+- `src/ui/DeviceGrid.cpp:6897-6905`：完全遮挡窗口不再保留唯一前台高质量身份。
+- `tests/remote_quality_coordinator_tests.cpp:65-85`：补充完全遮挡映射到360p/1 FPS的策略断言。
+
+### Reason
+多个远控窗口同时打开时，普通后台窗口即使被其它窗口完全盖住，原逻辑仍把它视为可见后台窗口并持续请求720p/30 FPS。用户希望只有真正能看到画面的窗口保留可见档；完全没有任何可见区域的窗口应与最小化一样使用最低资源保活档。
+
+本次按 Windows 原生 Z 顺序逐层扣减目标窗口的屏幕区域。只要仍露出任意区域就保持普通前台/后台策略；区域被完全扣空、窗口完全移出屏幕或位于其它虚拟桌面时，统一请求360p/1 FPS和最低优先级。半透明、色键和鼠标穿透工具窗不作为完整遮挡依据，避免悬浮提示造成误降级。
+
+### Original Code
+```cpp
+// src/ui/RemoteQualityCoordinator.h:13-18（修改前）
+enum class RemoteQualityDegradationReason {
+    None,
+    ModePreference,
+    Background,
+    Minimized,
+    LargestWindowBelowThreshold,
+};
+
+struct RemoteQualityWindowMetrics {
+    bool visible = true;
+    bool minimized = false;
+    bool active = false;
+};
+```
+
+```cpp
+// src/ui/RemoteQualityCoordinator.cpp:118-141（修改前）
+if (window.windowId == 0 || !window.visible || window.minimized || !window.active) {
+    continue;
+}
+const bool eligibleVisibleWindow = window.visible && !window.minimized;
+decision.minimized = !eligibleVisibleWindow;
+decision.active = window.active && eligibleVisibleWindow;
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:2194-2201（修改前）
+RemoteQualityWindowMetrics metrics;
+metrics.visible = isVisible() && !m_closeInProgress;
+metrics.minimized = isMinimized();
+metrics.fullScreen = isFullScreen();
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:6902-6904（修改前）
+RemoteQualityWindowMetrics snapshot = window->remoteQualityMetrics();
+snapshot.active = snapshot.visible && !snapshot.minimized && window->isActiveWindow();
+metrics.push_back(snapshot);
+```
+
+```cpp
+// tests/remote_quality_coordinator_tests.cpp
+原测试仅验证 minimized=true 和 visible=false，未覆盖普通显示窗口被完全遮挡的情况。
+```
+
+### Modified Code
+```cpp
+// src/ui/RemoteQualityCoordinator.h:13-18,64-70,99-113
+enum class RemoteQualityDegradationReason {
+    None,
+    ModePreference,
+    Background,
+    Minimized,
+    FullyOccluded,
+};
+
+struct RemoteQualityWindowMetrics {
+    bool visible = true;
+    bool minimized = false;
+    bool fullyOccluded = false;
+    bool active = false;
+};
+
+struct RemoteQualityDecision {
+    bool minimized = false;
+    bool fullyOccluded = false;
+};
+```
+
+```cpp
+// src/ui/RemoteQualityCoordinator.cpp:118-203
+if (window.windowId == 0 || !window.visible || window.minimized || window.fullyOccluded || !window.active) {
+    continue;
+}
+const bool eligibleVisibleWindow = window.visible && !window.minimized && !window.fullyOccluded;
+decision.minimized = !eligibleVisibleWindow;
+decision.fullyOccluded = window.visible && !window.minimized && window.fullyOccluded;
+decision.active = window.active && eligibleVisibleWindow;
+
+decision.reason = decision.fullyOccluded
+    ? RemoteQualityDegradationReason::FullyOccluded
+    : decision.minimized
+        ? RemoteQualityDegradationReason::Minimized
+        : RemoteQualityDegradationReason::Background;
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:95-270（核心逻辑）
+bool nativeWindowFullyOccluded(HWND targetWindow)
+{
+    if (nativeWindowIsCloaked(targetWindow)) {
+        return true;
+    }
+    HRGN remainingRegion = nativeWindowVisualRegion(targetWindow, targetBounds);
+    for (HWND candidate = GetWindow(targetWindow, GW_HWNDPREV);
+         candidate;
+         candidate = GetWindow(candidate, GW_HWNDPREV)) {
+        // 跳过隐藏、最小化、其它虚拟桌面和透明工具窗口。
+        CombineRgn(remainingRegion, remainingRegion, candidateRegion, RGN_DIFF);
+        if (remainingType == NULLREGION) {
+            return true;
+        }
+    }
+    return false;
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:2370-2383
+metrics.visible = isVisible() && !m_closeInProgress;
+metrics.minimized = isMinimized();
+#if defined(Q_OS_WIN)
+metrics.fullyOccluded = metrics.visible
+    && !metrics.minimized
+    && nativeWindowFullyOccluded(reinterpret_cast<HWND>(winId()));
+#endif
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:6902-6905
+RemoteQualityWindowMetrics snapshot = window->remoteQualityMetrics();
+snapshot.active = snapshot.visible && !snapshot.minimized && !snapshot.fullyOccluded
+    && window->isActiveWindow();
+metrics.push_back(snapshot);
+```
+
+```cpp
+// tests/remote_quality_coordinator_tests.cpp:74-85
+backgroundWindow.minimized = false;
+backgroundWindow.fullyOccluded = true;
+decisions = coordinator.evaluate(configuration, {backgroundWindow}, 1250);
+assert(decisions.front().minimized);
+assert(decisions.front().fullyOccluded);
+assert(decisions.front().resolution == stream::RemoteResolutionTier::P360);
+assert(decisions.front().targetFps == configuration.minimizedFps);
+assert(decisions.front().reason == ui::RemoteQualityDegradationReason::FullyOccluded);
+```
+
+### Steps
+1. 动态解析 `DwmGetWindowAttribute`，读取真实扩展边界和虚拟桌面 Cloaked 状态。
+2. 为目标远控窗口建立屏幕可见 Region，并裁剪到多显示器虚拟屏幕范围。
+3. 按 Z 顺序遍历所有更高层窗口，逐个减去其实际窗口 Region。
+4. 跳过隐藏、最小化、其它虚拟桌面、半透明、色键及鼠标穿透窗口。
+5. Region 完全为空时写入 `fullyOccluded`，协调器复用最小化360p/1 FPS配置。
+6. 窗口重新露出任意区域后，下一次1秒采样恢复普通后台或焦点画质。
+7. 增加独立状态文案和日志字段 `occluded=1`，便于实机验证。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已静态核对所有 `RemoteQualityDegradationReason` 分支均包含 `FullyOccluded`。
+- 已检查 Windows Region、DWM模块和候选窗口 Region 在所有返回路径均释放。
+- 按用户要求未构建、未链接、未运行程序或测试二进制；测试源码已补充完全遮挡策略断言。

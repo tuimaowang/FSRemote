@@ -117,7 +117,7 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
     const bool singleRemoteWindow = validWindowCount == 1; // wjy: 单窗口保持高质量，多窗口只给真实焦点窗口高质量。
     uintptr_t focusedVisibleWindowId = 0;
     for (const RemoteQualityWindowMetrics& window : windows) {
-        if (window.windowId == 0 || !window.visible || window.minimized || !window.active) {
+        if (window.windowId == 0 || !window.visible || window.minimized || window.fullyOccluded || !window.active) {
             continue;
         }
         // wjy: Qt 主线程实际只会有一个活动顶层窗口；即使异常情况下多个快照同时标记 active，
@@ -130,9 +130,12 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
     for (const RemoteQualityWindowMetrics& window : windows) {
         RemoteQualityDecision decision;
         decision.windowId = window.windowId;
-        const bool eligibleVisibleWindow = window.visible && !window.minimized;
-        decision.minimized = !eligibleVisibleWindow;
-        decision.active = window.active && eligibleVisibleWindow; // wjy: 隐藏或最小化窗口即使收到迟到激活状态也不能保留前台资源。
+        // =====wjy====
+        const bool eligibleVisibleWindow = window.visible && !window.minimized && !window.fullyOccluded; // wjy: 完全遮挡与隐藏、最小化一样不再占用前台或后台可见资源。
+        decision.minimized = !eligibleVisibleWindow; // wjy: 资源策略刻意复用最小化角色，直接获得360p/1 FPS和最低优先级。
+        decision.fullyOccluded = window.visible && !window.minimized && window.fullyOccluded; // wjy: 单独保存真实原因，标题栏不会把遮挡误写成用户主动最小化。
+        decision.active = window.active && eligibleVisibleWindow; // wjy: 完全遮挡窗口即使保留迟到激活标记也不能继续持有高质量角色。
+        // ===end====
         decision.fullScreen = window.fullScreen && eligibleVisibleWindow;
         decision.softwareFallback = window.softwareFallback;
         const bool focusedWindowEligible = eligibleVisibleWindow
@@ -191,9 +194,13 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
                 : stream::RemoteVideoPolicy::backgroundProfile(); // wjy: 角色画质统一从RemoteVideoPolicy读取。
             decision.resolution = roleProfile.resolution; // wjy: 最小化和可见后台直接读取统一角色配置的分辨率档位。
             decision.targetFps = static_cast<int>(roleProfile.targetFps); // wjy: 最小化1FPS、后台30FPS均由唯一策略配置提供。
-            decision.reason = decision.minimized
-                ? RemoteQualityDegradationReason::Minimized
-                : RemoteQualityDegradationReason::Background; // wjy: 非焦点可见窗口统一进入后台策略，不再读取窗口面积阈值。
+            // =====wjy====
+            decision.reason = decision.fullyOccluded
+                ? RemoteQualityDegradationReason::FullyOccluded // wjy: 遮挡与最小化使用同一画质，但保留独立诊断原因。
+                : decision.minimized
+                    ? RemoteQualityDegradationReason::Minimized
+                    : RemoteQualityDegradationReason::Background; // wjy: 仅仍有可见区域的非焦点窗口使用普通后台720p/30。
+            // ===end====
         } else if (window.softwareFallback) {
             state.fpsIndex = baselineFps;
             state.pressureSinceMs = 0;
