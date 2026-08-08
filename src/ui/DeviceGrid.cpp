@@ -112,6 +112,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <shobjidl.h>
 #include <psapi.h>
 #include <tlhelp32.h>
 #ifndef MOD_NOREPEAT
@@ -122,6 +123,35 @@
 namespace ui {
 
 namespace {
+
+#if defined(Q_OS_WIN)
+QString virtualDesktopKey(const RemoteDesktopWindow* window)
+{
+    if (!window) {
+        return QStringLiteral("unknown");
+    }
+    IVirtualDesktopManager* manager = nullptr;
+    const HRESULT createResult = CoCreateInstance(
+        CLSID_VirtualDesktopManager,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&manager));
+    if (FAILED(createResult) || !manager) {
+        return QStringLiteral("unknown"); // wjy: 虚拟桌面接口不可用时回退到同一分组，保持原有平铺行为。
+    }
+    GUID desktopId{};
+    const HRESULT queryResult = manager->GetWindowDesktopId(reinterpret_cast<HWND>(window->winId()), &desktopId);
+    manager->Release();
+    if (FAILED(queryResult)) {
+        return QStringLiteral("unknown"); // wjy: 单个窗口查询失败时不阻断整个平铺动作。
+    }
+    return QStringLiteral("%1-%2-%3-%4")
+        .arg(QString::number(desktopId.Data1, 16))
+        .arg(QString::number(desktopId.Data2, 16))
+        .arg(QString::number(desktopId.Data3, 16))
+        .arg(QString::fromLatin1(reinterpret_cast<const char*>(desktopId.Data4), 8).toHex()); // wjy: GUID 转为稳定字符串作为分组键。
+}
+#endif
 
 //标题栏高度常量
 constexpr int kTitleBarHeight = 28;
@@ -9304,40 +9334,50 @@ void DeviceGrid::toggleRemoteWindowTiling()
     if (!screen) {
         screen = QGuiApplication::primaryScreen();
     }
-    const QRect availableRect = screen ? screen->availableGeometry() : QRect(0, 0, 1280, 720);
-    const int count = windows.size();
-    const int columnCount = qMax(1, static_cast<int>(std::ceil(std::sqrt(static_cast<double>(count)))));
-    const int rowCount = qMax(1, static_cast<int>(std::ceil(count / static_cast<double>(columnCount))));
-    const int tileWidth = qMax(1, availableRect.width() / columnCount); // wjy: 快捷键平铺同样取消 320px 宽度下限，窗口数量多时仍严格落在屏幕内。
-    const int tileHeight = qMax(1, availableRect.height() / rowCount); // wjy: 取消 240px 高度下限，12 个窗口可按 4x3 网格完整铺开且互不重叠。
-
     m_remoteWindowCoordinator->clearRestoreGeometries();
-    for (int i = 0; i < windows.size(); ++i) {
-        RemoteDesktopWindow* remoteWindow = windows.at(i).data();
-        if (!remoteWindow) {
+    QHash<QString, QVector<QPointer<RemoteDesktopWindow>>> desktopGroups;
+    for (const QPointer<RemoteDesktopWindow>& window : windows) {
+        if (!window) {
             continue;
         }
-        m_remoteWindowCoordinator->setRestoreGeometry(remoteWindow, remoteWindow->geometry());
-        remoteWindow->setRememberGeometryEnabled(false);
-        remoteWindow->showNormal();
-        const int row = i / columnCount;
-        const int column = i % columnCount;
-        QRect target(
-            availableRect.x() + column * tileWidth,
-            availableRect.y() + row * tileHeight,
-            tileWidth,
-            tileHeight);
-        if (column == columnCount - 1) {
-            target.setRight(availableRect.right());
+#if defined(Q_OS_WIN)
+        const QString desktopKey = virtualDesktopKey(window.data()); // wjy: 按 Windows 虚拟桌面归属拆分窗口，避免跨桌面总数量污染网格列数。
+#else
+        const QString desktopKey = QStringLiteral("default");
+#endif
+        desktopGroups[desktopKey].append(window);
+    }
+    for (auto groupIt = desktopGroups.begin(); groupIt != desktopGroups.end(); ++groupIt) {
+        const QVector<QPointer<RemoteDesktopWindow>>& group = groupIt.value();
+        if (group.isEmpty()) {
+            continue;
         }
-        if (row == rowCount - 1) {
-            target.setBottom(availableRect.bottom());
+        QScreen* groupScreen = group.first()->screen();
+        const QRect availableRect = groupScreen ? groupScreen->availableGeometry() : QRect(0, 0, 1280, 720);
+        const int count = group.size();
+        const int columnCount = qMax(1, static_cast<int>(std::ceil(std::sqrt(static_cast<double>(count))))); // wjy: 每个虚拟桌面独立计算列数。
+        const int rowCount = qMax(1, static_cast<int>(std::ceil(count / static_cast<double>(columnCount)))); // wjy: 每个虚拟桌面独立计算行数。
+        const int tileWidth = qMax(1, availableRect.width() / columnCount);
+        const int tileHeight = qMax(1, availableRect.height() / rowCount);
+        for (int i = 0; i < group.size(); ++i) {
+            RemoteDesktopWindow* remoteWindow = group.at(i).data();
+            if (!remoteWindow) {
+                continue;
+            }
+            m_remoteWindowCoordinator->setRestoreGeometry(remoteWindow, remoteWindow->geometry());
+            remoteWindow->setRememberGeometryEnabled(false);
+            remoteWindow->showNormal();
+            const int row = i / columnCount;
+            const int column = i % columnCount;
+            QRect target(availableRect.x() + column * tileWidth, availableRect.y() + row * tileHeight, tileWidth, tileHeight);
+            if (column == columnCount - 1) target.setRight(availableRect.right());
+            if (row == rowCount - 1) target.setBottom(availableRect.bottom());
+            remoteWindow->setGeometry(target);
+            remoteWindow->show();
+            remoteWindow->raise();
+            remoteWindow->activateWindow();
+            remoteWindow->setFocus(Qt::ActiveWindowFocusReason);
         }
-        remoteWindow->setGeometry(target);
-        remoteWindow->show();
-        remoteWindow->raise();
-        remoteWindow->activateWindow();
-        remoteWindow->setFocus(Qt::ActiveWindowFocusReason);
     }
     m_remoteWindowCoordinator->setWindowsTiled(true);
 }

@@ -11598,3 +11598,48 @@ QString RemoteDesktopWindow::deviceName() const
 ### Verification
 - 已通过静态阅读和 `git diff` 检查确认修改范围及排序链路。
 - 未构建，符合用户要求。
+## 2026-08-08 Windows 虚拟桌面分别平铺
+
+### Changed Location
+- `src/ui/DeviceGrid.cpp`：识别远控窗口所属 Windows 虚拟桌面，并对每个虚拟桌面单独计算平铺网格。
+
+### Reason
+多个 Windows 虚拟桌面同时存在时，原逻辑把所有远控窗口总数用于计算列数，导致桌面 1 只显示窗口 1、3 时按全局索引落在同一列，桌面 2 的窗口 2、4 也落在同一列。现在每个虚拟桌面独立计算行列，窗口会在各自桌面从左到右、从上到下排列。
+
+### Original Code
+```cpp
+// src/ui/DeviceGrid.cpp（原逻辑）
+const int count = windows.size();
+const int columnCount = qMax(1, static_cast<int>(std::ceil(std::sqrt(static_cast<double>(count)))));
+for (int i = 0; i < windows.size(); ++i) {
+    const int row = i / columnCount;
+    const int column = i % columnCount;
+    // 所有虚拟桌面共用 count 和索引 i
+}
+```
+
+### Modified Code
+```cpp
+// src/ui/DeviceGrid.cpp
+QHash<QString, QVector<QPointer<RemoteDesktopWindow>>> desktopGroups;
+for (const QPointer<RemoteDesktopWindow>& window : windows) {
+    desktopGroups[virtualDesktopKey(window.data())].append(window);
+}
+for (const auto& group : desktopGroups) {
+    const int count = group.size();
+    const int columnCount = qMax(1, static_cast<int>(std::ceil(std::sqrt(static_cast<double>(count)))));
+    for (int i = 0; i < group.size(); ++i) {
+        const int row = i / columnCount;
+        const int column = i % columnCount;
+        // 每个虚拟桌面独立计算并布局
+    }
+}
+```
+
+### Steps
+1. 使用 `IVirtualDesktopManager::GetWindowDesktopId` 获取每个远控窗口的虚拟桌面 GUID。
+2. 以 GUID 将窗口分组，查询失败时统一回退到原有单组行为。
+3. 对每组分别计算行列数和可用区域，保持既有名称/IP排序顺序。
+
+### Verification
+- 已执行差异静态检查准备工作，未构建，符合用户要求。
