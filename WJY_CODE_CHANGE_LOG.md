@@ -11765,3 +11765,83 @@ const QString sourceText = m_lastAppliedRemoteClipboardText;
 ### Verification
 - 已执行静态差异检查。
 - 未构建；本次修复针对用户反馈的本机剪贴板误用问题。
+
+## 2026-08-08 15:50 - 修复远控更新窗口遮挡主界面鼠标
+
+### Changed Location
+- `src/ui/RemoteDesktopWindow.cpp:2083`：更新期间让远控内容区的 Windows 鼠标命中穿透到下层窗口，同时保留标题栏本地操作。
+- `src/ui/RemoteDesktopWindow.cpp:2492`：更新状态开始时主动释放该远控窗口及其子控件持有的 Qt/Win32 鼠标捕获。
+
+### Reason
+其它设备进入远程更新状态后，原逻辑只隐藏 D3D/DirectComposition 视频表面，远控顶层窗口本身仍然存在并参与鼠标命中。如果它覆盖主窗口，主窗口虽然没有卡死，但鼠标消息会先落到更新中的远控窗口；任务栏或托盘恢复通过重新激活主窗口才会暂时恢复。此次修复保留可见更新遮罩和标题栏按钮，只让不可操作的远控内容区在更新期间穿透，并在状态切换时清理可能遗留的鼠标捕获。
+
+### Original Code
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:2081-2088（修改前）
+const auto* nativeMessage = static_cast<MSG*>(message);
+// =====wjy====
+if (nativeMessage && nativeMessage->message == WM_ERASEBKGND) {
+    if (m_resizingWindow) {
+        appendResizeDebugTrace(QStringLiteral("parent.native.WM_ERASEBKGND"));
+    }
+    if (result) *result = 1;
+    return true;
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:2477-2483（修改前）
+m_remoteMouseCaptureRequested = false;
+suspendRemoteMouseCapture();
+releaseForwardedKeys();
+m_waitingShortcutRelease = false;
+m_shortcutReleaseVirtualKeys.clear();
+m_localShortcutReleaseKeys.clear();
+setKeyboardForwardingActive(false);
+```
+
+### Modified Code
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:2083-2094（修改后）
+if (nativeMessage
+    && nativeMessage->message == WM_NCHITTEST
+    && remoteUpdateActive()
+    && result) {
+    const QPoint globalPosition(
+        static_cast<short>(LOWORD(nativeMessage->lParam)),
+        static_cast<short>(HIWORD(nativeMessage->lParam)));
+    if (remoteContentRect().contains(mapFromGlobal(globalPosition))) {
+        *result = HTTRANSPARENT;
+        return true;
+    }
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:2492-2505（修改后）
+if (QWidget* mouseGrabber = QWidget::mouseGrabber();
+    mouseGrabber && (mouseGrabber == this || isAncestorOf(mouseGrabber))) {
+    mouseGrabber->releaseMouse();
+}
+#if defined(Q_OS_WIN)
+const HWND remoteWindowHandle = reinterpret_cast<HWND>(winId());
+const HWND capturedWindow = ::GetCapture();
+if (capturedWindow
+    && remoteWindowHandle
+    && (capturedWindow == remoteWindowHandle || ::IsChild(remoteWindowHandle, capturedWindow))) {
+    ::ReleaseCapture();
+}
+#endif
+```
+
+### Steps
+1. 在远控顶层窗口的 `WM_NCHITTEST` 处理中识别更新状态和远控内容区。
+2. 更新期间对内容区返回 `HTTRANSPARENT`，让同一 GUI 线程下层的主窗口接收点击；标题栏区域继续由远控窗口处理。
+3. 在更新开始时释放当前远控窗口或其子控件持有的 Qt 鼠标抓取。
+4. 复核 Win32 `GetCapture()`，捕获句柄属于该远控窗口层级时调用 `ReleaseCapture()`。
+5. 依赖现有 `remoteUpdateActive()` 状态机自动关闭穿透，更新完成后无需维护额外恢复标志。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白或补丁格式错误。
+- 已静态检查 Windows 命中测试、多显示器负坐标、Qt/Win32 捕获释放以及更新结束后的自动恢复路径。
+- 未构建，按用户此前要求仅完成代码修改、记录和提交。
