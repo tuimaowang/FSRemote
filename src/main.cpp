@@ -439,10 +439,15 @@ int main(int argc, char* argv[])
         });
     }
     // ===end====
-    // wjy: 仅开机自启带 --minimized 时进托盘；手动双击启动仍显示主窗口。
+    // wjy: 仅开机自启或更新重启带 --minimized 时进入最小化；手动双击启动仍显示主窗口。
     if (args.contains(QStringLiteral("--minimized"), Qt::CaseInsensitive)) {
-        window.hideToTray();
-        writeStartupLog(QStringLiteral("[wjy-main] started minimized to tray"));
+        // =====wjy====
+        window.setAttribute(Qt::WA_ShowWithoutActivating, true); // wjy: 首次正常创建窗口时禁止抢占当前桌面焦点，更新后的目标设备不会突然弹到前台。
+        window.show(); // wjy: 无边框透明主窗口必须先完整进入一次普通显示生命周期，确保 Qt 客户区和原生输入状态都已建立。
+        window.showMinimized(); // wjy: 普通显示生命周期完成后再进入系统最小化，保留任务栏和托盘入口且首次恢复即可正常接收鼠标。
+        window.setAttribute(Qt::WA_ShowWithoutActivating, false); // wjy: 启动最小化完成后恢复普通激活能力，后续任务栏或托盘打开窗口可以获得焦点。
+        writeStartupLog(QStringLiteral("[wjy-main] initialized normally before startup minimize")); // wjy: 日志明确区分安全启动最小化与运行中的普通最小化。
+        // ===end====
     } else {
         window.show();
         writeStartupLog(QStringLiteral("[wjy-main] window shown before app.exec"));

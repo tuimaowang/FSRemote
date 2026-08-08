@@ -11849,3 +11849,56 @@ if (nativeMessage
 ### Verification
 - 已核对暂存差异仅包含上一轮代码的反向删除和本次回撤记录。
 - 未构建，等待下一步针对 Qt 客户区输入状态、隐藏弹窗或内部控件命中路径继续定位。
+
+## 2026-08-08 16:39 - 修复更新重启后首次恢复主窗口无法操作
+
+### Changed Location
+- `src/main.cpp:442-454`：调整 `--minimized` 启动分支，先完成一次不可激活的普通显示生命周期，再进入系统最小化。
+
+### Reason
+更新器从提交 `799e5e0` 开始为更新成功后的新进程追加 `--minimized`。原启动分支直接对一个从未普通显示过的无边框透明主窗口调用 `hideToTray()`，其内部实际执行 `showMinimized()`；目标设备更新重启后，首次从任务栏或托盘恢复时，Qt 客户区与 Windows 原生窗口的首次显示状态没有按普通窗口路径完整建立，表现为顶层窗口可以激活、但内部鼠标交互失效，再最小化和恢复一次才正常。
+
+本次保留“更新后静默最小化”、任务栏图标和托盘入口，只把首次窗口创建与系统最小化拆成两个明确步骤，并在首次创建时禁止抢占桌面焦点。
+
+### Original Code
+```cpp
+// src/main.cpp:442-449（修改前）
+// wjy: 仅开机自启带 --minimized 时进托盘；手动双击启动仍显示主窗口。
+if (args.contains(QStringLiteral("--minimized"), Qt::CaseInsensitive)) {
+    window.hideToTray();
+    writeStartupLog(QStringLiteral("[wjy-main] started minimized to tray"));
+} else {
+    window.show();
+    writeStartupLog(QStringLiteral("[wjy-main] window shown before app.exec"));
+}
+```
+
+### Modified Code
+```cpp
+// src/main.cpp:442-454
+// wjy: 仅开机自启或更新重启带 --minimized 时进入最小化；手动双击启动仍显示主窗口。
+if (args.contains(QStringLiteral("--minimized"), Qt::CaseInsensitive)) {
+    // =====wjy====
+    window.setAttribute(Qt::WA_ShowWithoutActivating, true); // wjy: 首次正常创建窗口时禁止抢占当前桌面焦点，更新后的目标设备不会突然弹到前台。
+    window.show(); // wjy: 无边框透明主窗口必须先完整进入一次普通显示生命周期，确保 Qt 客户区和原生输入状态都已建立。
+    window.showMinimized(); // wjy: 普通显示生命周期完成后再进入系统最小化，保留任务栏和托盘入口且首次恢复即可正常接收鼠标。
+    window.setAttribute(Qt::WA_ShowWithoutActivating, false); // wjy: 启动最小化完成后恢复普通激活能力，后续任务栏或托盘打开窗口可以获得焦点。
+    writeStartupLog(QStringLiteral("[wjy-main] initialized normally before startup minimize")); // wjy: 日志明确区分安全启动最小化与运行中的普通最小化。
+    // ===end====
+} else {
+    window.show();
+    writeStartupLog(QStringLiteral("[wjy-main] window shown before app.exec"));
+}
+```
+
+### Steps
+1. 重新按“被更新的是其它目标设备”校正故障场景，排除控制端更新回调和远控窗口遮挡方向。
+2. 对照更新器提交记录，确认故障出现前新增的 `--minimized` 会进入从未普通显示即最小化的启动路径。
+3. 启动最小化前先调用 `show()` 完成主窗口、中央 `DeviceGrid` 和原生客户区的首次显示生命周期。
+4. 使用 `Qt::WA_ShowWithoutActivating` 防止初始化窗口抢占目标设备当前桌面焦点，随后立即 `showMinimized()` 并恢复正常激活能力。
+5. 保留运行期间原有 `hideToTray()` 与托盘切换逻辑，避免扩大修改范围。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已核对修改只涉及 `src/main.cpp` 的 `--minimized` 启动分支和本条变更记录。
+- 按用户要求未构建、未链接、未运行程序或二进制测试；需在其它设备完成一次更新后验证首次从任务栏或托盘恢复的鼠标操作。
