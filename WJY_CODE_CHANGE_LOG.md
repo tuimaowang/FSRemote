@@ -11948,3 +11948,46 @@ if (args.contains(QStringLiteral("--minimized"), Qt::CaseInsensitive)) {
 - 已核对共享目录 `FSRemote.version` 和 `releases/1.1.187/FSRemote.version` 均为 `1.1.187`，发布时间为 2026-08-08 16:46。
 - 已执行 `git diff --check`，未发现空白错误。
 - 按用户要求未构建、未链接、未运行程序或二进制测试。
+
+## 2026-08-08 16:55 - 强制更新重启进程从创建阶段最小化
+
+### Changed Location
+- `src/updater/main.cpp:371-378`：为更新成功后的 `CreateProcessW` 设置 Windows 启动显示状态。
+
+### Reason
+用户确认更新后目标设备主窗口直接可见，而不是处于最小化状态；因此仅在 FSRemote 主程序启动后调用 `hideToTray()` 不足以保证更新重启期间窗口不可见。更新器已经传递 `--minimized`，但没有设置 `STARTUPINFO` 的 `wShowWindow`，Windows 仍可能先按普通窗口创建新进程。
+
+本次在更新器层把成功更新的启动状态明确设为 `SW_SHOWMINNOACTIVE`，让 Windows 从进程创建阶段就最小化且不抢焦点；回滚启动保持 `SW_SHOWNORMAL`，确保失败提示仍可见。
+
+### Original Code
+```cpp
+// src/updater/main.cpp:371-377（修改前）
+STARTUPINFOW startup{sizeof(startup)};
+PROCESS_INFORMATION process{};
+const BOOL created = CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+    task.targetDir.c_str(), &startup, &process);
+```
+
+### Modified Code
+```cpp
+// src/updater/main.cpp:371-378
+STARTUPINFOW startup{sizeof(startup)};
+// =====wjy====
+startup.dwFlags = STARTF_USESHOWWINDOW; // wjy: 明确要求 Windows 使用下面的启动显示状态，避免新进程在 Qt 解析参数前先按普通窗口创建。
+startup.wShowWindow = updated ? SW_SHOWMINNOACTIVE : SW_SHOWNORMAL; // wjy: 成功更新从创建阶段保持最小化且不抢焦点，回滚仍按普通窗口启动以便显示失败提示。
+// ===end====
+PROCESS_INFORMATION process{};
+const BOOL created = CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+    task.targetDir.c_str(), &startup, &process);
+```
+
+### Steps
+1. 保留成功更新命令行中的 `--minimized`，继续让 Qt 逻辑知道本次是静默重启。
+2. 在 `STARTUPINFOW` 中启用 `STARTF_USESHOWWINDOW`。
+3. 成功更新使用 `SW_SHOWMINNOACTIVE`，回滚使用 `SW_SHOWNORMAL`。
+4. 不修改更新文件安装、进程等待和旧进程清理顺序。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已核对修改只涉及 `src/updater/main.cpp` 和本次变更记录。
+- 按用户要求未构建、未链接、未运行程序或二进制测试；需发布新版本后验证更新完成时窗口是否保持最小化。

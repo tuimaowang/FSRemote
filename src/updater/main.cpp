@@ -369,6 +369,10 @@ bool restartFsRemote(const UpdateTask& task, bool updated)
         ? L"--updated-from \"" + task.fromVersion + L"\" --updated-to \"" + task.toVersion + L"\" --minimized" // wjy: 更新成功后的新主程序直接进入托盘，避免更新重启打断用户当前桌面。
         : L"--update-rollback \"" + task.toVersion + L"\""; // wjy: 成功参数仅记录已安装版本并静默启动，回滚参数继续触发主程序失败警告。
     STARTUPINFOW startup{sizeof(startup)};
+    // =====wjy====
+    startup.dwFlags = STARTF_USESHOWWINDOW; // wjy: 明确要求 Windows 使用下面的启动显示状态，避免新进程在 Qt 解析参数前先按普通窗口创建。
+    startup.wShowWindow = updated ? SW_SHOWMINNOACTIVE : SW_SHOWNORMAL; // wjy: 成功更新从创建阶段保持最小化且不抢焦点，回滚仍按普通窗口启动以便显示失败提示。
+    // ===end====
     PROCESS_INFORMATION process{};
     const BOOL created = CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr,
         task.targetDir.c_str(), &startup, &process);
