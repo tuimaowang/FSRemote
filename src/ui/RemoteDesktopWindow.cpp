@@ -3673,15 +3673,15 @@ void RemoteDesktopWindow::pushLocalClipboardIfNeeded()
 
 void RemoteDesktopWindow::applyRemoteClipboardPayload(const QString& encodedBase64)
 {
-    if (!m_clipboardSyncEnabled) {
-        return;
-    }
     QString text;
     if (!RemoteClipboardCodec::decode(encodedBase64, &text)
         || text == m_lastAppliedRemoteClipboardText) {
         return;
     }
     m_lastAppliedRemoteClipboardText = text;
+    if (!m_clipboardSyncEnabled) {
+        return; // wjy: 关闭同步时仍缓存目标设备剪贴板供脚本粘贴使用，但不改写控制端本机剪贴板。
+    }
     m_lastLocalClipboardText = text;
     if (QClipboard* clipboard = QGuiApplication::clipboard()) {
         clipboard->setText(text); // wjy: Host -> Viewer 文本剪贴板落地。
@@ -4134,8 +4134,7 @@ void RemoteDesktopWindow::processInputScriptPlaybackEvents()
             && event.type == RemoteInputEventType::KeyDown
             && event.virtualKey == 'V'
             && m_inputScriptPlaybackCtrlDown) {
-            QClipboard* clipboard = QGuiApplication::clipboard();
-            const QString sourceText = clipboard ? clipboard->text() : QString();
+            const QString sourceText = m_lastAppliedRemoteClipboardText; // wjy: 脚本粘贴必须基于目标设备最近上报的剪贴板，不能读取控制端本机剪贴板。
             if (!sourceText.isEmpty()) {
                 const QString alphabet = m_inputScriptPasteRandomMode == 1
                     ? QStringLiteral("0123456789")

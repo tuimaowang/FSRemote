@@ -11725,3 +11725,43 @@ if (m_inputScriptPasteRandomSuffixEnabled
 ### Verification
 - 已执行 `git diff --check` 静态检查。
 - 未构建；按用户要求仅静态检查并提交。
+## 2026-08-08 修复 F10 随机粘贴读取本机剪贴板问题
+
+### Changed Location
+- `src/ui/RemoteDesktopWindow.cpp`：剪贴板同步关闭时仍缓存目标设备文本，F10 脚本 Ctrl+V 使用目标设备剪贴板缓存生成随机后缀。
+
+### Reason
+此前播放逻辑读取 `QGuiApplication::clipboard()`，导致控制端本机剪贴板内容被追加随机字符串后发送到 A1；当 A1 的剪贴板同步关闭时，目标设备上报的文本又被提前丢弃。现在目标剪贴板缓存和本机剪贴板落地显示解耦，关闭同步只是不修改本机剪贴板。
+
+### Original Code
+```cpp
+// src/ui/RemoteDesktopWindow.cpp
+if (!m_clipboardSyncEnabled) {
+    return;
+}
+// F10 播放时读取控制端剪贴板
+const QString sourceText = clipboard ? clipboard->text() : QString();
+```
+
+### Modified Code
+```cpp
+// 先缓存 Host 上报文本；同步关闭时不写入本机剪贴板
+m_lastAppliedRemoteClipboardText = text;
+if (!m_clipboardSyncEnabled) {
+    return;
+}
+```
+
+```cpp
+// F10 Ctrl+V 基于目标设备最近上报的剪贴板
+const QString sourceText = m_lastAppliedRemoteClipboardText;
+```
+
+### Steps
+1. 移除剪贴板同步关闭时的提前返回，保留目标剪贴板缓存。
+2. 保持关闭同步时不更新控制端本机剪贴板。
+3. 将播放随机后缀的源文本改为目标设备剪贴板缓存。
+
+### Verification
+- 已执行静态差异检查。
+- 未构建；本次修复针对用户反馈的本机剪贴板误用问题。
