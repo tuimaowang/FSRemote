@@ -61,8 +61,8 @@ struct RemoteVideoDecision {
 
 // =====wjy====
 // 画质总开关集中在这里，后续只改常量即可调整所有窗口的角色画质。
-inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile = {RemoteResolutionTier::P1080, 60, 100, true, 48000}; // wjy: 修改这里的P1080即可切换焦点分辨率，60改帧率，48000改码率。
-inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile = {RemoteResolutionTier::P720, 30, 40, true, 24000}; // wjy: 修改这里的P720即可切换后台分辨率，30改帧率，24000改码率。
+inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile = {RemoteResolutionTier::P1080, 30, 100, true, 48000}; // wjy: 修改这里的P1080即可切换焦点分辨率，60改帧率，48000改码率。
+inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile = {RemoteResolutionTier::P720, 25, 40, true, 24000}; // wjy: 修改这里的P720即可切换后台分辨率，30改帧率，24000改码率。
 inline constexpr RemoteVideoProfile kMinimizedRemoteVideoProfile = {RemoteResolutionTier::P360, 1, 5, true, 7000}; // wjy: 修改这里的P360即可切换最小化分辨率，1改保活帧率，7000改码率。
 inline constexpr std::uint32_t kRemoteProfileFocusDebounceMs = 350;
 inline constexpr std::uint32_t kRemotePressureEnterHoldMs = 1000;
