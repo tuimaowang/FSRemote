@@ -11802,7 +11802,7 @@ setKeyboardForwardingActive(false);
 
 ### Modified Code
 ```cpp
-// src/ui/RemoteDesktopWindow.cpp:2083-2094（修改后）
+// src/ui/RemoteDesktopWindow.cpp:2083-2094（当时修改）
 if (nativeMessage
     && nativeMessage->message == WM_NCHITTEST
     && remoteUpdateActive()
@@ -11817,31 +11817,35 @@ if (nativeMessage
 }
 ```
 
+### Steps
+1. 曾在更新窗口中增加内容区命中穿透和 Qt/Win32 鼠标捕获释放。
+2. 根据复现反馈确认该方向没有改善主窗口客户区输入，且与实际现象不匹配。
+3. 已回撤上述源代码修改，恢复更新窗口原有行为。
+
+### Verification
+- 已执行 `git revert --no-commit 1772207`，源代码已恢复到提交前状态。
+- 未构建；本次只回撤无效修复并保留历史记录。
+
+## 2026-08-08 16:00 - 回撤无效的远控更新鼠标穿透修复
+
+### Changed Location
+- `src/ui/RemoteDesktopWindow.cpp`：删除 `WM_NCHITTEST` 内容区穿透及更新开始时的 Qt/Win32 捕获释放代码。
+- `WJY_CODE_CHANGE_LOG.md`：保留原修复记录并补充回撤原因，避免变更历史失真。
+
+### Reason
+用户复现确认：更新其它设备后，主窗口可以被点击带到前台，但客户区仍然不能操作；因此问题不是远控顶层窗口覆盖主窗口，上一轮穿透修复没有效果。继续保留会改变更新窗口的正常交互行为，故回撤。
+
+### Modified Code
 ```cpp
-// src/ui/RemoteDesktopWindow.cpp:2492-2505（修改后）
-if (QWidget* mouseGrabber = QWidget::mouseGrabber();
-    mouseGrabber && (mouseGrabber == this || isAncestorOf(mouseGrabber))) {
-    mouseGrabber->releaseMouse();
-}
-#if defined(Q_OS_WIN)
-const HWND remoteWindowHandle = reinterpret_cast<HWND>(winId());
-const HWND capturedWindow = ::GetCapture();
-if (capturedWindow
-    && remoteWindowHandle
-    && (capturedWindow == remoteWindowHandle || ::IsChild(remoteWindowHandle, capturedWindow))) {
-    ::ReleaseCapture();
-}
-#endif
+// src/ui/RemoteDesktopWindow.cpp
+已删除上一轮新增的 WM_NCHITTEST/HTTRANSPARENT 处理和鼠标捕获清理代码，恢复到 1772207 之前的实现。
 ```
 
 ### Steps
-1. 在远控顶层窗口的 `WM_NCHITTEST` 处理中识别更新状态和远控内容区。
-2. 更新期间对内容区返回 `HTTRANSPARENT`，让同一 GUI 线程下层的主窗口接收点击；标题栏区域继续由远控窗口处理。
-3. 在更新开始时释放当前远控窗口或其子控件持有的 Qt 鼠标抓取。
-4. 复核 Win32 `GetCapture()`，捕获句柄属于该远控窗口层级时调用 `ReleaseCapture()`。
-5. 依赖现有 `remoteUpdateActive()` 状态机自动关闭穿透，更新完成后无需维护额外恢复标志。
+1. 根据新的复现条件重新修正问题模型：主窗口激活成功，说明窗口层级不是根因。
+2. 回撤提交 `1772207` 的两个源代码修改点。
+3. 保留历史日志，并记录该修复无效的原因。
 
 ### Verification
-- 已执行 `git diff --check`，未发现空白或补丁格式错误。
-- 已静态检查 Windows 命中测试、多显示器负坐标、Qt/Win32 捕获释放以及更新结束后的自动恢复路径。
-- 未构建，按用户此前要求仅完成代码修改、记录和提交。
+- 已核对暂存差异仅包含上一轮代码的反向删除和本次回撤记录。
+- 未构建，等待下一步针对 Qt 客户区输入状态、隐藏弹窗或内部控件命中路径继续定位。

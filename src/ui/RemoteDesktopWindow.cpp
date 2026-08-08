@@ -2080,18 +2080,6 @@ bool RemoteDesktopWindow::nativeEvent(const QByteArray& eventType, void* message
     Q_UNUSED(eventType)
     const auto* nativeMessage = static_cast<MSG*>(message);
     // =====wjy====
-    if (nativeMessage
-        && nativeMessage->message == WM_NCHITTEST
-        && remoteUpdateActive()
-        && result) {
-        const QPoint globalPosition(
-            static_cast<short>(LOWORD(nativeMessage->lParam)),
-            static_cast<short>(HIWORD(nativeMessage->lParam))); // wjy: WM_NCHITTEST 使用带符号屏幕坐标，多显示器负坐标必须按 short 还原。
-        if (remoteContentRect().contains(mapFromGlobal(globalPosition))) {
-            *result = HTTRANSPARENT; // wjy: 更新遮罩继续可见，但内容区鼠标穿透到同线程下层主窗口，避免远控顶层窗口遮挡后让主界面看似失去响应。
-            return true;
-        }
-    }
     if (nativeMessage && nativeMessage->message == WM_ERASEBKGND) {
         if (m_resizingWindow) {
             appendResizeDebugTrace(QStringLiteral("parent.native.WM_ERASEBKGND")); // wjy: 记录Windows擦除消息是否在尺寸手势中先于D3D子窗口补帧到达。
@@ -2488,21 +2476,6 @@ void RemoteDesktopWindow::beginRemoteUpdateWait()
     // ===end====
     m_remoteMouseCaptureRequested = false; // wjy: 更新会替换 Viewer 代际，旧 Host 的 relative 请求不能带入新会话。
     suspendRemoteMouseCapture(); // wjy: F2 手动意图仍保留，但更新遮罩期间必须立即释放本机光标和远端捕获。
-    // =====wjy====
-    if (QWidget* mouseGrabber = QWidget::mouseGrabber();
-        mouseGrabber && (mouseGrabber == this || isAncestorOf(mouseGrabber))) {
-        mouseGrabber->releaseMouse(); // wjy: 异步更新受理可能落在标题栏拖动或子Presenter按下期间，先释放Qt抓取，主窗口才能立即重新接收鼠标。
-    }
-#if defined(Q_OS_WIN)
-    const HWND remoteWindowHandle = reinterpret_cast<HWND>(winId());
-    const HWND capturedWindow = ::GetCapture();
-    if (capturedWindow
-        && remoteWindowHandle
-        && (capturedWindow == remoteWindowHandle || ::IsChild(remoteWindowHandle, capturedWindow))) {
-        ::ReleaseCapture(); // wjy: 同步清理Qt之外的Win32捕获，防止更新窗口隐藏视频层后仍独占后续鼠标消息。
-    }
-#endif
-    // ===end====
     releaseForwardedKeys();
     m_waitingShortcutRelease = false;
     m_shortcutReleaseVirtualKeys.clear(); // wjy: 更新开始后不再等待本地组合键释放，确保键盘 hook 可以立即卸载。
