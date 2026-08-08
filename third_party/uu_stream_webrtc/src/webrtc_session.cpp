@@ -15,7 +15,9 @@
 #include <api/data_channel_interface.h>
 #include <api/field_trials.h>
 #include <api/rtp_transceiver_interface.h>
+#include <api/video/adapted_video_track_source.h>
 #include <api/video/video_frame.h>
+#include <api/video/video_frame_buffer.h>
 #include <api/video_codecs/sdp_video_format.h>
 #include <rtc_base/ref_counted_object.h>
 
@@ -50,6 +52,116 @@ webrtc::SdpType sdp_type_from_kind(const std::string& kind)
     if (kind == "rollback") return webrtc::SdpType::kRollback;
     return webrtc::SdpType::kOffer;
 }
+
+// =====wjy====
+class SessionVideoSource : public webrtc::AdaptedVideoTrackSource,
+                           public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
+public:
+    explicit SessionVideoSource(
+        webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> sharedSource)
+        : shared_source_(std::move(sharedSource))
+    {
+        if (!shared_source_) return;
+        webrtc::VideoSinkWants sharedWants;
+        sharedWants.is_active = true; // wjy: 中继始终按活动且无限制的消费者订阅共享源，任一会话的1 FPS/低分辨率请求都不能反向降低公共采集节奏。
+        shared_source_->AddOrUpdateSink(this, sharedWants); // wjy: 共享源只向本会话中继投递原始帧；真正的sender wants在中继自己的VideoAdapter中独立生效。
+    }
+
+    ~SessionVideoSource() override
+    {
+        if (shared_source_) {
+            shared_source_->RemoveSink(this); // wjy: RemoveSink返回后保证不再有采集线程回调，避免会话关闭时访问已经析构的中继。
+        }
+    }
+
+    webrtc::MediaSourceInterface::SourceState state() const override
+    {
+        return shared_source_ ? shared_source_->state() : kEnded; // wjy: 中继不拥有采集生命周期，只透传HostMediaPipeline共享源的真实状态。
+    }
+
+    bool remote() const override
+    {
+        return shared_source_ && shared_source_->remote(); // wjy: 保留上游源属性，当前Host桌面源仍会返回false。
+    }
+
+    bool is_screencast() const override
+    {
+        return !shared_source_ || shared_source_->is_screencast(); // wjy: 缺少上游时仍按桌面流处理，避免错误启用摄像头类优化。
+    }
+
+    std::optional<bool> needs_denoising() const override
+    {
+        return shared_source_ ? shared_source_->needs_denoising() : std::optional<bool>(false); // wjy: 沿用共享桌面源的降噪声明，不改变现有编码画质策略。
+    }
+
+    bool allow_zero_hertz_video() const override
+    {
+        return shared_source_ && shared_source_->allow_zero_hertz_video(); // wjy: 只隔离会话适配参数，其它WebRTC源能力保持与共享源一致。
+    }
+
+    void OnFrame(const webrtc::VideoFrame& frame) override
+    {
+        const auto sourceBuffer = frame.video_frame_buffer();
+        if (!sourceBuffer) {
+            AdaptedVideoTrackSource::OnFrameDropped();
+            return; // wjy: 异常空帧只通知当前会话丢帧，不能影响共享源和其它控制端。
+        }
+
+        const int width = frame.width();
+        const int height = frame.height();
+        int outWidth = width;
+        int outHeight = height;
+        int cropWidth = width;
+        int cropHeight = height;
+        int cropX = 0;
+        int cropY = 0;
+        if (!AdaptFrame(
+                width,
+                height,
+                frame.timestamp_us(),
+                &outWidth,
+                &outHeight,
+                &cropWidth,
+                &cropHeight,
+                &cropX,
+                &cropY)) {
+            return; // wjy: 每个会话在这里独立执行max_framerate丢帧，A请求1 FPS时B的适配器仍可继续输出60 FPS。
+        }
+
+        webrtc::scoped_refptr<webrtc::VideoFrameBuffer> outputBuffer = sourceBuffer;
+        const bool requiresTransform = outWidth != width
+            || outHeight != height
+            || cropWidth != width
+            || cropHeight != height;
+        if (requiresTransform) {
+            outputBuffer = sourceBuffer->CropAndScale(
+                cropX,
+                cropY,
+                cropWidth,
+                cropHeight,
+                outWidth,
+                outHeight); // wjy: D3D11原生帧只创建共享纹理视图，CPU回退帧才实际缩放，分辨率档位同样按会话隔离。
+        }
+        if (!outputBuffer) {
+            AdaptedVideoTrackSource::OnFrameDropped();
+            return; // wjy: 当前会话转换失败时只丢弃这一条发送链路的帧，不向公共采集源反馈降级状态。
+        }
+
+        webrtc::VideoFrame outputFrame(frame);
+        outputFrame.set_video_frame_buffer(std::move(outputBuffer)); // wjy: 保留时间戳、旋转和屏幕内容类型，仅替换本会话所需的帧缓冲视图。
+        if (requiresTransform) outputFrame.clear_update_rect(); // wjy: 裁剪或缩放后原始脏矩形坐标已失效，清除后让编码器按完整帧处理。
+        AdaptedVideoTrackSource::OnFrame(outputFrame); // wjy: 发布到本会话track的独立broadcaster，不再与其它控制端共享sink wants。
+    }
+
+    void OnDiscardedFrame() override
+    {
+        AdaptedVideoTrackSource::OnFrameDropped(); // wjy: 上游偶发丢帧通知仅转发给当前会话sender，保持各会话统计链路完整。
+    }
+
+private:
+    webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> shared_source_; // wjy: 持有公共采集源生命周期，但不把本会话的画质限制回写给它。
+};
+// ===end====
 
 // =====wjy====
 void append_viewer_log(const std::string& line)
@@ -751,7 +863,8 @@ bool WebrtcSession::configure_host_media(std::string* error)
     const auto send_caps = factory->GetRtpSenderCapabilities(webrtc::MediaType::VIDEO);
     log_video_capabilities("host sender", send_caps);
     // =====wjy====
-    local_video_source_ = config_.host_video_source; // wjy: 多个 host 会话保存同一 source 引用，各自 track/sender 仍完全独立。
+    local_video_source_ = webrtc::make_ref_counted<SessionVideoSource>(
+        config_.host_video_source); // wjy: 每个PeerConnection使用独立中继，sender的1 FPS/分辨率请求不再进入HostMediaPipeline共享源的wants聚合。
     const std::string media_suffix = config_.media_id.empty() ? std::string("0") : config_.media_id;
     std::cout << "host media: create video track\n";
     local_video_track_ = factory->CreateVideoTrack(local_video_source_, "video-" + media_suffix); // wjy: track ID 绑定会话，便于定位单个发送端失败。

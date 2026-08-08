@@ -12212,3 +12212,96 @@ assert(decisions.front().reason == ui::RemoteQualityDegradationReason::FullyOccl
 - 已静态核对所有 `RemoteQualityDegradationReason` 分支均包含 `FullyOccluded`。
 - 已检查 Windows Region、DWM模块和候选窗口 Region 在所有返回路径均释放。
 - 按用户要求未构建、未链接、未运行程序或测试二进制；测试源码已补充完全遮挡策略断言。
+
+## 2026-08-08 18:01 - 隔离多控制端的远控画质请求
+
+### Changed Location
+- `third_party/uu_stream_webrtc/src/webrtc_session.cpp:18-20`：引入会话视频中继所需的 WebRTC 适配源与帧缓冲接口。
+- `third_party/uu_stream_webrtc/src/webrtc_session.cpp:56-164`：新增 `SessionVideoSource`，在每个 PeerConnection 内独立完成帧率和分辨率适配。
+- `third_party/uu_stream_webrtc/src/webrtc_session.cpp:866-868`：Host 视频 track 改为连接本会话中继，不再直接连接 `HostMediaPipeline` 共享源。
+
+### Reason
+A、B 两台控制端同时远控同一台设备 D 时，Host 端为多个 PeerConnection 共用一个 `AdaptedVideoTrackSource`。A 上的 D 窗口完全遮挡后，A 会话通过 `RtpSender::SetParameters` 请求 1 FPS；WebRTC 又把这个 sender 的 `VideoSinkWants.max_framerate_fps` 反馈到共享源。经核对本地 WebRTC `api/video/video_broadcaster.cc`，多个 sink 的最大帧率按最小值聚合，因此共享源被整体限制成 1 FPS，B 上未遮挡的 D 会话也只能取得 1 FPS。
+
+本次在共享采集源和每个发送 track 之间增加独立 `SessionVideoSource`。中继向共享源只提交无限制的活动订阅，使公共桌面采集继续按原始节奏发布；每个 sender 的 1 FPS、60 FPS及分辨率请求只进入自己中继内的 `VideoAdapter`。A 的窗口被遮挡后只丢弃 A 会话的多余帧，B 的会话不再受影响。
+
+### Original Code
+```cpp
+// third_party/uu_stream_webrtc/src/webrtc_session.cpp:15-19（修改前）
+#include <api/field_trials.h>
+#include <api/rtp_transceiver_interface.h>
+#include <api/video/video_frame.h>
+#include <api/video_codecs/sdp_video_format.h>
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/webrtc_session.cpp:53（修改前）
+// sdp_type_from_kind() 后直接进入 append_viewer_log()，没有会话级视频中继。
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/webrtc_session.cpp:751-757（修改前）
+const auto send_caps = factory->GetRtpSenderCapabilities(webrtc::MediaType::VIDEO);
+log_video_capabilities("host sender", send_caps);
+local_video_source_ = config_.host_video_source;
+const std::string media_suffix = config_.media_id.empty() ? std::string("0") : config_.media_id;
+local_video_track_ = factory->CreateVideoTrack(local_video_source_, "video-" + media_suffix);
+```
+
+### Modified Code
+```cpp
+// third_party/uu_stream_webrtc/src/webrtc_session.cpp:18-20
+#include <api/video/adapted_video_track_source.h>
+#include <api/video/video_frame.h>
+#include <api/video/video_frame_buffer.h>
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/webrtc_session.cpp:56-164（核心逻辑）
+class SessionVideoSource : public webrtc::AdaptedVideoTrackSource,
+                           public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
+public:
+    explicit SessionVideoSource(
+        webrtc::scoped_refptr<webrtc::VideoTrackSourceInterface> sharedSource)
+        : shared_source_(std::move(sharedSource))
+    {
+        webrtc::VideoSinkWants sharedWants;
+        sharedWants.is_active = true;
+        shared_source_->AddOrUpdateSink(this, sharedWants);
+    }
+
+    void OnFrame(const webrtc::VideoFrame& frame) override
+    {
+        if (!AdaptFrame(width, height, frame.timestamp_us(),
+                        &outWidth, &outHeight,
+                        &cropWidth, &cropHeight, &cropX, &cropY)) {
+            return;
+        }
+        outputBuffer = sourceBuffer->CropAndScale(
+            cropX, cropY, cropWidth, cropHeight, outWidth, outHeight);
+        AdaptedVideoTrackSource::OnFrame(outputFrame);
+    }
+};
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/webrtc_session.cpp:866-868
+local_video_source_ = webrtc::make_ref_counted<SessionVideoSource>(
+    config_.host_video_source);
+```
+
+### Steps
+1. 核对 Viewer 质量请求、Host 控制消息和 `apply_sender_quality()`，确认请求原本只修改目标 PeerConnection 的 sender。
+2. 检查本地 WebRTC `VideoBroadcaster::UpdateWants()`，确认共享源会取所有 sink 中最低的 `max_framerate_fps`。
+3. 新增每会话 `SessionVideoSource`，使用无限制 wants 订阅公共采集源，切断 sender 限制向共享源的传播。
+4. 在中继内调用独立 `AdaptFrame()`，按当前会话决定丢帧、裁剪和目标尺寸。
+5. D3D11 原生帧继续通过 `CropAndScale()` 创建共享纹理视图，不增加桌面重复采集；CPU 回退帧按需缩放。
+6. 会话中继析构时从共享源移除 sink，保证关闭后不再收到采集线程回调。
+7. Host track 改为使用中继源，现有 sender 码率、优先级和编解码器选择保持不变。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已静态核对 WebRTC `VideoBroadcaster` 的帧率聚合确实取最小值，问题原因已定位到共享 `AdaptedVideoTrackSource` 的 sink wants 反馈。
+- 已静态核对每个 `WebrtcSession` 都创建独立 `SessionVideoSource`，共享源收到的订阅不携带 1 FPS 或低分辨率限制。
+- 已核对 D3D11 原生帧缓冲已实现 `CropAndScale()` 共享纹理视图，隔离适配不会新增一套桌面采集器。
+- 按用户要求未构建、未链接、未运行程序或测试二进制。
