@@ -9254,6 +9254,34 @@ void DeviceGrid::toggleRemoteWindowTiling()
         return;
     }
 
+    // =====wjy====
+    QCollator naturalCollator; // wjy: 使用系统排序规则并启用数字模式，让设备名中的 4 排在 15 前面。
+    naturalCollator.setCaseSensitivity(Qt::CaseInsensitive); // wjy: 字母排序忽略大小写，避免同一名称因大小写分散。
+    naturalCollator.setNumericMode(true); // wjy: 连续数字按数值比较，而不是按字符串逐字符比较。
+    std::sort(windows.begin(), windows.end(), [&naturalCollator](const QPointer<RemoteDesktopWindow>& left,
+                                                                  const QPointer<RemoteDesktopWindow>& right) {
+        if (!left || !right) {
+            return static_cast<bool>(left); // wjy: 有效窗口优先，保证后续布局索引始终对应有效对象。
+        }
+        const QString leftName = left->deviceName();
+        const QString rightName = right->deviceName();
+        const bool leftStartsWithDigit = !leftName.isEmpty() && leftName.front().isDigit();
+        const bool rightStartsWithDigit = !rightName.isEmpty() && rightName.front().isDigit();
+        if (leftStartsWithDigit != rightStartsWithDigit) {
+            return leftStartsWithDigit; // wjy: 数字开头设备整体排在字母开头设备之前。
+        }
+        const int nameCompare = naturalCollator.compare(leftName, rightName);
+        if (nameCompare != 0) {
+            return nameCompare < 0; // wjy: 同一类别内按自然名称顺序排列，确保从左到右再从上到下稳定落位。
+        }
+        const int exactNameCompare = QString::compare(leftName, rightName, Qt::CaseSensitive);
+        if (exactNameCompare != 0) {
+            return exactNameCompare < 0; // wjy: 忽略大小写相同的名称再按原始文本确定顺序。
+        }
+        return QString::compare(left->hostIp(), right->hostIp(), Qt::CaseInsensitive) < 0; // wjy: 同名设备按 IP 地址排序，避免使用随机顺序。
+    });
+    // ===end====
+
     if (m_remoteWindowCoordinator->windowsTiled()) {
         for (const QPointer<RemoteDesktopWindow>& window : windows) {
             if (!window) {

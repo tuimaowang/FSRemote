@@ -2125,6 +2125,11 @@ QString RemoteDesktopWindow::hostIp() const
     return m_hostIp.trimmed(); // wjy: 更新操作按窗口固定目标 IP 匹配，不跟随主界面选择变化。
 }
 
+QString RemoteDesktopWindow::deviceName() const
+{
+    return m_deviceName.trimmed(); // wjy: 返回创建窗口时固定的设备名，供平铺排序使用。
+}
+
 void RemoteDesktopWindow::setRemoteUpdateAvailable(bool available)
 {
     const bool normalizedAvailable = available && !remoteUpdateActive(); // wjy: 已进入更新遮罩后不再保留标题栏入口，避免重复点击同一任务。

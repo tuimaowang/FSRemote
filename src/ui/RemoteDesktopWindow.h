@@ -90,6 +90,7 @@ public:
     // ===end====
     // =====wjy====
     QString hostIp() const; // wjy: 设备菜单更新成功后按固定 IP 找到所有对应远控窗口。
+    QString deviceName() const; // wjy: 平铺排序读取窗口绑定的设备名，避免依赖窗口标题显示状态。
     void beginRemoteUpdateWait(); // wjy: 远控窗口进入更新遮罩、暂停输入并自动等待目标设备重启。
     bool isRemoteUpdateActive() const; // wjy: 供设备状态刷新识别“预期更新离线”，避免把正在等待重启的远控窗口当作普通断线关闭。
     void setRemoteUpdateAvailable(bool available); // wjy: 主界面统一探测目标版本后控制标题栏更新按钮，不让远控流线程参与版本检测。

@@ -11539,3 +11539,62 @@ inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile =
 
 - 已执行静态搜索，确认源码和测试不再引用 `profile.width/profile.height`。
 - 未编译；按用户要求本次不编译。
+## 2026-08-08 设备平铺自然排序
+
+### Changed Location
+- `src/ui/DeviceGrid.cpp:9258`：平铺前按设备名和 IP 对远控窗口排序，确保布局按从左到右、从上到下呈现。
+- `src/ui/RemoteDesktopWindow.h:93`、`src/ui/RemoteDesktopWindow.cpp:2128`：提供窗口绑定设备名读取接口，作为平铺排序依据。
+
+### Reason
+用户要求数字开头的设备按自然数顺序排列（例如 4 在 15 前），数字开头设备排在字母开头设备前；名称相同时按 IP 地址排序，避免哈希容器遍历造成顺序不稳定，也不使用随机排序。
+
+### Original Code
+```cpp
+// src/ui/DeviceGrid.cpp:9258（原逻辑）
+if (m_remoteWindowCoordinator->windowsTiled()) {
+    // ...
+}
+const int count = windows.size();
+for (int i = 0; i < windows.size(); ++i) {
+    RemoteDesktopWindow* remoteWindow = windows.at(i).data();
+    // 按 openedRemoteWindows() 返回顺序直接布局
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.h / .cpp（原状态）
+// 原来仅提供 hostIp()，没有公开窗口绑定的设备名。
+```
+
+### Modified Code
+```cpp
+// src/ui/DeviceGrid.cpp:9258-9285
+QCollator naturalCollator;
+naturalCollator.setCaseSensitivity(Qt::CaseInsensitive);
+naturalCollator.setNumericMode(true);
+std::sort(windows.begin(), windows.end(), [&naturalCollator](
+    const QPointer<RemoteDesktopWindow>& left,
+    const QPointer<RemoteDesktopWindow>& right) {
+    // 数字开头优先；名称自然排序；同名按 IP 排序。
+});
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.h:93
+QString deviceName() const;
+
+// src/ui/RemoteDesktopWindow.cpp:2128-2131
+QString RemoteDesktopWindow::deviceName() const
+{
+    return m_deviceName.trimmed();
+}
+```
+
+### Steps
+1. 在远控窗口公开构造时保存的设备名和已有 IP。
+2. 在平铺动作开始处对有效窗口执行稳定的分类、自然名称和 IP 排序。
+3. 保留原有行优先网格计算，使排序后的窗口依次从左到右、从上到下放置。
+
+### Verification
+- 已通过静态阅读和 `git diff` 检查确认修改范围及排序链路。
+- 未构建，符合用户要求。
