@@ -11902,3 +11902,49 @@ if (args.contains(QStringLiteral("--minimized"), Qt::CaseInsensitive)) {
 - 已执行 `git diff --check`，未发现空白错误。
 - 已核对修改只涉及 `src/main.cpp` 的 `--minimized` 启动分支和本条变更记录。
 - 按用户要求未构建、未链接、未运行程序或二进制测试；需在其它设备完成一次更新后验证首次从任务栏或托盘恢复的鼠标操作。
+
+## 2026-08-08 16:51 - 回撤错误的更新启动最小化修复
+
+### Changed Location
+- `src/main.cpp:442-451`：删除“先正常显示再立即最小化”的启动顺序，恢复既有 `hideToTray()` 最小化入口。
+
+### Reason
+用户提供的更新后实机截图显示版本为 `v1.1.187`，该版本已包含上一条启动顺序修改；窗口更新后直接正常显示，但整个客户区仍无法响应鼠标。因此上一条将问题归因于“首次从最小化恢复”的判断不成立：它既没有让实机更新重启可靠保持最小化，也没有改善客户区输入。为避免保留没有效果且会改变启动时序的代码，本次立即回撤该分支修改，后续改从更新后新进程的 Qt 输入门禁、鼠标抓取和隐藏弹窗状态继续定位。
+
+### Original Code
+```cpp
+// src/main.cpp:442-454（回撤前）
+// wjy: 仅开机自启或更新重启带 --minimized 时进入最小化；手动双击启动仍显示主窗口。
+if (args.contains(QStringLiteral("--minimized"), Qt::CaseInsensitive)) {
+    // =====wjy====
+    window.setAttribute(Qt::WA_ShowWithoutActivating, true);
+    window.show();
+    window.showMinimized();
+    window.setAttribute(Qt::WA_ShowWithoutActivating, false);
+    writeStartupLog(QStringLiteral("[wjy-main] initialized normally before startup minimize"));
+    // ===end====
+}
+```
+
+### Modified Code
+```cpp
+// src/main.cpp:442-451
+// wjy: 仅开机自启带 --minimized 时进托盘；手动双击启动仍显示主窗口。
+if (args.contains(QStringLiteral("--minimized"), Qt::CaseInsensitive)) {
+    // =====wjy====
+    window.hideToTray(); // wjy: v1.1.187 实机证明“先普通显示再最小化”既未让更新重启可靠最小化，也未恢复客户区输入，回到原有启动最小化入口。
+    writeStartupLog(QStringLiteral("[wjy-main] started minimized to tray")); // wjy: 恢复既有日志文字，避免把已证伪的初始化顺序误判成成功路径。
+    // ===end====
+}
+```
+
+### Steps
+1. 根据用户截图确认故障窗口是更新后直接显示的窗口，而不是从最小化状态恢复后的窗口。
+2. 对照共享更新目录，确认截图 `v1.1.187` 于 2026-08-08 16:46 发布，已包含上一条修改。
+3. 删除未奏效的首次普通显示、禁止激活和二次最小化调用，恢复原有 `hideToTray()` 路径。
+4. 将原先的推测保留在历史记录中，并明确标注为已被实机结果证伪。
+
+### Verification
+- 已核对共享目录 `FSRemote.version` 和 `releases/1.1.187/FSRemote.version` 均为 `1.1.187`，发布时间为 2026-08-08 16:46。
+- 已执行 `git diff --check`，未发现空白错误。
+- 按用户要求未构建、未链接、未运行程序或二进制测试。
