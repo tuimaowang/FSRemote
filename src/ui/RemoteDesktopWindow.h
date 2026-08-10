@@ -72,6 +72,7 @@ public:
     void setConnectionStatus(int code, const QString& message);
     void setEncodedBitrateMbps(double mbps);
     void setRemoteMouseCaptureActive(bool active); // wjy: Host 的 absolute/relative 状态只更新自动请求，最终捕获由 Host 请求与 F2 手动锁定共同决定。
+    void toggleFullscreenMode(); // wjy: Ctrl+D 由窗口自身保存和恢复进入全屏前的普通几何与最大化状态。
     // =====wjy====
     void setRemoteCursorShape(const QString& statusMessage); // wjy: 查看器状态回调在 Qt 主线程缓存远端 Windows 标准光标，并按当前命中区域安全刷新。
     void setRemoteMouseBackendStatus(const QString& statusMessage); // wjy: 只接受 Host 已确认的 system/faker 状态，不在按钮点击时乐观修改真实后端。
@@ -359,6 +360,11 @@ private:
     bool m_remoteUpdateAvailable = false; // wjy: 仅保存 DeviceGrid 最近一次状态刷新结果，不在远控连接回调中主动探测更新。
     // ===end====
     bool m_rememberGeometry = true;
+    // =====wjy====
+    QRect m_fullscreenRestoreGeometry; // wjy: 保存进入全屏前的普通窗口矩形，退出后重建Qt的最大化还原基准。
+    bool m_fullscreenRestoreWasMaximized = false; // wjy: 记录进入全屏前是否最大化，退出时恢复同一显示状态。
+    bool m_fullscreenRestoreStateValid = false; // wjy: 区分本窗口发起的全屏切换和外部未知状态变化，避免使用陈旧几何。
+    // ===end====
     bool m_textureFrameActive = false;
     std::atomic_bool m_texturePresentFailed = false;
     QTimer* m_textureRecoveryTimer = nullptr; // wjy: D3D11失败后按退避间隔重新允许一帧纹理尝试，成功即可退出软件回退。

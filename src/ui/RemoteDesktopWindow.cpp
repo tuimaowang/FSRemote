@@ -3805,6 +3805,42 @@ void RemoteDesktopWindow::toggleMaximizedState()
     isMaximized() ? showNormal() : showMaximized(); // wjy: 标题栏双击的唯一最大化入口只切换显示状态，不把系统最大化矩形写入设备窗口 JSON。
 }
 
+// =====wjy====
+void RemoteDesktopWindow::toggleFullscreenMode()
+{
+    if (!isFullScreen()) {
+        finishInteractiveWindowOperation(); // wjy: 快捷键触发前结束可能残留的拖动或缩放候选，保存的几何必须来自稳定窗口状态。
+        m_fullscreenRestoreWasMaximized = isMaximized(); // wjy: 最大化窗口退出全屏后仍应回到最大化，随后双击才能正确还原普通尺寸。
+        m_fullscreenRestoreGeometry = m_fullscreenRestoreWasMaximized
+            ? normalGeometry()
+            : frameGeometry(); // wjy: 最大化时读取Qt维护的普通矩形，普通或平铺窗口直接保存当前实际矩形。
+        if (!m_fullscreenRestoreGeometry.isValid()) {
+            m_fullscreenRestoreGeometry = normalizedSavedWindowGeometry(
+                platform::AppSettings::remoteDesktopWindowGeometry(m_hostIp),
+                minimumSize()); // wjy: 窗口管理器没有提供有效normalGeometry时回退设备JSON，避免退出全屏后使用屏幕矩形作为还原尺寸。
+        }
+        m_fullscreenRestoreStateValid = true;
+        showFullScreen();
+        return;
+    }
+
+    const QRect restoreGeometry = m_fullscreenRestoreGeometry;
+    const bool restoreMaximized = m_fullscreenRestoreWasMaximized;
+    const bool restoreStateValid = m_fullscreenRestoreStateValid;
+    m_fullscreenRestoreGeometry = {};
+    m_fullscreenRestoreWasMaximized = false;
+    m_fullscreenRestoreStateValid = false; // wjy: 先清空一次性快照，后续状态事件或重复快捷键不能再次套用旧矩形。
+
+    showNormal(); // wjy: 必须先离开全屏，Windows才允许普通几何重新成为最大化还原基准。
+    if (restoreStateValid && restoreGeometry.isValid()) {
+        setGeometry(restoreGeometry); // wjy: 在可能重新最大化之前恢复普通矩形，保证标题栏双击showNormal回到进入全屏前的大小。
+    }
+    if (restoreStateValid && restoreMaximized) {
+        showMaximized(); // wjy: 从最大化进入全屏时恢复最大化外观，但其normalGeometry已经被上面的普通矩形校正。
+    }
+}
+// ===end====
+
 void RemoteDesktopWindow::setClipboardSyncEnabled(bool enabled)
 {
     if (m_clipboardSyncEnabled == enabled) {

@@ -9323,7 +9323,7 @@ void DeviceGrid::toggleTopmostRemoteWindowFullscreen()
         return;
     }
     rememberRemoteWindowActivation(window);
-    window->isFullScreen() ? window->showNormal() : window->showFullScreen();
+    window->toggleFullscreenMode(); // wjy: 由远控窗口保存全屏前状态，退出后双击标题栏仍可恢复原本普通尺寸。
     window->raise();
     window->activateWindow();
 }

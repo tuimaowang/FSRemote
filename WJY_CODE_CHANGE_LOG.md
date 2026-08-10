@@ -12783,3 +12783,88 @@ painter.drawText(controlledSessionBadgeRect, Qt::AlignCenter, controlledSessionT
 - 已静态核对标题栏数字不限制为 10，颜色档位超过 10 后保持最高等级但文本继续显示真实总数。
 - 已静态核对窄窗口先为数字徽标预留空间，带宽文字使用 `elidedText` 缩短，不覆盖本机身份和窗口按钮。
 - 按此前用户要求，本次未构建、未链接和未运行程序。
+
+## 2026-08-10 14:27 - 修复全屏退出后标题栏双击无法还原窗口
+
+### Changed Location
+- `src/ui/RemoteDesktopWindow.h:75、364-366`：新增全屏切换入口及进入全屏前的窗口状态快照。
+- `src/ui/RemoteDesktopWindow.cpp:3809-3842`：保存并恢复普通窗口几何和最大化状态。
+- `src/ui/DeviceGrid.cpp:9326`：Ctrl+D 改为调用远控窗口自己的状态保持入口。
+
+### Reason
+原 Ctrl+D 逻辑直接在 `showFullScreen()` 和 `showNormal()` 之间切换，没有记录进入全屏前的普通窗口矩形和最大化状态。从最大化窗口进入全屏后再次按 Ctrl+D 会无条件进入普通状态，Qt 的最大化还原基准也可能被全屏切换扰动，导致随后双击标题栏不能回到进入全屏前的窗口大小。
+
+### Original Code
+```cpp
+// src/ui/DeviceGrid.cpp:9325-9328（修改前）
+rememberRemoteWindowActivation(window);
+window->isFullScreen() ? window->showNormal() : window->showFullScreen();
+window->raise();
+window->activateWindow();
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.h（修改前）
+// 没有保存全屏前普通几何和最大化状态的成员，也没有独立全屏切换入口。
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3807（修改前）
+// 全屏切换完全由 DeviceGrid 直接调用 QWidget 的 showFullScreen/showNormal。
+```
+
+### Modified Code
+```cpp
+// src/ui/RemoteDesktopWindow.h:75、364-366
+void toggleFullscreenMode();
+QRect m_fullscreenRestoreGeometry;
+bool m_fullscreenRestoreWasMaximized = false;
+bool m_fullscreenRestoreStateValid = false;
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3809-3842
+void RemoteDesktopWindow::toggleFullscreenMode()
+{
+    if (!isFullScreen()) {
+        m_fullscreenRestoreWasMaximized = isMaximized();
+        m_fullscreenRestoreGeometry = m_fullscreenRestoreWasMaximized
+            ? normalGeometry()
+            : frameGeometry();
+        m_fullscreenRestoreStateValid = true;
+        showFullScreen();
+        return;
+    }
+
+    showNormal();
+    if (restoreStateValid && restoreGeometry.isValid()) {
+        setGeometry(restoreGeometry);
+    }
+    if (restoreStateValid && restoreMaximized) {
+        showMaximized();
+    }
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:9325-9328
+rememberRemoteWindowActivation(window);
+window->toggleFullscreenMode();
+window->raise();
+window->activateWindow();
+```
+
+### Steps
+1. 将 Ctrl+D 的全屏状态管理从 `DeviceGrid` 收回 `RemoteDesktopWindow`。
+2. 进入全屏前记录普通窗口矩形以及是否处于最大化状态。
+3. 最大化窗口优先读取 `normalGeometry()`，无效时回退设备 JSON 中保存的普通矩形。
+4. 退出全屏时先 `showNormal()` 并恢复普通矩形，再根据进入前状态重新最大化。
+5. 使用一次性有效标志清理状态快照，避免后续切换重复使用陈旧几何。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已通过 `rg` 确认 `showFullScreen()` 只保留在 `RemoteDesktopWindow::toggleFullscreenMode()` 内部，Ctrl+D 不再直接切换 QWidget 状态。
+- 已静态核对普通窗口路径：普通矩形进入全屏，退出后恢复同一矩形。
+- 已静态核对最大化路径：保存 `normalGeometry()`，退出后先恢复普通矩形再最大化，随后标题栏双击 `showNormal()` 可回到原大小。
+- 已静态核对平铺路径：保存当前平铺矩形，退出全屏后不改变 `m_rememberGeometry`，仍回到原平铺位置。
+- 按此前用户要求，本次未构建、未链接和未运行程序。
