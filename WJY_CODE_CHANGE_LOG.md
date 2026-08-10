@@ -12649,3 +12649,40 @@ appendViewerDebugLog(QStringLiteral("target input script accepted host=%1 run_id
 - 已通过 Visual Studio 2022 `VsDevCmd.bat` 加载 MSVC x64 环境。
 - 已执行 `cmake --build build/Desktop_Qt_6_11_1_MSVC2022_64bit-Release --target FSRemote`，增量编译、链接和目标生成完成，退出码为 0。
 - 原 C2039、C2589、C2059、C2143 报错均未再次出现。
+
+## 2026-08-10 12:06 - 主窗口标题栏仅显示当前带宽
+
+### Changed Location
+- `src/ui/DeviceGrid.cpp:10114-10128`：调整主窗口标题栏带宽文本生成逻辑。
+
+### Reason
+主窗口标题栏原本同时显示当前接收带宽和理论剩余带宽，例如 `↓12M 余999M`。理论余量容易造成信息拥挤，用户要求只保留当前实际占用数量，因此删除余量文本及其相关判断分支，保留当前接收带宽、风险颜色和窄窗口省略策略。
+
+### Original Code
+```cpp
+// src/ui/DeviceGrid.cpp:10114-10138（修改前）
+const QString receiveText = formatMbps(m_titlebarBandwidthSample.receive.currentMbps);
+const QString headroomText = formatMbps(m_titlebarBandwidthSample.receive.headroomMbps);
+networkText = m_titlebarBandwidthSample.receive.capacityMbps > 0.0
+    ? QString::fromUtf8("↓%1M 余%2M").arg(receiveText, headroomText)
+    : QString::fromUtf8("↓%1M").arg(receiveText);
+// 后续根据标题栏剩余宽度再次隐藏余量。
+```
+
+### Modified Code
+```cpp
+// src/ui/DeviceGrid.cpp:10114-10128
+const QString receiveText = formatMbps(m_titlebarBandwidthSample.receive.currentMbps);
+networkText = QString::fromUtf8("↓%1M").arg(receiveText); // wjy: 主窗口标题栏只显示当前接收带宽，不再展示理论余量。
+// 保留带宽风险颜色和最终的 elidedText 窄窗口保护。
+```
+
+### Steps
+1. 删除理论剩余带宽 `headroomText` 的格式化和标题栏拼接。
+2. 删除仅用于隐藏剩余带宽的重复宽度判断。
+3. 保留当前接收带宽数值、风险颜色和标题栏空间保护逻辑。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已通过 `rg` 确认标题栏带宽文本只生成 `↓当前值M`，不再包含 `余` 字样。
+- 按此前用户要求，本次未构建、未链接和未运行程序。

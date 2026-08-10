@@ -10112,10 +10112,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                     return QString::number(value, 'f', value < 10.0 ? 1 : 0); // wjy: 低速保留一位小数，高速取整以节省标题栏宽度。
                 };
                 const QString receiveText = formatMbps(m_titlebarBandwidthSample.receive.currentMbps);
-                const QString headroomText = formatMbps(m_titlebarBandwidthSample.receive.headroomMbps);
-                networkText = m_titlebarBandwidthSample.receive.capacityMbps > 0.0
-                    ? QString::fromUtf8("↓%1M 余%2M").arg(receiveText, headroomText)
-                    : QString::fromUtf8("↓%1M").arg(receiveText); // wjy: 驱动没有容量时只展示真实速率，不伪造剩余带宽。
+                networkText = QString::fromUtf8("↓%1M").arg(receiveText); // wjy: 主窗口标题栏只显示当前接收带宽，不再展示容易干扰查看的理论余量。
                 const bool adapterDropping = m_titlebarBandwidthSample.receiveDiscardsDelta > 0
                     || m_titlebarBandwidthSample.receiveErrorsDelta > 0;
                 if (adapterDropping
@@ -10129,14 +10126,6 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                 }
             }
             const QFontMetrics networkMetrics(networkFont);
-            if (networkMetrics.horizontalAdvance(networkText) > networkRect.width()
-                && m_titlebarBandwidthSample.valid) {
-                networkText = QString::fromUtf8("↓%1M").arg(
-                    QString::number(
-                        m_titlebarBandwidthSample.receive.currentMbps,
-                        'f',
-                        m_titlebarBandwidthSample.receive.currentMbps < 10.0 ? 1 : 0)); // wjy: 宽度不足时优先保留当前接收速率，余量只在空间充足时显示。
-            }
             painter.setPen(networkColor);
             painter.drawText(
                 QRectF(networkRect),
