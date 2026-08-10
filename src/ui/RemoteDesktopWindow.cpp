@@ -12,6 +12,7 @@
 #include "ui/RemoteTitleBarRenderer.h"
 #include "ui/RemoteViewerLifecycleManager.h"
 
+#include <QAction>
 #include <QByteArray>
 #include <QApplication>
 #include <QClipboard>
@@ -36,6 +37,7 @@
 #include <QKeySequence>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QMouseEvent>
@@ -3298,6 +3300,8 @@ RemoteTitleBarVisualState RemoteDesktopWindow::titleBarVisualState() const
     if (m_remoteMouseBackendFallback) state.mouseBackendAccent = QColor(QStringLiteral("#D97706"));
     if (m_remoteMouseBackendPending) state.mouseBackendAccent = QColor(QStringLiteral("#64748B"));
     state.mouseBackendPressed = m_mouseBackendButtonPressed;
+    state.qualityText = m_qualityPreviewText; // wjy: 菜单选择仅写入本窗口前端文字，不读取或覆盖协调器的实际画质决策。
+    state.qualityMenuOpen = m_qualityMenuOpen || m_qualityButtonPressed; // wjy: 鼠标按下和菜单展开共用稳定按压色，松开取消后立即恢复默认背景。
     state.mouseBackendText = (m_remoteMouseBackendPending ? m_pendingRemoteMouseBackend : m_remoteMouseBackend)
             == RemoteMouseBackend::Faker
         ? zh("驱动")
@@ -3314,7 +3318,6 @@ RemoteTitleBarVisualState RemoteDesktopWindow::titleBarVisualState() const
         state.mouseLockColor = QColor(QStringLiteral("#DC2626")); // wjy: 仅显示 F2 手动意图；游戏自动 relative 不额外占用标题栏状态文字。
     }
 
-    // wjy: 标题栏快照不再携带画质胶囊状态，避免把只读策略信息误认为手动操作入口。
     state.inputSyncText = QString::fromUtf8("同步");
     state.inputSyncAccent = QColor(QStringLiteral("#98A2B3"));
     state.inputSyncBackground = QColor(QStringLiteral("#F2F4F7"));
@@ -3690,7 +3693,7 @@ QRect RemoteDesktopWindow::titleBarHoverRectAt(const QPoint& position) const
         return {};
     }
     const RemoteTitleBarLayoutSnapshot layout = titleBarLayoutSnapshot();
-    for (const QRect& control : {layout.update, layout.mouseBackend,
+    for (const QRect& control : {layout.update, layout.quality, layout.mouseBackend,
              layout.inputSync, layout.audio, layout.clipboard, layout.minimize, layout.close}) {
         if (!control.isEmpty() && control.contains(position)) {
             return control; // wjy: 只把实际可见按钮视为悬停区域，设备文字和标题栏空白区移动不会产生绘制请求。
@@ -3754,6 +3757,11 @@ QRect RemoteDesktopWindow::remoteUpdateButtonRect() const
     return titleBarLayoutSnapshot().update;
 }
 
+QRect RemoteDesktopWindow::qualityPreviewRect() const
+{
+    return titleBarLayoutSnapshot().quality; // wjy: 画质按钮与绘制器复用同一可见性快照，窄窗口隐藏后不保留透明热区。
+}
+
 QRect RemoteDesktopWindow::mouseInputModeRect() const
 {
     return titleBarLayoutSnapshot().mouseBackend;
@@ -3792,6 +3800,7 @@ bool RemoteDesktopWindow::isTitleBarBlankArea(const QPoint& position) const
         && position.y() >= 0
         && position.y() < titleBarHeight()
         && !(m_remoteUpdateAvailable && remoteUpdateButtonRect().contains(position)) // wjy: 更新按钮可见时从拖动、双击和右键空白区中排除。
+        && !qualityPreviewRect().contains(position) // wjy: 前端画质菜单按钮不参与拖窗、双击最大化或右键设备菜单。
         && !mouseInputModeRect().contains(position) // wjy: 键鼠注入后端是本地标题栏开关，不能触发拖窗、右键设备菜单或远端输入。
         && !inputSyncRect().contains(position) // wjy: 键鼠同步是纯本地标题栏操作，不能落入拖窗或远端鼠标路径。
         && !audioToggleRect().contains(position)
@@ -3878,6 +3887,60 @@ void RemoteDesktopWindow::toggleViewerAudio()
         .arg(m_hostIp)
         .arg(m_viewerAudioEnabled ? 1 : 0));
 }
+
+// =====wjy====
+void RemoteDesktopWindow::showQualityPreviewMenu()
+{
+    const QRect buttonRect = qualityPreviewRect();
+    if (buttonRect.isEmpty()) {
+        return;
+    }
+
+    QMenu menu(this);
+    menu.setAttribute(Qt::WA_TranslucentBackground);
+    menu.setWindowFlag(Qt::NoDropShadowWindowHint, true);
+    menu.setFixedWidth(96); // wjy: 菜单比54px标题栏按钮略宽，最长的“1080/60”与选中标记都能保持单行。
+    menu.setStyleSheet(QStringLiteral(
+        "QMenu{background:#FFFFFF;border:1px solid #D8DEE8;border-radius:5px;padding:4px 0;"
+        "font-family:'Microsoft YaHei UI';font-size:11px;color:#344054;}"
+        "QMenu::item{height:27px;padding:0 10px 0 26px;background:transparent;}"
+        "QMenu::item:selected{background:#E8F1FF;color:#1D4ED8;}"
+        "QMenu::item:checked{font-weight:600;color:#1D4ED8;background:#F3F7FF;}"
+        "QMenu::indicator{width:12px;height:12px;}")); // wjy: 八个档位以紧凑纵列呈现，当前项用Qt原生勾选标记和浅蓝背景识别。
+
+    const QStringList options = {
+        QStringLiteral("1080/60"),
+        QStringLiteral("1080/30"),
+        QStringLiteral("720/60"),
+        QStringLiteral("720/30"),
+        QStringLiteral("540/30"),
+        QStringLiteral("540/25"),
+        QStringLiteral("360/25"),
+        QStringLiteral("360/1")
+    }; // wjy: 顺序固定从最高画质到最低保活档，360常规档按用户要求改为25 FPS。
+    for (const QString& option : options) {
+        QAction* action = menu.addAction(option);
+        action->setCheckable(true);
+        action->setChecked(option == m_qualityPreviewText);
+        action->setData(option); // wjy: 动作只携带显示文字，当前阶段不映射分辨率、帧率或码率结构。
+    }
+
+    m_qualityMenuOpen = true;
+    requestTitleBarUpdate(buttonRect);
+    const QPoint popupPosition = mapToGlobal(QPoint(
+        buttonRect.right() - menu.width() + 1,
+        buttonRect.bottom() + 4)); // wjy: 菜单右边缘与标题栏按钮对齐并向下留4px，视觉上保持明确的下拉归属。
+    QAction* selectedAction = menu.exec(popupPosition);
+    if (selectedAction) {
+        const QString selectedText = selectedAction->data().toString();
+        if (!selectedText.isEmpty()) {
+            m_qualityPreviewText = selectedText; // wjy: 仅更新前端选中文字，不发remoteQualityInputsChanged，也不调用质量协调器。
+        }
+    }
+    m_qualityMenuOpen = false;
+    requestTitleBarUpdate(buttonRect);
+}
+// ===end====
 
 stream::RemoteQualityMode RemoteDesktopWindow::effectiveQualityMode() const
 {
@@ -5084,6 +5147,10 @@ void RemoteDesktopWindow::updateResizeCursor(const QPoint& position)
     if (!isFullScreen() && m_remoteUpdateAvailable && remoteUpdateButtonRect().contains(position)) {
         setWindowAndPresenterCursor(Qt::PointingHandCursor);
         return; // wjy: 更新入口使用手型指针；按钮远离 6px 缩放边缘，不影响窗口缩放命中。
+    }
+    if (!isFullScreen() && qualityPreviewRect().contains(position)) {
+        setWindowAndPresenterCursor(Qt::PointingHandCursor);
+        return; // wjy: 画质预览入口使用手型指针，但当前只操作本地菜单文字。
     }
     if (!isFullScreen() && mouseInputModeRect().contains(position)) {
         setWindowAndPresenterCursor(Qt::PointingHandCursor);
@@ -6473,7 +6540,7 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
     constexpr int elapsedTextWidth = 70;
     constexpr int elapsedGap = 14;
     int titleTextRight = width() - 6;
-    for (const QRect& control : {titleLayout.update, titleLayout.mouseBackend,
+    for (const QRect& control : {titleLayout.update, titleLayout.quality, titleLayout.mouseBackend,
              titleLayout.inputSync, titleLayout.audio, titleLayout.clipboard, titleLayout.minimize, titleLayout.close}) {
         if (!control.isEmpty()) titleTextRight = qMin(titleTextRight, control.left());
     } // wjy: 标题辅助文字只让位给当前真正可见的最左侧控件，隐藏控件不会继续占用空白。
@@ -6519,6 +6586,28 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
         painter.setPen(QColor(QStringLiteral("#FFFFFF")));
         painter.drawText(updateRect, Qt::AlignCenter, QString::fromUtf8("更新")); // wjy: 只在目标端明确返回需要更新时显示文字按钮。
     }
+
+    // =====wjy====
+    if (!titleLayout.quality.isEmpty()) {
+        const QRect qualityRect = titleLayout.quality;
+        QColor qualityBackground = qualityRect.contains(m_hoveredPos)
+            ? QColor(QStringLiteral("#E8F1FF"))
+            : QColor(QStringLiteral("#F8FAFC"));
+        if (m_qualityButtonPressed || m_qualityMenuOpen) {
+            qualityBackground = QColor(QStringLiteral("#DCE8F8"));
+        }
+        painter.setPen(QPen(QColor(QStringLiteral("#64748B")), 1));
+        painter.setBrush(qualityBackground);
+        painter.drawRoundedRect(QRectF(qualityRect), 4, 4);
+        QFont qualityFont(QStringLiteral("Microsoft YaHei UI"));
+        qualityFont.setPixelSize(10);
+        qualityFont.setWeight(QFont::DemiBold);
+        painter.setFont(qualityFont);
+        painter.setPen(QColor(QStringLiteral("#344054")));
+        painter.drawText(qualityRect.adjusted(2, 0, -2, 0), Qt::AlignCenter,
+            m_qualityPreviewText + QStringLiteral(" ▾")); // wjy: 旧Qt父窗口回退路径显示与原生标题栏相同的当前档位和展开态。
+    }
+    // ===end====
 
     if (!titleLayout.audio.isEmpty()) {
         const QPixmap audioIcon = icon(m_viewerAudioEnabled
@@ -6729,6 +6818,12 @@ void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
     // ===end====
     if (event->button() == Qt::LeftButton) {
         // =====wjy====
+        if (!isFullScreen() && qualityPreviewRect().contains(event->pos())) {
+            m_qualityButtonPressed = true;
+            requestTitleBarUpdate(qualityPreviewRect());
+            event->accept();
+            return; // wjy: 按下阶段只显示反馈，必须在同一按钮内释放才展开前端档位菜单。
+        }
         if (!isFullScreen() && mouseInputModeRect().contains(event->pos())) {
             m_mouseBackendButtonPressed = true;
             requestTitleBarUpdate(mouseInputModeRect());
@@ -6923,6 +7018,17 @@ void RemoteDesktopWindow::mouseReleaseEvent(QMouseEvent* event)
 {
     if (event->button() == Qt::LeftButton) {
         // =====wjy====
+        if (m_qualityButtonPressed) {
+            const bool activate = !isFullScreen() && qualityPreviewRect().contains(event->pos());
+            m_qualityButtonPressed = false;
+            if (activate) {
+                showQualityPreviewMenu(); // wjy: 菜单返回后仍在本次本地鼠标事件内结束，不把释放事件转发给远端桌面。
+            } else {
+                requestTitleBarUpdate(qualityPreviewRect());
+            }
+            event->accept();
+            return;
+        }
         if (m_mouseBackendButtonPressed) {
             const bool activate = !isFullScreen() && mouseInputModeRect().contains(event->pos());
             m_mouseBackendButtonPressed = false;

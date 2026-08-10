@@ -13053,3 +13053,117 @@ void verifyCompactSessionMetricsRendering()
 - 已执行 `git diff --check`，未发现空白错误。
 - 用户要求不再构建后，未继续执行构建或程序运行。
 - 在用户消息到达前，`fsremote_remote_titlebar_renderer_tests` 目标已完成编译与链接；本次未运行该测试可执行文件。
+
+## 2026-08-10 16:48 - 增加远控标题栏画质档位前端菜单
+
+### Changed Location
+- `src/ui/RemoteTitleBarLayout.h:10-94`: 在系统/驱动按钮左侧增加54px画质按钮，并纳入可见性、局部坐标和按钮组签名。
+- `src/ui/RemoteTitleBarRenderer.h:41-42`: 增加默认 `540/30` 文本与菜单展开视觉状态。
+- `src/ui/RemoteTitleBarRenderer.cpp:77-98、174-179、293-296、352-355`: 绘制紧凑画质按钮，并让计时、性能文字和鼠标锁定状态避开新按钮。
+- `src/ui/RemoteDesktopWindow.h:192、210、438-440`: 增加画质按钮热区、菜单函数和纯前端选择状态。
+- `src/ui/RemoteDesktopWindow.cpp:3303-3304、3692-3809、3892-3943、5148-5159、6543-6608、6821-6826、7021-7031`: 接入状态快照、悬停、手型光标、按压释放、纵向菜单以及旧标题栏回退绘制。
+- `tests/remote_titlebar_renderer_tests.cpp:33-51、112-126`: 增加画质按钮可见性和展开态像素断言，并按新增按钮宽度调整紧凑数字场景。
+- `tests/remote_input_broadcast_coordinator_tests.cpp:307-333`: 增加正常、窄和最小宽度下画质按钮可见性断言。
+
+### Reason
+需要先确认远控窗口画质切换入口的标题栏视觉和交互，再接入实际清晰度策略。本次仅增加前端预览：按钮默认显示 `540/30`，菜单按从高到低顺序列出八个档位，点选后只更新当前窗口按钮文字和菜单勾选项，不发送远端请求、不修改协调器输入，也不实现“全部窗口默认540p/25”的后续策略。
+
+### Original Code
+```cpp
+// src/ui/RemoteTitleBarLayout.h:10-13（修改前）
+struct RemoteTitleBarLayoutSnapshot {
+    QRect update;
+    QRect mouseBackend;
+    QRect inputSync;
+};
+```
+
+```cpp
+// src/ui/RemoteTitleBarLayout.h:80-81（修改前）
+const QRect rawMouseBackend(rawInputSync.left() - 58, 3, 54, std::max(0, safeHeight - 6));
+const QRect rawUpdate(rawMouseBackend.left() - 58, 3, 54, std::max(0, safeHeight - 6));
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:6729-6737（修改前）
+if (event->button() == Qt::LeftButton) {
+    if (!isFullScreen() && mouseInputModeRect().contains(event->pos())) {
+        m_mouseBackendButtonPressed = true;
+        requestTitleBarUpdate(mouseInputModeRect());
+        event->accept();
+        return;
+    }
+}
+```
+
+### Modified Code
+```cpp
+// src/ui/RemoteTitleBarLayout.h:10-13、80-83
+struct RemoteTitleBarLayoutSnapshot {
+    QRect update;
+    QRect quality;
+    QRect mouseBackend;
+};
+
+const QRect rawMouseBackend(rawInputSync.left() - 58, 3, 54, std::max(0, safeHeight - 6));
+const QRect rawQuality(rawMouseBackend.left() - 58, 3, 54, std::max(0, safeHeight - 6));
+const QRect rawUpdate(rawQuality.left() - 58, 3, 54, std::max(0, safeHeight - 6));
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3911-3925
+const QStringList options = {
+    QStringLiteral("1080/60"),
+    QStringLiteral("1080/30"),
+    QStringLiteral("720/60"),
+    QStringLiteral("720/30"),
+    QStringLiteral("540/30"),
+    QStringLiteral("540/25"),
+    QStringLiteral("360/25"),
+    QStringLiteral("360/1")
+};
+for (const QString& option : options) {
+    QAction* action = menu.addAction(option);
+    action->setCheckable(true);
+    action->setChecked(option == m_qualityPreviewText);
+    action->setData(option);
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3934-3941
+if (selectedAction) {
+    const QString selectedText = selectedAction->data().toString();
+    if (!selectedText.isEmpty()) {
+        m_qualityPreviewText = selectedText;
+    }
+}
+m_qualityMenuOpen = false;
+requestTitleBarUpdate(buttonRect);
+```
+
+```cpp
+// tests/remote_titlebar_renderer_tests.cpp:35-45
+ui::RemoteTitleBarVisualState normalState = baseState(900, 1.0);
+assert(!normalState.layout.quality.isEmpty());
+const QImage normal = ui::RemoteTitleBarRenderer::render(normalState);
+normalState.qualityMenuOpen = true;
+const QImage menuOpen = ui::RemoteTitleBarRenderer::render(normalState);
+assert(menuOpen != normal);
+```
+
+### Steps
+1. 在标题栏统一布局快照中把画质按钮固定放到系统/驱动按钮左侧，更新按钮继续排列在更左侧。
+2. 为原生标题栏绘制器和旧Qt父窗口回退路径增加相同的 `540/30 ▾` 按钮视觉。
+3. 点击按钮后弹出96px宽、八行纵向紧凑菜单，当前项使用可勾选动作和浅蓝背景显示。
+4. 选择动作只写入 `m_qualityPreviewText` 并刷新标题栏，不触发 `remoteQualityInputsChanged()`。
+5. 将新按钮加入悬停、空白标题栏排除、手型光标、按压释放和窄窗口隐藏规则。
+6. 增加布局与渲染静态测试断言；由于新增54px按钮，将性能数字紧凑场景宽度从700px调整为760px。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已使用 `rg` 核对八个菜单项顺序为 `1080/60` 到 `360/1`，其中常规360档为 `360/25`。
+- 已使用 `rg` 确认新增菜单函数只更新 `m_qualityPreviewText`，没有新增 `remoteQualityInputsChanged()` 调用。
+- 已静态核对原生标题栏和 `FSREMOTE_LEGACY_PARENT_TITLE_BAR` 回退路径均绘制新按钮。
+- 按用户要求，本次未构建、未链接、未运行测试或启动程序。
+- 用户在 `src/stream/RemoteVideoPolicy.h` 中单独修改的360档参数不属于本次前端任务，未改动且不会随本次提交暂存。

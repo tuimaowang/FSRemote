@@ -38,6 +38,8 @@ struct RemoteTitleBarVisualState {
     QString mouseBackendText;
     QColor mouseBackendAccent;
     bool mouseBackendPressed = false;
+    QString qualityText = QStringLiteral("540/30"); // wjy: 前端预览默认显示540/30，当前只改变标题栏文字，不连接实际远控质量请求。
+    bool qualityMenuOpen = false; // wjy: 菜单展开时保持按钮按下视觉，方便用户确认当前弹出层归属。
     QString mouseLockText; // wjy: F2 手动锁定开启时显示固定“鼠标锁定”，不与 Host 自动 relative 状态混用。
     QColor mouseLockColor;
 

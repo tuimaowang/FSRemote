@@ -73,6 +73,31 @@ void paintTitleBarButtons(
         painter.drawText(layout.update, Qt::AlignCenter, QString::fromUtf8("更新"));
     }
 
+    // =====wjy====
+    if (!layout.quality.isEmpty()) {
+        const bool hovered = layout.quality.contains(hoveredPosition);
+        const QColor accent(QStringLiteral("#64748B"));
+        QColor background = hovered
+            ? QColor(QStringLiteral("#E8F1FF"))
+            : QColor(QStringLiteral("#F8FAFC")); // wjy: 默认使用中性浅色，悬停时用浅蓝与右侧“系统”按钮区分功能层级。
+        if (state.qualityMenuOpen) {
+            background = QColor(QStringLiteral("#DCE8F8")); // wjy: 下拉菜单展开期间保持按下色，不使用闪烁或动画。
+        }
+        painter.setPen(QPen(accent, 1));
+        painter.setBrush(background);
+        painter.drawRoundedRect(QRectF(layout.quality), 4, 4);
+        QFont font(QStringLiteral("Microsoft YaHei UI"));
+        font.setPixelSize(10); // wjy: 54px宽按钮内同时容纳“540/30”和下拉箭头，不挤压相邻系统按钮。
+        font.setWeight(QFont::DemiBold);
+        painter.setFont(font);
+        painter.setPen(QColor(QStringLiteral("#344054")));
+        painter.drawText(
+            layout.quality.adjusted(2, 0, -2, 0),
+            Qt::AlignCenter,
+            state.qualityText + QStringLiteral(" ▾")); // wjy: 按钮本体只显示当前前端选中档与下拉方向，不显示额外说明文字。
+    }
+    // ===end====
+
     if (!layout.mouseBackend.isEmpty()) {
         const bool hovered = layout.mouseBackend.contains(hoveredPosition);
         QColor background = hovered
@@ -146,7 +171,9 @@ QRect mouseLockStatusRect(const RemoteTitleBarVisualState& state)
 
     constexpr int kStatusWidth = 68;
     constexpr int kStatusGap = 8;
-    int controlsLeft = state.layout.mouseBackend.left();
+    int controlsLeft = state.layout.quality.isEmpty()
+        ? state.layout.mouseBackend.left()
+        : std::min(state.layout.quality.left(), state.layout.mouseBackend.left()); // wjy: 更新按钮不可见时，鼠标锁定文字也要让位给新画质按钮。
     if (!state.layout.update.isEmpty()) {
         controlsLeft = std::min(controlsLeft, state.layout.update.left()); // wjy: 有更新按钮时把文字放到整个按钮组左侧，禁止覆盖可点击区域。
     }
@@ -263,7 +290,7 @@ QImage RemoteTitleBarRenderer::renderIdentityBand(const RemoteTitleBarVisualStat
     // 窄窗口时按钮子表面叠在上层覆盖它，与旧实现"没有空间就不显示计时"的视觉结果一致。
     const QRect mouseLockRect = mouseLockStatusRect(state);
     int titleTextRight = state.logicalWidth - 6;
-    for (const QRect& control : {state.layout.update, state.layout.mouseBackend,
+    for (const QRect& control : {state.layout.update, state.layout.quality, state.layout.mouseBackend,
              state.layout.inputSync, state.layout.audio, state.layout.clipboard, state.layout.minimize, state.layout.close}) {
         if (!control.isEmpty()) titleTextRight = std::min(titleTextRight, control.left());
     }
@@ -322,7 +349,7 @@ QImage RemoteTitleBarRenderer::render(const RemoteTitleBarVisualState& state)
 
     const QRect mouseLockRect = mouseLockStatusRect(state);
     int titleTextRight = state.logicalWidth - 6;
-    for (const QRect& control : {state.layout.update, state.layout.mouseBackend,
+    for (const QRect& control : {state.layout.update, state.layout.quality, state.layout.mouseBackend,
              state.layout.inputSync, state.layout.audio, state.layout.clipboard, state.layout.minimize, state.layout.close}) {
         if (!control.isEmpty()) titleTextRight = std::min(titleTextRight, control.left());
     }

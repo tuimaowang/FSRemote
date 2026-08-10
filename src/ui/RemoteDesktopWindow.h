@@ -188,7 +188,8 @@ private:
     // ===end====
 
     // =====wjy====
-    QRect remoteUpdateButtonRect() const; // wjy: 更新按钮位于剪切板按钮左侧，对应用户标出的标题栏空白区域。
+    QRect remoteUpdateButtonRect() const; // wjy: 更新按钮位于画质按钮左侧，对应标题栏右侧按钮组的最左侧入口。
+    QRect qualityPreviewRect() const; // wjy: 前端画质预览按钮位于系统/驱动按钮左侧，当前不下发远端质量请求。
     QRect mouseInputModeRect() const; // wjy: 兼容保留既有函数名；该标题栏开关现在统一切换系统/驱动键鼠后端。
     QRect clipboardSyncRect() const;
     QRect audioToggleRect() const; // wjy: 标题栏独立音频开关，默认静音且不参与画质焦点判定。
@@ -206,6 +207,7 @@ private:
     void toggleClipboardSync();
     void toggleViewerAudio(); // wjy: 只切换当前远控窗口本地音频播放器，不影响其它窗口。
     void toggleInputSynchronization(); // wjy: 标题栏一次点击根据关闭、主控、跟随三态执行开启、关闭或主控切换。
+    void showQualityPreviewMenu(); // wjy: 弹出纵向档位菜单并只更新标题栏选中文字，实际画质接入留待后续。
     void toggleRemoteMouseBackend(); // wjy: 兼容沿用现有协议入口，根据 Host 确认状态同时切换键盘和鼠标注入后端。
     void requestRemoteMouseBackend(RemoteMouseBackend backend);
     void queryRemoteMouseBackend(); // wjy: 每次新 Viewer 收到画面后查询 Host 全局状态，多控制窗口由真实值对齐。
@@ -433,6 +435,9 @@ private:
     bool m_remoteMouseBackendPending = false;
     bool m_remoteMouseBackendFallback = false;
     bool m_mouseBackendButtonPressed = false;
+    QString m_qualityPreviewText = QStringLiteral("540/30"); // wjy: 前端预览默认540/30，与后续的实际默认540/25策略暂时解耦。
+    bool m_qualityButtonPressed = false; // wjy: 按下并在同一热区释放才展开菜单，拖出按钮可取消。
+    bool m_qualityMenuOpen = false; // wjy: 只用于前端绘制菜单展开态，不参与质量协调器输入。
     quint64 m_remoteMouseBackendRequestGeneration = 0; // wjy: 两秒超时按请求代际判定，迟到定时器不能覆盖后续成功确认。
     QString m_remoteMouseBackendMessage;
     // ===end====

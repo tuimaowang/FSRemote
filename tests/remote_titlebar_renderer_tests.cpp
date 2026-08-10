@@ -32,10 +32,17 @@ ui::RemoteTitleBarVisualState baseState(int width, qreal dpr)
 
 void verifyNormalAndDpiRendering()
 {
-    const QImage normal = ui::RemoteTitleBarRenderer::render(baseState(900, 1.0));
+    ui::RemoteTitleBarVisualState normalState = baseState(900, 1.0);
+    assert(!normalState.layout.quality.isEmpty()); // wjy: 正常宽度必须为系统/驱动按钮左侧的前端画质入口分配完整热区。
+    const QImage normal = ui::RemoteTitleBarRenderer::render(normalState);
     assert(!normal.isNull());
     assert(normal.width() == 900);
     assert(normal.height() == 28);
+
+    normalState.qualityMenuOpen = true;
+    const QImage menuOpen = ui::RemoteTitleBarRenderer::render(normalState);
+    assert(!menuOpen.isNull());
+    assert(menuOpen != normal); // wjy: 菜单展开期间按钮必须生成不同按压态像素，用户能确认下拉层来自哪个入口。
 
     const QImage scaled = ui::RemoteTitleBarRenderer::render(baseState(900, 1.5));
     assert(!scaled.isNull());
@@ -103,15 +110,15 @@ void verifyInputScriptStatusRendering()
 // =====wjy====
 void verifyCompactSessionMetricsRendering()
 {
-    ui::RemoteTitleBarVisualState compact = baseState(700, 1.0);
+    ui::RemoteTitleBarVisualState compact = baseState(760, 1.0);
     const QImage elapsedOnly = ui::RemoteTitleBarRenderer::render(compact);
-    compact.performanceText = QStringLiteral("60FPS · 30Mbps"); // wjy: 700px窗口在保留全部右侧按钮时只能容纳按实际宽度紧凑排列的性能文本。
+    compact.performanceText = QStringLiteral("60FPS · 30Mbps"); // wjy: 新增54px画质入口后以760px验证全部右侧按钮与紧凑性能文本可以同时显示。
     const QImage compactImage = ui::RemoteTitleBarRenderer::render(compact);
     assert(!elapsedOnly.isNull());
     assert(!compactImage.isNull());
-    assert(compactImage != elapsedOnly); // wjy: 紧凑布局必须在700px宽度下真正绘制FPS/码率，旧的122px固定占位会使两帧完全相同并导致测试失败。
+    assert(compactImage != elapsedOnly); // wjy: 紧凑布局必须在760px宽度下真正绘制FPS/码率，旧的122px固定占位会使两帧完全相同并导致测试失败。
 
-    ui::RemoteTitleBarVisualState bandState = baseState(700, 1.0);
+    ui::RemoteTitleBarVisualState bandState = baseState(760, 1.0);
     const QImage elapsedBand = ui::RemoteTitleBarRenderer::renderIdentityBand(bandState, 1200);
     bandState.performanceText = QStringLiteral("60FPS · 30Mbps");
     const QImage compactBand = ui::RemoteTitleBarRenderer::renderIdentityBand(bandState, 1200);

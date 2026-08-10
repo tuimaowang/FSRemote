@@ -308,6 +308,7 @@ void testRemoteTitleBarLayoutVisibility()
     const ui::RemoteTitleBarLayoutSnapshot normal = ui::remoteTitleBarLayoutSnapshot(
         920, 28, 250, true, 6);
     assert(!normal.update.isEmpty());
+    assert(!normal.quality.isEmpty());
     assert(!normal.mouseBackend.isEmpty());
     assert(!normal.inputSync.isEmpty());
     assert(!normal.clipboard.isEmpty());
@@ -317,6 +318,7 @@ void testRemoteTitleBarLayoutVisibility()
     const ui::RemoteTitleBarLayoutSnapshot narrow = ui::remoteTitleBarLayoutSnapshot(
         260, 28, 80, true, 6);
     assert(narrow.update.isEmpty());
+    assert(narrow.quality.isEmpty());
     assert(narrow.mouseBackend.isEmpty());
     assert(!narrow.inputSync.isEmpty());
     assert(!narrow.clipboard.isEmpty());
@@ -326,6 +328,7 @@ void testRemoteTitleBarLayoutVisibility()
     const ui::RemoteTitleBarLayoutSnapshot minimum = ui::remoteTitleBarLayoutSnapshot(
         100, 28, 99, true, 6);
     assert(minimum.update.isEmpty());
+    assert(minimum.quality.isEmpty());
     assert(minimum.mouseBackend.isEmpty());
     assert(minimum.inputSync.isEmpty());
     assert(minimum.clipboard.isEmpty());

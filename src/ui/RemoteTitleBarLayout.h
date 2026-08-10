@@ -9,8 +9,8 @@ namespace ui {
 // =====wjy====
 struct RemoteTitleBarLayoutSnapshot {
     QRect update;
+    QRect quality;
     QRect mouseBackend;
-    // wjy: 标题栏不再为只读画质状态胶囊分配空间，质量策略仍由后台协调器维护。
     QRect inputSync;
     QRect audio;
     QRect clipboard;
@@ -39,7 +39,7 @@ inline RemoteTitleBarButtonGroupGeometry remoteTitleBarButtonGroupGeometry(
     RemoteTitleBarButtonGroupGeometry geometry;
     int groupLeft = windowWidth;
     quint32 bit = 1;
-    for (const QRect& control : {layout.update, layout.mouseBackend,
+    for (const QRect& control : {layout.update, layout.quality, layout.mouseBackend,
              layout.inputSync, layout.audio, layout.clipboard, layout.minimize, layout.close}) {
         if (!control.isEmpty()) {
             groupLeft = std::min(groupLeft, control.left());
@@ -55,6 +55,7 @@ inline RemoteTitleBarButtonGroupGeometry remoteTitleBarButtonGroupGeometry(
     geometry.width = std::max(0, windowWidth - groupLeft); // wjy: 组右边界固定对齐窗口右边缘，末尾resizeMargin空隙由组背景一并覆盖。
     const int shift = -groupLeft;
     geometry.localLayout.update = layout.update.isEmpty() ? QRect() : layout.update.translated(shift, 0);
+    geometry.localLayout.quality = layout.quality.isEmpty() ? QRect() : layout.quality.translated(shift, 0);
     geometry.localLayout.mouseBackend = layout.mouseBackend.isEmpty() ? QRect() : layout.mouseBackend.translated(shift, 0);
     geometry.localLayout.inputSync = layout.inputSync.isEmpty() ? QRect() : layout.inputSync.translated(shift, 0);
     geometry.localLayout.audio = layout.audio.isEmpty() ? QRect() : layout.audio.translated(shift, 0);
@@ -76,10 +77,10 @@ inline RemoteTitleBarLayoutSnapshot remoteTitleBarLayoutSnapshot(
     const QRect rawMinimize(rawClose.left() - 36, 0, 36, safeHeight);
     const QRect rawAudio(rawMinimize.left() - 32, 0, 28, safeHeight);
     const QRect rawClipboard(rawAudio.left() - 32, 0, 28, safeHeight);
-    // wjy: 移除画质胶囊后，输入同步、键鼠后端和更新按钮按固定间距连续排列。
     const QRect rawInputSync(rawClipboard.left() - 50, 0, 46, safeHeight);
     const QRect rawMouseBackend(rawInputSync.left() - 58, 3, 54, std::max(0, safeHeight - 6));
-    const QRect rawUpdate(rawMouseBackend.left() - 58, 3, 54, std::max(0, safeHeight - 6));
+    const QRect rawQuality(rawMouseBackend.left() - 58, 3, 54, std::max(0, safeHeight - 6)); // wjy: 画质预览按钮紧贴系统/驱动键鼠按钮左侧，后续菜单不改变标题栏按钮组宽度规则。
+    const QRect rawUpdate(rawQuality.left() - 58, 3, 54, std::max(0, safeHeight - 6));
 
     RemoteTitleBarLayoutSnapshot layout;
     layout.close = visibleRemoteTitleBarControl(rawClose, identityRight, windowWidth);
@@ -88,6 +89,7 @@ inline RemoteTitleBarLayoutSnapshot remoteTitleBarLayoutSnapshot(
     layout.clipboard = visibleRemoteTitleBarControl(rawClipboard, identityRight, windowWidth);
     layout.inputSync = visibleRemoteTitleBarControl(rawInputSync, identityRight, windowWidth);
     layout.mouseBackend = visibleRemoteTitleBarControl(rawMouseBackend, identityRight, windowWidth);
+    layout.quality = visibleRemoteTitleBarControl(rawQuality, identityRight, windowWidth);
     layout.update = updateAvailable
         ? visibleRemoteTitleBarControl(rawUpdate, identityRight, windowWidth)
         : QRect(); // wjy: 不可更新设备直接移除更新按钮的视觉和命中区域，其余按钮位置保持稳定。
