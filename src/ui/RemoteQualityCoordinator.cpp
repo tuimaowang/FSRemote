@@ -32,11 +32,6 @@ int baselineTargetFps(stream::RemoteQualityMode mode)
     return 60;
 }
 
-int priorityForRole(bool highPerformance)
-{
-    return highPerformance ? 100 : 10; // wjy: 真实获得焦点的可见窗口获得最高资源优先级，其余窗口统一使用最低优先级保活。
-}
-
 // ===end====
 
 } // namespace
@@ -142,11 +137,16 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
             && window.windowId == focusedVisibleWindowId;
         const bool highPerformance = eligibleVisibleWindow
             && (singleRemoteWindow || focusedWindowEligible); // wjy: 单窗口或真实焦点窗口统一使用同一个高质量配置。
+        const auto roleProfile = decision.minimized
+            ? stream::RemoteVideoPolicy::minimizedProfile()
+            : highPerformance
+                ? stream::kFocusedRemoteVideoProfile
+                : stream::RemoteVideoPolicy::backgroundProfile(); // wjy: 分辨率、FPS、码率和优先级在分支前一次选定，后续所有决策共享同一角色档案。
         decision.audioEnabled = false; // wjy: 音频不再由协调器控制，RemoteDesktopWindow按自己的标题栏按钮独立下发。
         decision.effectiveMode = highPerformance
             ? stream::RemoteQualityMode::HighQualityLocked
             : stream::RemoteQualityMode::Smooth; // wjy: 单窗口或多窗口真实焦点使用高质量，其余窗口进入统一后台安全档。
-        decision.priority = priorityForRole(highPerformance);
+        decision.priority = static_cast<int>(roleProfile.priority); // wjy: 真正使用角色档案中的100/40/5优先级，修改顶部别名后协调器无需另行同步。
 
         WindowState& state = m_states[window.windowId];
         const int baselineFps = fpsIndexForTarget(baselineTargetFps(decision.effectiveMode));
@@ -189,17 +189,14 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
             state.pressureSinceMs = 0;
             state.recoverySinceMs = 0;
             state.degradationReason = RemoteQualityDegradationReason::None;
-            const auto roleProfile = decision.minimized
-                ? stream::RemoteVideoPolicy::minimizedProfile()
-                : stream::RemoteVideoPolicy::backgroundProfile(); // wjy: 角色画质统一从RemoteVideoPolicy读取。
             decision.resolution = roleProfile.resolution; // wjy: 最小化和可见后台直接读取统一角色配置的分辨率档位。
-            decision.targetFps = static_cast<int>(roleProfile.targetFps); // wjy: 最小化1FPS、后台30FPS均由唯一策略配置提供。
+            decision.targetFps = static_cast<int>(roleProfile.targetFps); // wjy: 最小化1FPS、后台25FPS均由命名角色档案提供。
             // =====wjy====
             decision.reason = decision.fullyOccluded
                 ? RemoteQualityDegradationReason::FullyOccluded // wjy: 遮挡与最小化使用同一画质，但保留独立诊断原因。
                 : decision.minimized
                     ? RemoteQualityDegradationReason::Minimized
-                    : RemoteQualityDegradationReason::Background; // wjy: 仅仍有可见区域的非焦点窗口使用普通后台720p/30。
+                    : RemoteQualityDegradationReason::Background; // wjy: 仅仍有可见区域的非焦点窗口使用命名后台540p/25 FPS档。
             // ===end====
         } else if (window.softwareFallback) {
             state.fpsIndex = baselineFps;
@@ -207,15 +204,15 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
             state.recoverySinceMs = 0;
             state.degradationReason = RemoteQualityDegradationReason::None;
             decision.reason = RemoteQualityDegradationReason::SoftwareFallback;
-            decision.resolution = stream::RemoteResolutionTier::P540; // wjy: 最大窗口的软件回退允许540p，普通后台窗口已在上一分支固定P720并动态降帧。
+            decision.resolution = stream::RemoteResolutionTier::P540; // wjy: 最大窗口的软件回退仍使用540p安全档，与正常角色档分开诊断。
             decision.targetFps = 24; // wjy: 软件Presenter回退使用540p/24安全档，退出回退后立即恢复当前单选/多选前台质量变量。
         } else if (!automaticMode) {
             state.fpsIndex = baselineFps;
             state.pressureSinceMs = 0;
             state.recoverySinceMs = 0;
             state.degradationReason = RemoteQualityDegradationReason::None;
-            decision.resolution = stream::kFocusedRemoteVideoProfile.resolution; // wjy: 单窗口和多窗口焦点直接读取统一配置的分辨率档位。
-            decision.targetFps = static_cast<int>(stream::kFocusedRemoteVideoProfile.targetFps); // wjy: 高质量焦点统一使用60FPS。
+            decision.resolution = roleProfile.resolution; // wjy: 焦点窗口与后台分支一样从已选角色档案读取分辨率。
+            decision.targetFps = static_cast<int>(roleProfile.targetFps); // wjy: 当前焦点别名使用540p/30 FPS，后续替换别名即可整组切换。
             if (decision.effectiveMode == stream::RemoteQualityMode::Balanced
                 || decision.effectiveMode == stream::RemoteQualityMode::Smooth) {
                 decision.reason = RemoteQualityDegradationReason::ModePreference; // wjy: 1080p或720p是用户主动预设，不显示成性能降级。
@@ -285,14 +282,9 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
         }
 
         targetSize(decision.resolution, window.sourceWidth, window.sourceHeight, &decision.targetWidth, &decision.targetHeight);
-        const auto roleProfile = decision.minimized
-            ? stream::RemoteVideoPolicy::minimizedProfile()
-            : highPerformance
-                ? stream::kFocusedRemoteVideoProfile
-                : stream::RemoteVideoPolicy::backgroundProfile(); // wjy: 角色码率与分辨率、FPS来自同一配置源。
         decision.maxBitrateKbps = window.softwareFallback
             ? bitrateForDecision(stream::RemoteResolutionTier::P540, 24, decision.effectiveMode)
-            : static_cast<int>(roleProfile.maxBitrateKbps); // wjy: 软件回退保留540p安全码率，正常角色不再走第二套码率表。
+            : static_cast<int>(roleProfile.maxBitrateKbps); // wjy: 正常角色直接使用命名档案的48/24/14/7 Mbps码率，切换分辨率时不会遗留旧上限。
         decisions.push_back(decision);
     }
     // =====wjy====

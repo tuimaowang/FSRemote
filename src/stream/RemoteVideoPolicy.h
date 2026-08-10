@@ -53,6 +53,19 @@ struct RemoteVideoProfile {
     std::uint32_t maxBitrateKbps = 0; // wjy: 角色默认码率与分辨率、FPS放在同一配置源，避免协调器再维护第二套码率表。
 };
 
+struct RemoteVideoEncodingPreset {
+    RemoteResolutionTier resolution = RemoteResolutionTier::Native; // wjy: 编码档案只描述画面尺寸，不把焦点或后台优先级绑定到分辨率名称上。
+    std::uint32_t targetFps = 0; // wjy: 每个命名档案固定目标帧率，角色切换时不再手工拼接数值。
+    std::uint32_t maxBitrateKbps = 0; // wjy: 码率与分辨率档一起切换，避免低分辨率继续沿用高清档的发送上限。
+};
+
+constexpr RemoteVideoProfile makeRemoteVideoProfile(
+    const RemoteVideoEncodingPreset& preset,
+    std::uint32_t priority)
+{
+    return {preset.resolution, preset.targetFps, priority, true, preset.maxBitrateKbps}; // wjy: 角色只补充资源优先级，分辨率、FPS和码率必须成套取自同一命名档案。
+}
+
 struct RemoteVideoDecision {
     RemoteVideoWindowRole role = RemoteVideoWindowRole::Hidden;
     RemoteVideoEmergencyTier emergency = RemoteVideoEmergencyTier::None;
@@ -60,10 +73,20 @@ struct RemoteVideoDecision {
 };
 
 // =====wjy====
-// 画质总开关集中在这里，后续只改常量即可调整所有窗口的角色画质。
-inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile = {RemoteResolutionTier::P1080, 30, 100, true, 48000}; // wjy: 修改这里的P1080即可切换焦点分辨率，60改帧率，48000改码率。
-inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile = {RemoteResolutionTier::P720, 25, 40, true, 24000}; // wjy: 修改这里的P720即可切换后台分辨率，30改帧率，24000改码率。
-inline constexpr RemoteVideoProfile kMinimizedRemoteVideoProfile = {RemoteResolutionTier::P360, 1, 5, true, 7000}; // wjy: 修改这里的P360即可切换最小化分辨率，1改保活帧率，7000改码率。
+// 编码档案集中在这里，每组同时携带分辨率、FPS和对应码率上限。
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo1080p60Preset = {RemoteResolutionTier::P1080, 60, 48000}; // wjy: 1080p/60 FPS高清档，保留48 Mbps上限供高动态桌面使用。
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo1080p30Preset = {RemoteResolutionTier::P1080, 30, 48000}; // wjy: 1080p/30 FPS清晰度优先档，降帧时不同步压缩单帧质量上限。
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo720p60Preset = {RemoteResolutionTier::P720, 60, 24000}; // wjy: 720p/60 FPS流畅档，使用现有720p对应的24 Mbps码率上限。
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo720p30Preset = {RemoteResolutionTier::P720, 30, 24000}; // wjy: 720p/30 FPS平衡档，与60 FPS档共享同一清晰度预算。
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo540p30Preset = {RemoteResolutionTier::P540, 30, 14000}; // wjy: 540p/30 FPS当前焦点档，码率同步收敛到540p的14 Mbps上限。
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo540p25Preset = {RemoteResolutionTier::P540, 25, 14000}; // wjy: 540p/25 FPS当前可见后台档，减少失焦窗口的编码和呈现频率。
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo360p30Preset = {RemoteResolutionTier::P360, 30, 7000}; // wjy: 360p/30 FPS低清交互档，用于需要继续操作但优先节省资源的场景。
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo360p1Preset = {RemoteResolutionTier::P360, 1, 7000}; // wjy: 360p/1 FPS保活档，保持连接和画面更新能力以便快速恢复。
+
+// 角色画质只选择上面的命名档案并补充优先级，以后切档不再手工改五个字段。
+inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile = makeRemoteVideoProfile(kRemoteVideo540p30Preset, 100); // wjy: 当前焦点窗口选用540p/30 FPS档并获得最高优先级。
+inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile = makeRemoteVideoProfile(kRemoteVideo540p25Preset, 40); // wjy: 当前可见后台窗口选用540p/25 FPS档和中等资源优先级。
+inline constexpr RemoteVideoProfile kMinimizedRemoteVideoProfile = makeRemoteVideoProfile(kRemoteVideo360p1Preset, 5); // wjy: 最小化和完全遮挡窗口选用360p/1 FPS保活档和最低优先级。
 inline constexpr std::uint32_t kRemoteProfileFocusDebounceMs = 350;
 inline constexpr std::uint32_t kRemotePressureEnterHoldMs = 1000;
 inline constexpr std::uint32_t kRemotePressureRecoveryHoldMs = 3000;
@@ -73,7 +96,7 @@ class RemoteVideoPolicy final {
 public:
     static constexpr RemoteVideoProfile backgroundProfile()
     {
-        return kVisibleBackgroundRemoteVideoProfile; // wjy: 正常可见后台固定720p/30，统一由顶部变量调整。
+        return kVisibleBackgroundRemoteVideoProfile; // wjy: 正常可见后台直接返回角色别名选中的完整编码档案。
     }
 
     static constexpr RemoteVideoProfile minimizedProfile()

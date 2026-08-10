@@ -12687,6 +12687,107 @@ networkText = QString::fromUtf8("↓%1M").arg(receiveText); // wjy: 主窗口标
 - 已通过 `rg` 确认标题栏带宽文本只生成 `↓当前值M`，不再包含 `余` 字样。
 - 按此前用户要求，本次未构建、未链接和未运行程序。
 
+## 2026-08-10 15:44 - 封装远控分辨率与帧率命名档案
+
+### Changed Location
+- `src/stream/RemoteVideoPolicy.h:56`: 新增不携带角色语义的 `RemoteVideoEncodingPreset` 编码档案结构和角色组装函数。
+- `src/stream/RemoteVideoPolicy.h:77`: 新增 1080p/60、1080p/30、720p/60、720p/30、540p/30、540p/25、360p/30和360p/1共8组命名档案。
+- `src/stream/RemoteVideoPolicy.h:87`: 将焦点、可见后台和最小化角色改为引用命名档案，当前分别选用540p/30、540p/25和360p/1。
+- `src/ui/RemoteQualityCoordinator.cpp:140`: 协调器一次选定角色档案，并将其分辨率、FPS、码率和优先级统一用于最终质量决策。
+- `tests/remote_video_policy_tests.cpp:7`: 新增8组命名档案及三类角色别名的纯C++回归断言。
+- `tests/remote_quality_coordinator_tests.cpp:31`: 将协调器预期更新为焦点540p/30、后台540p/25、最小化360p/1，并验证14/14/7 Mbps码率和100/40/5优先级。
+
+### Reason
+原有代码在焦点、后台和最小化常量中直接手工填写分辨率、FPS、优先级、请求标记和码率。只改分辨率时容易遗留上一档的高码率，例如540p仍使用48/24 Mbps。本次把编码参数封装为8组命名档案，角色只选择档案并补充优先级，使以后的画质切换只需替换一个别名，不再重复手工同步多个数值。
+
+### Original Code
+```cpp
+// src/stream/RemoteVideoPolicy.h:64-66
+inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile = {RemoteResolutionTier::P540, 30, 100, true, 48000};
+inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile = {RemoteResolutionTier::P540, 25, 40, true, 24000};
+inline constexpr RemoteVideoProfile kMinimizedRemoteVideoProfile = {RemoteResolutionTier::P360, 1, 5, true, 7000};
+```
+
+```cpp
+// src/ui/RemoteQualityCoordinator.cpp:143-149
+const bool highPerformance = eligibleVisibleWindow
+    && (singleRemoteWindow || focusedWindowEligible);
+decision.priority = priorityForRole(highPerformance);
+```
+
+```cpp
+// tests/remote_video_policy_tests.cpp:7-7
+const stream::RemoteVideoProfile focused{stream::RemoteResolutionTier::P1080, 60, 100, true, 48000};
+```
+
+```cpp
+// tests/remote_quality_coordinator_tests.cpp:31-43
+assert(decisions[0].resolution == stream::RemoteResolutionTier::P1080);
+assert(decisions[0].targetFps == 60);
+assert(decisions[1].resolution == stream::RemoteResolutionTier::P720);
+assert(decisions[1].targetFps == 30);
+assert(decisions[1].priority == 10);
+```
+
+### Modified Code
+```cpp
+// src/stream/RemoteVideoPolicy.h:77-89
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo1080p60Preset = {RemoteResolutionTier::P1080, 60, 48000};
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo1080p30Preset = {RemoteResolutionTier::P1080, 30, 48000};
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo720p60Preset = {RemoteResolutionTier::P720, 60, 24000};
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo720p30Preset = {RemoteResolutionTier::P720, 30, 24000};
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo540p30Preset = {RemoteResolutionTier::P540, 30, 14000};
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo540p25Preset = {RemoteResolutionTier::P540, 25, 14000};
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo360p30Preset = {RemoteResolutionTier::P360, 30, 7000};
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo360p1Preset = {RemoteResolutionTier::P360, 1, 7000};
+
+inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile = makeRemoteVideoProfile(kRemoteVideo540p30Preset, 100);
+inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile = makeRemoteVideoProfile(kRemoteVideo540p25Preset, 40);
+inline constexpr RemoteVideoProfile kMinimizedRemoteVideoProfile = makeRemoteVideoProfile(kRemoteVideo360p1Preset, 5);
+```
+
+```cpp
+// src/ui/RemoteQualityCoordinator.cpp:140-149
+const auto roleProfile = decision.minimized
+    ? stream::RemoteVideoPolicy::minimizedProfile()
+    : highPerformance
+        ? stream::kFocusedRemoteVideoProfile
+        : stream::RemoteVideoPolicy::backgroundProfile();
+decision.priority = static_cast<int>(roleProfile.priority);
+```
+
+```cpp
+// tests/remote_video_policy_tests.cpp:8-33
+assert(stream::kRemoteVideo1080p60Preset.resolution == stream::RemoteResolutionTier::P1080
+    && stream::kRemoteVideo1080p60Preset.targetFps == 60
+    && stream::kRemoteVideo1080p60Preset.maxBitrateKbps == 48000);
+const stream::RemoteVideoProfile focused = stream::kFocusedRemoteVideoProfile;
+```
+
+```cpp
+// tests/remote_quality_coordinator_tests.cpp:31-45
+assert(decisions[0].resolution == stream::RemoteResolutionTier::P540);
+assert(decisions[0].targetFps == 30);
+assert(decisions[0].maxBitrateKbps == 14000);
+assert(decisions[1].resolution == stream::RemoteResolutionTier::P540);
+assert(decisions[1].targetFps == 25);
+assert(decisions[1].maxBitrateKbps == 14000);
+assert(decisions[1].priority == 40);
+```
+
+### Steps
+1. 拆分编码档案与角色优先级，避免档案名称隐含焦点或后台语义。
+2. 定义8组用户指定的分辨率/FPS组合，并按现有码率表为1080p、720p、540p和360p分别配置48、24、14和7 Mbps上限。
+3. 使用 `makeRemoteVideoProfile()` 把命名档案与焦点/可见后台/最小化优先级组合为生产角色别名。
+4. 调整 `RemoteQualityCoordinator` 只选择一次 `roleProfile`，后续统一读取分辨率、FPS、码率和优先级。
+5. 更新策略和协调器回归测试，覆盖8组档案、角色切换、遮挡/最小化、多窗口和焦点防抖。
+
+### Verification
+- 已使用 VS2022 C++20 直接编译 `tests/remote_video_policy_tests.cpp`，编译通过。
+- 已运行 `build/resolution-policy-review/remote_video_policy_tests.exe`，所有档案和角色策略断言通过。
+- 已使用 VS2022 C++20 直接编译 `tests/remote_quality_coordinator_tests.cpp` 与 `src/ui/RemoteQualityCoordinator.cpp`，编译通过。
+- 已运行 `build/resolution-policy-review/remote_quality_coordinator_tests.exe`，角色分辨率、FPS、码率、优先级、多窗口和焦点防抖断言全部通过。
+
 ## 2026-08-10 13:47 - 主窗口标题栏显示被控会话总数
 
 ### Changed Location

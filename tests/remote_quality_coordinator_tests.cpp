@@ -29,36 +29,39 @@ int main()
         1000);
     assert(decisions.size() == 3);
     assert(decisions[0].effectiveMode == stream::RemoteQualityMode::HighQualityLocked);
-    assert(decisions[0].resolution == stream::RemoteResolutionTier::P1080);
-    assert(decisions[0].targetWidth == 1920 && decisions[0].targetHeight == 1080);
-    assert(decisions[0].targetFps == 60); // wjy: 单窗口和多窗口焦点统一使用1080p/60。
+    assert(decisions[0].resolution == stream::RemoteResolutionTier::P540);
+    assert(decisions[0].targetWidth == 960 && decisions[0].targetHeight == 540);
+    assert(decisions[0].targetFps == 30); // wjy: 当前焦点角色直接展开为540p/30 FPS命名档案。
+    assert(decisions[0].maxBitrateKbps == 14000); // wjy: 焦点降到540p后同步使用14 Mbps码率上限，不再沿用旧1080p的48 Mbps。
     assert(!decisions[0].audioEnabled);
-    assert(decisions[0].priority == 100); // wjy: 单选质量变量默认请求1080p/60并获得最高可见优先级。
+    assert(decisions[0].priority == 100); // wjy: 焦点角色继续使用档案别名配置的最高可见优先级。
     // 音频由标题栏按钮独立控制，不由质量协调器按焦点授予。
 
     assert(decisions[1].effectiveMode == stream::RemoteQualityMode::Smooth);
-    assert(decisions[1].resolution == stream::RemoteResolutionTier::P720);
-    assert(decisions[1].targetWidth == 1280 && decisions[1].targetHeight == 720);
-    assert(decisions[1].targetFps == 30); // wjy: 可见后台固定720p/30，不按窗口数量降帧。
-    assert(decisions[1].priority == 10);
+    assert(decisions[1].resolution == stream::RemoteResolutionTier::P540);
+    assert(decisions[1].targetWidth == 960 && decisions[1].targetHeight == 540);
+    assert(decisions[1].targetFps == 25); // wjy: 可见后台固定使用540p/25 FPS档，不按窗口数量动态改写。
+    assert(decisions[1].maxBitrateKbps == 14000); // wjy: 后台分辨率和码率成套取自同一档案。
+    assert(decisions[1].priority == 40); // wjy: 协调器使用角色别名的40优先级，不再硬编码为10。
     assert(!decisions[1].audioEnabled); // wjy: 其它普通可见窗口统一降到最低保活档且没有音频。
 
     assert(decisions[2].effectiveMode == stream::RemoteQualityMode::Smooth);
-    assert(decisions[2].resolution == stream::RemoteResolutionTier::P720);
-    assert(decisions[2].targetWidth == 1280 && decisions[2].targetHeight == 720);
-    assert(decisions[2].targetFps == 30); // wjy: 失焦全屏窗口按统一后台配置运行。
+    assert(decisions[2].resolution == stream::RemoteResolutionTier::P540);
+    assert(decisions[2].targetWidth == 960 && decisions[2].targetHeight == 540);
+    assert(decisions[2].targetFps == 25); // wjy: 失焦全屏窗口与普通可见后台使用同一540p/25 FPS档。
     assert(!decisions[2].audioEnabled); // wjy: 全屏窗口失焦时使用后台FPS，音频仍由标题栏按钮独立控制。
 
     activeWindow.active = false;
     backgroundWindow.active = true;
     decisions = coordinator.evaluate(configuration, {activeWindow, backgroundWindow}, 1100);
     assert(decisions[0].effectiveMode == stream::RemoteQualityMode::Smooth);
-    assert(decisions[0].resolution == stream::RemoteResolutionTier::P720);
-    assert(decisions[0].targetFps == 30);
+    assert(decisions[0].resolution == stream::RemoteResolutionTier::P540);
+    assert(decisions[0].targetFps == 25);
+    assert(decisions[0].priority == 40); // wjy: 原焦点窗口失焦后立即切换为完整后台角色档案。
     assert(!decisions[0].audioEnabled);
     assert(decisions[1].effectiveMode == stream::RemoteQualityMode::HighQualityLocked);
-    assert(decisions[1].resolution == stream::RemoteResolutionTier::P1080);
-    assert(decisions[1].targetFps == 60);
+    assert(decisions[1].resolution == stream::RemoteResolutionTier::P540);
+    assert(decisions[1].targetFps == 30);
     assert(decisions[1].priority == 100);
     assert(!decisions[1].audioEnabled);
 
@@ -67,7 +70,8 @@ int main()
     assert(decisions.front().minimized);
     assert(decisions.front().resolution == stream::RemoteResolutionTier::P360); // wjy: 最小化窗口固定请求640x360，避免后台继续编码540p。
     assert(decisions.front().targetFps == configuration.minimizedFps);
-    assert(decisions.front().priority == 10);
+    assert(decisions.front().maxBitrateKbps == 7000); // wjy: 最小化档与360p/1 FPS命名档案共享7 Mbps上限。
+    assert(decisions.front().priority == 5); // wjy: 最小化窗口真正使用角色配置的最低优先级。
     assert(!decisions.front().audioEnabled);
     assert(decisions.front().reason == ui::RemoteQualityDegradationReason::Minimized); // wjy: 活动窗口一旦最小化，后台安全档优先于高质量身份。
 
@@ -79,7 +83,7 @@ int main()
     assert(decisions.front().fullyOccluded); // wjy: 决策保留遮挡来源，诊断文字不会误报为用户主动最小化。
     assert(decisions.front().resolution == stream::RemoteResolutionTier::P360);
     assert(decisions.front().targetFps == configuration.minimizedFps); // wjy: 遮挡窗口与最小化窗口严格使用同一1 FPS配置。
-    assert(decisions.front().priority == 10);
+    assert(decisions.front().priority == 5); // wjy: 完全遮挡复用最小化档的全部参数，包括优先级。
     assert(decisions.front().reason == ui::RemoteQualityDegradationReason::FullyOccluded);
     backgroundWindow.fullyOccluded = false; // wjy: 后续测试恢复普通可见窗口状态，避免遮挡标记污染其它策略断言。
     // ===end====
@@ -97,9 +101,9 @@ int main()
     activeWindow.active = true;
     decisions = coordinator.evaluate(thresholdConfiguration, {activeWindow}, 1350);
     assert(decisions.front().effectiveMode == stream::RemoteQualityMode::HighQualityLocked);
-    assert(decisions.front().resolution == stream::RemoteResolutionTier::P1080);
-    assert(decisions.front().targetWidth == 1920 && decisions.front().targetHeight == 1080);
-    assert(decisions.front().targetFps == 60);
+    assert(decisions.front().resolution == stream::RemoteResolutionTier::P540);
+    assert(decisions.front().targetWidth == 960 && decisions.front().targetHeight == 540);
+    assert(decisions.front().targetFps == 30); // wjy: 旧高清面积阈值不会覆盖当前焦点别名选择的540p/30 FPS档。
     assert(decisions.front().reason == ui::RemoteQualityDegradationReason::None);
 
     ui::RemoteQualityWindowMetrics hiddenWindow;
@@ -115,8 +119,8 @@ int main()
     fullScreenWindow.softwareFallback = false; // wjy: 清除上一段软件回退状态，单独验证正常硬件路径下单窗口无焦点仍保持高质量。
     decisions = coordinator.evaluate(configuration, {fullScreenWindow}, 1500);
     assert(decisions.front().effectiveMode == stream::RemoteQualityMode::HighQualityLocked);
-    assert(decisions.front().resolution == stream::RemoteResolutionTier::P1080);
-    assert(decisions.front().targetFps == 60);
+    assert(decisions.front().resolution == stream::RemoteResolutionTier::P540);
+    assert(decisions.front().targetFps == 30);
     assert(decisions.front().priority == 100);
     assert(decisions.front().reason == ui::RemoteQualityDegradationReason::None);
     assert(!decisions.front().audioEnabled); // wjy: 总共只有一个可见远控窗口时即使没有焦点也保持单选质量变量，音频仍由窗口按钮独立控制。
@@ -127,11 +131,12 @@ int main()
     decisions = coordinator.evaluate(configuration, {activeWindow, backgroundWindow}, 1550);
     assert(decisions.size() == 2);
     assert(decisions[0].effectiveMode == stream::RemoteQualityMode::Smooth);
-    assert(decisions[0].resolution == stream::RemoteResolutionTier::P720);
-    assert(decisions[0].targetFps == 30);
+    assert(decisions[0].resolution == stream::RemoteResolutionTier::P540);
+    assert(decisions[0].targetFps == 25);
+    assert(decisions[0].priority == 40); // wjy: 多窗口无焦点时每个可见窗口都展开为后台角色档案。
     assert(decisions[1].effectiveMode == stream::RemoteQualityMode::Smooth);
-    assert(decisions[1].resolution == stream::RemoteResolutionTier::P720);
-    assert(decisions[1].targetFps == 30); // wjy: 存在两个远控窗口且都无焦点时，两者都使用统一后台720p/30。
+    assert(decisions[1].resolution == stream::RemoteResolutionTier::P540);
+    assert(decisions[1].targetFps == 25); // wjy: 存在两个远控窗口且都无焦点时，两者都使用统一后台540p/25 FPS档。
 
     ui::RemotePerformanceSignalSampler sampler;
     ui::RemotePerformanceCounters firstSample;
@@ -170,31 +175,31 @@ int main()
     highRefreshWindow.performance.averageDecodeMs = 4.0;
     highRefreshWindow.performance.averageProcessingDelayMs = 6.0;
     auto highRefreshDecisions = highRefreshCoordinator.evaluate(configuration, {highRefreshWindow}, 1000);
-    assert(highRefreshDecisions.front().targetFps == 60);
+    assert(highRefreshDecisions.front().targetFps == 30);
     highRefreshDecisions = highRefreshCoordinator.evaluate(configuration, {highRefreshWindow}, 6000);
-    assert(highRefreshDecisions.front().targetFps == 60); // wjy: 即使Host/显示器支持144Hz，最大窗口策略也固定为60 FPS。
+    assert(highRefreshDecisions.front().targetFps == 30); // wjy: 即使Host/显示器支持144Hz，焦点窗口仍严格使用当前540p/30 FPS命名档。
 
     highRefreshWindow.receiveFps = 90.0;
     highRefreshDecisions = highRefreshCoordinator.evaluate(configuration, {highRefreshWindow}, 7000);
     highRefreshDecisions = highRefreshCoordinator.evaluate(configuration, {highRefreshWindow}, 12000);
-    assert(highRefreshDecisions.front().targetFps == 60); // wjy: 健康采样不会把最大窗口升到60以上。
+    assert(highRefreshDecisions.front().targetFps == 30); // wjy: 健康采样不会绕过命名档案把焦点窗口升到30 FPS以上。
 
     highRefreshWindow.receiveFps = 100.0;
     highRefreshWindow.performance.packetLossRatio = 0.04;
     highRefreshCoordinator.evaluate(configuration, {highRefreshWindow}, 13000);
     highRefreshDecisions = highRefreshCoordinator.evaluate(configuration, {highRefreshWindow}, 15000);
-    assert(highRefreshDecisions.front().targetFps == 60); // wjy: 最大窗口不因后台/统计压力改写为低于60的固定高质量请求。
+    assert(highRefreshDecisions.front().targetFps == 30); // wjy: 网络统计压力不改写固定焦点档的30 FPS请求。
 
     highRefreshWindow.receiveFps = 90.0;
     highRefreshWindow.performance.packetLossRatio = 0.0;
     highRefreshCoordinator.evaluate(configuration, {highRefreshWindow}, 20000);
     highRefreshDecisions = highRefreshCoordinator.evaluate(configuration, {highRefreshWindow}, 24000);
-    assert(highRefreshDecisions.front().targetFps == 60); // wjy: 固定高质量没有90 FPS冷却档位。
+    assert(highRefreshDecisions.front().targetFps == 30); // wjy: 固定焦点档没有额外的高刷新率冷却或恢复档位。
 
     highRefreshWindow.receiveFps = 40.0;
     highRefreshWindow.performance.packetLossRatio = 0.10;
     highRefreshDecisions = highRefreshCoordinator.evaluate(configuration, {highRefreshWindow}, 25000);
-    assert(highRefreshDecisions.front().targetFps == 60); // 严重压力直接回60并进入冷却，不继续向下破坏高质量语义。
+    assert(highRefreshDecisions.front().targetFps == 30); // wjy: 严重压力只作为诊断信号，不破坏当前540p/30 FPS固定角色语义。
 
     ui::RemoteQualityWindowMetrics legacyWindow = highRefreshWindow;
     legacyWindow.windowId = 11;
@@ -203,7 +208,7 @@ int main()
     legacyWindow.receiveFps = 60.0;
     legacyWindow.performance.packetLossRatio = 0.0;
     highRefreshDecisions = highRefreshCoordinator.evaluate(configuration, {legacyWindow}, 26000);
-    assert(highRefreshDecisions.front().targetFps == 60); // 旧Host或旧DLL始终保留v1原始分辨率/60兼容路径。
+    assert(highRefreshDecisions.front().targetFps == 30); // wjy: 旧Host或旧DLL仍通过v1质量请求接收当前540p/30 FPS焦点档。
 
     ui::RemoteQualityCoordinator bandwidthCoordinator;
     ui::RemoteQualityWindowMetrics bandwidthLimited = highRefreshWindow;
@@ -214,11 +219,11 @@ int main()
     bandwidthLimited.performance.availableIncomingBitrateKbps = 25000.0;
     bandwidthCoordinator.evaluate(configuration, {bandwidthLimited}, 1000);
     highRefreshDecisions = bandwidthCoordinator.evaluate(configuration, {bandwidthLimited}, 6000);
-    assert(highRefreshDecisions.front().targetFps == 60); // 已知可用带宽低于当前码率余量时优先保住单帧清晰度。
+    assert(highRefreshDecisions.front().targetFps == 30); // wjy: 已知可用带宽只作诊断，不覆盖已选命名档的帧率。
     bandwidthLimited.performance.availableIncomingBitrateKbps = 60000.0;
     bandwidthCoordinator.evaluate(configuration, {bandwidthLimited}, 7000);
     highRefreshDecisions = bandwidthCoordinator.evaluate(configuration, {bandwidthLimited}, 12000);
-    assert(highRefreshDecisions.front().targetFps == 60); // wjy: 带宽余量变化也不提升最大窗口的60 FPS上限。
+    assert(highRefreshDecisions.front().targetFps == 30); // wjy: 带宽余量变化也不提升焦点档的30 FPS上限。
     std::vector<ui::RemoteQualityWindowMetrics> manyWindows;
     manyWindows.reserve(20);
     for (int index = 1; index <= 20; ++index) {
@@ -235,9 +240,9 @@ int main()
         configuration,
         std::vector<ui::RemoteQualityWindowMetrics>(manyWindows.begin(), manyWindows.begin() + 6),
         30000);
-    assert(sixWindowDecisions.front().targetFps == 60);
+    assert(sixWindowDecisions.front().targetFps == 30);
     for (std::size_t index = 1; index < sixWindowDecisions.size(); ++index) {
-        assert(sixWindowDecisions[index].targetFps == 30); // wjy: 6个可见窗口仍使用统一后台30 FPS。
+        assert(sixWindowDecisions[index].targetFps == 25); // wjy: 6个可见窗口时唯一焦点使用30 FPS，其余统一使用后台25 FPS档。
     }
 
     manyWindows.front().presenterDropRatio = 0.03;
@@ -245,9 +250,9 @@ int main()
         configuration,
         std::vector<ui::RemoteQualityWindowMetrics>(manyWindows.begin(), manyWindows.begin() + 6),
         30500);
-    assert(sixWindowPressureDecisions.front().targetFps == 60);
+    assert(sixWindowPressureDecisions.front().targetFps == 30);
     for (std::size_t index = 1; index < sixWindowPressureDecisions.size(); ++index) {
-        assert(sixWindowPressureDecisions[index].targetFps == 30); // wjy: Presenter噪声不再触发旧数量FPS梯度。
+        assert(sixWindowPressureDecisions[index].targetFps == 25); // wjy: Presenter噪声不触发旧数量FPS梯度，后台仍保持命名档。
     }
     manyWindows.front().presenterDropRatio = 0.0;
 
@@ -255,35 +260,35 @@ int main()
         configuration,
         std::vector<ui::RemoteQualityWindowMetrics>(manyWindows.begin(), manyWindows.begin() + 11),
         31000);
-    assert(elevenWindowDecisions.front().targetFps == 60);
+    assert(elevenWindowDecisions.front().targetFps == 30);
     for (std::size_t index = 1; index < elevenWindowDecisions.size(); ++index) {
-        assert(elevenWindowDecisions[index].targetFps == 30); // wjy: 11个可见窗口仍使用统一后台30 FPS。
+        assert(elevenWindowDecisions[index].targetFps == 25); // wjy: 11个可见窗口仍使用统一后台25 FPS档。
     }
 
     auto twentyWindowDecisions = countCoordinator.evaluate(configuration, manyWindows, 32000);
-    assert(twentyWindowDecisions.front().targetFps == 60);
+    assert(twentyWindowDecisions.front().targetFps == 30);
     for (std::size_t index = 1; index < twentyWindowDecisions.size(); ++index) {
-        assert(twentyWindowDecisions[index].targetFps == 30); // wjy: 20个可见窗口仍使用统一后台30 FPS。
+        assert(twentyWindowDecisions[index].targetFps == 25); // wjy: 20个可见窗口仍使用统一后台25 FPS档。
     }
 
     manyWindows.push_back(manyWindows.back());
     manyWindows.back().windowId = 21;
     auto twentyOneWindowDecisions = countCoordinator.evaluate(configuration, manyWindows, 32500);
-    assert(twentyOneWindowDecisions.front().targetFps == 60);
+    assert(twentyOneWindowDecisions.front().targetFps == 30);
     for (std::size_t index = 1; index < twentyOneWindowDecisions.size(); ++index) {
-        assert(twentyOneWindowDecisions[index].targetFps == 30); // wjy: 超过20个可见窗口也不再按数量降帧。
+        assert(twentyOneWindowDecisions[index].targetFps == 25); // wjy: 超过20个可见窗口也不再按数量改写固定后台档。
     }
 
     manyWindows.front().presenterDropRatio = 0.20;
     manyWindows.front().workerBacklog = true;
     auto severePresenterDecisions = countCoordinator.evaluate(configuration, manyWindows, 33000);
-    assert(severePresenterDecisions.front().targetFps == 60);
+    assert(severePresenterDecisions.front().targetFps == 30);
     for (std::size_t index = 1; index < severePresenterDecisions.size(); ++index) {
-        assert(severePresenterDecisions[index].targetFps == 30); // wjy: 压力只记录，不改写统一后台FPS。
+        assert(severePresenterDecisions[index].targetFps == 25); // wjy: 压力只记录，不改写统一后台25 FPS档。
     }
     severePresenterDecisions = countCoordinator.evaluate(configuration, manyWindows, 34100);
     for (std::size_t index = 1; index < severePresenterDecisions.size(); ++index) {
-        assert(severePresenterDecisions[index].targetFps == 30); // wjy: 恢复期间仍保持统一后台FPS。
+        assert(severePresenterDecisions[index].targetFps == 25); // wjy: 恢复期间仍保持统一后台25 FPS档。
     }
 
     ui::RemoteQualityCoordinator debounceCoordinator;
