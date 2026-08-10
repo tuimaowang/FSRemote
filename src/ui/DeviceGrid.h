@@ -236,7 +236,7 @@ private:
     void saveRemoteQualitySettingsFromControls(); // wjy: 收集远控画质页字段、统一归一化持久化并立即通知跟随全局的窗口。
     void registerRemoteQualityWindow(RemoteDesktopWindow* window); // wjy: 普通和平铺窗口共用同一套质量注册、销毁清理和即时重算逻辑。
     void requestRemoteQualityEvaluation(); // wjy: 合并同一事件循环内多次窗口变化，最多排队一个全局质量计算任务。
-    void evaluateRemoteQuality(); // wjy: 每秒汇总窗口，保留真实焦点窗口的原始/60请求并按当前后台策略降低其它窗口。
+    void evaluateRemoteQuality(); // wjy: 每秒汇总窗口并在状态事件时即时重算，完全遮挡临时360/1，重新可见恢复手选或自动档。
     void saveShortcutKeySetting(int shortcutIndex, const QString& shortcutText); // wjy: Save one keyboard shortcut when its editor loses focus or receives Enter.
     void registerGlobalShortcuts();
     void unregisterGlobalShortcuts();
@@ -305,7 +305,7 @@ private:
     platform::DeviceRealtimeStateService* m_realtimeStateService = nullptr; // wjy: 由 main 持有且晚于 MainWindow 销毁，DeviceGrid 只连接和调用，不负责释放。
     RemoteInputBroadcastCoordinator m_remoteInputBroadcastCoordinator; // wjy: 单一协调器覆盖普通和平铺窗口，DeviceGrid 析构前先由窗口注销并完成同步输入释放。
     std::unique_ptr<RemoteViewerLifecycleManager> m_remoteViewerLifecycleManager; // wjy: 生命周期晚于窗口批量stop，析构时再次兜底join固定工作线程。
-    RemoteQualityCoordinator m_remoteQualityCoordinator; // wjy: 一个控制端按真实焦点统一授予唯一高质量角色，其余窗口沿用后台FPS策略。
+    RemoteQualityCoordinator m_remoteQualityCoordinator; // wjy: 一个控制端统一计算手选、全屏、默认和遮挡精确档位，不再按焦点分配画质。
     QTimer* m_remoteQualityTimer = nullptr; // wjy: 1秒采样接收FPS/码率，最小化和用户切换模式另走即时重算信号。
     // =====wjy====
     platform::LocalNetworkBandwidthMonitor m_titlebarBandwidthMonitor; // wjy: 主窗口内部只读采样物理网卡，不依赖或启动外部监控程序。

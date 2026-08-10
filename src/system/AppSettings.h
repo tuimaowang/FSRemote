@@ -4,7 +4,7 @@
 #include <QRect>
 #include <QString>
 
-#include "stream/RemoteQualityPolicy.h"
+#include "stream/RemoteVideoPolicy.h"
 
 namespace platform {
 
@@ -41,8 +41,8 @@ public:
     // =====wjy====
     static stream::RemoteQualityConfiguration remoteQualityConfiguration(); // wjy: 一次读取并归一化控制端全局远控画质默认值。
     static void setRemoteQualityConfiguration(const stream::RemoteQualityConfiguration& configuration); // wjy: 主窗口设置变更只持久化默认模式，高清面积阈值由代码内置配置控制。
-    static bool remoteDeviceQualityMode(const QString& deviceKey, stream::RemoteQualityMode* mode); // wjy: 按目标设备读取上次远控窗口画质；首次设备返回false并由窗口使用“自动”。
-    static void setRemoteDeviceQualityMode(const QString& deviceKey, stream::RemoteQualityMode mode); // wjy: 用户切换标题栏画质后立即按设备保存，关闭程序后仍能恢复。
+    static bool remoteDeviceQualityPreset(const QString& deviceKey, stream::RemoteVideoQualityPreset* preset); // wjy: 按目标设备读取上次精确的分辨率/FPS档位，配置存在即代表用户手动选择过。
+    static void setRemoteDeviceQualityPreset(const QString& deviceKey, stream::RemoteVideoQualityPreset preset); // wjy: 用户手选后立即保存稳定档位枚举，程序重启和重新远控都可恢复。
     // ===end====
     static QKeySequence remoteShortcutFullscreen();
     static void setRemoteShortcutFullscreen(const QKeySequence& shortcut);

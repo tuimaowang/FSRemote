@@ -1,10 +1,7 @@
 #include "ui/RemoteQualityCoordinator.h"
 
-#include "stream/RemoteVideoPolicy.h"
-
 #include <algorithm>
 #include <cmath>
-#include <cstddef>
 
 namespace ui {
 
@@ -13,26 +10,28 @@ bool shouldDispatchRemoteQualityDecision(
     bool viewerAvailable,
     bool closing)
 {
-    return decision.requestRemoteProfile && viewerAvailable && !closing; // wjy: 焦点未稳定时仅更新本地角色，禁止Host连续切分辨率、FPS和关键帧。
+    return decision.requestRemoteProfile && viewerAvailable && !closing; // wjy: 精确档位变化立即下发；Viewer未创建或窗口关闭时继续由统一门禁拦截。
 }
 
 namespace {
 
-int baselineTargetFps(stream::RemoteQualityMode mode)
+stream::RemoteQualityMode qualityModeForPreset(stream::RemoteVideoQualityPreset preset)
 {
-    switch (mode) {
-    case stream::RemoteQualityMode::Balanced:
-        return 45; // wjy: 均衡固定1080p/45 FPS，不读取旧全局目标或接收端压力。
-    case stream::RemoteQualityMode::HighQualityLocked:
-    case stream::RemoteQualityMode::Automatic:
-    case stream::RemoteQualityMode::Smooth:
-    case stream::RemoteQualityMode::FollowGlobal:
-        return 60; // wjy: 高质量、自动和流畅的可见预设均从60 FPS开始；只有自动模式后续允许降档。
+    switch (preset) {
+    case stream::RemoteVideoQualityPreset::P1080_60:
+    case stream::RemoteVideoQualityPreset::P1080_30:
+        return stream::RemoteQualityMode::HighQualityLocked;
+    case stream::RemoteVideoQualityPreset::P720_60:
+    case stream::RemoteVideoQualityPreset::P720_30:
+        return stream::RemoteQualityMode::Balanced;
+    case stream::RemoteVideoQualityPreset::P540_30:
+    case stream::RemoteVideoQualityPreset::P540_25:
+    case stream::RemoteVideoQualityPreset::P360_25:
+    case stream::RemoteVideoQualityPreset::P360_1:
+        return stream::RemoteQualityMode::Smooth; // wjy: 协议mode只作兼容提示，真实尺寸、FPS和码率全部由精确预设字段决定。
     }
-    return 60;
+    return stream::RemoteQualityMode::Smooth;
 }
-
-// ===end====
 
 } // namespace
 
@@ -100,234 +99,55 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
     const std::vector<RemoteQualityWindowMetrics>& windows,
     int64_t nowMs)
 {
-    const stream::RemoteQualityConfiguration configuration =
-        stream::normalizedRemoteQualityConfiguration(rawConfiguration);
+    (void)rawConfiguration; // wjy: 保留调用签名兼容现有设置页；八档策略不再读取旧自动模式和压力阈值。
+    (void)nowMs; // wjy: 遮挡解除、全屏切换和用户手选要求立即生效，不再使用焦点防抖或性能滞回。
     std::vector<RemoteQualityDecision> decisions;
     decisions.reserve(windows.size());
-
-    const int validWindowCount = static_cast<int>(std::count_if(
-        windows.begin(),
-        windows.end(),
-        [](const RemoteQualityWindowMetrics& window) { return window.windowId != 0; })); // wjy: 仅用于保留单窗口失焦时的高质量行为，不再选择第二套画质配置。
-    const bool singleRemoteWindow = validWindowCount == 1; // wjy: 单窗口保持高质量，多窗口只给真实焦点窗口高质量。
-    uintptr_t focusedVisibleWindowId = 0;
-    for (const RemoteQualityWindowMetrics& window : windows) {
-        if (window.windowId == 0 || !window.visible || window.minimized || window.fullyOccluded || !window.active) {
-            continue;
-        }
-        // wjy: Qt 主线程实际只会有一个活动顶层窗口；即使异常情况下多个快照同时标记 active，
-        // 也稳定保留遍历到的第一个焦点窗口，避免多个会话同时获得高质量优先级。
-        focusedVisibleWindowId = window.windowId;
-        break;
-    }
-
 
     for (const RemoteQualityWindowMetrics& window : windows) {
         RemoteQualityDecision decision;
         decision.windowId = window.windowId;
-        // =====wjy====
-        const bool eligibleVisibleWindow = window.visible && !window.minimized && !window.fullyOccluded; // wjy: 完全遮挡与隐藏、最小化一样不再占用前台或后台可见资源。
-        decision.minimized = !eligibleVisibleWindow; // wjy: 资源策略刻意复用最小化角色，直接获得360p/1 FPS和最低优先级。
-        decision.fullyOccluded = window.visible && !window.minimized && window.fullyOccluded; // wjy: 单独保存真实原因，标题栏不会把遮挡误写成用户主动最小化。
-        decision.active = window.active && eligibleVisibleWindow; // wjy: 完全遮挡窗口即使保留迟到激活标记也不能继续持有高质量角色。
-        // ===end====
+        const bool eligibleVisibleWindow = window.visible && !window.minimized && !window.fullyOccluded;
+        decision.minimized = !eligibleVisibleWindow;
+        decision.fullyOccluded = window.visible && !window.minimized && window.fullyOccluded;
+        decision.active = window.active && eligibleVisibleWindow;
         decision.fullScreen = window.fullScreen && eligibleVisibleWindow;
-        decision.softwareFallback = window.softwareFallback;
-        const bool focusedWindowEligible = eligibleVisibleWindow
-            && window.windowId == focusedVisibleWindowId;
-        const bool highPerformance = eligibleVisibleWindow
-            && (singleRemoteWindow || focusedWindowEligible); // wjy: 单窗口或真实焦点窗口统一使用同一个高质量配置。
-        const auto roleProfile = decision.minimized
-            ? stream::RemoteVideoPolicy::minimizedProfile()
-            : highPerformance
-                ? stream::kFocusedRemoteVideoProfile
-                : stream::RemoteVideoPolicy::backgroundProfile(); // wjy: 分辨率、FPS、码率和优先级在分支前一次选定，后续所有决策共享同一角色档案。
-        decision.audioEnabled = false; // wjy: 音频不再由协调器控制，RemoteDesktopWindow按自己的标题栏按钮独立下发。
-        decision.effectiveMode = highPerformance
-            ? stream::RemoteQualityMode::HighQualityLocked
-            : stream::RemoteQualityMode::Smooth; // wjy: 单窗口或多窗口真实焦点使用高质量，其余窗口进入统一后台安全档。
-        decision.priority = static_cast<int>(roleProfile.priority); // wjy: 真正使用角色档案中的100/40/5优先级，修改顶部别名后协调器无需另行同步。
+        decision.softwareFallback = window.softwareFallback; // wjy: 软件回退继续进入诊断，但不再成为覆盖用户手选档的第二个例外。
+        decision.userSelectedPreset = window.userQualityPresetActive;
 
-        WindowState& state = m_states[window.windowId];
-        const int baselineFps = fpsIndexForTarget(baselineTargetFps(decision.effectiveMode));
-        const int automaticFpsFloor = fpsIndexForTarget(30); // wjy: 自动模式唯一可见下限固定30 FPS，不再读取旧严重压力或总预算参数。
-        const bool automaticMode = decision.effectiveMode == stream::RemoteQualityMode::Automatic;
-        if (!state.initialized) {
-            state = {};
-            state.fpsIndex = baselineFps;
-            state.effectiveMode = decision.effectiveMode;
-            state.initialized = true; // wjy: 新窗口从模式基线开始，不继承之前同设备窗口的降级历史。
-        } else if (state.effectiveMode != decision.effectiveMode) {
-            state.fpsIndex = baselineFps; // wjy: 焦点导致前后台模式切换时重置画质档位，但不能清空远端角色防抖状态。
-            state.pressureSinceMs = 0;
-            state.recoverySinceMs = 0;
-            state.degradationReason = RemoteQualityDegradationReason::None;
-            state.effectiveMode = decision.effectiveMode; // wjy: 保留pending/remoteHighPerformance与roleChangedAtMs，350ms稳定窗口不会被模式重置绕过。
-        }
-        if (!state.roleInitialized) {
-            state.pendingHighPerformance = highPerformance;
-            state.remoteHighPerformance = highPerformance;
-            state.roleChangedAtMs = nowMs;
-            state.roleInitialized = true;
-            decision.requestRemoteProfile = true;
-        } else {
-            if (state.pendingHighPerformance != highPerformance) {
-                state.pendingHighPerformance = highPerformance;
-                state.roleChangedAtMs = nowMs; // wjy: 每次焦点抖动重新计时，远端不会连续触发关键帧和码率突发。
-            }
-            if (state.remoteHighPerformance != state.pendingHighPerformance
-                && nowMs - state.roleChangedAtMs
-                    >= static_cast<int64_t>(stream::kRemoteProfileFocusDebounceMs)) {
-                state.remoteHighPerformance = state.pendingHighPerformance;
-            }
-            decision.requestRemoteProfile = state.remoteHighPerformance == highPerformance;
-        }
-        state.fpsIndex = std::clamp(state.fpsIndex, baselineFps, automaticFpsFloor);
+        const stream::RemoteVideoQualityPreset preferredPreset = window.userQualityPresetActive
+            ? window.userQualityPreset
+            : decision.fullScreen
+                ? stream::kFullscreenRemoteVideoQualityPreset
+                : stream::kDefaultRemoteVideoQualityPreset; // wjy: 手选最高；无手选时全屏720/30，普通窗口540/30，焦点完全不参与。
+        decision.preset = eligibleVisibleWindow
+            ? preferredPreset
+            : stream::kOccludedRemoteVideoQualityPreset; // wjy: 完全遮挡、最小化或隐藏统一临时降到360/1，重新可见后下一次评估立即恢复原意图。
 
-        if (!highPerformance) {
-            state.fpsIndex = baselineFps;
-            state.pressureSinceMs = 0;
-            state.recoverySinceMs = 0;
-            state.degradationReason = RemoteQualityDegradationReason::None;
-            decision.resolution = roleProfile.resolution; // wjy: 最小化和可见后台直接读取统一角色配置的分辨率档位。
-            decision.targetFps = static_cast<int>(roleProfile.targetFps); // wjy: 最小化1FPS、后台25FPS均由命名角色档案提供。
-            // =====wjy====
-            decision.reason = decision.fullyOccluded
-                ? RemoteQualityDegradationReason::FullyOccluded // wjy: 遮挡与最小化使用同一画质，但保留独立诊断原因。
-                : decision.minimized
-                    ? RemoteQualityDegradationReason::Minimized
-                    : RemoteQualityDegradationReason::Background; // wjy: 仅仍有可见区域的非焦点窗口使用命名后台540p/25 FPS档。
-            // ===end====
-        } else if (window.softwareFallback) {
-            state.fpsIndex = baselineFps;
-            state.pressureSinceMs = 0;
-            state.recoverySinceMs = 0;
-            state.degradationReason = RemoteQualityDegradationReason::None;
-            decision.reason = RemoteQualityDegradationReason::SoftwareFallback;
-            decision.resolution = stream::RemoteResolutionTier::P540; // wjy: 最大窗口的软件回退仍使用540p安全档，与正常角色档分开诊断。
-            decision.targetFps = 24; // wjy: 软件Presenter回退使用540p/24安全档，退出回退后立即恢复当前单选/多选前台质量变量。
-        } else if (!automaticMode) {
-            state.fpsIndex = baselineFps;
-            state.pressureSinceMs = 0;
-            state.recoverySinceMs = 0;
-            state.degradationReason = RemoteQualityDegradationReason::None;
-            decision.resolution = roleProfile.resolution; // wjy: 焦点窗口与后台分支一样从已选角色档案读取分辨率。
-            decision.targetFps = static_cast<int>(roleProfile.targetFps); // wjy: 当前焦点别名使用540p/30 FPS，后续替换别名即可整组切换。
-            if (decision.effectiveMode == stream::RemoteQualityMode::Balanced
-                || decision.effectiveMode == stream::RemoteQualityMode::Smooth) {
-                decision.reason = RemoteQualityDegradationReason::ModePreference; // wjy: 1080p或720p是用户主动预设，不显示成性能降级。
-            }
-        } else {
-            const int currentFps = stream::kRemoteFpsTiers[static_cast<std::size_t>(state.fpsIndex)];
-            const double frameBudgetMs = 1000.0 / std::max(1, currentFps);
-            const bool lowObservedFps = window.receiveFps > 1.0
-                && window.receiveFps < static_cast<double>(currentFps) * 0.80; // wjy: 低FPS只是结果信号，后面必须与真实管线压力相关才允许降档。
-            const bool decoderPressure = window.performance.valid
-                && (window.performance.averageDecodeMs >= frameBudgetMs * 0.70
-                    || window.performance.averageProcessingDelayMs >= frameBudgetMs * 0.90
-                    || window.performance.decoderDropRatio >= 0.05);
-            const bool networkPressure = window.performance.valid
-                && ((window.performance.packetLossRatio >= 0.03 && window.performance.roundTripTimeMs >= 80.0)
-                    || window.performance.averageJitterBufferDelayMs >= 80.0);
-            const bool freezePressure = window.performance.valid
-                && (window.performance.freezeCountDelta > 0
-                    || window.performance.freezeDurationDeltaMs >= 100.0);
-            const bool presenterPressure = window.presenterDropRatio >= 0.08;
-            const bool correlatedPressure = lowObservedFps
-                && (decoderPressure || networkPressure || freezePressure || presenterPressure); // wjy: 静止桌面即使只产生少量帧，只要所有直接压力健康就保持当前目标。
-            const bool severePressure = window.performance.valid
-                && (window.performance.freezeCountDelta >= 2
-                    || window.performance.freezeDurationDeltaMs >= 250.0
-                    || window.performance.averageDecodeMs >= frameBudgetMs
-                    || window.performance.decoderDropRatio >= 0.20
-                    || window.performance.packetLossRatio >= 0.08
-                    || window.performance.averageJitterBufferDelayMs >= 180.0)
-                || window.presenterDropRatio >= 0.20;
-            const bool pressure = severePressure || correlatedPressure; // wjy: 自动模式只响应当前窗口的真实管线证据，总预算不再跨窗口静默改写请求。
-            if (pressure) {
-                state.recoverySinceMs = 0;
-                if (state.pressureSinceMs == 0) state.pressureSinceMs = nowMs;
-                const int pressureHoldMs = severePressure
-                    ? std::min(configuration.degradationHoldMs, 1500)
-                    : configuration.degradationHoldMs; // wjy: 自动模式普通压力慢降，明确冻结或重丢帧可更快进入下一固定档。
-                if (nowMs - state.pressureSinceMs >= pressureHoldMs) {
-                    if (state.fpsIndex < automaticFpsFloor) {
-                        ++state.fpsIndex;
-                    }
-                    state.pressureSinceMs = nowMs; // wjy: 每个持续窗口只移动一档，使自动模式严格按60→45→30变化。
-                }
-                state.degradationReason = severePressure
-                    ? RemoteQualityDegradationReason::SeverePipelinePressure
-                    : RemoteQualityDegradationReason::PipelinePressure;
-                decision.reason = state.degradationReason;
-            } else {
-                state.pressureSinceMs = 0;
-                if (configuration.automaticRecoveryEnabled && state.fpsIndex > baselineFps) {
-                    if (state.recoverySinceMs == 0) state.recoverySinceMs = nowMs;
-                    if (nowMs - state.recoverySinceMs >= configuration.recoveryHoldMs) {
-                        --state.fpsIndex;
-                        state.recoverySinceMs = nowMs;
-                    }
-                } else {
-                    state.recoverySinceMs = 0;
-                }
-                if (state.fpsIndex > baselineFps) {
-                    decision.reason = state.degradationReason; // wjy: 压力消失后的滞回期保留最近原因，直到FPS恢复到模式基线。
-                } else {
-                    state.degradationReason = RemoteQualityDegradationReason::None;
-                }
-            }
-            decision.resolution = stream::RemoteResolutionTier::Native; // wjy: 自动模式始终保持原始分辨率，只在60/45/30三个FPS档之间适配。
-            decision.targetFps = stream::kRemoteFpsTiers[static_cast<std::size_t>(state.fpsIndex)];
-        }
-
+        const stream::RemoteVideoEncodingPreset encoding = stream::remoteVideoEncodingPreset(decision.preset);
+        decision.effectiveMode = qualityModeForPreset(decision.preset);
+        decision.resolution = encoding.resolution;
+        decision.targetFps = static_cast<int>(encoding.targetFps);
+        decision.maxBitrateKbps = static_cast<int>(encoding.maxBitrateKbps);
+        decision.priority = eligibleVisibleWindow ? 100 : 5; // wjy: 所有可见窗口同优先级，Host不能再按焦点把后台窗口隐式降档。
+        decision.reason = decision.fullyOccluded
+            ? RemoteQualityDegradationReason::FullyOccluded
+            : decision.minimized
+                ? RemoteQualityDegradationReason::Minimized
+                : window.userQualityPresetActive
+                    ? RemoteQualityDegradationReason::ModePreference
+                    : RemoteQualityDegradationReason::None;
+        decision.requestRemoteProfile = true; // wjy: RemoteDesktopWindow使用完整payload去重，相同档位不会每秒重复发包。
+        decision.audioEnabled = false;
         targetSize(decision.resolution, window.sourceWidth, window.sourceHeight, &decision.targetWidth, &decision.targetHeight);
-        decision.maxBitrateKbps = window.softwareFallback
-            ? bitrateForDecision(stream::RemoteResolutionTier::P540, 24, decision.effectiveMode)
-            : static_cast<int>(roleProfile.maxBitrateKbps); // wjy: 正常角色直接使用命名档案的48/24/14/7 Mbps码率，切换分辨率时不会遗留旧上限。
         decisions.push_back(decision);
     }
-    // =====wjy====
-    // 角色分辨率和FPS在上面的唯一配置源中一次决定，函数末尾不再进行第二次覆盖。
-    // ===end====
     return decisions;
 }
 
 void RemoteQualityCoordinator::removeWindow(uintptr_t windowId)
 {
-    m_states.erase(windowId);
-}
-
-int RemoteQualityCoordinator::fpsIndexForTarget(int fps)
-{
-    for (int index = 0; index < static_cast<int>(stream::kRemoteFpsTiers.size()); ++index) {
-        if (stream::kRemoteFpsTiers[static_cast<std::size_t>(index)] <= fps) return index;
-    }
-    return static_cast<int>(stream::kRemoteFpsTiers.size()) - 1;
-}
-
-int RemoteQualityCoordinator::bitrateForDecision(
-    stream::RemoteResolutionTier resolution,
-    int fps,
-    stream::RemoteQualityMode mode)
-{
-    int baseKbps = 80000;
-    switch (resolution) {
-    case stream::RemoteResolutionTier::Native: baseKbps = 80000; break;
-    case stream::RemoteResolutionTier::P1440: baseKbps = 80000; break;
-    case stream::RemoteResolutionTier::P1080: baseKbps = 48000; break;
-    case stream::RemoteResolutionTier::P900: baseKbps = 36000; break;
-    case stream::RemoteResolutionTier::P720: baseKbps = 24000; break;
-    case stream::RemoteResolutionTier::P540: baseKbps = 14000; break;
-    case stream::RemoteResolutionTier::P360: baseKbps = 7000; break;
-    }
-    double modeScale = 1.0; // wjy: 高质量使用80Mbps原始档上限，避免原始分辨率占用过高发送预算。
-    if (mode == stream::RemoteQualityMode::Smooth) modeScale = 0.85;
-    (void)fps; // wjy: FPS下降用于增加每帧可用码率并保持清晰度；WebRTC拥塞控制仍可按真实带宽使用低于上限的码率。
-    return std::clamp(
-        static_cast<int>(std::lround(baseKbps * modeScale)),
-        512,
-        240000); // wjy: 固定分辨率档位使用稳定码率上限，降帧不再同时把单帧质量预算砍掉。
+    (void)windowId; // wjy: 当前协调器无跨评估窗口状态，保留接口让既有销毁路径无需分叉。
 }
 
 void RemoteQualityCoordinator::targetSize(

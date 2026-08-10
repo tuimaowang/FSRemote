@@ -563,16 +563,41 @@ uint32_t viewerQualityModeValue(stream::RemoteQualityMode mode)
     return FSREMOTE_VIEWER_QUALITY_AUTOMATIC;
 }
 
-QString remoteQualityModeText(stream::RemoteQualityMode mode)
+QString remoteVideoQualityPresetText(stream::RemoteVideoQualityPreset preset)
 {
-    switch (mode) {
-    case stream::RemoteQualityMode::FollowGlobal: return QString::fromUtf8("自定义"); // wjy: 保留内部FollowGlobal兼容语义，但按产品文案在界面统一显示“自定义”。
-    case stream::RemoteQualityMode::Automatic: return QString::fromUtf8("自动");
-    case stream::RemoteQualityMode::HighQualityLocked: return QString::fromUtf8("高质量"); // wjy: 高质量对应原始分辨率/固定请求60 FPS，实际结果仍由Host和传输层回报。
-    case stream::RemoteQualityMode::Balanced: return QString::fromUtf8("均衡");
-    case stream::RemoteQualityMode::Smooth: return QString::fromUtf8("流畅");
+    switch (preset) {
+    case stream::RemoteVideoQualityPreset::P1080_60: return QStringLiteral("1080/60");
+    case stream::RemoteVideoQualityPreset::P1080_30: return QStringLiteral("1080/30");
+    case stream::RemoteVideoQualityPreset::P720_60: return QStringLiteral("720/60");
+    case stream::RemoteVideoQualityPreset::P720_30: return QStringLiteral("720/30");
+    case stream::RemoteVideoQualityPreset::P540_30: return QStringLiteral("540/30");
+    case stream::RemoteVideoQualityPreset::P540_25: return QStringLiteral("540/25");
+    case stream::RemoteVideoQualityPreset::P360_25: return QStringLiteral("360/25");
+    case stream::RemoteVideoQualityPreset::P360_1: return QStringLiteral("360/1");
     }
-    return QString::fromUtf8("自动");
+    return QStringLiteral("540/30"); // wjy: 异常枚举只显示产品默认档，不把内部无效值暴露到标题栏。
+}
+
+bool remoteVideoQualityPresetFromText(
+    const QString& text,
+    stream::RemoteVideoQualityPreset* preset)
+{
+    if (!preset) {
+        return false;
+    }
+    for (const stream::RemoteVideoQualityPreset candidate : stream::kRemoteVideoQualityPresets) {
+        if (remoteVideoQualityPresetText(candidate) == text) {
+            *preset = candidate;
+            return true;
+        }
+    }
+    return false; // wjy: 菜单以外的字符串禁止进入持久化和质量下发路径。
+}
+
+bool isHighBandwidthRemoteVideoPreset(stream::RemoteVideoQualityPreset preset)
+{
+    return preset == stream::RemoteVideoQualityPreset::P1080_60
+        || preset == stream::RemoteVideoQualityPreset::P720_60; // wjy: 仅红色60 FPS档需要高带宽确认，1080/30和720/30不弹确认框。
 }
 
 QString remoteQualityReasonText(RemoteQualityDegradationReason reason)
@@ -603,7 +628,9 @@ bool sameQualityPayload(const FsRemoteViewerQualityConfig& left, const FsRemoteV
 
 bool sameQualityDecision(const RemoteQualityDecision& left, const RemoteQualityDecision& right)
 {
-    return left.effectiveMode == right.effectiveMode
+    return left.preset == right.preset
+        && left.userSelectedPreset == right.userSelectedPreset
+        && left.effectiveMode == right.effectiveMode
         && left.resolution == right.resolution
         && left.targetWidth == right.targetWidth
         && left.targetHeight == right.targetHeight
@@ -1963,15 +1990,17 @@ RemoteDesktopWindow::RemoteDesktopWindow(
     , m_hostIp(hostIp)
     , m_lifecycleManager(lifecycleManager) // wjy: 生命周期管理器由DeviceGrid统一持有，保证窗口关闭和应用退出期间指针始终有效。
     , m_inputBroadcastCoordinator(inputBroadcastCoordinator) // wjy: 普通与平铺窗口借用同一个协调器，单主控约束覆盖全部远控窗口。
-    , m_globalQualityConfiguration(platform::AppSettings::remoteQualityConfiguration()) // wjy: 新窗口仍读取全局FPS和安全边界参数，但模式默认由会话内“自动”决定。
+    , m_globalQualityConfiguration(platform::AppSettings::remoteQualityConfiguration()) // wjy: 保留全局设置快照兼容接口；精确档位由标题栏手选和固定自动规则决定。
 {
     // =====wjy====
     m_remoteInputScriptStatus.supported = false;
     m_remoteInputScriptStatus.state = platform::RemoteInputScriptState::Unknown; // wjy: 新窗口先显示未知，DeviceGrid缓存、49102直查或UDP快照任一到达后再恢复目标端真实状态。
     appendViewerDebugLog(QStringLiteral("RemoteDesktopWindow ctor device=%1 host=%2").arg(deviceName, hostIp)); // wjy: mark each remote desktop window creation.
-    stream::RemoteQualityMode savedDeviceMode = stream::RemoteQualityMode::Automatic;
-    if (platform::AppSettings::remoteDeviceQualityMode(m_hostIp, &savedDeviceMode)) {
-        m_qualityOverrideMode = savedDeviceMode; // wjy: 设备有历史画质时在首轮协调前恢复；首次设备继续使用成员默认的“自动”。
+    m_hasSavedUserQualityPreset = platform::AppSettings::remoteDeviceQualityPreset(
+        m_hostIp,
+        &m_savedUserQualityPreset); // wjy: 构造阶段只读取历史手选意图，是否允许本次恢复由DeviceGrid结合其它已打开窗口仲裁。
+    if (m_hasSavedUserQualityPreset) {
+        m_userQualityPreset = m_savedUserQualityPreset;
     }
     // ===end====
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
@@ -2133,7 +2162,7 @@ RemoteDesktopWindow::RemoteDesktopWindow(
             m_texturePresenter->reset(); // wjy: 软件帧已经在父窗口铺好后再释放隐藏的旧SwapChain，恢复过程不露出黑色背景。
         }
         m_texturePresentFailed.store(false, std::memory_order_release); // wjy: 只开放下一帧纹理尝试；若仍失败会再次进入有上限的软件回退。
-        emit remoteQualityInputsChanged();
+        emit remoteQualityInputsChanged(); // wjy: 重试开放后即时刷新软件回退诊断，精确远端档位保持用户/自动选择不变。
     });
     // ===end====
     m_sessionTimer = new QTimer(this);
@@ -2274,8 +2303,7 @@ bool RemoteDesktopWindow::event(QEvent* event)
         && (event->type() == QEvent::WindowStateChange
             || event->type() == QEvent::Show
             || event->type() == QEvent::Hide
-            || event->type() == QEvent::WindowActivate
-            || event->type() == QEvent::WindowDeactivate); // wjy: 显隐、最小化和焦点状态变化统一触发一次焦点策略重算；音频按钮仍独立控制。
+            || event->type() == QEvent::Expose); // wjy: 显隐、遮挡暴露、最小化和全屏状态变化即时重算；焦点变化不再改变画质。
     const bool titleBarScaleChanged = event
         && event->type() == QEvent::DevicePixelRatioChange; // wjy: 跨不同DPI显示器后必须按新物理像素尺寸重建标题栏DIB，逻辑命中矩形保持不变。
     if (event && event->type() == QEvent::WindowActivate) {
@@ -2284,6 +2312,7 @@ bool RemoteDesktopWindow::event(QEvent* event)
 
     const bool handled = QWidget::event(event);
     if (windowStateChanged) {
+        refreshQualityPreviewText(); // wjy: 无手选窗口进入全屏立即显示/请求720/30，退出全屏立即恢复540/30。
         updateWindowMask(); // wjy: 进入全屏时清除圆角遮罩，退出全屏时恢复普通窗口圆角。
         updateTexturePresenterGeometry(); // wjy: 纹理直呈模式也要立即扩展到新的远控画面区域。
         ++m_titleBarVisualRevision;
@@ -2291,7 +2320,7 @@ bool RemoteDesktopWindow::event(QEvent* event)
         update(); // wjy: 状态改变后重绘，确保旧标题栏不会残留在全屏画面顶部。
     }
     if (qualityVisibilityChanged && !m_closeInProgress) {
-        emit remoteQualityInputsChanged(); // wjy: 显隐、最小化和窗口状态变化立即重算焦点窗口与后台FPS，不等待1秒轮询。
+        emit remoteQualityInputsChanged(); // wjy: 显隐、最小化和全屏变化立即重算精确档位，不等待1秒轮询。
     }
     if (titleBarScaleChanged) {
         ++m_titleBarVisualRevision;
@@ -2440,20 +2469,46 @@ void RemoteDesktopWindow::setGlobalQualityConfiguration(const stream::RemoteQual
     if (m_globalQualityConfiguration == normalized) {
         return;
     }
-    m_globalQualityConfiguration = normalized; // wjy: 每个窗口立即接收同一默认模式；局部覆盖继续直接使用自身固定预设。
-    emit remoteQualityInputsChanged(); // wjy: 主设置保存后立即重算全部窗口，无需关闭重连或等待周期轮询。
+    m_globalQualityConfiguration = normalized; // wjy: 兼容保存旧设置页快照，标题栏八档仍由窗口自身状态决定。
+    emit remoteQualityInputsChanged(); // wjy: 保留既有在线重算时序，未来兼容字段变化无需关闭重连。
 }
 
-stream::RemoteQualityMode RemoteDesktopWindow::qualityOverrideMode() const
+bool RemoteDesktopWindow::hasSavedUserQualityPreset() const
 {
-    return m_qualityOverrideMode; // wjy: 只返回当前窗口内存状态，不从全局设置反推，保证“局部覆盖”语义清晰。
+    return m_hasSavedUserQualityPreset;
+}
+
+stream::RemoteVideoQualityPreset RemoteDesktopWindow::savedUserQualityPreset() const
+{
+    return m_savedUserQualityPreset;
+}
+
+bool RemoteDesktopWindow::hasActiveUserQualityPresetAboveDefault() const
+{
+    return m_userQualityPresetActive
+        && stream::remoteVideoQualityPresetExceedsDefault(m_userQualityPreset); // wjy: 当前打开窗口手动升档可以多个并存，但会阻止后续窗口自动恢复历史高档。
+}
+
+void RemoteDesktopWindow::restoreSavedUserQualityPreset(bool anotherAboveDefaultPresetIsOpen)
+{
+    m_userQualityPresetActive = m_hasSavedUserQualityPreset
+        && stream::shouldRestoreSavedRemoteVideoQualityPreset(
+            m_savedUserQualityPreset,
+            anotherAboveDefaultPresetIsOpen); // wjy: 高档名额冲突只关闭本次自动恢复，QSettings中的历史档位保持不变。
+    if (m_userQualityPresetActive) {
+        m_userQualityPreset = m_savedUserQualityPreset;
+    } else {
+        m_userQualityPreset = stream::kDefaultRemoteVideoQualityPreset;
+    }
+    refreshQualityPreviewText();
 }
 
 RemoteQualityWindowMetrics RemoteDesktopWindow::remoteQualityMetrics()
 {
     RemoteQualityWindowMetrics metrics;
     metrics.windowId = reinterpret_cast<uintptr_t>(this); // wjy: 顶层窗口对象生命周期内地址稳定，关闭时协调器显式删除对应滞回状态。
-    metrics.effectiveMode = effectiveQualityMode();
+    metrics.userQualityPreset = m_userQualityPreset;
+    metrics.userQualityPresetActive = m_userQualityPresetActive;
     metrics.visible = isVisible() && !m_closeInProgress;
     metrics.minimized = isMinimized();
     // =====wjy====
@@ -2463,13 +2518,13 @@ RemoteQualityWindowMetrics RemoteDesktopWindow::remoteQualityMetrics()
         && nativeWindowFullyOccluded(reinterpret_cast<HWND>(winId())); // wjy: 每秒按原生Z序确认是否仍有可见区域，完全遮挡才进入最小化档。
 #endif
     // ===end====
-    metrics.fullScreen = isFullScreen(); // wjy: 保留全屏状态用于标题栏/诊断；视频高性能现在只由真实焦点决定。
-    metrics.softwareFallback = m_softwareFallbackActive; // wjy: 重试开放期间也保持BGRA回退硬上限，必须等纹理实际成功后才恢复。
+    metrics.fullScreen = isFullScreen(); // wjy: 无手选时全屏状态触发720/30，手选激活后该标记只用于诊断。
+    metrics.softwareFallback = m_softwareFallbackActive; // wjy: 软件回退继续进入诊断快照，但不再覆盖用户或自动精确档位。
     const QSize sourceSize = remoteFrameSize().isValid() ? remoteFrameSize() : QSize(1920, 1080);
     metrics.sourceWidth = sourceSize.width();
     metrics.sourceHeight = sourceSize.height();
     metrics.viewportWidth = qMax(1, width());
-    metrics.viewportHeight = qMax(1, height() - titleBarHeight()); // wjy: 平铺小窗口按真实显示高度降低像素，优先把资源留给FPS。
+    metrics.viewportHeight = qMax(1, height() - titleBarHeight()); // wjy: 保留真实视口用于资源诊断，远端精确档位不再按窗口面积静默变化。
     metrics.viewportArea = metrics.viewportWidth * metrics.viewportHeight;
     metrics.receiveFps = qMax(0.0, m_receiveFps);
     metrics.encodedMbps = qMax(0.0, m_encodedMbps);
@@ -2525,17 +2580,17 @@ void RemoteDesktopWindow::applyRemoteQualityDecision(const RemoteQualityDecision
     m_remoteQualityDecision = decision; // wjy: 无论Viewer是否已创建都保存最新值，连接成功后只补发这一份。
     m_hasRemoteQualityDecision = true;
     if (decision.requestRemoteProfile) {
-        sendCurrentRemoteQualityDecision(); // wjy: 350毫秒焦点防抖真正控制Host改参；本地临时角色不触发分辨率和FPS反转。
+        sendCurrentRemoteQualityDecision(); // wjy: 手选、全屏和遮挡档位立即尝试在线下发，相同payload由Viewer代际去重。
     }
     sendCurrentViewerAudioDecision(); // wjy: 质量请求变化时顺带补发本窗口独立音频状态，二者不共享所有权判定。
     if (feedbackChanged) {
-        const bool backgroundRole = decision.effectiveMode != stream::RemoteQualityMode::HighQualityLocked; // wjy: 日志按实际质量角色判断后台，单窗口无焦点保持高清时不再误报background=1。
-        appendViewerDebugLog(QStringLiteral("quality role host=%1 active=%2 fullscreen=%3 occluded=%4 background=%5 audio=%6 remote_request=%7 resolution=%8 target=%9x%10 fps=%11 priority=%12 reason=%13")
+        appendViewerDebugLog(QStringLiteral("quality role host=%1 active=%2 fullscreen=%3 occluded=%4 user_selected=%5 preset=%6 audio=%7 remote_request=%8 resolution=%9 target=%10x%11 fps=%12 priority=%13 reason=%14")
             .arg(m_hostIp)
             .arg(decision.active ? 1 : 0)
             .arg(decision.fullScreen ? 1 : 0)
             .arg(decision.fullyOccluded ? 1 : 0) // wjy: 日志可直接确认窗口是否因为完全遮挡进入最小化资源档。
-            .arg(backgroundRole ? 1 : 0)
+            .arg(decision.userSelectedPreset ? 1 : 0)
+            .arg(remoteVideoQualityPresetText(decision.preset))
             .arg(decision.audioEnabled ? 1 : 0)
             .arg(decision.requestRemoteProfile ? 1 : 0)
             .arg(static_cast<int>(decision.resolution))
@@ -2543,7 +2598,7 @@ void RemoteDesktopWindow::applyRemoteQualityDecision(const RemoteQualityDecision
             .arg(decision.targetHeight)
             .arg(decision.targetFps)
             .arg(decision.priority)
-            .arg(static_cast<int>(decision.reason))); // wjy: 明确记录防抖门禁，现场可区分本地角色变化与真正交给Host的质量请求。
+            .arg(static_cast<int>(decision.reason))); // wjy: 日志直接记录精确预设和手选来源，现场无需再从旧模式名称推断。
     }
 }
 
@@ -3904,16 +3959,10 @@ void RemoteDesktopWindow::showQualityPreviewMenu()
         "font-family:'Microsoft YaHei UI';font-size:11px;color:#344054;}"
         "QMenu::item{height:27px;padding:0;margin:0;background:transparent;}")); // wjy: 菜单本体只负责白色圆角底板，档位文字与悬停态交给内部按钮绘制。
 
-    const QStringList options = {
-        QStringLiteral("1080/60"),
-        QStringLiteral("1080/30"),
-        QStringLiteral("720/60"),
-        QStringLiteral("720/30"),
-        QStringLiteral("540/30"),
-        QStringLiteral("540/25"),
-        QStringLiteral("360/25"),
-        QStringLiteral("360/1")
-    }; // wjy: 顺序固定从最高画质到最低保活档，360常规档按用户要求改为25 FPS。
+    QStringList options;
+    for (const stream::RemoteVideoQualityPreset preset : stream::kRemoteVideoQualityPresets) {
+        options.push_back(remoteVideoQualityPresetText(preset));
+    } // wjy: 菜单直接读取生产八档枚举顺序，持久化、协调器和显示不会各维护一份列表。
     QString selectedText;
     for (const QString& option : options) {
         const bool highBandwidthOption = option == QStringLiteral("1080/60")
@@ -3957,13 +4006,15 @@ void RemoteDesktopWindow::showQualityPreviewMenu()
     menu.exec(popupPosition);
     m_qualityMenuOpen = false;
     requestTitleBarUpdate(buttonRect);
-    if (selectedText.isEmpty() || selectedText == m_qualityPreviewText) {
+    stream::RemoteVideoQualityPreset selectedPreset = stream::kDefaultRemoteVideoQualityPreset;
+    if (!remoteVideoQualityPresetFromText(selectedText, &selectedPreset)) {
         return;
     }
+    if (m_userQualityPresetActive && selectedPreset == m_userQualityPreset) {
+        return; // wjy: 已是同一手选档时不重复写QSettings或触发在线评估；自动全屏同名档仍允许转成手选锁定。
+    }
 
-    const bool needsBandwidthConfirmation = selectedText == QStringLiteral("1080/60")
-        || selectedText == QStringLiteral("720/60");
-    if (needsBandwidthConfirmation) {
+    if (isHighBandwidthRemoteVideoPreset(selectedPreset)) {
         QMessageBox confirmation(this);
         confirmation.setIcon(QMessageBox::Warning);
         confirmation.setWindowTitle(QString::fromUtf8("高带宽提示"));
@@ -3978,22 +4029,40 @@ void RemoteDesktopWindow::showQualityPreviewMenu()
         }
     }
 
-    m_qualityPreviewText = selectedText;
-    requestTitleBarUpdate(buttonRect); // wjy: 普通档直接更新，高带宽档仅在确认后更新；当前仍不发remoteQualityInputsChanged。
+    m_userQualityPreset = selectedPreset;
+    m_savedUserQualityPreset = selectedPreset;
+    m_hasSavedUserQualityPreset = true;
+    m_userQualityPresetActive = true;
+    platform::AppSettings::setRemoteDeviceQualityPreset(m_hostIp, selectedPreset); // wjy: 手选立即按设备落盘，程序重启和重新远控都读取同一精确档位。
+    refreshQualityPreviewText();
+    emit remoteQualityInputsChanged(); // wjy: 用户确认后立即通过现有协调器下发在线质量请求，不停止或重建Viewer。
 }
 // ===end====
 
-stream::RemoteQualityMode RemoteDesktopWindow::effectiveQualityMode() const
+stream::RemoteVideoQualityPreset RemoteDesktopWindow::preferredRemoteVideoQualityPreset() const
 {
-    return m_qualityOverrideMode == stream::RemoteQualityMode::FollowGlobal
-        ? m_globalQualityConfiguration.defaultMode
-        : m_qualityOverrideMode; // wjy: 全局变化只影响FollowGlobal窗口，已有局部覆盖保持不变。
+    if (m_userQualityPresetActive) {
+        return m_userQualityPreset; // wjy: 用户手选优先级最高，全屏和焦点变化都不能覆盖。
+    }
+    return isFullScreen()
+        ? stream::kFullscreenRemoteVideoQualityPreset
+        : stream::kDefaultRemoteVideoQualityPreset; // wjy: 无手选时普通窗口540/30，全屏自动720/30。
+}
+
+void RemoteDesktopWindow::refreshQualityPreviewText()
+{
+    const QString nextText = remoteVideoQualityPresetText(preferredRemoteVideoQualityPreset());
+    if (m_qualityPreviewText == nextText) {
+        return;
+    }
+    m_qualityPreviewText = nextText;
+    requestTitleBarUpdate(qualityPreviewRect()); // wjy: 只刷新标题栏文字；实际远端档位由下一次统一协调评估下发。
 }
 
 QString RemoteDesktopWindow::remoteQualityStatusSummary() const
 {
     if (!m_hasRemoteQualityDecision) {
-        return QString::fromUtf8("请求：智能切换\n实际：等待协调器\n状态：准备中");
+        return QString::fromUtf8("请求：540/30\n实际：等待协调器\n状态：准备中");
     }
 
     const QString requestedResolution = m_remoteQualityDecision.targetWidth > 0
@@ -4001,7 +4070,7 @@ QString RemoteDesktopWindow::remoteQualityStatusSummary() const
         ? QStringLiteral("%1×%2").arg(m_remoteQualityDecision.targetWidth).arg(m_remoteQualityDecision.targetHeight)
         : QString::fromUtf8("原始分辨率");
     const QString requested = QString::fromUtf8("请求：%1 · %2 · %3 FPS · ≤%4 Mbps")
-        .arg(remoteQualityModeText(m_remoteQualityDecision.effectiveMode))
+        .arg(remoteVideoQualityPresetText(m_remoteQualityDecision.preset))
         .arg(requestedResolution)
         .arg(m_remoteQualityDecision.targetFps)
         .arg(m_remoteQualityDecision.maxBitrateKbps / 1000.0, 0, 'f', 1);
@@ -4028,9 +4097,9 @@ QString RemoteDesktopWindow::remoteQualityStatusSummary() const
     }
 
     QString state = QString::fromUtf8("状态：%1").arg(remoteQualityReasonText(m_remoteQualityDecision.reason));
-    if (m_remoteQualityDecision.effectiveMode == stream::RemoteQualityMode::HighQualityLocked
+    if (stream::remoteVideoQualityPresetExceedsDefault(m_remoteQualityDecision.preset)
         && remoteQualityIsDegraded()) {
-        state += QString::fromUtf8("（实际结果受Host或传输边界限制）"); // wjy: 高质量请求保持原始/60，向下提示只解释实际应用或兼容限制，不再暗示控制端主动降档。
+        state += QString::fromUtf8("（实际结果受Host或传输边界限制）"); // wjy: 高于默认的精确档位若被Host夹紧，诊断明确说明实际值而不改写用户配置。
     }
     return requested + QLatin1Char('\n') + applied + QLatin1Char('\n') + state;
 }
@@ -4040,12 +4109,8 @@ bool RemoteDesktopWindow::remoteQualityIsDegraded() const
     if (!m_hasRemoteQualityDecision) {
         return false;
     }
-    if (m_remoteQualityDecision.reason == RemoteQualityDegradationReason::Background
-        || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::Minimized
+    if (m_remoteQualityDecision.reason == RemoteQualityDegradationReason::Minimized
         || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::FullyOccluded
-        || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::PipelinePressure
-        || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::SeverePipelinePressure
-        || m_remoteQualityDecision.reason == RemoteQualityDegradationReason::SoftwareFallback
         || m_qualityProtocolUnavailable) {
         return true;
     }
@@ -5686,7 +5751,7 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
                 if (m_textureRecoveryTimer) {
                     m_textureRecoveryTimer->start(retryDelayMs); // wjy: 1/2/4/8/10秒退避重试，持续故障时不每帧重建设备。
                 }
-                emit remoteQualityInputsChanged(); // wjy: 连续失败才下发540p/24 FPS软件保活档，单帧抖动不再造成画质来回切换。
+                emit remoteQualityInputsChanged(); // wjy: 连续失败只刷新软件回退诊断，不再隐藏改写用户或自动精确档位。
                 requestTitleBarUpdate(); // wjy: 软件回退状态真正变化时刷新一次标题栏，不把单帧失败变成持续重绘。
             }
         } else {
@@ -5710,7 +5775,7 @@ void RemoteDesktopWindow::drainPendingRemoteTextureFrame()
                 m_softwareFallbackActive = false;
                 if (m_textureRecoveryTimer) m_textureRecoveryTimer->stop();
                 if (recoveredFromSoftwareFallback) {
-                    emit remoteQualityInputsChanged(); // wjy: D3D11从软件保活恢复后，协调器按先FPS后分辨率的滞回策略逐档恢复。
+                    emit remoteQualityInputsChanged(); // wjy: D3D11恢复后清除软件回退诊断，远端档位始终保持原手选或自动基线。
                 }
             }
             m_connectionStatusCode = 50;

@@ -3,6 +3,7 @@
 #include "stream/RemoteQualityPolicy.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -59,6 +60,17 @@ struct RemoteVideoEncodingPreset {
     std::uint32_t maxBitrateKbps = 0; // wjy: 码率与分辨率档一起切换，避免低分辨率继续沿用高清档的发送上限。
 };
 
+enum class RemoteVideoQualityPreset : std::uint8_t {
+    P1080_60 = 0,
+    P1080_30 = 1,
+    P720_60 = 2,
+    P720_30 = 3,
+    P540_30 = 4,
+    P540_25 = 5,
+    P360_25 = 6,
+    P360_1 = 7,
+}; // wjy: 标题栏、持久化和协调器共享同一稳定枚举，禁止再用显示字符串或旧模式枚举推断精确档位。
+
 constexpr RemoteVideoProfile makeRemoteVideoProfile(
     const RemoteVideoEncodingPreset& preset,
     std::uint32_t priority)
@@ -78,16 +90,75 @@ inline constexpr RemoteVideoEncodingPreset kRemoteVideo1080p60Preset = {RemoteRe
 inline constexpr RemoteVideoEncodingPreset kRemoteVideo1080p30Preset = {RemoteResolutionTier::P1080, 30, 48000}; // wjy: 1080p/30 FPS清晰度优先档，降帧时不同步压缩单帧质量上限。
 inline constexpr RemoteVideoEncodingPreset kRemoteVideo720p60Preset = {RemoteResolutionTier::P720, 60, 24000}; // wjy: 720p/60 FPS流畅档，使用现有720p对应的24 Mbps码率上限。
 inline constexpr RemoteVideoEncodingPreset kRemoteVideo720p30Preset = {RemoteResolutionTier::P720, 30, 24000}; // wjy: 720p/30 FPS平衡档，与60 FPS档共享同一清晰度预算。
-inline constexpr RemoteVideoEncodingPreset kRemoteVideo540p30Preset = {RemoteResolutionTier::P540, 30, 14000}; // wjy: 540p/30 FPS当前焦点档，码率同步收敛到540p的14 Mbps上限。
-inline constexpr RemoteVideoEncodingPreset kRemoteVideo540p25Preset = {RemoteResolutionTier::P540, 25, 14000}; // wjy: 540p/25 FPS当前可见后台档，减少失焦窗口的编码和呈现频率。
-inline constexpr RemoteVideoEncodingPreset kRemoteVideo360p30Preset = {RemoteResolutionTier::P360, 30, 7000}; // wjy: 360p/30 FPS低清交互档，用于需要继续操作但优先节省资源的场景。
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo540p30Preset = {RemoteResolutionTier::P540, 30, 14000}; // wjy: 540p/30 FPS普通窗口默认档，码率使用14 Mbps上限。
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo540p25Preset = {RemoteResolutionTier::P540, 25, 14000}; // wjy: 540p/25 FPS手动节流档，不再由失焦自动触发。
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo360p25Preset = {RemoteResolutionTier::P360, 25, 7000}; // wjy: 360p/25 FPS低清交互档，名称与用户已修改的真实帧率保持一致。
 inline constexpr RemoteVideoEncodingPreset kRemoteVideo360p1Preset = {RemoteResolutionTier::P360, 1, 7000}; // wjy: 360p/1 FPS保活档，保持连接和画面更新能力以便快速恢复。
 
+inline constexpr std::array<RemoteVideoQualityPreset, 8> kRemoteVideoQualityPresets = {
+    RemoteVideoQualityPreset::P1080_60,
+    RemoteVideoQualityPreset::P1080_30,
+    RemoteVideoQualityPreset::P720_60,
+    RemoteVideoQualityPreset::P720_30,
+    RemoteVideoQualityPreset::P540_30,
+    RemoteVideoQualityPreset::P540_25,
+    RemoteVideoQualityPreset::P360_25,
+    RemoteVideoQualityPreset::P360_1,
+}; // wjy: 顺序与标题栏菜单完全一致，从最高档到最低保活档。
+
+inline constexpr RemoteVideoQualityPreset kDefaultRemoteVideoQualityPreset = RemoteVideoQualityPreset::P540_30;
+inline constexpr RemoteVideoQualityPreset kFullscreenRemoteVideoQualityPreset = RemoteVideoQualityPreset::P720_30;
+inline constexpr RemoteVideoQualityPreset kOccludedRemoteVideoQualityPreset = RemoteVideoQualityPreset::P360_1;
+
+inline constexpr bool isValidRemoteVideoQualityPreset(RemoteVideoQualityPreset preset)
+{
+    const int value = static_cast<int>(preset);
+    return value >= static_cast<int>(RemoteVideoQualityPreset::P1080_60)
+        && value <= static_cast<int>(RemoteVideoQualityPreset::P360_1); // wjy: QSettings损坏值必须在进入窗口状态前被拒绝。
+}
+
+inline constexpr RemoteVideoEncodingPreset remoteVideoEncodingPreset(RemoteVideoQualityPreset preset)
+{
+    switch (preset) {
+    case RemoteVideoQualityPreset::P1080_60: return kRemoteVideo1080p60Preset;
+    case RemoteVideoQualityPreset::P1080_30: return kRemoteVideo1080p30Preset;
+    case RemoteVideoQualityPreset::P720_60: return kRemoteVideo720p60Preset;
+    case RemoteVideoQualityPreset::P720_30: return kRemoteVideo720p30Preset;
+    case RemoteVideoQualityPreset::P540_30: return kRemoteVideo540p30Preset;
+    case RemoteVideoQualityPreset::P540_25: return kRemoteVideo540p25Preset;
+    case RemoteVideoQualityPreset::P360_25: return kRemoteVideo360p25Preset;
+    case RemoteVideoQualityPreset::P360_1: return kRemoteVideo360p1Preset;
+    }
+    return kRemoteVideo540p30Preset; // wjy: 防御性回退始终使用产品默认540/30，不请求无界原始分辨率。
+}
+
+inline constexpr bool remoteVideoQualityPresetExceedsDefault(RemoteVideoQualityPreset preset)
+{
+    return preset == RemoteVideoQualityPreset::P1080_60
+        || preset == RemoteVideoQualityPreset::P1080_30
+        || preset == RemoteVideoQualityPreset::P720_60
+        || preset == RemoteVideoQualityPreset::P720_30; // wjy: 仅这四档参与“历史高档自动恢复名额”，运行中手选不受此函数限制。
+}
+
+inline constexpr bool shouldRestoreSavedRemoteVideoQualityPreset(
+    RemoteVideoQualityPreset preset,
+    bool anotherAboveDefaultPresetIsOpen)
+{
+    return !remoteVideoQualityPresetExceedsDefault(preset)
+        || !anotherAboveDefaultPresetIsOpen; // wjy: 默认及以下档始终恢复；高于默认的历史档只在没有其它已打开高档窗口时自动恢复。
+}
+
+inline constexpr RemoteVideoProfile remoteVideoProfileForPreset(
+    RemoteVideoQualityPreset preset,
+    std::uint32_t priority)
+{
+    return makeRemoteVideoProfile(remoteVideoEncodingPreset(preset), priority);
+}
+
 // 角色画质只选择上面的命名档案并补充优先级，以后切档不再手工改五个字段。
-inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile = makeRemoteVideoProfile(kRemoteVideo540p30Preset, 100); // wjy: 当前焦点窗口选用540p/30 FPS档并获得最高优先级。
-inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile = makeRemoteVideoProfile(kRemoteVideo540p25Preset, 40); // wjy: 当前可见后台窗口选用540p/25 FPS档和中等资源优先级。
+inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile = makeRemoteVideoProfile(kRemoteVideo540p30Preset, 100); // wjy: 本地焦点角色使用统一540p/30 FPS默认档和可见优先级。
+inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile = makeRemoteVideoProfile(kRemoteVideo540p30Preset, 100); // wjy: 所有普通可见窗口统一使用默认540p/30，不再因焦点变化自动降到25 FPS。
 inline constexpr RemoteVideoProfile kMinimizedRemoteVideoProfile = makeRemoteVideoProfile(kRemoteVideo360p1Preset, 5); // wjy: 最小化和完全遮挡窗口选用360p/1 FPS保活档和最低优先级。
-inline constexpr std::uint32_t kRemoteProfileFocusDebounceMs = 350;
 inline constexpr std::uint32_t kRemotePressureEnterHoldMs = 1000;
 inline constexpr std::uint32_t kRemotePressureRecoveryHoldMs = 3000;
 // ===end====
@@ -96,7 +167,7 @@ class RemoteVideoPolicy final {
 public:
     static constexpr RemoteVideoProfile backgroundProfile()
     {
-        return kVisibleBackgroundRemoteVideoProfile; // wjy: 正常可见后台直接返回角色别名选中的完整编码档案。
+        return kVisibleBackgroundRemoteVideoProfile; // wjy: 正常可见后台与焦点返回相同的540p/30完整编码档案。
     }
 
     static constexpr RemoteVideoProfile minimizedProfile()
@@ -162,9 +233,9 @@ public:
     {
         switch (role) {
         case RemoteVideoWindowRole::Focused:
-            return focusedProfile; // wjy: 焦点窗口优先保持用户选择的尺寸和60 FPS预算。
+            return focusedProfile; // wjy: 本地调度仍保留焦点角色，但控制端远端画质不再由该角色自动改写。
         case RemoteVideoWindowRole::VisibleBackground:
-            return backgroundProfile(); // wjy: 压力状态不再改写正常后台FPS，避免恢复旧的设备数量降帧策略。
+            return backgroundProfile(); // wjy: 本地后台角色与焦点角色共享540/30远端档，压力状态不再改写精确请求。
         case RemoteVideoWindowRole::Minimized:
             return minimizedProfile();
         case RemoteVideoWindowRole::Hidden:

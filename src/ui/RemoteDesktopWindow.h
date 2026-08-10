@@ -97,8 +97,11 @@ public:
     bool isRemoteUpdateActive() const; // wjy: 供设备状态刷新识别“预期更新离线”，避免把正在等待重启的远控窗口当作普通断线关闭。
     void setRemoteUpdateAvailable(bool available); // wjy: 主界面统一探测目标版本后控制标题栏更新按钮，不让远控流线程参与版本检测。
     void setRemoteInputScriptStatus(const platform::RemoteInputScriptRuntimeInfo& runtime); // wjy: DeviceGrid把目标端统一快照投影到同IP的所有普通和平铺窗口。
-    void setGlobalQualityConfiguration(const stream::RemoteQualityConfiguration& configuration); // wjy: 主窗口全局设置变化时立即更新跟随全局窗口的会话内策略快照。
-    stream::RemoteQualityMode qualityOverrideMode() const; // wjy: 兼容读取历史设备模式；智能协调器不再把它作为活动 UI 的手动覆盖入口。
+    void setGlobalQualityConfiguration(const stream::RemoteQualityConfiguration& configuration); // wjy: 保留旧设置页配置快照接口；精确档位不再由全局模式覆盖。
+    bool hasSavedUserQualityPreset() const; // wjy: 判断该设备是否存在程序上次保存的精确手选档位。
+    stream::RemoteVideoQualityPreset savedUserQualityPreset() const; // wjy: 返回设备历史手选档，用于DeviceGrid决定是否授予本次高档自动恢复名额。
+    bool hasActiveUserQualityPresetAboveDefault() const; // wjy: 运行中用户手选的高档可以多个并存，重新打开历史档时由此判断已有高档窗口。
+    void restoreSavedUserQualityPreset(bool anotherAboveDefaultPresetIsOpen); // wjy: 注册窗口时恢复历史档；已有高档窗口时只阻止历史高档本次恢复，不删除持久化记录。
     RemoteQualityWindowMetrics remoteQualityMetrics(); // wjy: 协调器每秒读取只读原生统计并对累计值求差，不阻塞或修改 WebRTC 会话。
     void applyRemoteQualityDecision(const RemoteQualityDecision& decision); // wjy: 在线下发最新质量档位；相同请求去重，连接建立后自动补发，不停止或重建流。
     void refreshAppliedRemoteQualityStatus(); // wjy: 收到状态码63后从类型化ABI读取Host实际应用值，标题栏不会把请求值冒充结果。
@@ -189,7 +192,7 @@ private:
 
     // =====wjy====
     QRect remoteUpdateButtonRect() const; // wjy: 更新按钮位于画质按钮左侧，对应标题栏右侧按钮组的最左侧入口。
-    QRect qualityPreviewRect() const; // wjy: 前端画质预览按钮位于系统/驱动按钮左侧，当前不下发远端质量请求。
+    QRect qualityPreviewRect() const; // wjy: 画质按钮位于系统/驱动按钮左侧，点击后直接更新持久化手选档和在线质量输入。
     QRect mouseInputModeRect() const; // wjy: 兼容保留既有函数名；该标题栏开关现在统一切换系统/驱动键鼠后端。
     QRect clipboardSyncRect() const;
     QRect audioToggleRect() const; // wjy: 标题栏独立音频开关，默认静音且不参与画质焦点判定。
@@ -207,7 +210,7 @@ private:
     void toggleClipboardSync();
     void toggleViewerAudio(); // wjy: 只切换当前远控窗口本地音频播放器，不影响其它窗口。
     void toggleInputSynchronization(); // wjy: 标题栏一次点击根据关闭、主控、跟随三态执行开启、关闭或主控切换。
-    void showQualityPreviewMenu(); // wjy: 弹出纵向档位菜单并只更新标题栏选中文字，实际画质接入留待后续。
+    void showQualityPreviewMenu(); // wjy: 弹出八档菜单，高带宽确认后保存精确预设并立即请求协调器下发。
     void toggleRemoteMouseBackend(); // wjy: 兼容沿用现有协议入口，根据 Host 确认状态同时切换键盘和鼠标注入后端。
     void requestRemoteMouseBackend(RemoteMouseBackend backend);
     void queryRemoteMouseBackend(); // wjy: 每次新 Viewer 收到画面后查询 Host 全局状态，多控制窗口由真实值对齐。
@@ -215,11 +218,12 @@ private:
     void updateRemoteMouseCaptureState(); // wjy: 根据 Host 请求、F2 手动意图、连接资格和窗口焦点统一计算实际捕获状态。
     void applyRemoteMouseCaptureState(bool active); // wjy: 只负责实际 Raw Input、光标隐藏、回中心和远端释放，不改变两类请求来源。
     void suspendRemoteMouseCapture(); // wjy: 焦点离开、断线、更新或关闭时强制释放实际捕获，同时保留 F2 手动意图供重新获得资格后恢复。
-    stream::RemoteQualityMode effectiveQualityMode() const; // wjy: FollowGlobal解析为最新全局模式，局部覆盖则直接返回覆盖值。
+    stream::RemoteVideoQualityPreset preferredRemoteVideoQualityPreset() const; // wjy: 手选优先；无手选时全屏720/30，普通窗口540/30。
+    void refreshQualityPreviewText(); // wjy: 窗口状态或手选变化后同步标题栏文字，不把遮挡临时360/1写成用户配置。
     void sendCurrentRemoteQualityDecision(); // wjy: 把内存中的最新决策转换为稳定C ABI结构；连接中只保留最新请求，重连后按新代际补发。
     void sendCurrentViewerAudioDecision(); // wjy: 按Viewer代际和布尔状态去重在线音频切换，连接前只保留协调器最新决策。
     QString remoteQualityStatusSummary() const; // wjy: 统一生成诊断中的请求/实际/降级说明，避免状态文案分叉。
-    bool remoteQualityIsDegraded() const; // wjy: 判断当前是否处于最小化、自动降级、Host限制或高质量硬边界保护状态。
+    bool remoteQualityIsDegraded() const; // wjy: 判断当前是否处于遮挡/最小化保活或Host实际应用受限状态。
     // ===end====
     QRect remoteContentRect() const; // wjy: D3D11 Presenter覆盖标题栏下的完整内容区，真实远端矩形仍由remoteImageRect单独计算。
     QRect remoteImageRect() const;
@@ -320,8 +324,11 @@ private:
     RemoteViewerLifecycleManager* m_lifecycleManager = nullptr; // wjy: 由DeviceGrid持有且晚于全部远控窗口停止，窗口只借用它提交可等待任务。
     RemoteInputBroadcastCoordinator* m_inputBroadcastCoordinator = nullptr; // wjy: DeviceGrid 统一持有协调器，生命周期覆盖普通和平铺远控窗口。
     RemoteInputSyncRole m_inputSyncRole = RemoteInputSyncRole::Off;
-    stream::RemoteQualityConfiguration m_globalQualityConfiguration; // wjy: 当前窗口持有最新全局策略，后续本地覆盖和协调器从这里解析有效值。
-    stream::RemoteQualityMode m_qualityOverrideMode = stream::RemoteQualityMode::Automatic; // wjy: 首次远控设备默认“自动”，构造时若存在该设备历史记录则恢复上次选择。
+    stream::RemoteQualityConfiguration m_globalQualityConfiguration; // wjy: 兼容保留旧设置结构，不参与标题栏八档的优先级和持久化计算。
+    stream::RemoteVideoQualityPreset m_savedUserQualityPreset = stream::kDefaultRemoteVideoQualityPreset; // wjy: 持久化的历史手选档位，恢复名额不足时仍保留作为下次重开的候选。
+    stream::RemoteVideoQualityPreset m_userQualityPreset = stream::kDefaultRemoteVideoQualityPreset; // wjy: 当前窗口用户意图，完全遮挡时只由协调器临时覆盖实际请求。
+    bool m_hasSavedUserQualityPreset = false; // wjy: 配置键存在即代表用户手动选择过，即使档位正好是540/30也要阻止全屏自动720/30。
+    bool m_userQualityPresetActive = false; // wjy: 历史恢复获准或本次手选后为true；被历史高档仲裁拒绝的窗口保持false并使用自动基线。
     RemoteQualityDecision m_remoteQualityDecision; // wjy: 保存协调器针对当前窗口的最新目标，Viewer尚未创建时也不会丢失用户选择。
     bool m_hasRemoteQualityDecision = false;
     FsRemoteViewerQualityConfig m_lastSentQualityConfig = {}; // wjy: 记录最后一次成功交给DLL的配置，用于1秒协调循环去重，避免控制通道重复刷屏。
@@ -435,7 +442,7 @@ private:
     bool m_remoteMouseBackendPending = false;
     bool m_remoteMouseBackendFallback = false;
     bool m_mouseBackendButtonPressed = false;
-    QString m_qualityPreviewText = QStringLiteral("540/30"); // wjy: 前端预览默认540/30，与后续的实际默认540/25策略暂时解耦。
+    QString m_qualityPreviewText = QStringLiteral("540/30"); // wjy: 标题栏显示当前自动/手选基线；全屏无手选时切换为720/30。
     bool m_qualityButtonPressed = false; // wjy: 按下并在同一热区释放才展开菜单，拖出按钮可取消。
     bool m_qualityMenuOpen = false; // wjy: 只用于前端绘制菜单展开态，不参与质量协调器输入。
     quint64 m_remoteMouseBackendRequestGeneration = 0; // wjy: 两秒超时按请求代际判定，迟到定时器不能覆盖后续成功确认。

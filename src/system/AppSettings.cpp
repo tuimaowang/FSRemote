@@ -17,16 +17,10 @@ QSettings settings()
     return QSettings(QStringLiteral("FSRemote"), QStringLiteral("FSRemote"));
 }
 
-QString remoteDeviceQualityModeKey(const QString& deviceKey)
+QString remoteDeviceQualityPresetKey(const QString& deviceKey)
 {
     const QByteArray encodedKey = QUrl::toPercentEncoding(deviceKey.trimmed().toLower()); // wjy: 对IP或设备键做百分号编码，避免IPv6冒号等字符破坏QSettings层级。
-    return QStringLiteral("remoteQuality/deviceModes/%1").arg(QString::fromLatin1(encodedKey));
-}
-
-bool isRemoteWindowQualityMode(stream::RemoteQualityMode mode)
-{
-    return mode == stream::RemoteQualityMode::FollowGlobal
-        || stream::isPersistentGlobalQualityMode(mode); // wjy: 允许保存标题栏提供的全部模式，同时拒绝未知枚举污染后续会话。
+    return QStringLiteral("remoteQuality/devicePresets/%1").arg(QString::fromLatin1(encodedKey)); // wjy: 新键只保存八档精确预设，不与旧模式枚举共用注册表路径。
 }
 
 QString configDirectoryPath()
@@ -273,32 +267,36 @@ void AppSettings::setRemoteQualityConfiguration(const stream::RemoteQualityConfi
 // ===end====
 
 // =====wjy====
-bool AppSettings::remoteDeviceQualityMode(const QString& deviceKey, stream::RemoteQualityMode* mode)
+bool AppSettings::remoteDeviceQualityPreset(
+    const QString& deviceKey,
+    stream::RemoteVideoQualityPreset* preset)
 {
-    if (!mode || deviceKey.trimmed().isEmpty()) {
-        return false; // wjy: 空设备键或空输出指针不读取共享配置，调用方继续使用“自动”默认值。
+    if (!preset || deviceKey.trimmed().isEmpty()) {
+        return false; // wjy: 空设备键或空输出指针不读取共享配置，调用方继续使用540/30默认档。
     }
-    const QVariant stored = settings().value(remoteDeviceQualityModeKey(deviceKey));
+    const QVariant stored = settings().value(remoteDeviceQualityPresetKey(deviceKey));
     if (!stored.isValid()) {
-        return false; // wjy: 首次远控该设备没有记录，明确让窗口保持“自动”。
+        return false; // wjy: 首次远控该设备没有手选记录，窗口按普通540/30和全屏720/30自动规则运行。
     }
     bool parsed = false;
-    const int storedValue = stored.toInt(&parsed); // wjy: 显式检查整数转换，损坏字符串不能静默变成FollowGlobal枚举0。
-    const stream::RemoteQualityMode storedMode = static_cast<stream::RemoteQualityMode>(storedValue);
-    if (!parsed || !isRemoteWindowQualityMode(storedMode)) {
-        return false; // wjy: 旧版本或损坏枚举不参与恢复，防止下发未定义画质模式。
+    const int storedValue = stored.toInt(&parsed);
+    const auto storedPreset = static_cast<stream::RemoteVideoQualityPreset>(storedValue);
+    if (!parsed || !stream::isValidRemoteVideoQualityPreset(storedPreset)) {
+        return false; // wjy: 损坏整数不参与恢复，防止下发未定义分辨率或帧率组合。
     }
-    *mode = storedMode;
+    *preset = storedPreset;
     return true;
 }
 
-void AppSettings::setRemoteDeviceQualityMode(const QString& deviceKey, stream::RemoteQualityMode mode)
+void AppSettings::setRemoteDeviceQualityPreset(
+    const QString& deviceKey,
+    stream::RemoteVideoQualityPreset preset)
 {
-    if (deviceKey.trimmed().isEmpty() || !isRemoteWindowQualityMode(mode)) {
-        return; // wjy: 只保存有稳定设备键且属于标题栏菜单的合法模式。
+    if (deviceKey.trimmed().isEmpty() || !stream::isValidRemoteVideoQualityPreset(preset)) {
+        return; // wjy: 只保存有稳定设备键且属于标题栏八档集合的合法预设。
     }
     QSettings appSettings = settings();
-    appSettings.setValue(remoteDeviceQualityModeKey(deviceKey), static_cast<int>(mode)); // wjy: 每台设备独立覆盖同一键，模式切换立即落盘且不会影响其它设备。
+    appSettings.setValue(remoteDeviceQualityPresetKey(deviceKey), static_cast<int>(preset)); // wjy: 每台设备独立保存精确档位，临时全屏和遮挡档不会调用此入口。
 }
 // ===end====
 

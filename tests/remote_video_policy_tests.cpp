@@ -22,13 +22,21 @@ int main()
         && stream::kRemoteVideo540p30Preset.maxBitrateKbps == 14000); // wjy: 验证当前焦点选用的540p/30 FPS档已降到14 Mbps上限。
     assert(stream::kRemoteVideo540p25Preset.resolution == stream::RemoteResolutionTier::P540
         && stream::kRemoteVideo540p25Preset.targetFps == 25
-        && stream::kRemoteVideo540p25Preset.maxBitrateKbps == 14000); // wjy: 验证当前可见后台选用的540p/25 FPS档。
-    assert(stream::kRemoteVideo360p30Preset.resolution == stream::RemoteResolutionTier::P360
-        && stream::kRemoteVideo360p30Preset.targetFps == 30
-        && stream::kRemoteVideo360p30Preset.maxBitrateKbps == 7000); // wjy: 验证360p/30 FPS交互档保留7 Mbps上限。
+        && stream::kRemoteVideo540p25Preset.maxBitrateKbps == 14000); // wjy: 验证用户可手选的540p/25 FPS节流档。
+    assert(stream::kRemoteVideo360p25Preset.resolution == stream::RemoteResolutionTier::P360
+        && stream::kRemoteVideo360p25Preset.targetFps == 25
+        && stream::kRemoteVideo360p25Preset.maxBitrateKbps == 7000); // wjy: 验证用户修改后的360p/25 FPS交互档和名称保持一致。
     assert(stream::kRemoteVideo360p1Preset.resolution == stream::RemoteResolutionTier::P360
         && stream::kRemoteVideo360p1Preset.targetFps == 1
         && stream::kRemoteVideo360p1Preset.maxBitrateKbps == 7000); // wjy: 验证360p/1 FPS保活档的尺寸、帧率和码率集合。
+
+    assert(stream::remoteVideoEncodingPreset(stream::RemoteVideoQualityPreset::P1080_60).targetFps == 60);
+    assert(stream::remoteVideoEncodingPreset(stream::RemoteVideoQualityPreset::P720_30).resolution
+        == stream::RemoteResolutionTier::P720);
+    assert(stream::remoteVideoEncodingPreset(stream::RemoteVideoQualityPreset::P540_30).maxBitrateKbps == 14000);
+    assert(stream::remoteVideoEncodingPreset(stream::RemoteVideoQualityPreset::P360_25).targetFps == 25);
+    assert(stream::remoteVideoQualityPresetExceedsDefault(stream::RemoteVideoQualityPreset::P720_30));
+    assert(!stream::remoteVideoQualityPresetExceedsDefault(stream::RemoteVideoQualityPreset::P540_30)); // wjy: 八档枚举必须稳定映射到编码集合，并准确识别历史高档恢复范围。
 
     const stream::RemoteVideoProfile focused = stream::kFocusedRemoteVideoProfile; // wjy: 策略测试直接使用生产焦点别名，避免测试里再手工拼一套过时参数。
     // ===end====
@@ -51,9 +59,9 @@ int main()
     assert(healthy[0].profile.priority == 100); // wjy: 编码档不包含角色语义，焦点别名单独补充最高优先级。
     assert(healthy[1].role == stream::RemoteVideoWindowRole::VisibleBackground);
     assert(healthy[1].profile.resolution == stream::RemoteResolutionTier::P540);
-    assert(healthy[1].profile.targetFps == 25);
-    assert(healthy[1].profile.maxBitrateKbps == 14000); // wjy: 可见后台与焦点共享540p清晰度预算，只降到25 FPS。
-    assert(healthy[1].profile.priority == 40); // wjy: 后台角色使用配置的中等优先级，不再被协调器强制改成10。
+    assert(healthy[1].profile.targetFps == 30);
+    assert(healthy[1].profile.maxBitrateKbps == 14000); // wjy: 可见后台与焦点完整共享默认540p/30 FPS/14 Mbps档。
+    assert(healthy[1].profile.priority == 100); // wjy: 焦点不再影响可见窗口优先级，避免Host二次隐式降档。
     assert(healthy[2].role == stream::RemoteVideoWindowRole::Minimized);
     assert(healthy[2].profile.targetFps == 1);
     assert(healthy[2].profile.priority == 5); // wjy: 最小化角色保留最低优先级和不断流语义。
@@ -65,12 +73,12 @@ int main()
     const auto degraded = stream::RemoteVideoPolicy::resolve(states, focused, pressure);
     assert(degraded[0].profile.targetFps == 30);
     assert(degraded[1].emergency == stream::RemoteVideoEmergencyTier::Fps15);
-    assert(degraded[1].profile.targetFps == 25); // wjy: 压力等级仍可诊断，但不改写已选的540p/25 FPS后台档。
+    assert(degraded[1].profile.targetFps == 30); // wjy: 压力等级仍可诊断，但不改写所有可见窗口统一的540p/30 FPS默认档。
 
     pressure.frameAgeHigh = true;
     pressure.syncBusy = true;
     const auto severe = stream::RemoteVideoPolicy::resolve(states, focused, pressure);
-    assert(severe[1].profile.targetFps == 25); // wjy: 严重压力不再恢复15/10/5/3/1的后台降帧策略。
+    assert(severe[1].profile.targetFps == 30); // wjy: 严重压力不再恢复15/10/5/3/1的后台降帧策略。
 
     stream::RemoteVideoPressureController controller;
     assert(controller.update(pressure, 1000) == stream::RemoteVideoEmergencyTier::None);

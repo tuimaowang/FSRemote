@@ -4,7 +4,6 @@
 #include "stream/RemoteVideoPolicy.h"
 
 #include <cstdint>
-#include <unordered_map>
 #include <vector>
 
 namespace ui {
@@ -63,7 +62,8 @@ private:
 
 struct RemoteQualityWindowMetrics {
     uintptr_t windowId = 0;
-    stream::RemoteQualityMode effectiveMode = stream::RemoteQualityMode::Automatic;
+    stream::RemoteVideoQualityPreset userQualityPreset = stream::kDefaultRemoteVideoQualityPreset; // wjy: 仅在userQualityPresetActive时生效，保存用户手选而不是临时全屏档。
+    bool userQualityPresetActive = false; // wjy: false表示使用普通540/30或全屏720/30自动规则；历史高档被恢复仲裁拒绝时也保持false。
     bool visible = true;
     bool minimized = false;
     bool fullyOccluded = false; // wjy: Windows 可见区域计算结果；只要仍露出任意像素就保持 false。
@@ -98,6 +98,8 @@ struct RemoteQualityWindowMetrics {
 
 struct RemoteQualityDecision {
     uintptr_t windowId = 0;
+    stream::RemoteVideoQualityPreset preset = stream::kDefaultRemoteVideoQualityPreset; // wjy: 决策保留精确档位，标题栏诊断和Host参数不再从旧模式名称反推。
+    bool userSelectedPreset = false; // wjy: 标记可见窗口是否正在使用用户手选档，完全遮挡时档位临时降级但该意图仍保留在窗口中。
     stream::RemoteQualityMode effectiveMode = stream::RemoteQualityMode::Automatic;
     stream::RemoteResolutionTier resolution = stream::RemoteResolutionTier::Native;
     int targetWidth = 0;
@@ -111,42 +113,25 @@ struct RemoteQualityDecision {
     bool minimized = false;
     bool fullyOccluded = false; // wjy: 保留遮挡来源供标题栏诊断显示，资源角色仍通过 minimized 复用最小化策略。
     bool softwareFallback = false;
-    bool requestRemoteProfile = true; // wjy: 本地调度立即应用；快速焦点切换期间可延迟远端编码器改参。
+    bool requestRemoteProfile = true; // wjy: 精确档位变化允许立即下发，相同payload由窗口层去重。
     bool audioEnabled = false; // wjy: 音频由远控窗口自身按钮独立控制，不再由画质协调器抢占。
 };
 
 bool shouldDispatchRemoteQualityDecision(
     const RemoteQualityDecision& decision,
     bool viewerAvailable,
-    bool closing); // wjy: 统一消费焦点防抖门禁；新Viewer补发和在线评估都不能绕过requestRemoteProfile。
+    bool closing); // wjy: 新Viewer补发和在线评估统一经过可用性、关闭状态和请求门禁。
 
 class RemoteQualityCoordinator final {
 public:
     std::vector<RemoteQualityDecision> evaluate(
         const stream::RemoteQualityConfiguration& configuration,
         const std::vector<RemoteQualityWindowMetrics>& windows,
-        int64_t nowMs); // wjy: 每秒评估全部窗口，输出在线质量请求但永远不返回“断开/暂停”动作。
-    void removeWindow(uintptr_t windowId); // wjy: 窗口关闭时删除滞回状态，重开设备从全局默认档重新开始。
+        int64_t nowMs); // wjy: 每次按手选、全屏、默认和遮挡优先级直接生成精确档位，不再因焦点或性能采样自动改档。
+    void removeWindow(uintptr_t windowId); // wjy: 当前策略无窗口滞回状态，保留接口兼容DeviceGrid销毁清理路径。
 
 private:
-    struct WindowState {
-        int fpsIndex = 0;
-        int64_t pressureSinceMs = 0;
-        int64_t recoverySinceMs = 0;
-        RemoteQualityDegradationReason degradationReason = RemoteQualityDegradationReason::None; // wjy: 记录最近一次真实降级来源，压力消失后的滞回恢复期仍能显示准确原因。
-        stream::RemoteQualityMode effectiveMode = stream::RemoteQualityMode::Automatic; // wjy: 模式切换时立即丢弃旧自动档位，固定模式不会继承先前的低FPS状态。
-        bool initialized = false;
-        bool pendingHighPerformance = false;
-        bool remoteHighPerformance = false;
-        bool roleInitialized = false;
-        int64_t roleChangedAtMs = 0;
-    };
-
-    static int fpsIndexForTarget(int fps);
-    static int bitrateForDecision(stream::RemoteResolutionTier resolution, int fps, stream::RemoteQualityMode mode);
     static void targetSize(stream::RemoteResolutionTier resolution, int sourceWidth, int sourceHeight, int* width, int* height);
-    std::unordered_map<uintptr_t, WindowState> m_states;
-    stream::RemoteVideoPressureController m_pipelinePressureController; // wjy: 全部窗口共享同一适配器压力滞回，避免每个窗口各自抖动降级。
 };
 // ===end====
 

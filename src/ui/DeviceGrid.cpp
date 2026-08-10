@@ -3351,7 +3351,7 @@ void drawSettingsPage(
         painter.setPen(QColor(QStringLiteral("#040B18")));
         painter.drawText(QRectF(qualityCard.x() + 28, qualityCard.y() + 16, qualityCard.width() - 56, 22),
             Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("智能远控画质"));
+            QString::fromUtf8("远控画质策略"));
 
         QFont detail(textFont);
         detail.setPixelSize(11);
@@ -3359,7 +3359,7 @@ void drawSettingsPage(
         painter.setPen(QColor(QStringLiteral("#687384")));
         painter.drawText(QRectF(qualityCard.x() + 28, qualityCard.y() + 38, qualityCard.width() - 56, 18),
             Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("按当前获得焦点的窗口选择高清，其它窗口使用低质保活档；音频由标题栏按钮独立控制。")); // wjy: 设置页与当前焦点策略保持一致。
+            QString::fromUtf8("普通窗口默认540p/30，全屏自动720p/30；手选优先，完全遮挡使用360p/1保活。")); // wjy: 设置页与标题栏精确档位和遮挡规则保持一致。
 
         QFont labelFont(textFont);
         labelFont.setPixelSize(12);
@@ -3375,11 +3375,11 @@ void drawSettingsPage(
         presetFont.setPixelSize(12);
         painter.setFont(presetFont);
         const QStringList presetLines = {
-            QString::fromUtf8("当前焦点窗口    原始分辨率 · 60 FPS"),
-            QString::fromUtf8("其它可见窗口    720p · 当前后台 FPS"),
-            QString::fromUtf8("无远控窗口焦点  全部使用后台策略"),
-            QString::fromUtf8("最小化/隐藏       540p · 当前最小化 FPS"),
-            QString::fromUtf8("软件回退            540p · 24 FPS 安全档"),
+            QString::fromUtf8("普通可见窗口       540p · 30 FPS"),
+            QString::fromUtf8("全屏且无手选       720p · 30 FPS"),
+            QString::fromUtf8("用户手动选择       保持所选精确档位"),
+            QString::fromUtf8("完全遮挡/最小化  360p · 1 FPS"),
+            QString::fromUtf8("历史高档恢复       同时自动恢复一个"),
             QString::fromUtf8("音频                    默认静音，按钮独立控制"),
         };
         for (int index = 0; index < presetLines.size(); ++index) {
@@ -3391,7 +3391,7 @@ void drawSettingsPage(
             painter.setPen(index == presetLines.size() - 1
                     ? QColor(QStringLiteral("#687384"))
                     : QColor(QStringLiteral("#111827")));
-            painter.drawText(lineRect, Qt::AlignVCenter | Qt::AlignLeft, presetLines.at(index)); // wjy: 直接展示智能优先级和安全档，用户无需逐窗口操作按钮。
+            painter.drawText(lineRect, Qt::AlignVCenter | Qt::AlignLeft, presetLines.at(index)); // wjy: 直接展示当前自动基线、手选优先级和历史恢复名额规则。
         }
         painter.restore();
         return;
@@ -6344,18 +6344,18 @@ void DeviceGrid::setupSettingsControls()
 
     // =====wjy====
     m_remoteQualityConfiguration = platform::AppSettings::remoteQualityConfiguration();
-    m_remoteQualityConfiguration.defaultMode = stream::RemoteQualityMode::Automatic; // wjy: 迁移到智能策略后统一保存自动模式，旧设备手动档不再控制当前 UI。
+    m_remoteQualityConfiguration.defaultMode = stream::RemoteQualityMode::Automatic; // wjy: 旧全局模式字段固定保留兼容值，真实画质由标题栏精确档位控制。
     platform::AppSettings::setRemoteQualityConfiguration(m_remoteQualityConfiguration);
     const QString qualityControlStyle = QStringLiteral(
         "QComboBox{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;padding:0 8px;"
         "font-family:'Microsoft YaHei UI';font-size:13px;color:#040B18;}"
         "QComboBox:focus{border:1px solid #3A7BFC;}"
-        "QComboBox:disabled{background:#F5F7FA;color:#94A3B8;}"); // wjy: 远控画质页只保留一个默认模式下拉框，避免高级参数继续暗示固定预设可被改写。
+        "QComboBox:disabled{background:#F5F7FA;color:#94A3B8;}"); // wjy: 远控画质页保留只读策略标识，逐窗口档位从远控标题栏选择。
 
     m_remoteQualityModeCombo = new QComboBox(this);
-    m_remoteQualityModeCombo->addItem(QString::fromUtf8("智能切换"), static_cast<int>(stream::RemoteQualityMode::Automatic));
+    m_remoteQualityModeCombo->addItem(QString::fromUtf8("固定规则 + 标题栏手选"), static_cast<int>(stream::RemoteQualityMode::Automatic));
     m_remoteQualityModeCombo->setCurrentIndex(0);
-    m_remoteQualityModeCombo->setEnabled(false); // wjy: 设置页改为只读策略说明，不再允许全局或单窗口手动覆盖智能画质。
+    m_remoteQualityModeCombo->setEnabled(false); // wjy: 设置页只读展示策略来源，精确手选入口位于每个远控窗口标题栏。
     m_remoteQualityModeCombo->setStyleSheet(qualityControlStyle);
     m_remoteQualityModeCombo->setVisible(false); // wjy: 首次显隐统一交给updateSettingsControls，构造阶段不会闪到常规页上。
 
@@ -6892,11 +6892,24 @@ void DeviceGrid::registerRemoteQualityWindow(RemoteDesktopWindow* window)
     if (!window) {
         return;
     }
-    window->setGlobalQualityConfiguration(m_remoteQualityConfiguration); // wjy: 新窗口读取全局默认模式；设备没有已保存选择时仍从“自动”固定预设开始。
+    bool anotherAboveDefaultPresetIsOpen = false;
+    if (window->hasSavedUserQualityPreset()
+        && stream::remoteVideoQualityPresetExceedsDefault(window->savedUserQualityPreset())) {
+        const QVector<QPointer<RemoteDesktopWindow>> openedWindows = openedRemoteWindows();
+        for (const QPointer<RemoteDesktopWindow>& openedWindow : openedWindows) {
+            if (openedWindow && openedWindow.data() != window
+                && openedWindow->hasActiveUserQualityPresetAboveDefault()) {
+                anotherAboveDefaultPresetIsOpen = true;
+                break; // wjy: 只限制历史高档自动恢复；当前已打开窗口之后继续手选高档不进入此仲裁。
+            }
+        }
+    }
+    window->restoreSavedUserQualityPreset(anotherAboveDefaultPresetIsOpen); // wjy: 第一个重新打开的历史高档窗口获得恢复名额，其余本次从540/30自动基线开始。
+    window->setGlobalQualityConfiguration(m_remoteQualityConfiguration); // wjy: 保留现有设置快照接口，精确档位由窗口手选和固定自动规则决定。
     connect(window, &RemoteDesktopWindow::remoteQualityInputsChanged,
-        this, &DeviceGrid::requestRemoteQualityEvaluation); // wjy: 最小化/恢复/模式切换即时生效，不等待下一次1秒采样。
+        this, &DeviceGrid::requestRemoteQualityEvaluation); // wjy: 手选、全屏、显隐和最小化变化即时生效，不等待下一次1秒采样。
     connect(window, &QObject::destroyed, this, [this, window] {
-        m_remoteQualityCoordinator.removeWindow(reinterpret_cast<uintptr_t>(window)); // wjy: 删除该窗口滞回历史，之后同设备重开从全局基线重新开始。
+        m_remoteQualityCoordinator.removeWindow(reinterpret_cast<uintptr_t>(window)); // wjy: 协调器当前无滞回状态，仍保留统一销毁通知和重新评估时序。
         requestRemoteQualityEvaluation();
     });
     requestRemoteQualityEvaluation();
@@ -6927,8 +6940,8 @@ void DeviceGrid::evaluateRemoteQuality()
             if (window) {
                 RemoteQualityWindowMetrics snapshot = window->remoteQualityMetrics();
                 snapshot.active = snapshot.visible && !snapshot.minimized && !snapshot.fullyOccluded
-                    && window->isActiveWindow(); // wjy: 完全遮挡窗口即使Windows仍保留激活状态也不能继续占用唯一高质量角色。
-                metrics.push_back(snapshot); // wjy: 只在Qt线程附加真实焦点身份，不跨线程访问原生WebRTC对象。
+                    && window->isActiveWindow(); // wjy: 焦点只保留给诊断，不再影响默认或手选档位。
+                metrics.push_back(snapshot); // wjy: Qt线程汇总手选、全屏和遮挡状态，协调器据此生成精确档位。
             }
         }
         const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
@@ -6939,7 +6952,7 @@ void DeviceGrid::evaluateRemoteQuality()
         for (const RemoteQualityDecision& decision : decisions) {
             auto* window = reinterpret_cast<RemoteDesktopWindow*>(decision.windowId);
             if (window && windows.contains(QPointer<RemoteDesktopWindow>(window))) {
-                window->applyRemoteQualityDecision(decision); // wjy: 画质按真实焦点窗口统一下发，音频由每个窗口自己的标题栏按钮控制。
+                window->applyRemoteQualityDecision(decision); // wjy: 在线下发手选/全屏/默认/遮挡档位，音频仍由各窗口标题栏按钮独立控制。
             }
         }
         if (!windows.isEmpty()

@@ -13289,3 +13289,189 @@ requestTitleBarUpdate(buttonRect);
 - 已静态核对最终赋值仍只写入 `m_qualityPreviewText` 并刷新标题栏，没有新增 `remoteQualityInputsChanged()`。
 - 按用户要求，本次未构建、未链接、未运行测试或启动程序。
 - `src/stream/RemoteVideoPolicy.h` 的用户独立修改继续保持未暂存。
+
+## 2026-08-10 18:19 - 接入远控精确画质档位与持久化恢复策略
+
+### Changed Location
+- `src/stream/RemoteVideoPolicy.h:63-163`: 增加八档稳定枚举、精确编码映射、默认/全屏/遮挡档常量和历史高档恢复判断；将用户修改的360常规档正式命名为 `360p/25`。
+- `src/system/AppSettings.h:42-45`、`src/system/AppSettings.cpp:20-24、270-300`: 使用现有 `QSettings` 按设备保存精确档位枚举，不创建额外配置文件。
+- `src/ui/RemoteQualityCoordinator.h:63-134`、`src/ui/RemoteQualityCoordinator.cpp:18-168`: 删除焦点、窗口数量和性能压力改档分支，按手选、全屏、默认、遮挡的固定优先级输出精确档位。
+- `src/ui/RemoteDesktopWindow.h:100-104、221-222、327-331`、`src/ui/RemoteDesktopWindow.cpp:566-601、1999-2004、2299-2324、2476-2522、3954-4059`: 读取历史手选、接入菜单选择、立即持久化、刷新标题栏并向协调器发送真实输入。
+- `src/ui/DeviceGrid.cpp:3346-3393、6346-6359、6890-6956`、`src/ui/DeviceGrid.h:239、308`: 更新设置页说明，并在窗口注册时执行“历史高档只自动恢复一个”的A/B/C仲裁。
+- `tests/remote_quality_coordinator_tests.cpp:1-181`: 覆盖默认540/30、全屏720/30、手选优先、遮挡360/1、多个运行中高档并存以及A/B/C重新打开场景。
+- `tests/remote_video_policy_tests.cpp:6-85`: 覆盖八档枚举映射、360/25命名修正和焦点/后台统一540/30。
+- `CMakeLists.txt:247-253`: 更新质量协调器测试目标说明，使其与新策略一致。
+
+### Reason
+前端菜单此前只修改标题栏文字，没有连接Host在线质量接口，也没有保存精确的分辨率/FPS组合。旧协调器仍按焦点把窗口分为540/30和540/25，并可能按软件回退或性能压力继续改档，与“默认全部540/30、全屏自动720/30、手选最高、完全遮挡360/1”的规则冲突。同时，重新远控多个保存了高档位的设备时，需要只允许一个历史高档自动恢复，但不能限制当前打开窗口之后继续手动升档。
+
+### Original Code
+```cpp
+// src/stream/RemoteVideoPolicy.h:83-88（修改前）
+inline constexpr RemoteVideoEncodingPreset kRemoteVideo360p30Preset =
+    {RemoteResolutionTier::P360, 25, 7000};
+inline constexpr RemoteVideoProfile kFocusedRemoteVideoProfile =
+    makeRemoteVideoProfile(kRemoteVideo540p30Preset, 100);
+inline constexpr RemoteVideoProfile kVisibleBackgroundRemoteVideoProfile =
+    makeRemoteVideoProfile(kRemoteVideo540p25Preset, 40);
+```
+
+```cpp
+// src/system/AppSettings.h:44-45（修改前）
+static bool remoteDeviceQualityMode(
+    const QString& deviceKey,
+    stream::RemoteQualityMode* mode);
+static void setRemoteDeviceQualityMode(
+    const QString& deviceKey,
+    stream::RemoteQualityMode mode);
+```
+
+```cpp
+// src/ui/RemoteQualityCoordinator.cpp:129-149（修改前）
+const bool highPerformance = eligibleVisibleWindow
+    && (singleRemoteWindow || focusedWindowEligible);
+const auto roleProfile = decision.minimized
+    ? stream::RemoteVideoPolicy::minimizedProfile()
+    : highPerformance
+        ? stream::kFocusedRemoteVideoProfile
+        : stream::RemoteVideoPolicy::backgroundProfile();
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3934-3942（修改前）
+if (selectedAction) {
+    m_qualityPreviewText = selectedAction->data().toString();
+}
+m_qualityMenuOpen = false;
+requestTitleBarUpdate(buttonRect);
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:6890-6902（修改前）
+window->setGlobalQualityConfiguration(m_remoteQualityConfiguration);
+connect(window, &RemoteDesktopWindow::remoteQualityInputsChanged,
+    this, &DeviceGrid::requestRemoteQualityEvaluation);
+requestRemoteQualityEvaluation();
+```
+
+### Modified Code
+```cpp
+// src/stream/RemoteVideoPolicy.h:63-72、109-111
+enum class RemoteVideoQualityPreset : std::uint8_t {
+    P1080_60,
+    P1080_30,
+    P720_60,
+    P720_30,
+    P540_30,
+    P540_25,
+    P360_25,
+    P360_1,
+};
+inline constexpr RemoteVideoQualityPreset kDefaultRemoteVideoQualityPreset =
+    RemoteVideoQualityPreset::P540_30;
+inline constexpr RemoteVideoQualityPreset kFullscreenRemoteVideoQualityPreset =
+    RemoteVideoQualityPreset::P720_30;
+inline constexpr RemoteVideoQualityPreset kOccludedRemoteVideoQualityPreset =
+    RemoteVideoQualityPreset::P360_1;
+```
+
+```cpp
+// src/system/AppSettings.cpp:270-300
+bool AppSettings::remoteDeviceQualityPreset(
+    const QString& deviceKey,
+    stream::RemoteVideoQualityPreset* preset)
+{
+    const QVariant stored = settings().value(remoteDeviceQualityPresetKey(deviceKey));
+    const auto storedPreset = static_cast<stream::RemoteVideoQualityPreset>(stored.toInt());
+    if (!stream::isValidRemoteVideoQualityPreset(storedPreset)) return false;
+    *preset = storedPreset;
+    return true;
+}
+
+void AppSettings::setRemoteDeviceQualityPreset(
+    const QString& deviceKey,
+    stream::RemoteVideoQualityPreset preset)
+{
+    QSettings appSettings = settings();
+    appSettings.setValue(remoteDeviceQualityPresetKey(deviceKey), static_cast<int>(preset));
+}
+```
+
+```cpp
+// src/ui/RemoteQualityCoordinator.cpp:118-139
+const stream::RemoteVideoQualityPreset preferredPreset = window.userQualityPresetActive
+    ? window.userQualityPreset
+    : decision.fullScreen
+        ? stream::kFullscreenRemoteVideoQualityPreset
+        : stream::kDefaultRemoteVideoQualityPreset;
+decision.preset = eligibleVisibleWindow
+    ? preferredPreset
+    : stream::kOccludedRemoteVideoQualityPreset;
+const stream::RemoteVideoEncodingPreset encoding =
+    stream::remoteVideoEncodingPreset(decision.preset);
+decision.resolution = encoding.resolution;
+decision.targetFps = static_cast<int>(encoding.targetFps);
+decision.maxBitrateKbps = static_cast<int>(encoding.maxBitrateKbps);
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:4009-4038
+stream::RemoteVideoQualityPreset selectedPreset = stream::kDefaultRemoteVideoQualityPreset;
+if (!remoteVideoQualityPresetFromText(selectedText, &selectedPreset)) return;
+// 1080/60与720/60先执行已有高带宽确认框。
+m_userQualityPreset = selectedPreset;
+m_savedUserQualityPreset = selectedPreset;
+m_hasSavedUserQualityPreset = true;
+m_userQualityPresetActive = true;
+platform::AppSettings::setRemoteDeviceQualityPreset(m_hostIp, selectedPreset);
+refreshQualityPreviewText();
+emit remoteQualityInputsChanged();
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:6895-6908
+bool anotherAboveDefaultPresetIsOpen = false;
+for (const QPointer<RemoteDesktopWindow>& openedWindow : openedRemoteWindows()) {
+    if (openedWindow && openedWindow.data() != window
+        && openedWindow->hasActiveUserQualityPresetAboveDefault()) {
+        anotherAboveDefaultPresetIsOpen = true;
+        break;
+    }
+}
+window->restoreSavedUserQualityPreset(anotherAboveDefaultPresetIsOpen);
+```
+
+```cpp
+// tests/remote_quality_coordinator_tests.cpp:122-147
+// A、B、C运行中手选多个高档允许并存。
+assert(decisions[0].preset == stream::RemoteVideoQualityPreset::P720_30);
+assert(decisions[1].preset == stream::RemoteVideoQualityPreset::P720_30);
+assert(decisions[2].preset == stream::RemoteVideoQualityPreset::P1080_60);
+
+// A先重新打开并恢复历史720/30后，B本次恢复被拒绝；C已高档时A、B都被拒绝。
+const bool restoreA = stream::shouldRestoreSavedRemoteVideoQualityPreset(
+    stream::RemoteVideoQualityPreset::P720_30, false);
+const bool restoreB = stream::shouldRestoreSavedRemoteVideoQualityPreset(
+    stream::RemoteVideoQualityPreset::P720_30, restoreA);
+assert(restoreA && !restoreB);
+```
+
+### Steps
+1. 将八个标题栏选项定义为稳定枚举，并集中映射分辨率、FPS和码率；正式纳入用户已修改的360/25档。
+2. 使用现有 `QSettings("FSRemote", "FSRemote")` 按设备IP保存精确档位，配置键存在即表示用户手动选择过。
+3. 普通可见窗口统一请求540/30，不再根据焦点、窗口数量、接收性能或软件Presenter状态自动改档。
+4. 无手选窗口进入全屏自动请求720/30，退出全屏恢复540/30；手选窗口全屏仍保持手选档。
+5. 完全遮挡、最小化或隐藏窗口临时请求360/1；重新暴露时通过 `Expose` 和周期采样立即恢复手选或自动档。
+6. 标题栏确认选择后立即写QSettings并触发现有在线质量评估，Viewer连接不停止、不重建。
+7. 重新打开历史高档窗口时扫描当前已打开窗口：第一个历史高档可恢复，后续历史高档本次使用默认；历史配置本身不删除。
+8. 当前打开窗口随后手动升到高档不受数量限制，因此A、B、C可以同时保持用户选择的高档位。
+9. 用户手选540/30也会保存“手选”身份，从而阻止全屏自动切到720/30；默认及以下历史档不占高档恢复名额。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已使用 `rg` 确认旧 `remoteDeviceQualityMode`、`qualityOverrideMode`、`kRemoteVideo360p30Preset` 和焦点画质防抖字段均已移除。
+- 已静态核对菜单选择会调用 `setRemoteDeviceQualityPreset()`、更新用户手选状态并发出 `remoteQualityInputsChanged()`。
+- 已静态核对全屏自动档不会写入QSettings，遮挡360/1也不会覆盖历史手选配置。
+- 已静态核对A/B/C规则：运行中多高档允许；重新打开历史高档时只恢复一个；已有C高档时A、B均从默认开始。
+- 已更新纯策略测试源码覆盖默认、全屏、手选、遮挡、恢复和多窗口场景。
+- 按用户此前要求，本次未构建、未链接、未运行测试或启动程序。
