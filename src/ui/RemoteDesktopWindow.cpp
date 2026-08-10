@@ -4370,8 +4370,8 @@ void RemoteDesktopWindow::chooseAndStartInputScriptPlayback()
                 [window, cancelled, result, errorMessage] {
                     if (!window || window->m_inputScriptStartCancelled != cancelled) return;
                     if (result == platform::RemoteInputScriptCommandResult::Accepted) {
-                        window->appendViewerDebugLog(QStringLiteral("target input script accepted host=%1 run_id=%2")
-                            .arg(window->m_hostIp, window->m_remoteInputScriptStatus.runId));
+                        appendViewerDebugLog(QStringLiteral("target input script accepted host=%1 run_id=%2")
+                            .arg(window->m_hostIp, window->m_remoteInputScriptStatus.runId)); // wjy: 日志函数属于当前翻译单元，异步回到UI线程后按自由函数调用。
                         window->requestRemoteInputScriptStatus();
                         return;
                     }

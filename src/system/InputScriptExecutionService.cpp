@@ -22,6 +22,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif // wjy: 禁止windows.h定义min/max宏，避免破坏std::min和numeric_limits::max()模板调用。
 #include <windows.h>
 #endif
 

@@ -12594,3 +12594,58 @@ QString RemoteInputScriptStore::defaultDirectory()
 - 已静态核对目标运行状态同时进入 UDP 49104、TCP 49101 和 TCP 49102，主控窗口重开可恢复，且同 IP 全部窗口使用同一快照。
 - 已静态核对控制端窗口析构、远程更新、应用退出、连接断开和关窗路径不再发送 F10 停止命令。
 - 按用户要求未构建、未链接、未运行程序或测试二进制。
+
+## 2026-08-10 11:25 - 修复目标端键鼠脚本编译错误
+
+### Changed Location
+- `src/ui/RemoteDesktopWindow.cpp:4373`：按自由函数方式调用 Viewer 调试日志。
+- `src/system/InputScriptExecutionService.cpp:25`：在包含 `windows.h` 前定义 `NOMINMAX`。
+
+### Reason
+本次大量 MSVC 报错实际只有两个根因。`appendViewerDebugLog` 定义在 `RemoteDesktopWindow.cpp` 的匿名命名空间中，并不是 `RemoteDesktopWindow` 成员，使用 `window->appendViewerDebugLog()` 会产生 C2039。目标端执行服务直接包含 `windows.h` 但没有定义 `NOMINMAX`，Windows 的 `min/max` 宏会破坏 `std::min<>()` 和 `std::numeric_limits<int>::max()`，因此同一宏污染连续产生 C2589、C2059 和 C2143。
+
+### Original Code
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:4373-4374（修改前）
+window->appendViewerDebugLog(QStringLiteral("target input script accepted host=%1 run_id=%2")
+    .arg(window->m_hostIp, window->m_remoteInputScriptStatus.runId));
+```
+
+```cpp
+// src/system/InputScriptExecutionService.cpp:21-25（修改前）
+#if defined(Q_OS_WIN)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+```
+
+### Modified Code
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:4373-4374
+appendViewerDebugLog(QStringLiteral("target input script accepted host=%1 run_id=%2")
+    .arg(window->m_hostIp, window->m_remoteInputScriptStatus.runId)); // wjy: 日志函数属于当前翻译单元，异步回到UI线程后按自由函数调用。
+```
+
+```cpp
+// src/system/InputScriptExecutionService.cpp:21-29
+#if defined(Q_OS_WIN)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif // wjy: 禁止windows.h定义min/max宏，避免破坏std::min和numeric_limits::max()模板调用。
+#include <windows.h>
+```
+
+### Steps
+1. 将异步启动成功日志从错误的成员调用改为当前翻译单元内的自由函数调用。
+2. 在目标端执行服务包含 Windows SDK 前关闭 `min/max` 宏定义。
+3. 使用现有 Qt 6.11.1 MSVC 2022 Release 构建目录重新增量编译 `FSRemote`。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已通过 Visual Studio 2022 `VsDevCmd.bat` 加载 MSVC x64 环境。
+- 已执行 `cmake --build build/Desktop_Qt_6_11_1_MSVC2022_64bit-Release --target FSRemote`，增量编译、链接和目标生成完成，退出码为 0。
+- 原 C2039、C2589、C2059、C2143 报错均未再次出现。
