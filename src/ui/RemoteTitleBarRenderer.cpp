@@ -87,14 +87,18 @@ void paintTitleBarButtons(
         painter.setBrush(background);
         painter.drawRoundedRect(QRectF(layout.quality), 4, 4);
         QFont font(QStringLiteral("Microsoft YaHei UI"));
-        font.setPixelSize(10); // wjy: 54px宽按钮内同时容纳“540/30”和下拉箭头，不挤压相邻系统按钮。
+        font.setPixelSize(10); // wjy: 54px宽按钮只绘制当前档位文字，删除右侧下拉三角后最长档位也保持居中。
         font.setWeight(QFont::DemiBold);
         painter.setFont(font);
-        painter.setPen(QColor(QStringLiteral("#344054")));
+        const bool highBandwidthSelection = state.qualityText == QStringLiteral("1080/60")
+            || state.qualityText == QStringLiteral("720/60");
+        painter.setPen(highBandwidthSelection
+            ? QColor(QStringLiteral("#DC2626"))
+            : QColor(QStringLiteral("#344054"))); // wjy: 高带宽档选中后标题栏文字继续保持红色，和菜单内风险提示颜色一致。
         painter.drawText(
             layout.quality.adjusted(2, 0, -2, 0),
             Qt::AlignCenter,
-            state.qualityText + QStringLiteral(" ▾")); // wjy: 按钮本体只显示当前前端选中档与下拉方向，不显示额外说明文字。
+            state.qualityText); // wjy: 按钮本体仅显示当前前端档位，不再绘制向下三角形。
     }
     // ===end====
 

@@ -12,7 +12,6 @@
 #include "ui/RemoteTitleBarRenderer.h"
 #include "ui/RemoteViewerLifecycleManager.h"
 
-#include <QAction>
 #include <QByteArray>
 #include <QApplication>
 #include <QClipboard>
@@ -60,6 +59,7 @@
 #include <QVBoxLayout>
 #include <QWheelEvent>
 #include <QWindow>
+#include <QWidgetAction>
 #include <QUuid>
 
 #include <algorithm>
@@ -3897,16 +3897,12 @@ void RemoteDesktopWindow::showQualityPreviewMenu()
     }
 
     QMenu menu(this);
-    menu.setAttribute(Qt::WA_TranslucentBackground);
     menu.setWindowFlag(Qt::NoDropShadowWindowHint, true);
-    menu.setFixedWidth(96); // wjy: 菜单比54px标题栏按钮略宽，最长的“1080/60”与选中标记都能保持单行。
+    menu.setFixedWidth(96); // wjy: 菜单比54px标题栏按钮略宽，最长的“1080/60”保持单行且不再预留对勾区域。
     menu.setStyleSheet(QStringLiteral(
         "QMenu{background:#FFFFFF;border:1px solid #D8DEE8;border-radius:5px;padding:4px 0;"
         "font-family:'Microsoft YaHei UI';font-size:11px;color:#344054;}"
-        "QMenu::item{height:27px;padding:0 10px 0 26px;background:transparent;}"
-        "QMenu::item:selected{background:#E8F1FF;color:#1D4ED8;}"
-        "QMenu::item:checked{font-weight:600;color:#1D4ED8;background:#F3F7FF;}"
-        "QMenu::indicator{width:12px;height:12px;}")); // wjy: 八个档位以紧凑纵列呈现，当前项用Qt原生勾选标记和浅蓝背景识别。
+        "QMenu::item{height:27px;padding:0;margin:0;background:transparent;}")); // wjy: 菜单本体只负责白色圆角底板，档位文字与悬停态交给内部按钮绘制。
 
     const QStringList options = {
         QStringLiteral("1080/60"),
@@ -3918,27 +3914,72 @@ void RemoteDesktopWindow::showQualityPreviewMenu()
         QStringLiteral("360/25"),
         QStringLiteral("360/1")
     }; // wjy: 顺序固定从最高画质到最低保活档，360常规档按用户要求改为25 FPS。
+    QString selectedText;
     for (const QString& option : options) {
-        QAction* action = menu.addAction(option);
-        action->setCheckable(true);
-        action->setChecked(option == m_qualityPreviewText);
-        action->setData(option); // wjy: 动作只携带显示文字，当前阶段不映射分辨率、帧率或码率结构。
+        const bool highBandwidthOption = option == QStringLiteral("1080/60")
+            || option == QStringLiteral("720/60");
+        const QString textColor = highBandwidthOption
+            ? QStringLiteral("#DC2626")
+            : QStringLiteral("#344054"); // wjy: 两个60 FPS高带宽档固定使用红字，其余档位保持中性深灰。
+        const QString defaultBackground = option == m_qualityPreviewText
+            ? QStringLiteral("#F3F7FF")
+            : QStringLiteral("transparent"); // wjy: 当前档仅保留轻微底色，不绘制对勾、圆点或额外占位。
+
+        auto* action = new QWidgetAction(&menu);
+        auto* optionButton = new QPushButton(option, &menu);
+        optionButton->setCursor(Qt::PointingHandCursor);
+        optionButton->setFocusPolicy(Qt::NoFocus);
+        optionButton->setFixedHeight(27);
+        optionButton->setStyleSheet(QStringLiteral(
+            "QPushButton{border:0;border-radius:0;background:%1;color:%2;"
+            "font-family:'Microsoft YaHei UI';font-size:11px;font-weight:500;text-align:center;padding:0;}"
+            "QPushButton:hover{background:#E8F1FF;color:%2;}"
+            "QPushButton:pressed{background:#DCE8F8;color:%2;}")
+            .arg(defaultBackground, textColor)); // wjy: QWidgetAction让每一档都是无勾选区域的真实按钮，并允许高带宽项独立着色。
+        connect(optionButton, &QPushButton::clicked, &menu, [&menu, &selectedText, option] {
+            selectedText = option;
+            menu.close(); // wjy: 先关闭下拉层再处理确认弹窗，避免菜单按压态和警告框同时叠在标题栏上。
+        });
+        action->setDefaultWidget(optionButton);
+        menu.addAction(action);
     }
+
+    menu.adjustSize();
+    QPainterPath menuMaskPath;
+    menuMaskPath.addRoundedRect(QRectF(menu.rect()), 5, 5);
+    menu.setMask(QRegion(menuMaskPath.toFillPolygon().toPolygon())); // wjy: 用窗口区域真正裁掉圆角外像素，清除Windows弹出层四角残留的黑色直角。
 
     m_qualityMenuOpen = true;
     requestTitleBarUpdate(buttonRect);
     const QPoint popupPosition = mapToGlobal(QPoint(
         buttonRect.right() - menu.width() + 1,
         buttonRect.bottom() + 4)); // wjy: 菜单右边缘与标题栏按钮对齐并向下留4px，视觉上保持明确的下拉归属。
-    QAction* selectedAction = menu.exec(popupPosition);
-    if (selectedAction) {
-        const QString selectedText = selectedAction->data().toString();
-        if (!selectedText.isEmpty()) {
-            m_qualityPreviewText = selectedText; // wjy: 仅更新前端选中文字，不发remoteQualityInputsChanged，也不调用质量协调器。
-        }
-    }
+    menu.exec(popupPosition);
     m_qualityMenuOpen = false;
     requestTitleBarUpdate(buttonRect);
+    if (selectedText.isEmpty() || selectedText == m_qualityPreviewText) {
+        return;
+    }
+
+    const bool needsBandwidthConfirmation = selectedText == QStringLiteral("1080/60")
+        || selectedText == QStringLiteral("720/60");
+    if (needsBandwidthConfirmation) {
+        QMessageBox confirmation(this);
+        confirmation.setIcon(QMessageBox::Warning);
+        confirmation.setWindowTitle(QString::fromUtf8("高带宽提示"));
+        confirmation.setText(QString::fromUtf8("此分辨率设置会大幅消耗带宽，造成卡顿，是否设置？"));
+        QPushButton* confirmButton = confirmation.addButton(QString::fromUtf8("是"), QMessageBox::AcceptRole);
+        QPushButton* cancelButton = confirmation.addButton(QString::fromUtf8("否"), QMessageBox::RejectRole);
+        confirmation.setDefaultButton(cancelButton);
+        confirmation.setEscapeButton(cancelButton);
+        confirmation.exec();
+        if (confirmation.clickedButton() != confirmButton) {
+            return; // wjy: 选择“否”、按Esc或关闭弹窗都保持原前端档位，不触发任何后台质量请求。
+        }
+    }
+
+    m_qualityPreviewText = selectedText;
+    requestTitleBarUpdate(buttonRect); // wjy: 普通档直接更新，高带宽档仅在确认后更新；当前仍不发remoteQualityInputsChanged。
 }
 // ===end====
 
@@ -6603,9 +6644,13 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
         qualityFont.setPixelSize(10);
         qualityFont.setWeight(QFont::DemiBold);
         painter.setFont(qualityFont);
-        painter.setPen(QColor(QStringLiteral("#344054")));
+        const bool highBandwidthSelection = m_qualityPreviewText == QStringLiteral("1080/60")
+            || m_qualityPreviewText == QStringLiteral("720/60");
+        painter.setPen(highBandwidthSelection
+            ? QColor(QStringLiteral("#DC2626"))
+            : QColor(QStringLiteral("#344054"))); // wjy: 旧Qt回退标题栏与原生绘制器保持相同的高带宽红字状态。
         painter.drawText(qualityRect.adjusted(2, 0, -2, 0), Qt::AlignCenter,
-            m_qualityPreviewText + QStringLiteral(" ▾")); // wjy: 旧Qt父窗口回退路径显示与原生标题栏相同的当前档位和展开态。
+            m_qualityPreviewText); // wjy: 旧Qt父窗口回退路径同样删除向下三角，只显示当前前端档位。
     }
     // ===end====
 

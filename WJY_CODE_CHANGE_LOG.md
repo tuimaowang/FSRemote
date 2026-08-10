@@ -13167,3 +13167,125 @@ assert(menuOpen != normal);
 - 已静态核对原生标题栏和 `FSREMOTE_LEGACY_PARENT_TITLE_BAR` 回退路径均绘制新按钮。
 - 按用户要求，本次未构建、未链接、未运行测试或启动程序。
 - 用户在 `src/stream/RemoteVideoPolicy.h` 中单独修改的360档参数不属于本次前端任务，未改动且不会随本次提交暂存。
+
+## 2026-08-10 17:04 - 精简画质菜单并增加高带宽确认
+
+### Changed Location
+- `src/ui/RemoteTitleBarRenderer.cpp:89-101`: 删除画质按钮右侧下拉三角，并让选中的 `1080/60`、`720/60` 使用红色文字。
+- `src/ui/RemoteDesktopWindow.cpp:3892-3983`: 用无勾选区域的按钮重做八档菜单，增加圆角窗口遮罩和高带宽中文确认框。
+- `src/ui/RemoteDesktopWindow.cpp:6639-6653`: 旧Qt标题栏回退路径同步删除三角，并显示高带宽红字。
+
+### Reason
+原标题栏按钮带有向下三角，菜单通过可勾选 `QAction` 显示对勾，与用户要求的纯数字紧凑界面不符。菜单透明圆角窗口在Windows上还可能残留黑色直角。高帧率的 `1080/60` 和 `720/60` 会显著增加带宽压力，因此需要用红字提示，并在前端选中前二次确认；本次仍不接入实际清晰度下发逻辑。
+
+### Original Code
+```cpp
+// src/ui/RemoteTitleBarRenderer.cpp:94-97（修改前）
+painter.drawText(
+    layout.quality.adjusted(2, 0, -2, 0),
+    Qt::AlignCenter,
+    state.qualityText + QStringLiteral(" ▾"));
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3899-3909（修改前）
+QMenu menu(this);
+menu.setAttribute(Qt::WA_TranslucentBackground);
+menu.setWindowFlag(Qt::NoDropShadowWindowHint, true);
+menu.setStyleSheet(QStringLiteral(
+    "QMenu{background:#FFFFFF;border:1px solid #D8DEE8;border-radius:5px;}"
+    "QMenu::item:checked{font-weight:600;color:#1D4ED8;background:#F3F7FF;}"
+    "QMenu::indicator{width:12px;height:12px;}"));
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3921-3925（修改前）
+QAction* action = menu.addAction(option);
+action->setCheckable(true);
+action->setChecked(option == m_qualityPreviewText);
+action->setData(option);
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3933-3941（修改前）
+QAction* selectedAction = menu.exec(popupPosition);
+if (selectedAction) {
+    m_qualityPreviewText = selectedAction->data().toString();
+}
+m_qualityMenuOpen = false;
+requestTitleBarUpdate(buttonRect);
+```
+
+### Modified Code
+```cpp
+// src/ui/RemoteTitleBarRenderer.cpp:93-101
+const bool highBandwidthSelection = state.qualityText == QStringLiteral("1080/60")
+    || state.qualityText == QStringLiteral("720/60");
+painter.setPen(highBandwidthSelection
+    ? QColor(QStringLiteral("#DC2626"))
+    : QColor(QStringLiteral("#344054")));
+painter.drawText(layout.quality.adjusted(2, 0, -2, 0),
+    Qt::AlignCenter, state.qualityText);
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3917-3945
+QString selectedText;
+for (const QString& option : options) {
+    const bool highBandwidthOption = option == QStringLiteral("1080/60")
+        || option == QStringLiteral("720/60");
+    auto* action = new QWidgetAction(&menu);
+    auto* optionButton = new QPushButton(option, &menu);
+    optionButton->setStyleSheet(QStringLiteral(
+        "QPushButton{border:0;background:%1;color:%2;}"
+        "QPushButton:hover{background:#E8F1FF;color:%2;}")
+        .arg(defaultBackground, textColor));
+    connect(optionButton, &QPushButton::clicked, &menu, [&menu, &selectedText, option] {
+        selectedText = option;
+        menu.close();
+    });
+    action->setDefaultWidget(optionButton);
+    menu.addAction(action);
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3947-3950
+menu.adjustSize();
+QPainterPath menuMaskPath;
+menuMaskPath.addRoundedRect(QRectF(menu.rect()), 5, 5);
+menu.setMask(QRegion(menuMaskPath.toFillPolygon().toPolygon()));
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3964-3982
+const bool needsBandwidthConfirmation = selectedText == QStringLiteral("1080/60")
+    || selectedText == QStringLiteral("720/60");
+if (needsBandwidthConfirmation) {
+    QMessageBox confirmation(this);
+    confirmation.setWindowTitle(QString::fromUtf8("高带宽提示"));
+    confirmation.setText(QString::fromUtf8("此分辨率设置会大幅消耗带宽，造成卡顿，是否设置？"));
+    QPushButton* confirmButton = confirmation.addButton(QString::fromUtf8("是"), QMessageBox::AcceptRole);
+    QPushButton* cancelButton = confirmation.addButton(QString::fromUtf8("否"), QMessageBox::RejectRole);
+    confirmation.exec();
+    if (confirmation.clickedButton() != confirmButton) return;
+}
+m_qualityPreviewText = selectedText;
+requestTitleBarUpdate(buttonRect);
+```
+
+### Steps
+1. 删除原生标题栏和旧Qt回退标题栏中的下拉三角字符。
+2. 将可勾选 `QAction` 替换为 `QWidgetAction` 内嵌无边框 `QPushButton`，彻底移除对勾及其左侧占位。
+3. 当前档位仅保留轻微浅蓝底色；`1080/60`、`720/60` 在菜单和标题栏中固定显示红字。
+4. 菜单按最终尺寸创建5px圆角窗口遮罩，裁掉四角窗口像素，避免黑色直角残留。
+5. 点击两个高带宽档时弹出“是/否”中文警告，只有“是”会更新前端标题栏文字。
+6. 选择“否”、Esc、关闭弹窗或取消菜单都保持原值，不发送任何后台质量请求。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已使用 `rg` 确认标题栏源码中不再包含下拉三角字符、`setCheckable()`、画质项 `setChecked()` 或 `QMenu::indicator`。
+- 已静态核对 `1080/60` 和 `720/60` 同时控制红字与确认框，其他六档不会弹出警告。
+- 已静态核对最终赋值仍只写入 `m_qualityPreviewText` 并刷新标题栏，没有新增 `remoteQualityInputsChanged()`。
+- 按用户要求，本次未构建、未链接、未运行测试或启动程序。
+- `src/stream/RemoteVideoPolicy.h` 的用户独立修改继续保持未暂存。
