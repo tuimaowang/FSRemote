@@ -63,7 +63,7 @@ void verifyNarrowVisibilityAndStateChanges()
 void verifyNetworkWarningRendering()
 {
     ui::RemoteTitleBarVisualState normal = baseState(900, 1.0);
-    normal.performanceText = QStringLiteral("60 FPS | 30 Mbps");
+    normal.performanceText = QStringLiteral("60FPS · 30Mbps");
     const QImage normalImage = ui::RemoteTitleBarRenderer::render(normal);
     assert(!normalImage.isNull());
 
@@ -82,7 +82,7 @@ void verifyNetworkWarningRendering()
 void verifyInputScriptStatusRendering()
 {
     ui::RemoteTitleBarVisualState normal = baseState(900, 1.0);
-    normal.performanceText = QStringLiteral("60 FPS | 30 Mbps");
+    normal.performanceText = QStringLiteral("60FPS · 30Mbps");
     const QImage normalImage = ui::RemoteTitleBarRenderer::render(normal);
     assert(!normalImage.isNull());
 
@@ -97,6 +97,25 @@ void verifyInputScriptStatusRendering()
     const QImage playbackBand = ui::RemoteTitleBarRenderer::renderIdentityBand(normal, 1200);
     assert(!playbackBand.isNull());
     assert(playbackBand != ui::RemoteTitleBarRenderer::renderIdentityBand(baseState(900, 1.0), 1200)); // wjy: 分段原生标题栏路径也必须显示F10回放状态。
+}
+// ===end====
+
+// =====wjy====
+void verifyCompactSessionMetricsRendering()
+{
+    ui::RemoteTitleBarVisualState compact = baseState(700, 1.0);
+    const QImage elapsedOnly = ui::RemoteTitleBarRenderer::render(compact);
+    compact.performanceText = QStringLiteral("60FPS · 30Mbps"); // wjy: 700px窗口在保留全部右侧按钮时只能容纳按实际宽度紧凑排列的性能文本。
+    const QImage compactImage = ui::RemoteTitleBarRenderer::render(compact);
+    assert(!elapsedOnly.isNull());
+    assert(!compactImage.isNull());
+    assert(compactImage != elapsedOnly); // wjy: 紧凑布局必须在700px宽度下真正绘制FPS/码率，旧的122px固定占位会使两帧完全相同并导致测试失败。
+
+    ui::RemoteTitleBarVisualState bandState = baseState(700, 1.0);
+    const QImage elapsedBand = ui::RemoteTitleBarRenderer::renderIdentityBand(bandState, 1200);
+    bandState.performanceText = QStringLiteral("60FPS · 30Mbps");
+    const QImage compactBand = ui::RemoteTitleBarRenderer::renderIdentityBand(bandState, 1200);
+    assert(compactBand != elapsedBand); // wjy: 当前生产使用的分段原生标题栏路径也必须应用同一紧凑布局。
 }
 // ===end====
 
@@ -130,5 +149,6 @@ int main(int argc, char** argv)
     verifyNetworkWarningRendering();
     verifyInputScriptStatusRendering();
     verifyMouseLockStatusRendering();
+    verifyCompactSessionMetricsRendering();
     return 0;
 }

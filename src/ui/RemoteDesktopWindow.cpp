@@ -3278,9 +3278,9 @@ RemoteTitleBarVisualState RemoteDesktopWindow::titleBarVisualState() const
         const QString bitrateText = m_encodedMbps > 0.0
             ? QString::number(qRound(m_encodedMbps))
             : QStringLiteral("--");
-        state.performanceText = QStringLiteral("%1 FPS | %2 Mbps")
+        state.performanceText = QStringLiteral("%1FPS · %2Mbps")
             .arg(fpsText)
-            .arg(bitrateText); // wjy: 标题栏仅在收到视频时显示实际接收FPS和压缩码率。
+            .arg(bitrateText); // wjy: 去掉数字与单位之间的空格并使用中点分隔，保留FPS/码率语义同时缩短标题栏占用。
     }
 
     const RemoteTitleBarIdentityLayout identity = remoteTitleBarIdentityLayout(width(), m_deviceName, m_hostIp);

@@ -12969,3 +12969,87 @@ window->activateWindow();
 - 已静态核对最大化路径：保存 `normalGeometry()`，退出后先恢复普通矩形再最大化，随后标题栏双击 `showNormal()` 可回到原大小。
 - 已静态核对平铺路径：保存当前平铺矩形，退出全屏后不改变 `m_rememberGeometry`，仍回到原平铺位置。
 - 按此前用户要求，本次未构建、未链接和未运行程序。
+
+## 2026-08-10 16:11 - 收紧远控标题栏计时与性能数字
+
+### Changed Location
+- `src/ui/RemoteDesktopWindow.cpp:3281`: 将FPS与码率文本改为紧凑的数字、单位和中点分隔格式。
+- `src/ui/RemoteTitleBarRenderer.cpp:181`: 计时、FPS和码率改用11px字号、实际文字宽度和10px分组间距布局。
+- `tests/remote_titlebar_renderer_tests.cpp:104`: 新增700px宽度下性能数字仍能绘制的像素回归覆盖。
+
+### Reason
+原标题栏为会话计时固定预留70px，为FPS与码率固定预留122px，第二组文字还使用固定起点。实际的 `00:00:53` 只占其中一部分，因此计时和 `30 FPS | 1 Mbps` 之间出现明显空白。本次改为根据 `QFontMetrics` 计算真实宽度，仅保留10px视觉分组距离，并缩短文本本身，在不删减信息的前提下收紧整个数字区域。
+
+### Original Code
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3281-3283
+state.performanceText = QStringLiteral("%1 FPS | %2 Mbps")
+    .arg(fpsText)
+    .arg(bitrateText);
+```
+
+```cpp
+// src/ui/RemoteTitleBarRenderer.cpp:181-190
+const int elapsedX = state.identityRight + 14;
+const int secondaryX = elapsedX + 78;
+const int contentRight = titleTextRight - 8;
+const auto paintElapsed = [&] {
+    if (elapsedX + 70 > contentRight) return;
+    QFont elapsedFont(QStringLiteral("Microsoft YaHei UI"));
+    elapsedFont.setPixelSize(12);
+    painter.drawText(QRectF(elapsedX, 0, 70, barHeight),
+        Qt::AlignVCenter | Qt::AlignLeft, state.elapsedText);
+};
+```
+
+```cpp
+// tests/remote_titlebar_renderer_tests.cpp:62-121
+// 原测试只验证网络警告、脚本状态和鼠标锁定的像素差异，
+// 没有覆盖计时与性能数字的紧凑布局。
+```
+
+### Modified Code
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3281-3283
+state.performanceText = QStringLiteral("%1FPS · %2Mbps")
+    .arg(fpsText)
+    .arg(bitrateText);
+```
+
+```cpp
+// src/ui/RemoteTitleBarRenderer.cpp:181-190
+constexpr int kIdentityToSessionGap = 10;
+constexpr int kSessionItemGap = 10;
+constexpr int kSessionRightPadding = 6;
+QFont sessionFont(QStringLiteral("Microsoft YaHei UI"));
+sessionFont.setPixelSize(11);
+const QFontMetrics sessionMetrics(sessionFont);
+const int elapsedWidth = std::max(1, sessionMetrics.horizontalAdvance(state.elapsedText) + 1);
+const int performanceWidth = std::max(1, sessionMetrics.horizontalAdvance(state.performanceText) + 1);
+const int elapsedX = state.identityRight + kIdentityToSessionGap;
+const int secondaryX = elapsedX + elapsedWidth + kSessionItemGap;
+```
+
+```cpp
+// tests/remote_titlebar_renderer_tests.cpp:104-120
+void verifyCompactSessionMetricsRendering()
+{
+    ui::RemoteTitleBarVisualState compact = baseState(700, 1.0);
+    const QImage elapsedOnly = ui::RemoteTitleBarRenderer::render(compact);
+    compact.performanceText = QStringLiteral("60FPS · 30Mbps");
+    const QImage compactImage = ui::RemoteTitleBarRenderer::render(compact);
+    assert(compactImage != elapsedOnly);
+}
+```
+
+### Steps
+1. 将标题栏性能文本从 `30 FPS | 1 Mbps` 改为 `30FPS · 1Mbps`。
+2. 将数字区字号从12px调整为11px，设备名和IP字号保持不变。
+3. 删除70px计时占位、122px性能占位和固定第二起点，改用 `QFontMetrics::horizontalAdvance()` 计算实际宽度。
+4. 设备信息到计时保留10px，计时到FPS/码率保留10px，保持分组又减少空白。
+5. 为完整DComp标题栏和分段原生标题栏增加700px宽度回归断言。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 用户要求不再构建后，未继续执行构建或程序运行。
+- 在用户消息到达前，`fsremote_remote_titlebar_renderer_tests` 目标已完成编译与链接；本次未运行该测试可执行文件。

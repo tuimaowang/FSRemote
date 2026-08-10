@@ -178,16 +178,22 @@ void paintTitleBarSessionText(
     int barHeight)
 {
     // =====wjy====
-    const int elapsedX = state.identityRight + 14;
-    const int secondaryX = elapsedX + 78;
-    const int contentRight = titleTextRight - 8;
+    constexpr int kIdentityToSessionGap = 10;
+    constexpr int kSessionItemGap = 10;
+    constexpr int kSessionRightPadding = 6;
+    QFont sessionFont(QStringLiteral("Microsoft YaHei UI"));
+    sessionFont.setPixelSize(11); // wjy: 仅缩小计时、FPS和码率数字，设备名与IP仍保持原12px字号。
+    const QFontMetrics sessionMetrics(sessionFont);
+    const int elapsedWidth = std::max(1, sessionMetrics.horizontalAdvance(state.elapsedText) + 1); // wjy: 计时区按当前字体实际宽度占位，删除原来70px固定空白。
+    const int performanceWidth = std::max(1, sessionMetrics.horizontalAdvance(state.performanceText) + 1); // wjy: FPS与码率区同样使用实际文字宽度，不再预留122px。
+    const int elapsedX = state.identityRight + kIdentityToSessionGap;
+    const int secondaryX = elapsedX + elapsedWidth + kSessionItemGap; // wjy: 计时后只保留10px分组间距，数字不再被固定起点拉开。
+    const int contentRight = titleTextRight - kSessionRightPadding;
     const auto paintElapsed = [&] {
-        if (elapsedX + 70 > contentRight) return;
-        QFont elapsedFont(QStringLiteral("Microsoft YaHei UI"));
-        elapsedFont.setPixelSize(12);
-        painter.setFont(elapsedFont);
+        if (elapsedX + elapsedWidth > contentRight) return;
+        painter.setFont(sessionFont);
         painter.setPen(QColor(QStringLiteral("#4B4B4C")));
-        painter.drawText(QRectF(elapsedX, 0, 70, barHeight),
+        painter.drawText(QRectF(elapsedX, 0, elapsedWidth, barHeight),
             Qt::AlignVCenter | Qt::AlignLeft, state.elapsedText);
     };
     const auto paintPriorityStatus = [&](const QString& text, const QColor& color, int textWidth) {
@@ -217,13 +223,11 @@ void paintTitleBarSessionText(
     }
 
     paintElapsed();
-    if (!state.performanceText.isEmpty() && secondaryX + 122 <= contentRight) {
-        QFont performanceFont(QStringLiteral("Microsoft YaHei UI"));
-        performanceFont.setPixelSize(12);
-        painter.setFont(performanceFont);
+    if (!state.performanceText.isEmpty() && secondaryX + performanceWidth <= contentRight) {
+        painter.setFont(sessionFont);
         painter.setPen(QColor(QStringLiteral("#344054")));
-        painter.drawText(QRectF(secondaryX, 0, 122, barHeight),
-            Qt::AlignVCenter | Qt::AlignLeft, state.performanceText);
+        painter.drawText(QRectF(secondaryX, 0, performanceWidth, barHeight),
+            Qt::AlignVCenter | Qt::AlignLeft, state.performanceText); // wjy: 实际宽度足够时立即紧跟计时绘制，窄窗口仍按原有规则隐藏性能文本。
     }
     // ===end====
 }
