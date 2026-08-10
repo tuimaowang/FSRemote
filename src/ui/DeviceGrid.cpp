@@ -4266,6 +4266,13 @@ void DeviceGrid::updateRealtimeConfiguredDevices()
             ++it;
         }
     }
+    for (auto it = m_deviceRealtimeInputScriptStates.begin(); it != m_deviceRealtimeInputScriptStates.end();) {
+        if (!configuredIps.contains(it.key())) {
+            it = m_deviceRealtimeInputScriptStates.erase(it);
+        } else {
+            ++it;
+        }
+    }
     m_realtimeStateService->setConfiguredDeviceIps(configuredIps); // wjy: 来源过滤与设备列表共用一份 IP 集合，未知广播不会写入任何 UI 缓存。
 }
 
@@ -4282,6 +4289,7 @@ void DeviceGrid::applyRealtimeDeviceState(
     m_deviceRemoteSessionCounts.insert(ip, qBound(0, state.remoteSessionCount, 10)); // wjy: 徽标人数只接收目标主机快照里的会话数。
     m_deviceRemoteControllerNames.insert(ip, state.remoteControllerLabels.join(QLatin1Char(',')));
     m_deviceRealtimeScriptStates.insert(ip, state.script.state);
+    applyRemoteInputScriptRuntimeState(ip, state.inputScript); // wjy: 每次UDP或49101归并结果都同步到该设备当前全部监控窗口。
     if (!state.update.installedVersion.trimmed().isEmpty()) {
         m_deviceRealtimeUpdateStates.insert(ip, state.update);
         setRemoteUpdateAvailability(ip, realtimeUpdateAvailable(state.update));
@@ -4309,6 +4317,22 @@ void DeviceGrid::applyRealtimeDeviceState(
         m_poweringOnStartedAtMs.remove(ip); // wjy: 实时心跳到达即确认开机完成，不等待两秒 TCP 唤醒探测。
     }
     update(deviceListViewportRect(m_deviceGroupExpanded));
+}
+
+void DeviceGrid::applyRemoteInputScriptRuntimeState(
+    const QString& deviceIp,
+    const platform::RemoteInputScriptRuntimeInfo& runtime)
+{
+    const QString ip = deviceIp.trimmed();
+    if (ip.isEmpty()) {
+        return;
+    }
+    m_deviceRealtimeInputScriptStates.insert(ip, runtime);
+    for (const QPointer<RemoteDesktopWindow>& window : openedRemoteWindows()) {
+        if (window && window->hostIp().compare(ip, Qt::CaseInsensitive) == 0) {
+            window->setRemoteInputScriptStatus(runtime); // wjy: 多窗口只展示目标端同一快照，不在各窗口内部推测其它窗口的执行状态。
+        }
+    }
 }
 
 void DeviceGrid::publishRemoteControllerTarget(
@@ -9036,6 +9060,9 @@ void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex)
     connect(remoteWindow, &RemoteDesktopWindow::titleBarUpdateRequested,
         this, &DeviceGrid::updateRemoteWindowDevice); // wjy: 普通远控窗口更新按钮按自身 IP 复用单设备更新逻辑。
     remoteWindow->setRemoteUpdateAvailable(m_deviceUpdateAvailability.value(deviceIp, false)); // wjy: 窗口创建时立即使用最近一次状态刷新结果，不等待下一轮定时刷新。
+    if (m_deviceRealtimeInputScriptStates.contains(deviceIp)) {
+        remoteWindow->setRemoteInputScriptStatus(m_deviceRealtimeInputScriptStates.value(deviceIp)); // wjy: 主控重启或关闭窗口后再次远控时，先恢复缓存状态，随后直查和UDP继续校准。
+    }
     registerRemoteQualityWindow(remoteWindow); // wjy: 普通窗口纳入控制端统一质量预算，最终在线数量不设上限。
     // ===end====
     connect(remoteWindow, &RemoteDesktopWindow::shortcutFullscreenRequested, this, [this] { triggerShortcutAction(0); });
@@ -9183,7 +9210,11 @@ void DeviceGrid::openAuthorizedTiledWindows(const QVector<QString>& deviceIds)
             this, &DeviceGrid::showRemoteWindowDeviceMenu); // wjy: 分组平铺创建的远控窗口也按各自 IP 弹出菜单，不会串到其它格子设备。
         connect(remoteWindow, &RemoteDesktopWindow::titleBarUpdateRequested,
             this, &DeviceGrid::updateRemoteWindowDevice); // wjy: 平铺窗口同样只更新自身绑定设备。
-        remoteWindow->setRemoteUpdateAvailable(m_deviceUpdateAvailability.value(g_devices.at(deviceIndex).ip.trimmed(), false)); // wjy: 平铺创建后同步显示该设备最近确认的更新状态。
+        const QString tiledDeviceIp = g_devices.at(deviceIndex).ip.trimmed();
+        remoteWindow->setRemoteUpdateAvailable(m_deviceUpdateAvailability.value(tiledDeviceIp, false)); // wjy: 平铺创建后同步显示该设备最近确认的更新状态。
+        if (m_deviceRealtimeInputScriptStates.contains(tiledDeviceIp)) {
+            remoteWindow->setRemoteInputScriptStatus(m_deviceRealtimeInputScriptStates.value(tiledDeviceIp)); // wjy: 平铺窗口与普通窗口读取同一目标端F10缓存，状态不会因窗口类型分叉。
+        }
         registerRemoteQualityWindow(remoteWindow); // wjy: 平铺小窗口按实际显示高度降分辨率并优先保持FPS，所有窗口仍持续不断流。
         // ===end====
         connect(remoteWindow, &RemoteDesktopWindow::shortcutFullscreenRequested, this, [this] { triggerShortcutAction(0); });
@@ -9469,6 +9500,11 @@ bool DeviceGrid::scheduleDevicePowerActions(const QVector<int>& deviceIndexes, b
                 grid->m_deviceRemoteSessionCounts.insert(ip, 0);
                 grid->m_deviceRemoteControllerNames.insert(ip, {});
                 grid->m_deviceRealtimeScriptStates.insert(ip, platform::RealtimeScriptState::Unknown); // wjy: 命令已受理后立即清除在线会话和脚本缓存，等待目标重启后的新快照。
+                platform::RemoteInputScriptRuntimeInfo inputScript;
+                inputScript.supported = false;
+                inputScript.state = platform::RemoteInputScriptState::Unknown;
+                grid->applyRemoteInputScriptRuntimeState(ip, inputScript);
+                grid->m_deviceRealtimeInputScriptStates.remove(ip); // wjy: 关机或重启已使运行状态不可确认，现有窗口显示Unknown，未来新窗口等待目标重新上报。
             }
             grid->update();
             if (showMessages && !failedIps.isEmpty()) {
@@ -9696,6 +9732,11 @@ void DeviceGrid::deleteDeviceForIndex(int deviceIndex)
     m_deviceRemoteSessionCounts.remove(removedIp); // wjy: 删除设备时同步清掉远控人数缓存。
     m_deviceRemoteControllerNames.remove(removedIp);
     m_deviceRealtimeScriptStates.remove(removedIp); // wjy: 删除设备时同步清掉实时脚本三态，未来复用该 IP 不继承旧 Logo。
+    platform::RemoteInputScriptRuntimeInfo removedInputScript;
+    removedInputScript.supported = false;
+    removedInputScript.state = platform::RemoteInputScriptState::Unknown;
+    applyRemoteInputScriptRuntimeState(removedIp, removedInputScript);
+    m_deviceRealtimeInputScriptStates.remove(removedIp); // wjy: 已打开窗口先撤下目标端回放状态，再删除按IP缓存。
     m_authorizedRemoteControlIps.remove(removedIp); // wjy: 删除后清除本进程授权缓存，未来其它设备复用该 IP 时必须重新登记公钥。
     m_pendingRemoteControlAuthorizationIps.remove(removedIp);
     m_pendingTerminalOpenIps.remove(removedIp);

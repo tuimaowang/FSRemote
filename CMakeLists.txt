@@ -578,6 +578,10 @@ qt_add_executable(FSRemote WIN32
     # ===end====
     src/system/PortableOpenSshManager.cpp
     src/system/PortableOpenSshManager.h
+    # =====wjy====
+    src/system/InputScriptExecutionService.cpp
+    src/system/InputScriptExecutionService.h
+    # ===end====
     src/system/StartupManager.cpp
     src/system/StartupManager.h
     src/system/ParsecVddInstaller.cpp

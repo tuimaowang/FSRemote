@@ -214,6 +214,7 @@ private:
     // =====wjy====
     void updateRealtimeConfiguredDevices(); // wjy: 把当前 devices.json 中的 IP 白名单同步给 UDP 接收器，广播不能创建未配置设备。
     void applyRealtimeDeviceState(const QString& deviceIp, const platform::DeviceRealtimeReducedState& state); // wjy: 只消费单线程归并后的最终状态，统一刷新在线、人数、提示和脚本三态。
+    void applyRemoteInputScriptRuntimeState(const QString& deviceIp, const platform::RemoteInputScriptRuntimeInfo& runtime); // wjy: 同一IP的普通、平铺和后来重开的窗口共用一份目标端F10权威状态。
     void publishRemoteControllerTarget(RemoteDesktopWindow* window, const QString& deviceName, const QString& deviceIp); // wjy: 远控窗口创建时发布本机目标租约，仅用于双向诊断。
     void removeRemoteControllerTarget(RemoteDesktopWindow* window); // wjy: 窗口销毁立即移除对应租约并广播最新完整快照。
     // ===end====
@@ -314,6 +315,7 @@ private:
     qint64 m_lastRemoteResourceDiagnosticAtMs = 0; // wjy: 资源快照限制为30秒一次，避免稳定性诊断本身成为性能热点。
     QHash<RemoteDesktopWindow*, QString> m_realtimeControllerTargetSessionIds; // wjy: 每个普通/平铺窗口映射一个唯一目标租约，关闭时精确删除。
     QHash<QString, platform::RealtimeScriptState> m_deviceRealtimeScriptStates; // wjy: Unknown/Idle/Running 独立于可恢复脚本 UI 元数据，离线只隐藏 Logo 不破坏恢复信息。
+    QHash<QString, platform::RemoteInputScriptRuntimeInfo> m_deviceRealtimeInputScriptStates; // wjy: 缓存被控端本地键鼠脚本快照，新窗口无需依赖原发起窗口即可恢复标题栏状态。
     // ===end====
     QString m_currentDeviceName;
     ScriptUiStateStore m_scriptUiStateStore; // wjy: 每设备脚本状态由独立仓储唯一持有，DeviceGrid 只投影当前设备页面。

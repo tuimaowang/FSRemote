@@ -279,6 +279,31 @@ QByteArray statusPayload(const DeviceStatusServer::HostSessionSnapshot& snapshot
     payload.append(QByteArray::number(sessionCount)); // wjy: 第 16 字段为远控会话数；旧控制端忽略，新控制端驱动数字徽标。
     payload.append('|');
     payload.append(encodedStatusText(snapshot.controllerNames)); // wjy: 第 17 字段为控制端设备名列表，气泡展示。
+    const RemoteInputScriptRuntimeInfo inputScript = InputScriptExecutionService::instance().snapshot();
+    payload.append('|');
+    payload.append(inputScript.supported ? '1' : '0');
+    payload.append('|');
+    payload.append(remoteInputScriptStateName(inputScript.state).toUtf8());
+    payload.append('|');
+    payload.append(inputScript.runId.toUtf8());
+    payload.append('|');
+    payload.append(encodedStatusText(inputScript.scriptName));
+    payload.append('|');
+    payload.append(inputScript.scriptHash.toUtf8());
+    payload.append('|');
+    payload.append(QByteArray::number(inputScript.completedLoops));
+    payload.append('|');
+    payload.append(QByteArray::number(inputScript.configuredLoops));
+    payload.append('|');
+    payload.append(QByteArray::number(inputScript.eventIndex));
+    payload.append('|');
+    payload.append(QByteArray::number(inputScript.eventCount));
+    payload.append('|');
+    payload.append(QByteArray::number(inputScript.startedAtEpochMs));
+    payload.append('|');
+    payload.append(QByteArray::number(inputScript.revision));
+    payload.append('|');
+    payload.append(encodedStatusText(inputScript.errorMessage)); // wjy: 49101追加F9/F10完整快照，旧客户端只读取此前17个字段即可继续兼容。
     // ===end====
     payload.append('\n');
     return payload;
@@ -348,6 +373,32 @@ DeviceStatusInfo queryStatusInfo(const QString& hostIp, uint16_t port, int timeo
         if (parts.size() > 16) {
             info.remoteControllerNames = decodedStatusText(parts.at(16)); // wjy: 控制端设备名列表（Base64）。
         }
+        // =====wjy====
+        if (parts.size() > 28 && parts.at(17).trimmed() == QByteArrayLiteral("1")) {
+            RemoteInputScriptState inputState;
+            if (remoteInputScriptStateFromName(QString::fromUtf8(parts.at(18)), &inputState)) {
+                info.inputScriptRuntime.supported = true;
+                info.inputScriptRuntime.state = inputState;
+                info.inputScriptRuntime.runId = QString::fromUtf8(parts.at(19)).trimmed();
+                info.inputScriptRuntime.scriptName = decodedStatusText(parts.at(20));
+                info.inputScriptRuntime.scriptHash = QString::fromUtf8(parts.at(21)).trimmed();
+                info.inputScriptRuntime.completedLoops = parts.at(22).trimmed().toInt();
+                info.inputScriptRuntime.configuredLoops = parts.at(23).trimmed().toInt();
+                info.inputScriptRuntime.eventIndex = parts.at(24).trimmed().toInt();
+                info.inputScriptRuntime.eventCount = parts.at(25).trimmed().toInt();
+                info.inputScriptRuntime.startedAtEpochMs = parts.at(26).trimmed().toLongLong();
+                info.inputScriptRuntime.revision = parts.at(27).trimmed().toULongLong();
+                info.inputScriptRuntime.errorMessage = decodedStatusText(parts.at(28));
+            } else {
+                info.inputScriptRuntime.supported = false;
+                info.inputScriptRuntime.state = RemoteInputScriptState::Unknown; // wjy: 状态名非法时拒绝整段F10快照，不能沿用结构体默认Idle。
+            }
+        } else {
+            info.inputScriptRuntime.supported = false;
+            info.inputScriptRuntime.state = RemoteInputScriptState::Unknown;
+        }
+        // wjy: 旧目标端没有第17至28字段时保持 Unknown；新目标端重连后可通过49101一次性恢复F10状态。
+        // ===end====
         // ===end====
     } else {
         // =====wjy====

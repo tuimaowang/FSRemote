@@ -64,6 +64,7 @@ struct DeviceRealtimeUpdateState {
 struct DeviceRealtimeLocalState {
     QList<DeviceRealtimeHostSession> hostSessions;
     DeviceRealtimeScriptRuntime script;
+    RemoteInputScriptRuntimeInfo inputScript; // wjy: F9/F10目标端运行状态独立于右键脚本，所有订阅设备接收同一权威快照。
     DeviceRealtimeUpdateState update;
 
     bool operator==(const DeviceRealtimeLocalState&) const = default;
@@ -80,6 +81,7 @@ struct DeviceRealtimeSnapshot {
     QString loginUser;
     QList<DeviceRealtimeHostSession> hostSessions;
     DeviceRealtimeScriptRuntime script;
+    RemoteInputScriptRuntimeInfo inputScript; // wjy: UDP快照追加键鼠脚本状态，主控退出重连后无需依赖旧窗口内存。
     QList<DeviceRealtimeControllerTarget> controllerTargets;
     DeviceRealtimeUpdateState update;
 };
@@ -93,6 +95,7 @@ struct DeviceRealtimeReducedState {
     int remoteSessionCount = 0;
     QStringList remoteControllerLabels;
     DeviceRealtimeScriptRuntime script;
+    RemoteInputScriptRuntimeInfo inputScript; // wjy: 控制端归并器按目标IP保存F9/F10状态，并转交当前和后来打开的远控窗口。
     QList<DeviceRealtimeControllerTarget> controllerTargets; // wjy: 仅保留发布者自身正在控制的目标，供诊断使用，不参与 remoteSessionCount。
     DeviceRealtimeUpdateState update;
     qint64 lastSeenEpochMs = 0;

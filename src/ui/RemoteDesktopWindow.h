@@ -17,6 +17,7 @@
 
 #include "FsRemoteStreamApi.h"
 #include "stream/RemoteQualityPolicy.h"
+#include "system/InputScriptExecutionService.h" // wjy: 窗口只消费目标端运行快照和启动参数类型，不再持有本地回放调度器。
 #include "ui/LatestTextureFrameSlot.h" // wjy: 远控纹理跨线程交接改为可单测的单槽最新帧模型，禁止每帧都堆积Qt任务。
 #include "ui/RemoteQualityCoordinator.h"
 #include "ui/RemoteInputBroadcastCoordinator.h"
@@ -94,6 +95,7 @@ public:
     void beginRemoteUpdateWait(); // wjy: 远控窗口进入更新遮罩、暂停输入并自动等待目标设备重启。
     bool isRemoteUpdateActive() const; // wjy: 供设备状态刷新识别“预期更新离线”，避免把正在等待重启的远控窗口当作普通断线关闭。
     void setRemoteUpdateAvailable(bool available); // wjy: 主界面统一探测目标版本后控制标题栏更新按钮，不让远控流线程参与版本检测。
+    void setRemoteInputScriptStatus(const platform::RemoteInputScriptRuntimeInfo& runtime); // wjy: DeviceGrid把目标端统一快照投影到同IP的所有普通和平铺窗口。
     void setGlobalQualityConfiguration(const stream::RemoteQualityConfiguration& configuration); // wjy: 主窗口全局设置变化时立即更新跟随全局窗口的会话内策略快照。
     stream::RemoteQualityMode qualityOverrideMode() const; // wjy: 兼容读取历史设备模式；智能协调器不再把它作为活动 UI 的手动覆盖入口。
     RemoteQualityWindowMetrics remoteQualityMetrics(); // wjy: 协调器每秒读取只读原生统计并对累计值求差，不阻塞或修改 WebRTC 会话。
@@ -227,14 +229,11 @@ private:
     void finishInputScriptRecording(bool limitReached = false);
     void cancelInputScriptRecording(const QString& reason); // wjy: 关闭、更新或失去控制权时直接丢弃未完成录制，生命周期路径不得弹出模态命名框。
     void recordRemoteInputEvent(const RemoteInputEvent& event);
-    void toggleInputScriptPlayback(); // wjy: 按设置页当前播放快捷键在空闲时选择本地脚本，播放中再次按下则立即停止并释放远端持有输入。
+    void toggleInputScriptPlayback(); // wjy: F10只启动或停止目标端独立执行器，控制端不再按事件时间轴发送键鼠消息。
     void chooseAndStartInputScriptPlayback();
-    void scheduleNextInputScriptPlaybackEvent();
-    void processInputScriptPlaybackEvents();
-    void completeInputScriptPlaybackLoop(); // wjy: 每轮结束统一释放持有输入，再按循环次数决定自然结束或等待 F10 配置的轮间隔后重启。
-    void stopInputScriptPlayback(const QString& reason, bool releaseRemoteInputs = true);
-    void releaseInputScriptPlaybackInputs();
-    void trackInputScriptPlaybackState(const RemoteInputEvent& event);
+    void stopRemoteInputScriptPlayback();
+    void requestRemoteInputScriptStatus();
+    bool inputScriptPlaybackActive() const;
     void setInputScriptDialogActive(bool active); // wjy: 命名和文件选择期间暂停全局键盘转发，防止对话框文字误送到远端。
     // ===end====
     bool synchronizedInputEligible() const override;
@@ -443,28 +442,18 @@ private:
     QElapsedTimer m_inputScriptRecordingClock;
     QSize m_inputScriptRecordingFrameSize;
     QVector<RemoteInputScriptEvent> m_recordedInputScriptEvents;
-    bool m_inputScriptPlaying = false;
-    bool m_dispatchingInputScriptPlayback = false; // wjy: 区分定时器产生的脚本事件和用户实时输入，播放期间只允许前者进入远端发送路径。
     bool m_inputScriptDialogActive = false;
-    QTimer* m_inputScriptPlaybackTimer = nullptr;
-    QElapsedTimer m_inputScriptPlaybackClock;
-    QString m_inputScriptPlaybackFilePath; // wjy: 同一远控窗口再次按F10时默认带回上次选择，仍可在设置弹窗内重新选择。
+    QString m_inputScriptPlaybackFilePath; // wjy: 同一远控窗口再次按F10时默认带回上次共享目录文件，命令只发送其文件名和校验信息。
     int m_inputScriptPlaybackLoopCount = 1;
-    int m_inputScriptPlaybackCompletedLoopCount = 0;
     int m_inputScriptPlaybackLoopIntervalMs = 0; // wjy: 保存 F10 设置的两轮完整脚本之间等待时间，0 表示连续执行。
-    bool m_inputScriptPlaybackWaitingForLoopInterval = false; // wjy: 复用可取消的播放定时器等待下一轮，F10 停止时无需处理遗留 singleShot 回调。
     double m_inputScriptPlaybackSpeedMultiplier = 1.0;
     bool m_inputScriptPasteRandomSuffixEnabled = false; // wjy: F10 播放时仅对脚本内 Ctrl+V 追加随机后缀。
     QString m_inputScriptPasteRandomSeparator = QStringLiteral("......");
     int m_inputScriptPasteRandomLength = 3;
     int m_inputScriptPasteRandomMode = 0;
-    bool m_inputScriptPlaybackCtrlDown = false;
-    QVector<RemoteInputScriptEvent> m_inputScriptPlaybackEvents;
-    qsizetype m_inputScriptPlaybackIndex = 0;
-    QSet<int> m_inputScriptPlaybackHeldKeys;
-    QSet<int> m_inputScriptPlaybackHeldButtons;
-    int m_inputScriptPlaybackX = 32768;
-    int m_inputScriptPlaybackY = 32768;
+    platform::RemoteInputScriptRuntimeInfo m_remoteInputScriptStatus; // wjy: 只缓存目标端权威状态；窗口关闭不会改变目标端执行生命周期。
+    quint64 m_inputScriptStatusQueryGeneration = 0;
+    std::shared_ptr<std::atomic_bool> m_inputScriptStartCancelled; // wjy: F10在共享文件哈希尚未完成时再次按下可取消尚未发送的启动命令。
     // ===end====
     bool m_inputSyncButtonPressed = false; // wjy: 仅按下并在同一按钮内释放才切换主控，拖出热区不会误操作同步状态。
     // =====wjy====

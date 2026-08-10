@@ -1,5 +1,7 @@
 #pragma once
 
+#include "system/InputScriptExecutionService.h" // wjy: 命令协议直接复用独立键鼠脚本请求和状态数据结构，不接入主界面右键脚本类型。
+
 #include <cstdint>
 
 #include <QString>
@@ -56,6 +58,26 @@ public:
     static RemoteUpdateRequestResult requestUpdate(const QString& hostIp, QString* errorMessage = nullptr,
         uint16_t port = 49102, int timeoutMs = 1500, const QString& expectedVersion = QString()); // wjy: 只请求目标机启动它自己的更新流程，控制端不直接复制或覆盖目标安装目录。
     static bool requestDeviceListSync(const QString& hostIp, QString* errorMessage = nullptr, uint16_t port = 49102, int timeoutMs = 700); // wjy: 只通知目标设备立即读取共享 revision，设备 JSON 本身不通过命令端口传输。
+    // ===end====
+
+    // =====wjy====
+    static RemoteInputScriptCommandResult requestInputScriptStart(
+        const QString& hostIp,
+        const RemoteInputScriptStartRequest& request,
+        QString* errorMessage = nullptr,
+        uint16_t port = 49102,
+        int timeoutMs = 1500); // wjy: F10只把共享脚本标识和播放参数交给目标端，目标端随后独立复制并执行本地缓存。
+    static RemoteInputScriptCommandResult requestInputScriptStop(
+        const QString& hostIp,
+        const QString& runId,
+        QString* errorMessage = nullptr,
+        uint16_t port = 49102,
+        int timeoutMs = 1500); // wjy: 停止命令携带runId，主控重连或多窗口监控时不会误停另一轮新脚本。
+    static RemoteInputScriptRuntimeInfo queryInputScriptStatus(
+        const QString& hostIp,
+        QString* errorMessage = nullptr,
+        uint16_t port = 49102,
+        int timeoutMs = 700); // wjy: 新远控窗口可立即取得目标端脚本快照，UDP实时状态随后继续校准。
     // ===end====
 };
 

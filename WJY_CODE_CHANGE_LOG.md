@@ -12305,3 +12305,292 @@ local_video_source_ = webrtc::make_ref_counted<SessionVideoSource>(
 - 已静态核对每个 `WebrtcSession` 都创建独立 `SessionVideoSource`，共享源收到的订阅不携带 1 FPS 或低分辨率限制。
 - 已核对 D3D11 原生帧缓冲已实现 `CropAndScale()` 共享纹理视图，隔离适配不会新增一套桌面采集器。
 - 按用户要求未构建、未链接、未运行程序或测试二进制。
+
+## 2026-08-10 11:11 - F9共享发布与F10目标端独立执行
+
+### Changed Location
+- `CMakeLists.txt:582`：登记独立目标端键鼠脚本执行服务。
+- `src/main.cpp:181`、`src/main.cpp:323`、`src/main.cpp:397`、`src/main.cpp:491`：把目标端执行状态接入实时广播，并只在目标程序自身退出时停止执行器。
+- `src/system/InputScriptExecutionService.h:20`、`src/system/InputScriptExecutionService.cpp:37`：新增独立状态模型、共享下载、哈希缓存、本地定时调度和 `SendInput` 执行器。
+- `src/system/DeviceCommandService.h:64`、`src/system/DeviceCommandService.cpp:230`、`src/system/DeviceCommandService.cpp:355`、`src/system/DeviceCommandService.cpp:924`：新增 F10 启动、停止和状态查询命令。
+- `src/system/DeviceStatusService.h:45`、`src/system/DeviceStatusService.cpp:282`、`src/system/DeviceStatusService.cpp:377`：在 TCP 49101 状态中追加目标端键鼠脚本快照。
+- `src/system/DeviceRealtimeStateService.h:67`、`src/system/DeviceRealtimeStateService.cpp:160`、`src/system/DeviceRealtimeStateService.cpp:592`、`src/system/DeviceRealtimeStateService.cpp:871`、`src/system/DeviceRealtimeStateService.cpp:1043`、`src/system/DeviceRealtimeStateService.cpp:1189`：通过 UDP 49104 广播、校验和归并独立 F9/F10 状态。
+- `src/ui/DeviceGrid.h:217`、`src/ui/DeviceGrid.h:318`、`src/ui/DeviceGrid.cpp:4292`、`src/ui/DeviceGrid.cpp:4322`、`src/ui/DeviceGrid.cpp:9063`、`src/ui/DeviceGrid.cpp:9215`：按 IP 缓存状态并同步到全部普通、平铺和后来打开的远控窗口。
+- `src/ui/RemoteDesktopWindow.h:98`、`src/ui/RemoteDesktopWindow.h:232`、`src/ui/RemoteDesktopWindow.h:454`、`src/ui/RemoteDesktopWindow.cpp:354`、`src/ui/RemoteDesktopWindow.cpp:2403`、`src/ui/RemoteDesktopWindow.cpp:4241`、`src/ui/RemoteDesktopWindow.cpp:4255`、`src/ui/RemoteDesktopWindow.cpp:4397`、`src/ui/RemoteDesktopWindow.cpp:4437`：F10 改为发送元数据命令，删除控制端逐事件回放和生命周期自动停止逻辑。
+- `src/ui/RemoteInputScript.h:33`、`src/ui/RemoteInputScript.cpp:187`：F9 录制文件固定发布到 `\\192.168.1.100\广告部工具\远控键鼠脚本`。
+
+### Reason
+旧 F10 在控制端按录制时间逐条通过 Viewer 网络发送键鼠事件，网络抖动或主控退出会造成执行断流。新实现让 F9 把完整脚本发布到固定共享目录，F10 只发送文件名、大小、SHA-256 和循环参数；被控端自行复制到按哈希命名的本地缓存并执行。运行状态由被控端持有，因此主控关闭窗口、退出控制或重启程序后，重新远控仍可通过 UDP 49104、TCP 49101 和 TCP 49102 恢复同一状态。
+
+该实现使用独立 `InputScriptExecutionService`，没有复用主界面右键脚本的 `work`、PowerShell、SSH、进程清单或运行状态。
+
+### Original Code
+```cmake
+# CMakeLists.txt:578-584（修改前）
+src/system/PortableOpenSshManager.cpp
+src/system/PortableOpenSshManager.h
+src/system/StartupManager.cpp
+src/system/StartupManager.h
+```
+
+```cpp
+// src/main.cpp:177-181（修改前）
+platform::DeviceRealtimeLocalState state;
+state.script = currentRealtimeScriptRuntime();
+state.update = updateState;
+```
+
+```cpp
+// src/system/InputScriptExecutionService.h、.cpp（修改前）
+// 新增文件，原位置没有独立的目标端键鼠脚本执行服务。
+```
+
+```cpp
+// src/system/DeviceCommandService.h、.cpp（修改前）
+// 49102 只处理电源、更新、重命名、授权和设备同步命令，
+// 没有 input_script_start、input_script_stop、input_script_status。
+```
+
+```cpp
+// src/system/DeviceStatusService.h、.cpp（修改前）
+struct DeviceStatusInfo {
+    RemoteScriptRuntimeInfo scriptRuntime;
+    int remoteSessionCount = 0;
+    QString remoteControllerNames;
+};
+```
+
+```cpp
+// src/system/DeviceRealtimeStateService.h、.cpp（修改前）
+struct DeviceRealtimeLocalState {
+    QList<DeviceRealtimeHostSession> hostSessions;
+    DeviceRealtimeScriptRuntime script;
+    DeviceRealtimeUpdateState update;
+};
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp（修改前）
+m_deviceRealtimeScriptStates.insert(ip, state.script.state);
+// 没有独立 F9/F10 状态缓存，也没有向同 IP 的全部远控窗口分发。
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:4160-4171（修改前）
+if (m_inputScriptPlaying) {
+    stopInputScriptPlayback(QStringLiteral("user_f10"), true);
+    return;
+}
+chooseAndStartInputScriptPlayback();
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:4248-4272（修改前）
+m_inputScriptPlaybackEvents = std::move(script.events);
+m_inputScriptPlaybackClock.start();
+m_inputScriptPlaying = true;
+processInputScriptPlaybackEvents();
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:2162-2164（修改前）
+cancelInputScriptRecording(QStringLiteral("window_destructed"));
+stopInputScriptPlayback(QStringLiteral("window_destructed"), true);
+```
+
+```cpp
+// src/ui/RemoteInputScript.cpp:187-190（修改前）
+QString RemoteInputScriptStore::defaultDirectory()
+{
+    return QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("script"));
+}
+```
+
+### Modified Code
+```cmake
+# CMakeLists.txt:581-584
+# =====wjy====
+src/system/InputScriptExecutionService.cpp
+src/system/InputScriptExecutionService.h
+# ===end====
+```
+
+```cpp
+// src/main.cpp:179-182、320-324
+platform::DeviceRealtimeLocalState state;
+state.script = currentRealtimeScriptRuntime();
+state.inputScript = platform::InputScriptExecutionService::instance().snapshot();
+
+platform::InputScriptExecutionService::instance().setStatusChangedCallback(
+    [&realtimeStateService] { realtimeStateService.notifyLocalStateChanged(); });
+```
+
+```cpp
+// src/system/InputScriptExecutionService.h:20-68
+enum class RemoteInputScriptState {
+    Unknown, Idle, Preparing, Running, WaitingLoop, Stopping, Failed,
+};
+
+struct RemoteInputScriptStartRequest {
+    QString runId;
+    QString fileName;
+    qint64 fileSize = 0;
+    QString sha256;
+    int loopCount = 1;
+    int loopIntervalMs = 0;
+    double speedMultiplier = 1.0;
+};
+```
+
+```cpp
+// src/system/InputScriptExecutionService.cpp:371-419
+const QString cachePath = cacheDirectory.filePath(
+    request.sha256.toLower() + QStringLiteral(".fsinput.json"));
+if (QFileInfo::exists(cachePath)
+    && hashFile(cachePath, request.fileSize, request.sha256, cancelled, &validationError)
+    && ui::RemoteInputScriptStore::loadFromFile(cachePath, &result.script, &validationError)) {
+    result.success = true;
+    return result;
+}
+const QString sourcePath = QDir(remoteInputScriptSharedDirectory()).filePath(request.fileName);
+```
+
+```cpp
+// src/system/DeviceCommandService.cpp:355-409
+const RemoteInputScriptCommandResult result = InputScriptExecutionService::instance().start(
+    request, &errorMessage);
+if (result == RemoteInputScriptCommandResult::Accepted) {
+    replyAndClose(QByteArrayLiteral("accepted|") + request.runId.toUtf8() + '\n');
+} else if (result == RemoteInputScriptCommandResult::AlreadyRunning) {
+    replyAndClose(QByteArrayLiteral("already_running\n"));
+}
+const QByteArray status = inputScriptRuntimeJson(
+    InputScriptExecutionService::instance().snapshot()).toBase64();
+replyAndClose(QByteArrayLiteral("status|") + status + '\n');
+```
+
+```cpp
+// src/system/DeviceStatusService.cpp:282-306
+const RemoteInputScriptRuntimeInfo inputScript = InputScriptExecutionService::instance().snapshot();
+payload.append('|');
+payload.append(inputScript.supported ? '1' : '0');
+payload.append('|');
+payload.append(remoteInputScriptStateName(inputScript.state).toUtf8());
+// 后续追加 runId、文件名、哈希、循环进度、事件进度、开始时间、revision 和错误文本。
+```
+
+```cpp
+// src/system/DeviceRealtimeStateService.cpp:160-175、1043
+QJsonObject inputScriptObject(const RemoteInputScriptRuntimeInfo& script)
+{
+    return {
+        {QStringLiteral("supported"), script.supported},
+        {QStringLiteral("state"), remoteInputScriptStateName(script.state)},
+        {QStringLiteral("runId"), script.runId},
+        {QStringLiteral("revision"), QString::number(script.revision)},
+    };
+}
+// encodeSnapshot() 中独立写入 inputScript 字段。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:4322-4335
+void DeviceGrid::applyRemoteInputScriptRuntimeState(
+    const QString& deviceIp,
+    const platform::RemoteInputScriptRuntimeInfo& runtime)
+{
+    const QString ip = deviceIp.trimmed();
+    if (ip.isEmpty()) {
+        return;
+    }
+    m_deviceRealtimeInputScriptStates.insert(ip, runtime);
+    for (const QPointer<RemoteDesktopWindow>& window : openedRemoteWindows()) {
+        if (window && window->hostIp().compare(ip, Qt::CaseInsensitive) == 0) {
+            window->setRemoteInputScriptStatus(runtime);
+        }
+    }
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:4255-4394
+QThreadPool::globalInstance()->start(QRunnable::create(
+    [window, hostIp, filePath, options, runId, cancelled] {
+        const RemoteInputScriptFileMetadata metadata = inspectSharedInputScriptFile(filePath, cancelled);
+        platform::RemoteInputScriptStartRequest request;
+        request.runId = runId;
+        request.fileName = metadata.fileName;
+        request.fileSize = metadata.fileSize;
+        request.sha256 = metadata.sha256;
+        request.loopCount = options.loopCount;
+        request.loopIntervalMs = options.loopIntervalMs;
+        request.speedMultiplier = options.speedMultiplier;
+        const platform::RemoteInputScriptCommandResult result =
+            platform::DeviceCommandService::requestInputScriptStart(hostIp, request, &errorMessage);
+    }));
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:4397-4458
+void RemoteDesktopWindow::stopRemoteInputScriptPlayback()
+{
+    QThreadPool::globalInstance()->start(QRunnable::create([window, hostIp, runId] {
+        const platform::RemoteInputScriptCommandResult result =
+            platform::DeviceCommandService::requestInputScriptStop(hostIp, runId, &errorMessage);
+        QMetaObject::invokeMethod(QCoreApplication::instance(), [window, result, errorMessage] {
+            if (window) window->requestRemoteInputScriptStatus();
+        }, Qt::QueuedConnection);
+    }));
+}
+
+void RemoteDesktopWindow::requestRemoteInputScriptStatus()
+{
+    QThreadPool::globalInstance()->start(QRunnable::create([window, hostIp, queryGeneration] {
+        const platform::RemoteInputScriptRuntimeInfo runtime =
+            platform::DeviceCommandService::queryInputScriptStatus(hostIp, &errorMessage);
+        QMetaObject::invokeMethod(QCoreApplication::instance(), [window, runtime, queryGeneration] {
+            if (window) window->setRemoteInputScriptStatus(runtime);
+        }, Qt::QueuedConnection);
+    }));
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.h:440-456
+bool m_inputScriptRecording = false;
+bool m_inputScriptDialogActive = false;
+QString m_inputScriptPlaybackFilePath;
+int m_inputScriptPlaybackLoopCount = 1;
+int m_inputScriptPlaybackLoopIntervalMs = 0;
+double m_inputScriptPlaybackSpeedMultiplier = 1.0;
+platform::RemoteInputScriptRuntimeInfo m_remoteInputScriptStatus;
+// 已删除控制端播放定时器、事件数组、事件索引、按键/按钮持有集合和播放时钟。
+```
+
+```cpp
+// src/ui/RemoteInputScript.cpp:187-190
+QString RemoteInputScriptStore::defaultDirectory()
+{
+    return QString::fromUtf8(R"(\\192.168.1.100\广告部工具\远控键鼠脚本)");
+}
+```
+
+### Steps
+1. 将 F9 默认保存目录从控制端程序目录 `script` 改为固定共享目录。
+2. 新增独立目标端执行服务，按 SHA-256 缓存脚本，复制后再次校验大小、哈希和 JSON 结构。
+3. 在目标端使用本机高精度定时器和 `SendInput` 执行键鼠事件，并在停止、失败、每轮结束和程序退出时释放持有输入。
+4. 新增 49102 启动、停止、状态查询命令；启动命令只携带文件元数据和播放选项。
+5. 将完整运行快照追加到 49101，并加入 49104 UDP 实时广播和 TCP 手动校准。
+6. 在 `DeviceGrid` 按 IP 缓存状态，并同步给同一目标的全部普通和平铺窗口；新窗口创建时立即恢复缓存并直查目标状态。
+7. F10 改为后台计算共享文件哈希和发送目标端命令；再次按下只发送带 runId 的停止命令。
+8. 删除控制端逐事件回放定时器、事件队列、持有键鼠集合，以及析构、断线、更新、关窗和控制端退出时自动停止目标脚本的旧逻辑。
+9. 目标端程序自身更新退出或正常退出时，统一停止执行器、汇合共享读取线程并释放输入。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已用 `rg` 确认 `m_inputScriptPlaying`、`m_dispatchingInputScriptPlayback`、`inputScriptPlaybackTimer`、`scheduleNextInputScriptPlaybackEvent`、`processInputScriptPlaybackEvents`、`completeInputScriptPlaybackLoop`、`stopInputScriptPlayback`、`releaseInputScriptPlaybackInputs`、`trackInputScriptPlaybackState` 均已从 `src` 删除。
+- 已静态核对 F10 命令只发送文件名、大小、SHA-256、循环、间隔、速度和随机粘贴选项，不发送脚本事件数组。
+- 已静态核对目标端缓存路径为 `data/input-scripts/cache/<sha256>.fsinput.json`，缓存命中和共享复制都执行大小、SHA-256 与 JSON 校验。
+- 已静态核对目标运行状态同时进入 UDP 49104、TCP 49101 和 TCP 49102，主控窗口重开可恢复，且同 IP 全部窗口使用同一快照。
+- 已静态核对控制端窗口析构、远程更新、应用退出、连接断开和关窗路径不再发送 F10 停止命令。
+- 按用户要求未构建、未链接、未运行程序或测试二进制。

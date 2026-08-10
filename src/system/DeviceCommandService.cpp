@@ -2,6 +2,7 @@
 
 #include "system/DeviceInfoService.h"
 #include "system/DeviceListSyncService.h"
+#include "system/InputScriptExecutionService.h"
 #include "system/PortableOpenSshManager.h"
 #include "system/UpdateService.h"
 #include "system/WakeOnLanSender.h"
@@ -12,6 +13,8 @@
 #include <QNetworkProxy>
 #include <QPointer>
 #include <QProcess>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTimer>
@@ -194,6 +197,98 @@ bool sendCommandPayload(const QString& hostIp, const QByteArray& payload, QStrin
     return false;
 }
 
+// =====wjy====
+bool sendCommandAndReadReply(
+    const QString& hostIp,
+    const QByteArray& payload,
+    QByteArray* reply,
+    QString* errorMessage,
+    uint16_t port,
+    int timeoutMs)
+{
+    if (hostIp.trimmed().isEmpty() || payload.isEmpty()) {
+        if (errorMessage) *errorMessage = QStringLiteral("目标地址或命令为空。");
+        return false;
+    }
+    QTcpSocket socket;
+    configureLanTcpSocket(socket);
+    socket.connectToHost(hostIp.trimmed(), port);
+    if (!socket.waitForConnected(timeoutMs)
+        || socket.write(payload) != payload.size()
+        || !socket.waitForBytesWritten(timeoutMs)
+        || !socket.waitForReadyRead(timeoutMs)) {
+        if (errorMessage) *errorMessage = socket.errorString().trimmed();
+        socket.disconnectFromHost();
+        return false;
+    }
+    if (reply) *reply = socket.readAll().trimmed();
+    socket.disconnectFromHost();
+    if (errorMessage) errorMessage->clear();
+    return true; // wjy: F10命令只等待短小结果，不把共享目录复制耗时阻塞在49102连接上。
+}
+
+QByteArray inputScriptRuntimeJson(const RemoteInputScriptRuntimeInfo& runtime)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("supported"), runtime.supported);
+    object.insert(QStringLiteral("state"), remoteInputScriptStateName(runtime.state));
+    object.insert(QStringLiteral("runId"), runtime.runId);
+    object.insert(QStringLiteral("scriptName"), runtime.scriptName);
+    object.insert(QStringLiteral("scriptHash"), runtime.scriptHash);
+    object.insert(QStringLiteral("completedLoops"), runtime.completedLoops);
+    object.insert(QStringLiteral("configuredLoops"), runtime.configuredLoops);
+    object.insert(QStringLiteral("eventIndex"), runtime.eventIndex);
+    object.insert(QStringLiteral("eventCount"), runtime.eventCount);
+    object.insert(QStringLiteral("startedAtEpochMs"), QString::number(runtime.startedAtEpochMs));
+    object.insert(QStringLiteral("revision"), QString::number(runtime.revision));
+    object.insert(QStringLiteral("errorMessage"), runtime.errorMessage);
+    return QJsonDocument(object).toJson(QJsonDocument::Compact);
+}
+
+bool inputScriptRuntimeFromJson(const QByteArray& payload, RemoteInputScriptRuntimeInfo* runtime)
+{
+    if (!runtime) return false;
+    QJsonParseError parseError;
+    const QJsonDocument document = QJsonDocument::fromJson(payload, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !document.isObject()) return false;
+    const QJsonObject object = document.object();
+    RemoteInputScriptState state;
+    if (!remoteInputScriptStateFromName(object.value(QStringLiteral("state")).toString(), &state)) return false;
+    runtime->supported = object.value(QStringLiteral("supported")).toBool();
+    runtime->state = state;
+    runtime->runId = object.value(QStringLiteral("runId")).toString().trimmed();
+    runtime->scriptName = object.value(QStringLiteral("scriptName")).toString().trimmed();
+    runtime->scriptHash = object.value(QStringLiteral("scriptHash")).toString().trimmed();
+    runtime->completedLoops = object.value(QStringLiteral("completedLoops")).toInt();
+    runtime->configuredLoops = object.value(QStringLiteral("configuredLoops")).toInt();
+    runtime->eventIndex = object.value(QStringLiteral("eventIndex")).toInt();
+    runtime->eventCount = object.value(QStringLiteral("eventCount")).toInt();
+    runtime->startedAtEpochMs = object.value(QStringLiteral("startedAtEpochMs")).toString().toLongLong();
+    runtime->revision = object.value(QStringLiteral("revision")).toString().toULongLong();
+    runtime->errorMessage = object.value(QStringLiteral("errorMessage")).toString().trimmed();
+    return true;
+}
+
+QByteArray inputScriptStartCommand(const RemoteInputScriptStartRequest& request)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("runId"), request.runId.trimmed());
+    object.insert(QStringLiteral("fileName"), request.fileName.trimmed());
+    object.insert(QStringLiteral("fileSize"), QString::number(request.fileSize));
+    object.insert(QStringLiteral("sha256"), request.sha256.trimmed().toLower());
+    object.insert(QStringLiteral("loopCount"), request.loopCount);
+    object.insert(QStringLiteral("loopIntervalMs"), request.loopIntervalMs);
+    object.insert(QStringLiteral("speedMultiplier"), request.speedMultiplier);
+    object.insert(QStringLiteral("pasteRandomSuffixEnabled"), request.pasteRandomSuffixEnabled);
+    object.insert(QStringLiteral("pasteRandomSeparator"), request.pasteRandomSeparator);
+    object.insert(QStringLiteral("pasteRandomLength"), request.pasteRandomLength);
+    object.insert(QStringLiteral("pasteRandomMode"), request.pasteRandomMode);
+    return QByteArrayLiteral("input_script_start|")
+        + QJsonDocument(object).toJson(QJsonDocument::Compact).toBase64()
+        + '\n'; // wjy: 49102仍保持一行短命令协议，JSON只承载元数据，脚本文件本身留在共享目录。
+}
+// ===end====
+
 void schedulePowerAction(DeviceControlAction action)
 {
     const QStringList args = action == DeviceControlAction::Restart
@@ -254,6 +349,64 @@ private:
                 DeviceListSyncService::instance().requestImmediateSync(); // wjy: 命令仅唤醒本机同步服务，实际数据仍从带锁和 revision 的共享快照读取。
             });
             return;
+        }
+// ===end====
+// =====wjy====
+        if (command == "input_script_start") {
+            const QJsonDocument document = QJsonDocument::fromJson(QByteArray::fromBase64(parts.value(1)));
+            if (!document.isObject()) {
+                replyAndClose(QByteArrayLiteral("invalid_request\n"));
+                return;
+            }
+            const QJsonObject object = document.object();
+            RemoteInputScriptStartRequest request;
+            request.runId = object.value(QStringLiteral("runId")).toString();
+            request.fileName = object.value(QStringLiteral("fileName")).toString();
+            request.fileSize = object.value(QStringLiteral("fileSize")).toString().toLongLong();
+            request.sha256 = object.value(QStringLiteral("sha256")).toString();
+            request.loopCount = object.value(QStringLiteral("loopCount")).toInt(1);
+            request.loopIntervalMs = object.value(QStringLiteral("loopIntervalMs")).toInt();
+            request.speedMultiplier = object.value(QStringLiteral("speedMultiplier")).toDouble(1.0);
+            request.pasteRandomSuffixEnabled = object.value(QStringLiteral("pasteRandomSuffixEnabled")).toBool();
+            request.pasteRandomSeparator = object.value(QStringLiteral("pasteRandomSeparator")).toString();
+            request.pasteRandomLength = object.value(QStringLiteral("pasteRandomLength")).toInt(3);
+            request.pasteRandomMode = object.value(QStringLiteral("pasteRandomMode")).toInt();
+            QString errorMessage;
+            const RemoteInputScriptCommandResult result = InputScriptExecutionService::instance().start(
+                request, &errorMessage);
+            if (result == RemoteInputScriptCommandResult::Accepted) {
+                replyAndClose(QByteArrayLiteral("accepted|") + request.runId.toUtf8() + '\n');
+            } else if (result == RemoteInputScriptCommandResult::AlreadyRunning) {
+                replyAndClose(QByteArrayLiteral("already_running\n"));
+            } else {
+                replyAndClose(QByteArrayLiteral("error|")
+                    + QUrl::toPercentEncoding(errorMessage.trimmed().isEmpty()
+                        ? QStringLiteral("键鼠脚本启动失败")
+                        : errorMessage.trimmed())
+                    + '\n');
+            }
+            return; // wjy: 目标端命令服务只受理元数据，真正共享目录复制在独立执行器后台线程完成。
+        }
+        if (command == "input_script_stop") {
+            QString errorMessage;
+            const RemoteInputScriptCommandResult result = InputScriptExecutionService::instance().stop(
+                QString::fromUtf8(parts.value(1)).trimmed(), &errorMessage);
+            if (result == RemoteInputScriptCommandResult::Accepted
+                || result == RemoteInputScriptCommandResult::NotRunning) {
+                replyAndClose(QByteArrayLiteral("ok\n"));
+            } else {
+                replyAndClose(QByteArrayLiteral("error|")
+                    + QUrl::toPercentEncoding(errorMessage.trimmed().isEmpty()
+                        ? QStringLiteral("键鼠脚本停止失败")
+                        : errorMessage.trimmed())
+                    + '\n');
+            }
+            return; // wjy: F10停止只依赖目标端runId，不会因原主控窗口已经退出而失去停止能力。
+        }
+        if (command == "input_script_status") {
+            const QByteArray status = inputScriptRuntimeJson(InputScriptExecutionService::instance().snapshot()).toBase64();
+            replyAndClose(QByteArrayLiteral("status|") + status + '\n');
+            return; // wjy: 新控制端可在实时UDP快照到达前主动取得目标端当前脚本状态。
         }
 // ===end====
 // =====wjy====
@@ -764,6 +917,92 @@ bool DeviceCommandService::authorizeTerminalKey(const QString& hostIp, const QSt
 bool DeviceCommandService::requestDeviceListSync(const QString& hostIp, QString* errorMessage, uint16_t port, int timeoutMs)
 {
     return sendCommandPayload(hostIp, QByteArrayLiteral("device_sync\n"), errorMessage, port, timeoutMs); // wjy: 通知包固定且幂等，重复收到只会多执行一次 revision 检查。
+}
+// ===end====
+
+// =====wjy====
+RemoteInputScriptCommandResult DeviceCommandService::requestInputScriptStart(
+    const QString& hostIp,
+    const RemoteInputScriptStartRequest& request,
+    QString* errorMessage,
+    uint16_t port,
+    int timeoutMs)
+{
+    QByteArray reply;
+    if (!sendCommandAndReadReply(
+            hostIp,
+            inputScriptStartCommand(request),
+            &reply,
+            errorMessage,
+            port,
+            timeoutMs)) {
+        return RemoteInputScriptCommandResult::Failed;
+    }
+    const QList<QByteArray> parts = reply.split('|');
+    const QByteArray status = parts.value(0).trimmed().toLower();
+    if (status == "accepted") return RemoteInputScriptCommandResult::Accepted;
+    if (status == "already_running") return RemoteInputScriptCommandResult::AlreadyRunning;
+    if (errorMessage) {
+        *errorMessage = parts.size() > 1
+            ? QUrl::fromPercentEncoding(parts.at(1)).trimmed()
+            : QStringLiteral("目标端未接受键鼠脚本启动请求");
+    }
+    return status == "invalid_request"
+        ? RemoteInputScriptCommandResult::InvalidRequest
+        : RemoteInputScriptCommandResult::Failed;
+}
+
+RemoteInputScriptCommandResult DeviceCommandService::requestInputScriptStop(
+    const QString& hostIp,
+    const QString& runId,
+    QString* errorMessage,
+    uint16_t port,
+    int timeoutMs)
+{
+    const QByteArray payload = QByteArrayLiteral("input_script_stop|") + runId.trimmed().toUtf8() + '\n';
+    QByteArray reply;
+    if (!sendCommandAndReadReply(hostIp, payload, &reply, errorMessage, port, timeoutMs)) {
+        return RemoteInputScriptCommandResult::Failed;
+    }
+    const QList<QByteArray> parts = reply.split('|');
+    if (parts.value(0).trimmed().toLower() == "ok") {
+        return RemoteInputScriptCommandResult::Accepted;
+    }
+    if (errorMessage) {
+        *errorMessage = parts.size() > 1
+            ? QUrl::fromPercentEncoding(parts.at(1)).trimmed()
+            : QStringLiteral("目标端未接受键鼠脚本停止请求");
+    }
+    return RemoteInputScriptCommandResult::Failed;
+}
+
+RemoteInputScriptRuntimeInfo DeviceCommandService::queryInputScriptStatus(
+    const QString& hostIp,
+    QString* errorMessage,
+    uint16_t port,
+    int timeoutMs)
+{
+    RemoteInputScriptRuntimeInfo runtime;
+    QByteArray reply;
+    if (!sendCommandAndReadReply(
+            hostIp,
+            QByteArrayLiteral("input_script_status\n"),
+            &reply,
+            errorMessage,
+            port,
+            timeoutMs)) {
+        runtime.state = RemoteInputScriptState::Unknown;
+        runtime.supported = false;
+        return runtime;
+    }
+    const QList<QByteArray> parts = reply.split('|');
+    if (parts.value(0).trimmed().toLower() != "status"
+        || !inputScriptRuntimeFromJson(QByteArray::fromBase64(parts.value(1)), &runtime)) {
+        runtime.state = RemoteInputScriptState::Unknown;
+        runtime.supported = false;
+        if (errorMessage) *errorMessage = QStringLiteral("目标端返回的键鼠脚本状态无效。");
+    }
+    return runtime;
 }
 // ===end====
 

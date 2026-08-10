@@ -186,7 +186,7 @@ bool remoteInputScriptShouldRepeat(int configuredLoopCount, int completedLoopCou
 
 QString RemoteInputScriptStore::defaultDirectory()
 {
-    return QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("script"));
+    return QString::fromUtf8(R"(\\192.168.1.100\广告部工具\远控键鼠脚本)"); // wjy: F9录制文件发布到固定共享目录，F10选择的脚本与被控端按需复制来源保持一致。
 }
 
 QString RemoteInputScriptStore::fileDialogFilter()

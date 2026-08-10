@@ -157,6 +157,56 @@ QJsonObject scriptObject(const DeviceRealtimeScriptRuntime& script)
     };
 }
 
+QJsonObject inputScriptObject(const RemoteInputScriptRuntimeInfo& script)
+{
+    return {
+        {QStringLiteral("supported"), script.supported},
+        {QStringLiteral("state"), remoteInputScriptStateName(script.state)},
+        {QStringLiteral("runId"), script.runId},
+        {QStringLiteral("scriptName"), script.scriptName},
+        {QStringLiteral("scriptHash"), script.scriptHash},
+        {QStringLiteral("completedLoops"), script.completedLoops},
+        {QStringLiteral("configuredLoops"), script.configuredLoops},
+        {QStringLiteral("eventIndex"), script.eventIndex},
+        {QStringLiteral("eventCount"), script.eventCount},
+        {QStringLiteral("startedAtEpochMs"), QString::number(script.startedAtEpochMs)},
+        {QStringLiteral("revision"), QString::number(script.revision)},
+        {QStringLiteral("errorMessage"), script.errorMessage},
+    }; // wjy: 实时UDP快照携带目标端完整键鼠脚本状态，新主控可以在没有旧窗口缓存时恢复标题栏。
+}
+
+bool parseInputScriptObject(const QJsonObject& object, RemoteInputScriptRuntimeInfo* script)
+{
+    if (!script) return false;
+    RemoteInputScriptState state;
+    if (!remoteInputScriptStateFromName(object.value(QStringLiteral("state")).toString(), &state)) return false;
+    bool startedOk = false;
+    bool revisionOk = false;
+    script->supported = object.value(QStringLiteral("supported")).toBool(false);
+    script->state = state;
+    script->runId = object.value(QStringLiteral("runId")).toString().trimmed();
+    script->scriptName = object.value(QStringLiteral("scriptName")).toString().trimmed();
+    script->scriptHash = object.value(QStringLiteral("scriptHash")).toString().trimmed();
+    script->completedLoops = object.value(QStringLiteral("completedLoops")).toInt();
+    script->configuredLoops = object.value(QStringLiteral("configuredLoops")).toInt();
+    script->eventIndex = object.value(QStringLiteral("eventIndex")).toInt();
+    script->eventCount = object.value(QStringLiteral("eventCount")).toInt();
+    script->startedAtEpochMs = object.value(QStringLiteral("startedAtEpochMs")).toString().toLongLong(&startedOk);
+    script->revision = object.value(QStringLiteral("revision")).toString().toULongLong(&revisionOk);
+    script->errorMessage = object.value(QStringLiteral("errorMessage")).toString().trimmed();
+    return startedOk && revisionOk
+        && script->completedLoops >= 0
+        && script->configuredLoops >= 0
+        && script->eventIndex >= 0
+        && script->eventCount >= 0
+        && script->eventIndex <= script->eventCount
+        && script->startedAtEpochMs >= 0
+        && script->runId.size() <= 160
+        && script->scriptName.size() <= 512
+        && script->scriptHash.size() <= 128
+        && script->errorMessage.size() <= 512; // wjy: 状态包只接受有限文本和单调计数，异常JSON不会污染设备列表或远控窗口。
+}
+
 QJsonObject updateObject(const DeviceRealtimeUpdateState& update)
 {
     return {
@@ -175,6 +225,7 @@ bool reducedStateMeaningfullyEqual(const DeviceRealtimeReducedState& left, const
         && left.remoteSessionCount == right.remoteSessionCount
         && left.remoteControllerLabels == right.remoteControllerLabels
         && left.script == right.script
+        && left.inputScript == right.inputScript
         && left.controllerTargets == right.controllerTargets
         && left.update == right.update; // wjy: 心跳只更新 lastSeen，不让 UI 每秒重复重绘相同状态。
 }
@@ -538,6 +589,7 @@ void DeviceRealtimeStateService::sendCurrentSnapshot()
     snapshot.loginUser = PortableOpenSshManager::instance().loginUser().trimmed().left(kMaxTextLength);
     snapshot.hostSessions = m_localState.hostSessions;
     snapshot.script = m_localState.script;
+    snapshot.inputScript = m_localState.inputScript; // wjy: 本机状态提供器里的F9/F10快照随同右键脚本一起发送，目标端是唯一状态源。
     snapshot.controllerTargets = m_controllerTargets.values();
     snapshot.update = m_localState.update;
     std::sort(snapshot.controllerTargets.begin(), snapshot.controllerTargets.end(), [](const auto& left, const auto& right) {
@@ -663,6 +715,7 @@ bool DeviceRealtimeStateService::localStateIsActive() const
 {
     return !m_localState.hostSessions.isEmpty()
         || m_localState.script.state == RealtimeScriptState::Running
+        || remoteInputScriptStateIsActive(m_localState.inputScript.state)
         || !m_controllerTargets.isEmpty();
 }
 
@@ -815,6 +868,7 @@ void DeviceRealtimeStateService::reduceSnapshot(
         ? DevicePresenceState::Busy
         : DevicePresenceState::Online;
     peer.reduced.script = snapshot.script;
+    peer.reduced.inputScript = snapshot.inputScript; // wjy: 归并器保留目标端F9/F10完整状态，窗口恢复不依赖原控制端进程。
     peer.reduced.controllerTargets = snapshot.controllerTargets;
     peer.reduced.update = snapshot.update;
     peer.reduced.lastSeenEpochMs = receivedAtMs;
@@ -839,6 +893,9 @@ void DeviceRealtimeStateService::reduceExpiry(const QString& sourceIp, qint64 no
     peer.reduced.remoteSessionCount = 0;
     peer.reduced.remoteControllerLabels.clear();
     peer.reduced.script = DeviceRealtimeScriptRuntime(); // wjy: 离线只能得出 Unknown，不能把无法验证的脚本误写成 Idle。
+    peer.reduced.inputScript = RemoteInputScriptRuntimeInfo();
+    peer.reduced.inputScript.state = RemoteInputScriptState::Unknown;
+    peer.reduced.inputScript.supported = false; // wjy: 目标状态过期时F9/F10也回到Unknown，避免网络断开期间继续显示正在执行。
     peer.reduced.controllerTargets.clear();
     peer.reduced.update = DeviceRealtimeUpdateState();
     peer.reduced.lastSeenEpochMs = nowMs;
@@ -884,6 +941,7 @@ void DeviceRealtimeStateService::reduceManualCalibration(
         peer.reduced.script.controllerPid = info.scriptRuntime.controllerPid;
         peer.reduced.script.startedAtEpochMs = info.scriptRuntime.startedAtEpochMs;
     }
+    peer.reduced.inputScript = info.inputScriptRuntime; // wjy: 49101手动校准同时恢复F9/F10状态，补偿UDP快照尚未到达的重连窗口。
     peer.reduced.lastSeenEpochMs = receivedAtMs;
     peer.expiresAtMs = receivedAtMs + kManualCalibrationTtlMs; // wjy: 手动校准是短期诊断租约，不让一次旧版 TCP 在线结果永久残留。
     emitReducedStateIfChanged(sourceIp, peer, true);
@@ -982,6 +1040,7 @@ QByteArray DeviceRealtimeStateService::encodeSnapshot(const DeviceRealtimeSnapsh
         }},
         {QStringLiteral("host"), QJsonObject {{QStringLiteral("sessions"), sessions}}},
         {QStringLiteral("script"), scriptObject(snapshot.script)},
+        {QStringLiteral("inputScript"), inputScriptObject(snapshot.inputScript)}, // wjy: 新字段独立承载F9/F10，旧客户端忽略它仍可继续读取右键脚本状态。
         {QStringLiteral("controller"), QJsonObject {{QStringLiteral("targets"), targets}}},
         {QStringLiteral("update"), updateObject(snapshot.update)},
     };
@@ -1125,6 +1184,17 @@ bool DeviceRealtimeStateService::decodeSnapshot(
         || (parsed.script.state == RealtimeScriptState::Running
             && (parsed.script.workName.isEmpty() || parsed.script.controllerPid <= 0))) {
         return false;
+    }
+
+    const QJsonValue inputScriptValue = root.value(QStringLiteral("inputScript"));
+    if (!inputScriptValue.isUndefined()) {
+        if (!inputScriptValue.isObject()
+            || !parseInputScriptObject(inputScriptValue.toObject(), &parsed.inputScript)) {
+            return false; // wjy: 键鼠脚本状态字段存在时必须完整校验，坏快照不能覆盖当前窗口的最后可信状态。
+        }
+    } else {
+        parsed.inputScript.supported = false; // wjy: 兼容旧版本目标端没有F9/F10状态字段的快照，主控显示Unknown而不是误报Idle。
+        parsed.inputScript.state = RemoteInputScriptState::Unknown;
     }
 
     const QJsonValue targetsValue = root.value(QStringLiteral("controller")).toObject().value(QStringLiteral("targets"));

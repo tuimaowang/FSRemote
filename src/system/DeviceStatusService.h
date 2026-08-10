@@ -1,5 +1,7 @@
 #pragma once
 
+#include "system/InputScriptExecutionService.h" // wjy: 49101状态响应追加独立键鼠脚本快照，不复用右键脚本进程状态。
+
 #include <cstdint>
 #include <functional>
 
@@ -40,6 +42,7 @@ struct DeviceStatusInfo {
     QString mac;
     RemoteScriptRuntimeInfo scriptRuntime; // wjy: 在现有设备在线状态响应中附带目标脚本运行信息，不额外增加服务端口。
     // =====wjy====
+    RemoteInputScriptRuntimeInfo inputScriptRuntime; // wjy: TCP 49101附带被控端F9/F10权威状态，主控重启和UDP丢包后都可重新校准窗口。
     int remoteSessionCount = 0; // wjy: 目标端当前远控会话数 0-10，驱动设备行数字徽标；旧协议缺失时保持 0。
     QString remoteControllerNames; // wjy: 逗号分隔控制端设备名，悬停远控徽标时气泡展示。
     // ===end====

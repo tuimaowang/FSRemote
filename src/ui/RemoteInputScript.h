@@ -30,7 +30,7 @@ bool remoteInputScriptShouldRepeat(
 
 class RemoteInputScriptStore final {
 public:
-    static QString defaultDirectory(); // wjy: 正式运行固定落到程序目录下的script文件夹，便于复制、备份和人工选择。
+    static QString defaultDirectory(); // wjy: F9录制和F10选择固定使用局域网共享目录，目标端按文件名和哈希从同一位置复制缓存。
     static QString fileDialogFilter();
     static QString safeBaseName(const QString& requestedName);
     static bool saveToDirectory(

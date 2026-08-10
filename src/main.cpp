@@ -6,6 +6,7 @@
 #include "system/DeviceCommandService.h"
 #include "system/DeviceRealtimeStateService.h"
 #include "system/DeviceStatusService.h"
+#include "system/InputScriptExecutionService.h" // wjy: 主进程持有目标端独立键鼠脚本执行器，并把状态接入现有实时广播生命周期。
 #include "system/ParsecVddInstaller.h"
 #include "system/PowerManager.h"
 #include "system/PortableOpenSshManager.h"
@@ -177,6 +178,7 @@ platform::DeviceRealtimeLocalState currentRealtimeLocalState(
 {
     platform::DeviceRealtimeLocalState state;
     state.script = currentRealtimeScriptRuntime();
+    state.inputScript = platform::InputScriptExecutionService::instance().snapshot(); // wjy: F9/F10 状态始终取被控端独立执行器快照，Viewer 是否存在不影响广播结果。
     state.update = updateState;
     if (!hostHandle) {
         return state;
@@ -318,6 +320,8 @@ int main(int argc, char* argv[])
     const bool realtimeStateStarted = realtimeStateService.start([hostHandle, &realtimeUpdateState] {
         return currentRealtimeLocalState(hostHandle, realtimeUpdateState); // wjy: 主机会话、脚本和版本状态都从本机权威来源组成一份完整快照。
     });
+    platform::InputScriptExecutionService::instance().setStatusChangedCallback(
+        [&realtimeStateService] { realtimeStateService.notifyLocalStateChanged(); }); // wjy: 目标端准备、执行、轮间等待和结束都立即触发同一份UDP状态广播。
     writeStartupLog(QStringLiteral("[wjy-main] after realtime state service start ok=%1").arg(realtimeStateStarted ? 1 : 0));
     QObject::connect(&platform::UpdateService::instance(), &platform::UpdateService::updateAvailabilityChanged,
         &realtimeStateService, [&realtimeStateService, &realtimeUpdateState](bool, const QString&) {
@@ -389,6 +393,9 @@ int main(int argc, char* argv[])
             writeStartupLog(QStringLiteral("[wjy-update-exit] command server stop begin"));
             commandServer.stop(); // wjy: 先关闭 49102 并汇合已经完成暂存的更新线程，禁止退出期间再受理第二个更新或电源命令。
             writeStartupLog(QStringLiteral("[wjy-update-exit] command server stop end"));
+            writeStartupLog(QStringLiteral("[wjy-update-exit] input script execution stop begin"));
+            platform::InputScriptExecutionService::instance().shutdown(); // wjy: 应用更新退出才停止目标端本地脚本；控制端窗口退出或断线不会进入此路径。
+            writeStartupLog(QStringLiteral("[wjy-update-exit] input script execution stop end"));
             writeStartupLog(QStringLiteral("[wjy-update-exit] status server stop begin"));
             statusServer.stop(); // wjy: 关闭 49101 后控制端会把本机视为预期更新离线，不再从旧 Host 句柄生成 busy 快照。
             writeStartupLog(QStringLiteral("[wjy-update-exit] status server stop end"));
@@ -478,6 +485,12 @@ int main(int argc, char* argv[])
     writeStartupLog(QStringLiteral("[wjy-main] before command server stop")); // wjy: Stop the command TCP server before Qt object teardown.
     commandServer.stop(); // wjy: Releases the 49102 listener synchronously.
     writeStartupLog(QStringLiteral("[wjy-main] after command server stop"));
+
+    // =====wjy====
+    writeStartupLog(QStringLiteral("[wjy-main] before input script execution stop"));
+    platform::InputScriptExecutionService::instance().shutdown(); // wjy: 被控端自身退出时汇合共享文件线程并释放脚本持有键鼠，普通主控退出不影响这里的运行状态。
+    writeStartupLog(QStringLiteral("[wjy-main] after input script execution stop"));
+    // ===end====
 
     writeStartupLog(QStringLiteral("[wjy-main] before status server stop")); // wjy: Stop the status TCP server before the stream host is released.
     statusServer.stop(); // wjy: Releases the 49101 listener synchronously.
