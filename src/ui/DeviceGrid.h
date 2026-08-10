@@ -219,6 +219,7 @@ private:
     void removeRemoteControllerTarget(RemoteDesktopWindow* window); // wjy: 窗口销毁立即移除对应租约并广播最新完整快照。
     // ===end====
     platform::DevicePresenceState devicePresenceForIndex(int index) const;
+    int totalRemoteControlSessionCount() const; // wjy: 汇总设备列表中的真实远控会话路数，标题栏数字与设备行徽标共用同一状态口径。
     bool devicePoweringOnForIndex(int index) const;
     int devicePoweringOnRemainingSecondsForIndex(int index) const;
     void setupSettingsControls();
@@ -309,7 +310,7 @@ private:
     // =====wjy====
     platform::LocalNetworkBandwidthMonitor m_titlebarBandwidthMonitor; // wjy: 主窗口内部只读采样物理网卡，不依赖或启动外部监控程序。
     platform::LocalNetworkBandwidthSample m_titlebarBandwidthSample; // wjy: UI 线程保存最新完整样本，paintEvent 只格式化文字而不查询系统 API。
-    QTimer* m_titlebarBandwidthTimer = nullptr; // wjy: 每秒更新一次版本号右侧的接收 Mbps 与理论余量。
+    QTimer* m_titlebarBandwidthTimer = nullptr; // wjy: 每秒更新一次版本号右侧的当前接收 Mbps 与被控会话总数。
     // ===end====
     bool m_remoteQualityEvaluationQueued = false; // wjy: 多窗口同时最小化或创建时合并为一个Qt任务，避免事件队列放大。
     qint64 m_lastRemoteResourceDiagnosticAtMs = 0; // wjy: 资源快照限制为30秒一次，避免稳定性诊断本身成为性能热点。

@@ -12686,3 +12686,100 @@ networkText = QString::fromUtf8("↓%1M").arg(receiveText); // wjy: 主窗口标
 - 已执行 `git diff --check`，未发现空白错误。
 - 已通过 `rg` 确认标题栏带宽文本只生成 `↓当前值M`，不再包含 `余` 字样。
 - 按此前用户要求，本次未构建、未链接和未运行程序。
+
+## 2026-08-10 13:47 - 主窗口标题栏显示被控会话总数
+
+### Changed Location
+- `src/ui/DeviceGrid.h:222、313`：声明设备列表远控会话总数汇总函数，并更新标题栏定时器职责说明。
+- `src/ui/DeviceGrid.cpp:4321`：实时设备会话变化时立即刷新标题栏区域。
+- `src/ui/DeviceGrid.cpp:7596-7620`：按设备列表和现有兼容规则汇总远控会话路数。
+- `src/ui/DeviceGrid.cpp:10155-10202`：在当前带宽右侧绘制远控会话总数徽标。
+
+### Reason
+主窗口设备列表已经保存每台目标设备的真实远控会话数，但标题栏没有汇总显示。用户要求在当前带宽右侧增加数字，并规定同一目标设备被两台设备控制时计为 2，因此不能只统计 `Busy` 设备个数，必须累计 `m_deviceRemoteSessionCounts`。旧版目标没有人数扩展字段时仍沿用设备行现有规则，将 `Busy` 按 1 路计算。
+
+### Original Code
+```cpp
+// src/ui/DeviceGrid.h:221-223（修改前）
+platform::DevicePresenceState devicePresenceForIndex(int index) const;
+bool devicePoweringOnForIndex(int index) const;
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:4319-4320（修改前）
+update(deviceListViewportRect(m_deviceGroupExpanded));
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:7593（修改前）
+// 此位置没有远控会话总数汇总函数。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:10128-10133（修改前）
+const QFontMetrics networkMetrics(networkFont);
+painter.setPen(networkColor);
+painter.drawText(
+    QRectF(networkRect),
+    Qt::AlignVCenter | Qt::AlignLeft,
+    networkMetrics.elidedText(networkText, Qt::ElideRight, networkRect.width()));
+```
+
+### Modified Code
+```cpp
+// src/ui/DeviceGrid.h:221-223
+platform::DevicePresenceState devicePresenceForIndex(int index) const;
+int totalRemoteControlSessionCount() const; // wjy: 汇总设备列表中的真实远控会话路数。
+bool devicePoweringOnForIndex(int index) const;
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:4320-4321
+update(deviceListViewportRect(m_deviceGroupExpanded));
+update(titlebarBandwidthUpdateRect()); // wjy: 会话变化时立即刷新标题栏汇总数字。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:7596-7620
+int DeviceGrid::totalRemoteControlSessionCount() const
+{
+    qint64 total = 0;
+    for (const DeviceEntry& device : g_devices) {
+        if (deviceHiddenByLocalPreference(device)) continue;
+        const QString ip = device.ip.trimmed();
+        int sessionCount = qBound(0, m_deviceRemoteSessionCounts.value(ip, 0), 10);
+        if (sessionCount <= 0
+            && m_deviceStatuses.value(ip) == platform::DevicePresenceState::Busy) {
+            sessionCount = 1;
+        }
+        total += sessionCount;
+    }
+    return static_cast<int>(qMin<qint64>(total, std::numeric_limits<int>::max()));
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:10155-10202
+const int controlledSessionCount = totalRemoteControlSessionCount();
+const QString controlledSessionText = QString::number(controlledSessionCount);
+// 为数字徽标预留空间，带宽文字不足时先省略。
+// 零路使用灰色，有会话时复用设备行远控人数色阶。
+painter.drawRoundedRect(controlledSessionBadgeRect.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
+painter.drawText(controlledSessionBadgeRect, Qt::AlignCenter, controlledSessionText);
+```
+
+### Steps
+1. 新增统一汇总函数，遍历设备目录并排除被用户隐藏的本机记录。
+2. 对每台设备优先使用目标端真实会话数，旧版 `Busy` 状态回退为 1 路。
+3. 在带宽文字右侧预留固定间距，绘制可随数字位数扩展的数量徽标。
+4. 保留带宽颜色和省略策略，并让窄窗口优先压缩带宽文字，避免覆盖数字和右侧身份区域。
+5. 实时设备状态发生变化时同时刷新设备列表和标题栏。
+6. 清理标题栏定时器仍描述“理论余量”的旧注释，使代码说明与当前界面一致。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已静态核对同一目标两路会话贡献 2，多台目标按会话路数继续累加，不按 `Busy` 设备个数统计。
+- 已静态核对标题栏数字不限制为 10，颜色档位超过 10 后保持最高等级但文本继续显示真实总数。
+- 已静态核对窄窗口先为数字徽标预留空间，带宽文字使用 `elidedText` 缩短，不覆盖本机身份和窗口按钮。
+- 按此前用户要求，本次未构建、未链接和未运行程序。

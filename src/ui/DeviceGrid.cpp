@@ -97,6 +97,7 @@
 #include <atomic>
 #include <cmath>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <tuple>
@@ -4018,7 +4019,7 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     m_titlebarBandwidthTimer->setInterval(1000);
     connect(m_titlebarBandwidthTimer, &QTimer::timeout, this, [this] {
         m_titlebarBandwidthSample = m_titlebarBandwidthMonitor.sample(); // wjy: UI 定时器只读取本机累计计数差，不创建 socket 或额外局域网流量。
-        update(titlebarBandwidthUpdateRect()); // wjy: 新样本只刷新版本号右侧的网络文字和可能被覆盖的本机身份区域。
+        update(titlebarBandwidthUpdateRect()); // wjy: 新样本只刷新版本号右侧的网络文字、会话数字和可能被覆盖的本机身份区域。
     });
     QTimer::singleShot(0, this, [this] {
         if (m_shuttingDown || !m_titlebarBandwidthTimer) {
@@ -4317,6 +4318,7 @@ void DeviceGrid::applyRealtimeDeviceState(
         m_poweringOnStartedAtMs.remove(ip); // wjy: 实时心跳到达即确认开机完成，不等待两秒 TCP 唤醒探测。
     }
     update(deviceListViewportRect(m_deviceGroupExpanded));
+    update(titlebarBandwidthUpdateRect()); // wjy: 远控会话数变化时立即刷新标题栏汇总数字，不等待下一秒带宽采样顺带重绘。
 }
 
 void DeviceGrid::applyRemoteInputScriptRuntimeState(
@@ -7590,6 +7592,30 @@ platform::DevicePresenceState DeviceGrid::devicePresenceForIndex(int index) cons
     return m_deviceStatuses.value(ip, platform::DevicePresenceState::Unknown);
 }
 
+// =====wjy====
+int DeviceGrid::totalRemoteControlSessionCount() const
+{
+    qint64 total = 0; // wjy: 使用宽整数累计多台设备的会话数，避免设备列表较大时中间求和溢出。
+    for (const DeviceEntry& device : g_devices) {
+        if (deviceHiddenByLocalPreference(device)) {
+            continue; // wjy: 用户隐藏的本机不属于当前设备列表显示范围，不计入标题栏汇总。
+        }
+        const QString ip = device.ip.trimmed();
+        if (ip.isEmpty()) {
+            continue; // wjy: 没有有效IP的目录记录无法关联目标端会话快照，按零路处理。
+        }
+        int sessionCount = qBound(0, m_deviceRemoteSessionCounts.value(ip, 0), 10); // wjy: 新版目标直接使用主机公布的唯一会话数。
+        if (sessionCount <= 0
+            && m_deviceStatuses.value(ip, platform::DevicePresenceState::Unknown)
+                == platform::DevicePresenceState::Busy) {
+            sessionCount = 1; // wjy: 旧版目标只有Busy状态而没有人数扩展字段时，沿用设备行徽标的单路兜底规则。
+        }
+        total += sessionCount; // wjy: 同一目标被两台设备控制会贡献2，最终结果是全列表远控路数而不是Busy设备个数。
+    }
+    return static_cast<int>(qMin<qint64>(total, std::numeric_limits<int>::max())); // wjy: 对外仍返回Qt UI常用int，并在理论极端数量下饱和保护。
+}
+// ===end====
+
 bool DeviceGrid::devicePoweringOnForIndex(int index) const
 {
     if (index < 0 || index >= g_devices.size()) {
@@ -10126,11 +10152,56 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
                 }
             }
             const QFontMetrics networkMetrics(networkFont);
-            painter.setPen(networkColor);
-            painter.drawText(
-                QRectF(networkRect),
-                Qt::AlignVCenter | Qt::AlignLeft,
-                networkMetrics.elidedText(networkText, Qt::ElideRight, networkRect.width())); // wjy: 极窄边界最终省略，绝不覆盖本机名称、更新或窗口控制按钮。
+            const int controlledSessionCount = totalRemoteControlSessionCount(); // wjy: 每次标题栏重绘从权威设备状态缓存汇总，不维护容易失同步的第二份总数。
+            const QString controlledSessionText = QString::number(controlledSessionCount); // wjy: 标题栏展示真实总路数，超过10时不截断为设备行颜色档位上限。
+            QFont controlledSessionFont(QStringLiteral("Microsoft YaHei UI"));
+            controlledSessionFont.setPixelSize(10);
+            controlledSessionFont.setBold(true);
+            const QFontMetrics controlledSessionMetrics(controlledSessionFont);
+            const int controlledSessionBadgeWidth = qMax(18, controlledSessionMetrics.horizontalAdvance(controlledSessionText) + 8); // wjy: 徽标宽度随数字位数扩展，单个数字保持18px稳定尺寸。
+            constexpr int kControlledSessionGap = 8;
+            const int networkTextWidthLimit = qMax(0,
+                networkRect.width() - controlledSessionBadgeWidth - kControlledSessionGap); // wjy: 先为右侧人数徽标预留空间，再对带宽文字执行省略，避免两者相互覆盖。
+            const QString visibleNetworkText = networkMetrics.elidedText(
+                networkText,
+                Qt::ElideRight,
+                networkTextWidthLimit);
+            const int visibleNetworkTextWidth = qMin(
+                networkTextWidthLimit,
+                networkMetrics.horizontalAdvance(visibleNetworkText));
+            if (networkTextWidthLimit > 0) {
+                painter.setPen(networkColor);
+                painter.drawText(
+                    QRectF(networkRect.x(), networkRect.y(), networkTextWidthLimit, networkRect.height()),
+                    Qt::AlignVCenter | Qt::AlignLeft,
+                    visibleNetworkText); // wjy: 带宽继续位于左侧，窄窗口时优先缩短文字但不侵占右侧会话数字。
+            }
+
+            const int controlledSessionBadgeLeft = networkRect.x()
+                + visibleNetworkTextWidth
+                + (visibleNetworkTextWidth > 0 ? kControlledSessionGap : 0);
+            const QRectF controlledSessionBadgeRect(
+                controlledSessionBadgeLeft,
+                networkRect.center().y() - 9,
+                controlledSessionBadgeWidth,
+                18); // wjy: 数字徽标紧跟当前带宽右侧，并与标题栏文字垂直居中。
+            if (controlledSessionBadgeRect.right() <= networkRect.right() + 1) {
+                const QColor controlledSessionAccent = controlledSessionCount > 0
+                    ? remoteControlCountAccent(controlledSessionCount)
+                    : QColor(QStringLiteral("#9CA3AF")); // wjy: 有会话时沿用设备行人数色阶，零路使用中性灰色。
+                const QColor controlledSessionFill = controlledSessionCount > 0
+                    ? remoteControlCountFill(controlledSessionCount)
+                    : QColor(QStringLiteral("#F3F4F6"));
+                painter.save();
+                painter.setRenderHint(QPainter::Antialiasing);
+                painter.setPen(QPen(controlledSessionAccent, 1.0));
+                painter.setBrush(controlledSessionFill);
+                painter.drawRoundedRect(controlledSessionBadgeRect.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
+                painter.setFont(controlledSessionFont);
+                painter.setPen(controlledSessionAccent);
+                painter.drawText(controlledSessionBadgeRect, Qt::AlignCenter, controlledSessionText); // wjy: 徽标只显示汇总数字，不增加解释文字占用标题栏空间。
+                painter.restore();
+            }
         }
     }
     // ===end====
