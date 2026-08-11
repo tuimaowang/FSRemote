@@ -58,6 +58,14 @@ public:
     static RemoteUpdateRequestResult requestUpdate(const QString& hostIp, QString* errorMessage = nullptr,
         uint16_t port = 49102, int timeoutMs = 1500, const QString& expectedVersion = QString()); // wjy: 只请求目标机启动它自己的更新流程，控制端不直接复制或覆盖目标安装目录。
     static bool requestDeviceListSync(const QString& hostIp, QString* errorMessage = nullptr, uint16_t port = 49102, int timeoutMs = 700); // wjy: 只通知目标设备立即读取共享 revision，设备 JSON 本身不通过命令端口传输。
+    static bool requestScreenshot(
+        const QString& hostIp,
+        const QString& groupName,
+        const QString& deviceName,
+        QString* filePath,
+        QString* errorMessage = nullptr,
+        uint16_t port = 49102,
+        int timeoutMs = 60000); // wjy: 主控只发送命名信息并等待共享路径；60秒覆盖大分辨率PNG在弱网共享目录中的写入时间。
     // ===end====
 
     // =====wjy====

@@ -263,6 +263,13 @@ private:
     void triggerShortcutAction(int shortcutIndex);
     void releaseRemoteShortcutKeyState(int shortcutIndex);
     // =====wjy====
+    RemoteDesktopWindow* focusedRemoteWindow() const; // wjy: 截图只认当前真实活动远控窗口，最近激活但已经失焦的窗口不能截远端。
+    void triggerScreenshotCapture(); // wjy: F12统一入口按焦点选择远端目标或本机回退。
+    void requestRemoteScreenshot(RemoteDesktopWindow* remoteWindow); // wjy: 后台等待目标端截图命令，主线程只显示结果窗口。
+    void captureLocalScreenshot(); // wjy: 没有远控焦点时直接调用本机原始主屏截图服务。
+    void showScreenshotReview(const QString& filePath, QWidget* preferredParent); // wjy: 控制端统一预览、重命名并决定保留或删除共享PNG。
+    // ===end====
+    // =====wjy====
     void applyPeriodicDeviceDiscoverySetting(bool scanImmediately);
     void startBatchAddDevices(bool userInitiated = true); // wjy: 手动按钮和周期定时器复用同一网段扫描；周期触发时不跳转当前页面或选择新设备。
     void applyHideLocalDeviceSetting(bool revealLocalDeviceIfMissing); // wjy: 同步本机过滤状态，关闭开关时按需立即补回本机记录。
@@ -369,6 +376,8 @@ private:
     // ===end====
     QSet<int> m_registeredGlobalShortcutIds;
     quintptr m_globalShortcutWindowHandle = 0;
+    QSet<QString> m_pendingScreenshotTargets; // wjy: 记录当前远端截图请求；集合非空期间统一暂停新截图，保证确认窗口串行显示。
+    bool m_screenshotReviewActive = false; // wjy: 截图确认窗口存在时暂停新截图，避免多个异步结果形成嵌套模态窗口。
     QLineEdit* m_deviceIpEdit = nullptr;
     QLineEdit* m_deviceNameEdit = nullptr;
     QLineEdit* m_deviceMacEdit = nullptr;

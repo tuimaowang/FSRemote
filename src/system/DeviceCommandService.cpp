@@ -4,12 +4,15 @@
 #include "system/DeviceListSyncService.h"
 #include "system/InputScriptExecutionService.h"
 #include "system/PortableOpenSshManager.h"
+#include "system/ScreenshotService.h"
 #include "system/UpdateService.h"
 #include "system/WakeOnLanSender.h"
 #include "system/WjyDiagnosticLog.h"
 
 #include <QAbstractSocket>
 #include <QCoreApplication>
+#include <QDir>
+#include <QElapsedTimer>
 #include <QNetworkProxy>
 #include <QPointer>
 #include <QProcess>
@@ -215,16 +218,40 @@ bool sendCommandAndReadReply(
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)
         || socket.write(payload) != payload.size()
-        || !socket.waitForBytesWritten(timeoutMs)
-        || !socket.waitForReadyRead(timeoutMs)) {
+        || !socket.waitForBytesWritten(timeoutMs)) {
         if (errorMessage) *errorMessage = socket.errorString().trimmed();
         socket.disconnectFromHost();
         return false;
     }
-    if (reply) *reply = socket.readAll().trimmed();
+
+    QElapsedTimer replyTimer;
+    replyTimer.start();
+    QByteArray completeReply;
+    while (!completeReply.contains('\n')) {
+        completeReply.append(socket.readAll());
+        if (completeReply.contains('\n')) break;
+        if (completeReply.size() > 64 * 1024) {
+            if (errorMessage) *errorMessage = QStringLiteral("目标端回复超过允许长度。");
+            socket.disconnectFromHost();
+            return false;
+        }
+        const int remainingMs = timeoutMs - static_cast<int>(replyTimer.elapsed());
+        if (remainingMs <= 0 || !socket.waitForReadyRead(remainingMs)) {
+            if (errorMessage) {
+                const QString socketError = socket.errorString().trimmed();
+                *errorMessage = socketError.isEmpty()
+                    ? QStringLiteral("等待目标端回复超时。")
+                    : socketError;
+            }
+            socket.disconnectFromHost();
+            return false;
+        }
+    }
+    const int newlineIndex = completeReply.indexOf('\n');
+    if (reply) *reply = completeReply.left(newlineIndex).trimmed(); // wjy: 弱网分包时持续读取到协议换行，避免Base64截图路径只收到前半段。
     socket.disconnectFromHost();
     if (errorMessage) errorMessage->clear();
-    return true; // wjy: F10命令只等待短小结果，不把共享目录复制耗时阻塞在49102连接上。
+    return true; // wjy: F10和截图命令共用完整单行回复读取，等待只发生在调用方后台线程。
 }
 
 QByteArray inputScriptRuntimeJson(const RemoteInputScriptRuntimeInfo& runtime)
@@ -287,6 +314,16 @@ QByteArray inputScriptStartCommand(const RemoteInputScriptStartRequest& request)
         + QJsonDocument(object).toJson(QJsonDocument::Compact).toBase64()
         + '\n'; // wjy: 49102仍保持一行短命令协议，JSON只承载元数据，脚本文件本身留在共享目录。
 }
+
+QByteArray screenshotCommand(const QString& groupName, const QString& deviceName)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("groupName"), groupName.trimmed());
+    object.insert(QStringLiteral("deviceName"), deviceName.trimmed());
+    return QByteArrayLiteral("screenshot|")
+        + QJsonDocument(object).toJson(QJsonDocument::Compact).toBase64()
+        + '\n'; // wjy: 一行命令只携带截图命名元数据，目标屏幕像素和PNG文件绝不通过49102传输。
+}
 // ===end====
 
 void schedulePowerAction(DeviceControlAction action)
@@ -348,6 +385,29 @@ private:
             QTimer::singleShot(0, [] {
                 DeviceListSyncService::instance().requestImmediateSync(); // wjy: 命令仅唤醒本机同步服务，实际数据仍从带锁和 revision 的共享快照读取。
             });
+            return;
+        }
+// ===end====
+// =====wjy====
+        if (command == "screenshot") {
+            const QJsonDocument document = QJsonDocument::fromJson(QByteArray::fromBase64(parts.value(1)));
+            if (!document.isObject()) {
+                replyAndClose(QByteArrayLiteral("invalid_request\n"));
+                return;
+            }
+            const QJsonObject object = document.object();
+            const QString groupName = object.value(QStringLiteral("groupName")).toString().trimmed().left(160);
+            const QString deviceName = object.value(QStringLiteral("deviceName")).toString().trimmed().left(160); // wjy: 命令输入先限制长度，真实文件名仍由截图服务执行Windows字符过滤和80字符上限。
+            const ScreenshotCaptureResult result = ScreenshotService::capturePrimaryScreen(groupName, deviceName); // wjy: 本调用发生在目标设备Qt线程，grabWindow读取目标主屏而不是主控Viewer画面。
+            if (result.success) {
+                replyAndClose(QByteArrayLiteral("screenshot|") + result.filePath.toUtf8().toBase64() + '\n');
+            } else {
+                replyAndClose(QByteArrayLiteral("error|")
+                    + QUrl::toPercentEncoding(result.errorMessage.trimmed().isEmpty()
+                        ? QStringLiteral("目标设备截图失败")
+                        : result.errorMessage.trimmed())
+                    + '\n');
+            }
             return;
         }
 // ===end====
@@ -917,6 +977,44 @@ bool DeviceCommandService::authorizeTerminalKey(const QString& hostIp, const QSt
 bool DeviceCommandService::requestDeviceListSync(const QString& hostIp, QString* errorMessage, uint16_t port, int timeoutMs)
 {
     return sendCommandPayload(hostIp, QByteArrayLiteral("device_sync\n"), errorMessage, port, timeoutMs); // wjy: 通知包固定且幂等，重复收到只会多执行一次 revision 检查。
+}
+
+bool DeviceCommandService::requestScreenshot(
+    const QString& hostIp,
+    const QString& groupName,
+    const QString& deviceName,
+    QString* filePath,
+    QString* errorMessage,
+    uint16_t port,
+    int timeoutMs)
+{
+    if (filePath) filePath->clear();
+    QByteArray reply;
+    if (!sendCommandAndReadReply(
+            hostIp,
+            screenshotCommand(groupName, deviceName),
+            &reply,
+            errorMessage,
+            port,
+            timeoutMs)) {
+        return false;
+    }
+    const QList<QByteArray> parts = reply.split('|');
+    const QByteArray status = parts.value(0).trimmed().toLower();
+    if (status == "screenshot") {
+        const QString returnedPath = QString::fromUtf8(QByteArray::fromBase64(parts.value(1))).trimmed();
+        if (ScreenshotService::isManagedScreenshotPath(returnedPath)) {
+            if (filePath) *filePath = QDir::toNativeSeparators(returnedPath);
+            if (errorMessage) errorMessage->clear();
+            return true; // wjy: 控制端只接受固定共享目录内的PNG路径，随后直接从网盘加载原图。
+        }
+    }
+    if (errorMessage) {
+        *errorMessage = parts.size() > 1 && status == "error"
+            ? QUrl::fromPercentEncoding(parts.at(1)).trimmed()
+            : QStringLiteral("目标端返回的截图结果无效。");
+    }
+    return false;
 }
 // ===end====
 

@@ -6263,6 +6263,14 @@ bool RemoteDesktopWindow::handleLocalShortcutKey(int virtualKey, Qt::KeyboardMod
         }, Qt::QueuedConnection);
         return true;
     }
+    const QKeySequence screenshotShortcut = platform::AppSettings::screenshotShortcut();
+    if (matchesShortcut(current, screenshotShortcut)) {
+        beginShortcutReleaseGuard(screenshotShortcut);
+        QMetaObject::invokeMethod(this, [this] {
+            emit shortcutScreenshotRequested(); // wjy: 低级键盘Hook只发布当前活动远控窗口意图，截图像素始终由目标设备命令服务本地采集。
+        }, Qt::QueuedConnection);
+        return true;
+    }
     // ===end====
     if (matchesShortcut(current, platform::AppSettings::remoteShortcutFullscreen())) {
         beginShortcutReleaseGuard(platform::AppSettings::remoteShortcutFullscreen());
@@ -7474,6 +7482,16 @@ void RemoteDesktopWindow::keyPressEvent(QKeyEvent* event)
         m_localShortcutReleaseKeys.insert(event->key()); // wjy: 记录自定义播放快捷键主键，等待 KeyUp 后再解除本地门禁。
         QMetaObject::invokeMethod(this, [this] {
             toggleInputScriptPlayback(); // wjy: F10 设置窗口和再次按键停止逻辑继续复用原有入口。
+        }, Qt::QueuedConnection);
+        event->accept();
+        return;
+    }
+    const QKeySequence screenshotShortcut = platform::AppSettings::screenshotShortcut();
+    if (!event->isAutoRepeat() && matchesShortcut(current, screenshotShortcut)) {
+        beginShortcutReleaseGuard(screenshotShortcut);
+        m_localShortcutReleaseKeys.insert(event->key());
+        QMetaObject::invokeMethod(this, [this] {
+            emit shortcutScreenshotRequested(); // wjy: Qt兜底路径与Windows Hook保持相同语义，F12不会被录制或转发给远端应用。
         }, Qt::QueuedConnection);
         event->accept();
         return;

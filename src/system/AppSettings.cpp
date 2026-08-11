@@ -411,6 +411,16 @@ void AppSettings::setRemoteShortcutInputScriptPlayback(const QKeySequence& short
     setShortcutToSettings(QStringLiteral("remoteShortcutInputScriptPlayback"), shortcut, QKeySequence(QStringLiteral("F10"))); // wjy: 保存设置页录入的脚本播放快捷键。
 }
 
+QKeySequence AppSettings::screenshotShortcut()
+{
+    return shortcutFromSettings(QStringLiteral("screenshotShortcut"), QKeySequence(QStringLiteral("F12"))); // wjy: 新安装默认F12，旧配置没有该键时自动采用相同默认值。
+}
+
+void AppSettings::setScreenshotShortcut(const QKeySequence& shortcut)
+{
+    setShortcutToSettings(QStringLiteral("screenshotShortcut"), shortcut, QKeySequence(QStringLiteral("F12"))); // wjy: 与其它键盘设置项使用相同的PortableText持久化和空值回退逻辑。
+}
+
 QKeySequence AppSettings::deviceShortcutDelete()
 {
     return shortcutFromSettings(QStringLiteral("deviceShortcutDelete"), QKeySequence(QStringLiteral("Delete"))); // wjy: 删除设备默认保持 Delete，同时允许从键盘设置页持久化为其它组合键。

@@ -140,6 +140,7 @@ signals:
     void shortcutCloseAllRequested();
     // =====wjy====
     void shortcutClipboardSyncRequested();
+    void shortcutScreenshotRequested(); // wjy: 活动远控窗口消费可配置截图快捷键，由DeviceGrid决定向当前目标发送本机截图命令。
     void titleBarContextMenuRequested(const QString& hostIp, const QPoint& globalPosition); // wjy: 标题栏右键只上报本窗口绑定的目标 IP 和屏幕坐标，由设备主界面复用统一菜单逻辑。
     void titleBarUpdateRequested(const QString& hostIp); // wjy: 标题栏更新按钮只上报固定目标 IP，由 DeviceGrid 复用设备右键菜单的更新入口。
     void remoteQualityInputsChanged(); // wjy: 最小化、恢复、显示状态或单窗口模式变化时通知全局协调器立即重算，不等待下一秒轮询。

@@ -541,6 +541,10 @@ qt_add_executable(FSRemote WIN32
     src/ui/DeviceListSortPolicy.h # wjy: 主设备列表复用可独立测试的在线优先与自然名称排序策略。
     src/ui/RemoteDesktopWindow.cpp
     src/ui/RemoteDesktopWindow.h
+    # =====wjy====
+    src/ui/ScreenshotReviewDialog.cpp
+    src/ui/ScreenshotReviewDialog.h
+    # ===end====
     src/ui/NativeRemoteTitleBarSurface.cpp
     src/ui/NativeRemoteTitleBarSurface.h
     src/ui/RemoteTitleBarRenderer.cpp
@@ -581,6 +585,8 @@ qt_add_executable(FSRemote WIN32
     # =====wjy====
     src/system/InputScriptExecutionService.cpp
     src/system/InputScriptExecutionService.h
+    src/system/ScreenshotService.cpp
+    src/system/ScreenshotService.h
     # ===end====
     src/system/StartupManager.cpp
     src/system/StartupManager.h

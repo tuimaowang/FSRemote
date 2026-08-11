@@ -4,6 +4,7 @@
 #include "system/DeviceCommandService.h"
 #include "system/DesktopWallpaperService.h"
 #include "system/SharedStorageAvailabilityService.h"
+#include "system/ScreenshotService.h"
 #include "system/StartupPerformanceLog.h"
 #include "system/DeviceInfoService.h"
 #include "system/DeviceCatalog.h"
@@ -23,6 +24,7 @@
 #include "ui/DeviceSearchPanel.h"
 #include "ui/DeviceListSortPolicy.h" // wjy: 设备栏统一复用在线优先、数字自然排序和英文字母排序策略。
 #include "ui/RemoteDesktopWindow.h"
+#include "ui/ScreenshotReviewDialog.h"
 #include "ui/ScriptPanelVisibility.h"
 #include "ui/SettingsLayoutSnapshot.h"
 #include "ui/RemoteViewerLifecycleManager.h"
@@ -630,13 +632,24 @@ void drawResourceIcon(QPainter& painter, const QRect& target, const QString& nam
 }
 
 // =====wjy====
-constexpr int kRemoteShortcutCount = 5; // wjy: 增加剪切板同步快捷键编辑项。
+constexpr int kRemoteGlobalShortcutCount = 5; // wjy: 前五项继续对应全屏、平铺、关闭和剪切板同步。
 constexpr int kRemoteWindowShortcutMouseLockIndex = 5;
 constexpr int kRemoteWindowShortcutRecordingIndex = 6;
 constexpr int kRemoteWindowShortcutPlaybackIndex = 7;
-constexpr int kShortcutEditorCount = 9; // wjy: 五个远控全局快捷键、三个远控窗口快捷键和一个删除设备快捷键共用同一编辑控件。
-constexpr int kDeleteDeviceShortcutIndex = 8;
+constexpr int kScreenshotShortcutIndex = 8;
+constexpr int kDeleteDeviceShortcutIndex = 9;
+constexpr int kShortcutEditorCount = 10; // wjy: 五项原全局操作、三项远控窗口操作、截图和删除设备共用同一编辑控件。
 constexpr int kGlobalShortcutIdBase = 0x5100;
+
+QVector<int> globalShortcutIndexes()
+{
+    return {0, 1, 2, 3, 4}; // wjy: 原五项继续使用RegisterHotKey；截图改由独立低级键盘Hook处理，兼容Windows保留的裸F12。
+}
+
+bool isGlobalShortcutIndex(int index)
+{
+    return index >= 0 && index < kRemoteGlobalShortcutCount; // wjy: WM_HOTKEY只接受原五项，截图使用独立消息进入同一动作分发入口。
+}
 
 bool isShortcutModifierKey(int key)
 {
@@ -688,6 +701,7 @@ QKeySequence remoteShortcutForIndex(int index)
     case kRemoteWindowShortcutMouseLockIndex: return platform::AppSettings::remoteShortcutMouseLock();
     case kRemoteWindowShortcutRecordingIndex: return platform::AppSettings::remoteShortcutInputScriptRecording();
     case kRemoteWindowShortcutPlaybackIndex: return platform::AppSettings::remoteShortcutInputScriptPlayback();
+    case kScreenshotShortcutIndex: return platform::AppSettings::screenshotShortcut();
     case kDeleteDeviceShortcutIndex: return platform::AppSettings::deviceShortcutDelete();
     default: return {};
     }
@@ -704,6 +718,7 @@ void setRemoteShortcutForIndex(int index, const QKeySequence& shortcut)
     case kRemoteWindowShortcutMouseLockIndex: platform::AppSettings::setRemoteShortcutMouseLock(shortcut); break;
     case kRemoteWindowShortcutRecordingIndex: platform::AppSettings::setRemoteShortcutInputScriptRecording(shortcut); break;
     case kRemoteWindowShortcutPlaybackIndex: platform::AppSettings::setRemoteShortcutInputScriptPlayback(shortcut); break;
+    case kScreenshotShortcutIndex: platform::AppSettings::setScreenshotShortcut(shortcut); break;
     case kDeleteDeviceShortcutIndex: platform::AppSettings::setDeviceShortcutDelete(shortcut); break;
     default: break;
     }
@@ -741,7 +756,7 @@ int globalShortcutIdForIndex(int index)
 int shortcutIndexForGlobalShortcutId(int id)
 {
     const int index = id - kGlobalShortcutIdBase;
-    return index >= 0 && index < kRemoteShortcutCount ? index : -1;
+    return isGlobalShortcutIndex(index) ? index : -1;
 }
 
 bool virtualKeyFromQtKey(int key, UINT* virtualKey)
@@ -834,6 +849,104 @@ bool windowsHotkeyFromShortcut(const QKeySequence& shortcut, UINT* modifiers, UI
     *modifiers = nativeModifiers;
     return true;
 }
+
+// =====wjy====
+constexpr UINT kScreenshotShortcutMessage = WM_APP + 0x512;
+HHOOK g_screenshotShortcutHook = nullptr;
+HWND g_screenshotShortcutMessageWindow = nullptr;
+UINT g_screenshotShortcutModifiers = 0;
+UINT g_screenshotShortcutVirtualKey = 0;
+bool g_screenshotShortcutPressed = false;
+
+UINT currentNativeShortcutModifiers()
+{
+    const auto keyDown = [](int virtualKey) {
+        return (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+    };
+    UINT modifiers = 0;
+    if (keyDown(VK_CONTROL) || keyDown(VK_LCONTROL) || keyDown(VK_RCONTROL)) modifiers |= MOD_CONTROL;
+    if (keyDown(VK_SHIFT) || keyDown(VK_LSHIFT) || keyDown(VK_RSHIFT)) modifiers |= MOD_SHIFT;
+    if (keyDown(VK_MENU) || keyDown(VK_LMENU) || keyDown(VK_RMENU)) modifiers |= MOD_ALT;
+    if (keyDown(VK_LWIN) || keyDown(VK_RWIN)) modifiers |= MOD_WIN;
+    return modifiers; // wjy: 低级Hook在主键按下时读取四类真实修饰键，和设置页保存的QKeySequence精确匹配。
+}
+
+bool foregroundUsesRemoteKeyboardHook()
+{
+    QWidget* foregroundWidget = QWidget::find(reinterpret_cast<WId>(GetForegroundWindow()));
+    QWidget* topLevelWidget = foregroundWidget ? foregroundWidget->window() : nullptr;
+    auto* remoteWindow = qobject_cast<RemoteDesktopWindow*>(topLevelWidget);
+    return remoteWindow && remoteWindow->focusPolicy() != Qt::NoFocus; // wjy: 普通远控窗口继续由其现有Hook消费快捷键并释放组合键；只读监控窗口则由主窗口全局Hook截图。
+}
+
+LRESULT CALLBACK screenshotShortcutHookProc(int code, WPARAM wParam, LPARAM lParam)
+{
+    if (code == HC_ACTION
+        && g_screenshotShortcutMessageWindow
+        && g_screenshotShortcutVirtualKey != 0) {
+        const auto* info = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+        const bool down = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
+        const bool up = wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
+        if (info && (down || up) && (info->flags & LLKHF_INJECTED) == 0
+            && info->vkCode == g_screenshotShortcutVirtualKey) {
+            if (down
+                && currentNativeShortcutModifiers() == g_screenshotShortcutModifiers
+                && !foregroundUsesRemoteKeyboardHook()) {
+                if (!g_screenshotShortcutPressed) {
+                    g_screenshotShortcutPressed = true;
+                    if (!PostMessageW(g_screenshotShortcutMessageWindow, kScreenshotShortcutMessage, 0, 0)) {
+                        g_screenshotShortcutPressed = false;
+                        return CallNextHookEx(g_screenshotShortcutHook, code, wParam, lParam); // wjy: 主窗口消息队列不可用时不吞按键，避免截图失败同时让前台程序丢失输入。
+                    } // wjy: Hook只投递自定义窗口消息，截图和共享目录IO仍回到Qt主线程及其后台任务执行。
+                }
+                return 1; // wjy: 本机、桌面、其它程序和只读监控窗口中的截图主键不再继续触发前台程序自己的F12动作。
+            }
+            if (up && g_screenshotShortcutPressed) {
+                g_screenshotShortcutPressed = false;
+                return 1; // wjy: 与已吞掉的KeyDown配对吞掉KeyUp，避免前台程序收到孤立抬键。
+            }
+        }
+    }
+    return CallNextHookEx(g_screenshotShortcutHook, code, wParam, lParam);
+}
+
+bool configureScreenshotShortcutHook(HWND messageWindow, const QKeySequence& shortcut)
+{
+    UINT modifiers = 0;
+    UINT virtualKey = 0;
+    if (!messageWindow || !windowsHotkeyFromShortcut(shortcut, &modifiers, &virtualKey)) {
+        g_screenshotShortcutMessageWindow = messageWindow;
+        g_screenshotShortcutModifiers = 0;
+        g_screenshotShortcutVirtualKey = 0;
+        g_screenshotShortcutPressed = false;
+        return false;
+    }
+    g_screenshotShortcutMessageWindow = messageWindow;
+    g_screenshotShortcutModifiers = modifiers & (MOD_CONTROL | MOD_SHIFT | MOD_ALT | MOD_WIN);
+    g_screenshotShortcutVirtualKey = virtualKey;
+    g_screenshotShortcutPressed = false;
+    if (!g_screenshotShortcutHook) {
+        g_screenshotShortcutHook = SetWindowsHookExW(
+            WH_KEYBOARD_LL,
+            screenshotShortcutHookProc,
+            GetModuleHandleW(nullptr),
+            0); // wjy: 裸F12不依赖RegisterHotKey，Windows将其保留给调试器时仍能按物理按键触发截图。
+    }
+    return g_screenshotShortcutHook != nullptr;
+}
+
+void uninstallScreenshotShortcutHook()
+{
+    if (g_screenshotShortcutHook) {
+        UnhookWindowsHookEx(g_screenshotShortcutHook);
+        g_screenshotShortcutHook = nullptr;
+    }
+    g_screenshotShortcutMessageWindow = nullptr;
+    g_screenshotShortcutModifiers = 0;
+    g_screenshotShortcutVirtualKey = 0;
+    g_screenshotShortcutPressed = false; // wjy: 程序退出时清空Hook目标和按键状态，禁止消息投递到已经销毁的主窗口。
+}
+// ===end====
 
 QVector<int> virtualKeysForShortcut(const QKeySequence& shortcut)
 {
@@ -1412,6 +1525,14 @@ QString deviceDisplayName(const DeviceEntry& device)
     const QString name = device.name.trimmed();
     return name.isEmpty() ? device.ip.trimmed() : name;
 }
+
+// =====wjy====
+QString screenshotGroupName(const DeviceEntry& device)
+{
+    const QString groupName = device.group.trimmed();
+    return groupName.isEmpty() ? QString::fromUtf8("我的设备") : groupName; // wjy: 根部设备使用界面现有“我的设备”名称，分组设备直接使用同步维护的兼容组名。
+}
+// ===end====
 
 // =====wjy====
 const QStringList kRemoteMonitorExclusionWhitelist = {
@@ -3349,7 +3470,7 @@ int keyboardShortcutMaxScrollOffset()
 {
     const QRect keyboardCard = settingsScrollViewportRect();
     const QRect lastShortcutRect = settingsShortcutKeyEditRect(kShortcutEditorCount - 1);
-    return qMax(0, lastShortcutRect.bottom() - keyboardCard.bottom()); // wjy: 键盘页只按九行实际高度计算滚动上限，不把常规页更长内容的偏移带到快捷键页。
+    return qMax(0, lastShortcutRect.bottom() - keyboardCard.bottom()); // wjy: 键盘页只按十行实际高度计算滚动上限，不把常规页更长内容的偏移带到快捷键页。
 }
 // ===end====
 
@@ -3406,7 +3527,11 @@ void drawSettingsOptionIcon(QPainter& painter, const QRect& rect, int iconKind)
     } else if (iconKind == 9) {
         painter.drawPolygon(QPolygonF{QPointF(c.x() - 4, c.y() - 8), QPointF(c.x() + 7, c.y()), QPointF(c.x() - 4, c.y() + 8)}); // wjy: 播放三角对应 F10 脚本播放。
     } else if (iconKind == 10) {
-        painter.drawRoundedRect(QRectF(c.x() - 6, c.y() - 5, 12, 12), 1, 1); // wjy: 简单垃圾桶图标对应删除设备。
+        painter.drawRoundedRect(QRectF(c.x() - 9, c.y() - 6, 18, 13), 2, 2); // wjy: 相机机身对应F12目标端原图截图。
+        painter.drawRoundedRect(QRectF(c.x() - 4, c.y() - 9, 8, 4), 1, 1);
+        painter.drawEllipse(QRectF(c.x() - 4, c.y() - 4, 8, 8));
+    } else if (iconKind == 12) {
+        painter.drawRoundedRect(QRectF(c.x() - 6, c.y() - 5, 12, 12), 1, 1); // wjy: 删除图标移到独立编号，新增截图行不会复用垃圾桶外观。
         painter.drawLine(QPointF(c.x() - 8, c.y() - 7), QPointF(c.x() + 8, c.y() - 7));
         painter.drawLine(QPointF(c.x() - 3, c.y() - 9), QPointF(c.x() + 3, c.y() - 9));
     } else if (iconKind == 11) {
@@ -3463,7 +3588,7 @@ void drawSettingsPage(
         localInfoExpanded,
         addDeviceExpanded,
         settingsScrollOffset,
-        keyboardSelected); // wjy: 键盘页使用九行快捷键自己的滚动上限，绘制、滚动条和真实输入框保持同一快照。
+        keyboardSelected); // wjy: 键盘页使用十行快捷键自己的滚动上限，绘制、滚动条和真实输入框保持同一快照。
     QFont tabFont(textFont);
     tabFont.setPixelSize(14);
     tabFont.setBold(true);
@@ -3634,6 +3759,7 @@ void drawSettingsPage(
             {"鼠标锁定", "切换当前远控窗口的手动相对鼠标锁定"},
             {"键鼠录制", "开始或结束当前远控窗口的键鼠录制"},
             {"脚本播放", "选择脚本并开始或停止键鼠回放"},
+            {"原图截图", "活动远控窗口截目标主屏，否则截本机主屏"},
             {"删除设备", "从本机设备列表中移除当前选中的设备"},
         };
 
@@ -3643,12 +3769,13 @@ void drawSettingsPage(
         rowDetail.setPixelSize(12);
         painter.save();
         painter.setClipRect(keyboardCard.adjusted(0, 56, 0, -1)); // wjy: 追加快捷键行超出最低窗口高度时，只裁剪内容区，标题仍固定在卡片顶部。
-        painter.translate(0, -layout.scrollOffset()); // wjy: 键盘页快捷键行与真实 QLineEdit 共用设置页滚动偏移，保证 9 行在窄窗口仍可访问。
+        painter.translate(0, -layout.scrollOffset()); // wjy: 键盘页快捷键行与真实 QLineEdit 共用设置页滚动偏移，保证10行在窄窗口仍可访问。
+        static const int shortcutIconKinds[] = {1, 2, 3, 4, 5, 7, 8, 9, 10, 12}; // wjy: 每一行显式绑定图标，新增截图不会改变常规页隐藏本机和壁纸图标编号。
         for (int i = 0; i < kShortcutEditorCount; ++i) {
             const int y = keyboardCard.y() + 64 + i * 48;
             const QRect keyRect = settingsShortcutKeyEditRect(i); // wjy: 绘制背景和真实输入框共用同一矩形，避免视觉/点击区域错位。
             // wjy: 快捷键行之间不再画分隔横线，界面更紧凑。
-            const int iconKind = i < 5 ? i + 1 : i + 2; // wjy: 保留 iconKind=6 给常规页自动壁纸，新增远控快捷键从 7 开始。
+            const int iconKind = shortcutIconKinds[i];
             drawSettingsOptionIcon(painter, QRect(keyboardCard.x() + 28, y + 2, 28, 28), iconKind);
             painter.setFont(rowTitle);
             painter.setPen(QColor(QStringLiteral("#111827")));
@@ -4686,15 +4813,29 @@ void DeviceGrid::prepareForApplicationExit()
 void DeviceGrid::registerGlobalShortcuts()
 {
 #if defined(Q_OS_WIN)
-    unregisterGlobalShortcuts();
+    HWND previousWindowHandle = reinterpret_cast<HWND>(m_globalShortcutWindowHandle);
+    if (previousWindowHandle) {
+        for (int id : m_registeredGlobalShortcutIds) {
+            UnregisterHotKey(previousWindowHandle, id); // wjy: 修改设置时只重建RegisterHotKey项目，截图Hook保持原安装顺序并原地更新按键配置。
+        }
+    }
+    m_registeredGlobalShortcutIds.clear();
 
     HWND windowHandle = reinterpret_cast<HWND>(winId());
     if (!windowHandle) {
+        uninstallScreenshotShortcutHook();
+        m_globalShortcutWindowHandle = 0;
         return;
     }
     m_globalShortcutWindowHandle = reinterpret_cast<quintptr>(windowHandle);
 
-    for (int i = 0; i < kRemoteShortcutCount; ++i) {
+    const QKeySequence screenshotShortcut = platform::AppSettings::screenshotShortcut();
+    if (!configureScreenshotShortcutHook(windowHandle, screenshotShortcut)) {
+        qWarning().noquote() << QStringLiteral("[global-hotkey] screenshot hook unavailable value=%1")
+            .arg(screenshotShortcut.toString(QKeySequence::NativeText)); // wjy: 截图按键不受支持或Hook安装失败时保留诊断，设置页其它全局快捷键仍继续注册。
+    }
+
+    for (const int i : globalShortcutIndexes()) {
         UINT modifiers = 0;
         UINT virtualKey = 0;
         const QKeySequence shortcut = remoteShortcutForIndex(i);
@@ -4721,6 +4862,7 @@ void DeviceGrid::registerGlobalShortcuts()
 void DeviceGrid::unregisterGlobalShortcuts()
 {
 #if defined(Q_OS_WIN)
+    uninstallScreenshotShortcutHook();
     if (m_registeredGlobalShortcutIds.isEmpty()) {
         m_globalShortcutWindowHandle = 0;
         return;
@@ -4782,10 +4924,132 @@ void DeviceGrid::triggerShortcutAction(int shortcutIndex)
         // ===end====
         break;
     }
+    case kScreenshotShortcutIndex:
+        triggerScreenshotCapture();
+        break;
     default:
         break;
     }
 }
+
+// =====wjy====
+RemoteDesktopWindow* DeviceGrid::focusedRemoteWindow() const
+{
+    for (QWidget* widget = QApplication::activeWindow(); widget; widget = widget->parentWidget()) {
+        if (auto* remoteWindow = qobject_cast<RemoteDesktopWindow*>(widget)) {
+            return remoteWindow->isClosingConnection() ? nullptr : remoteWindow; // wjy: 活动远控窗口的模态子窗口仍归属于同一目标，正在关闭的窗口不接受新截图命令。
+        }
+    }
+    for (QWidget* widget : QApplication::topLevelWidgets()) {
+        auto* remoteWindow = qobject_cast<RemoteDesktopWindow*>(widget);
+        if (remoteWindow && remoteWindow->isActiveWindow() && !remoteWindow->isClosingConnection()) {
+            return remoteWindow; // wjy: 原生标题栏或DComp子窗口导致activeWindow短暂为空时，用Qt活动标志兜底识别当前远控。
+        }
+    }
+    return nullptr; // wjy: 最近激活顺序不等于当前焦点，没有真实活动远控时必须截图本机。
+}
+
+void DeviceGrid::triggerScreenshotCapture()
+{
+    if (m_shuttingDown || m_screenshotReviewActive || !m_pendingScreenshotTargets.isEmpty()) {
+        return; // wjy: 一次只允许一张截图处于采集、共享写入或确认阶段，避免并发结果弹出嵌套模态窗口。
+    }
+    if (RemoteDesktopWindow* remoteWindow = focusedRemoteWindow()) {
+        requestRemoteScreenshot(remoteWindow);
+        return;
+    }
+    captureLocalScreenshot(); // wjy: F12是全局热键；焦点在主窗口、其它程序或桌面时统一截控制端本机主屏。
+}
+
+void DeviceGrid::requestRemoteScreenshot(RemoteDesktopWindow* remoteWindow)
+{
+    if (!remoteWindow || remoteWindow->isClosingConnection()) return;
+    const QString hostIp = remoteWindow->hostIp().trimmed();
+    if (hostIp.isEmpty()) {
+        QMessageBox::warning(remoteWindow, QString::fromUtf8("截图失败"), QString::fromUtf8("目标设备IP为空。"));
+        return;
+    }
+    const QString pendingKey = QStringLiteral("remote:%1").arg(hostIp.toLower());
+    if (m_pendingScreenshotTargets.contains(pendingKey)) return;
+
+    const int deviceIndex = deviceIndexForIp(hostIp);
+    const QString groupName = deviceIndex >= 0 && deviceIndex < g_devices.size()
+        ? screenshotGroupName(g_devices.at(deviceIndex))
+        : QString::fromUtf8("我的设备");
+    const QString deviceName = deviceIndex >= 0 && deviceIndex < g_devices.size()
+        ? deviceDisplayName(g_devices.at(deviceIndex))
+        : remoteWindow->deviceName(); // wjy: 命令发出瞬间冻结分组和设备名，后台返回前重命名不会改变已生成文件主体。
+
+    m_pendingScreenshotTargets.insert(pendingKey);
+    QPointer<DeviceGrid> self(this);
+    QPointer<RemoteDesktopWindow> preferredParent(remoteWindow);
+    runBackgroundTask([self, preferredParent, pendingKey, hostIp, groupName, deviceName] {
+        QString filePath;
+        QString errorMessage;
+        const bool success = platform::DeviceCommandService::requestScreenshot(
+            hostIp, groupName, deviceName, &filePath, &errorMessage); // wjy: 后台线程只等待目标端截图和共享写入结果，不读取任何Viewer帧。
+        if (!self) {
+            if (success && platform::ScreenshotService::isManagedScreenshotPath(filePath)) QFile::remove(filePath); // wjy: 控制端窗口已退出时无人确认，后台直接删除目标端刚生成的未确认PNG。
+            return;
+        }
+        QMetaObject::invokeMethod(QCoreApplication::instance(), [self, preferredParent, pendingKey, success, filePath, errorMessage] {
+            if (!self) {
+                if (success && platform::ScreenshotService::isManagedScreenshotPath(filePath)) QFile::remove(filePath);
+                return; // wjy: 结果排队后主窗口被销毁时仍执行“未确定不保留”，不会遗留孤立截图。
+            }
+            DeviceGrid* grid = self.data();
+            grid->m_pendingScreenshotTargets.remove(pendingKey);
+            QWidget* parent = preferredParent ? static_cast<QWidget*>(preferredParent.data()) : static_cast<QWidget*>(grid);
+            if (!success) {
+                QMessageBox::warning(parent, QString::fromUtf8("截图失败"),
+                    errorMessage.trimmed().isEmpty()
+                        ? QString::fromUtf8("目标设备没有返回有效截图。")
+                        : errorMessage.trimmed());
+                return;
+            }
+            grid->showScreenshotReview(filePath, parent); // wjy: 只有共享PNG已经提交成功后才创建预览窗口，弱网不会先显示空白占位。
+        }, Qt::QueuedConnection);
+    });
+}
+
+void DeviceGrid::captureLocalScreenshot()
+{
+    const int deviceIndex = localDeviceCatalogIndex();
+    const QString groupName = deviceIndex >= 0 && deviceIndex < g_devices.size()
+        ? screenshotGroupName(g_devices.at(deviceIndex))
+        : QString::fromUtf8("我的设备");
+    QString deviceName = deviceIndex >= 0 && deviceIndex < g_devices.size()
+        ? deviceDisplayName(g_devices.at(deviceIndex))
+        : g_localDeviceIdentityForList.name.trimmed();
+    if (deviceName.isEmpty()) deviceName = platform::DeviceInfoService::localDeviceName();
+
+    const platform::ScreenshotCaptureResult result = platform::ScreenshotService::capturePrimaryScreen(groupName, deviceName); // wjy: 无远控焦点时仍在当前Qt线程抓取本机主屏原始像素，随后才显示确认窗口。
+    if (!result.success) {
+        QMessageBox::warning(this, QString::fromUtf8("截图失败"), result.errorMessage);
+        return;
+    }
+    showScreenshotReview(result.filePath, QApplication::activeWindow());
+}
+
+void DeviceGrid::showScreenshotReview(const QString& filePath, QWidget* preferredParent)
+{
+    if (!platform::ScreenshotService::isManagedScreenshotPath(filePath)
+        || !QFileInfo::exists(filePath)
+        || QPixmap(filePath).isNull()) {
+        if (platform::ScreenshotService::isManagedScreenshotPath(filePath)) QFile::remove(filePath); // wjy: 无法显示的未确认PNG没有保留资格，避免共享目录积累损坏文件。
+        QMessageBox::warning(preferredParent ? preferredParent : this,
+            QString::fromUtf8("截图失败"), QString::fromUtf8("截图文件无法从共享目录读取。"));
+        return;
+    }
+    QWidget* parent = preferredParent && preferredParent->isVisible() ? preferredParent : this;
+    m_screenshotReviewActive = true;
+    {
+        ScreenshotReviewDialog dialog(filePath, parent);
+        dialog.exec(); // wjy: 栈对象退出立即执行未确认删除；只有对话框“确定”成功才保留或重命名后的PNG。
+    }
+    m_screenshotReviewActive = false; // wjy: 当前确认窗口完全销毁后才允许下一次F12，删除责任已经由对话框析构收口。
+}
+// ===end====
 
 void DeviceGrid::releaseRemoteShortcutKeyState(int shortcutIndex)
 {
@@ -6570,7 +6834,7 @@ void DeviceGrid::setupSettingsControls()
             saveShortcutKeySetting(shortcutIndex, shortcutText);
             return remoteShortcutDisplayText(shortcutIndex); // wjy: 保存后把输入框文本同步成最终应用的快捷键显示。
         };
-        m_shortcutKeyEdits.append(shortcutEdit); // wjy: 九个输入框按行号映射五项全局操作、三项远控窗口操作和删除设备操作。
+        m_shortcutKeyEdits.append(shortcutEdit); // wjy: 十个输入框按行号映射五项原全局操作、三项远控窗口操作、截图和删除设备操作。
     }
     // ===end====
 
@@ -9480,6 +9744,7 @@ void DeviceGrid::openRemoteDesktopWindowForDevice(int deviceIndex)
     connect(remoteWindow, &RemoteDesktopWindow::shortcutCloseTopmostRequested, this, [this] { triggerShortcutAction(2); });
     connect(remoteWindow, &RemoteDesktopWindow::shortcutCloseAllRequested, this, [this] { triggerShortcutAction(3); });
     connect(remoteWindow, &RemoteDesktopWindow::shortcutClipboardSyncRequested, this, [this] { triggerShortcutAction(4); });
+    connect(remoteWindow, &RemoteDesktopWindow::shortcutScreenshotRequested, this, [this] { triggerShortcutAction(kScreenshotShortcutIndex); }); // wjy: 远控Hook与Windows全局热键共用同一动作编号，120ms门禁消除一次按键的重复通知。
     remoteWindow->show();
     remoteWindow->raise();
     remoteWindow->activateWindow();
@@ -9631,6 +9896,7 @@ void DeviceGrid::openAuthorizedTiledWindows(const QVector<QString>& deviceIds)
         connect(remoteWindow, &RemoteDesktopWindow::shortcutTileRequested, this, [this] { triggerShortcutAction(1); });
         connect(remoteWindow, &RemoteDesktopWindow::shortcutCloseTopmostRequested, this, [this] { triggerShortcutAction(2); });
         connect(remoteWindow, &RemoteDesktopWindow::shortcutCloseAllRequested, this, [this] { triggerShortcutAction(3); });
+        connect(remoteWindow, &RemoteDesktopWindow::shortcutScreenshotRequested, this, [this] { triggerShortcutAction(kScreenshotShortcutIndex); }); // wjy: 平铺窗口获得焦点时同样把F12固定到自身目标设备。
         // wjy: 不再为平铺窗口设置 240x180 最小尺寸，targetRect 的网格尺寸可以被 QWidget 原样采用。
         remoteWindow->setGeometry(targetRect); // wjy: 按网格设置窗口位置和大小，形成 2x2、3x3 等平铺效果。
         remoteWindow->show();
@@ -12674,6 +12940,11 @@ void DeviceGrid::keyPressEvent(QKeyEvent* event)
         event->accept();
         return;
     }
+    if (!event->isAutoRepeat() && matchesShortcut(event, platform::AppSettings::screenshotShortcut())) {
+        triggerShortcutAction(kScreenshotShortcutIndex);
+        event->accept();
+        return; // wjy: Qt兜底路径保证主窗口未收到WM_HOTKEY的平台仍可按自定义快捷键执行本机或远端截图。
+    }
 // ===end====
     QFrame::keyPressEvent(event);
 }
@@ -12682,6 +12953,11 @@ bool DeviceGrid::nativeEvent(const QByteArray& eventType, void* message, qintptr
 {
 #if defined(Q_OS_WIN)
     MSG* nativeMessage = reinterpret_cast<MSG*>(message);
+    if (nativeMessage && nativeMessage->message == kScreenshotShortcutMessage) {
+        triggerShortcutAction(kScreenshotShortcutIndex);
+        if (result) *result = 0;
+        return true; // wjy: 低级键盘Hook通过主窗口消息进入统一截图动作，焦点判断和远端命令不会在Hook回调里执行。
+    }
     if (nativeMessage && nativeMessage->message == WM_HOTKEY) {
         const int shortcutIndex = shortcutIndexForGlobalShortcutId(static_cast<int>(nativeMessage->wParam));
         if (shortcutIndex >= 0) {

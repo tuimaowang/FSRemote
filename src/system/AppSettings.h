@@ -63,6 +63,8 @@ public:
     static void setRemoteShortcutInputScriptRecording(const QKeySequence& shortcut);
     static QKeySequence remoteShortcutInputScriptPlayback(); // wjy: 远控窗口 F10 脚本播放快捷键，默认仍为 F10 并持久化用户修改。
     static void setRemoteShortcutInputScriptPlayback(const QKeySequence& shortcut);
+    static QKeySequence screenshotShortcut(); // wjy: F12默认触发活动远控设备原图截图，没有活动远控窗口时截图本机。
+    static void setScreenshotShortcut(const QKeySequence& shortcut);
     static QKeySequence deviceShortcutDelete();
     static void setDeviceShortcutDelete(const QKeySequence& shortcut);
     static bool remoteClipboardSyncEnabled();

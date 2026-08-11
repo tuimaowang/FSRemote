@@ -14734,3 +14734,299 @@ if (transientFormat != 0 && ::IsClipboardFormatAvailable(transientFormat)) {
 - 已静态核对恢复前比较Windows剪贴板序号，外部新内容不会被旧脚本覆盖。
 - 已静态核对临时随机文本带自定义格式，Host轮询不会把它广播到主控或其它监控窗口。
 - 按用户此前要求，本次未构建、未链接、未运行测试或启动程序。
+
+## 2026-08-11 14:52 - 新增F12目标端原图截图与确认管理
+
+### Changed Location
+- `CMakeLists.txt:545`：登记截图确认窗口源码；`CMakeLists.txt:588`登记截图服务源码。
+- `src/system/AppSettings.h:66`、`src/system/AppSettings.cpp:414`：增加默认F12的截图快捷键读取和保存接口。
+- `src/system/DeviceCommandService.h:61`、`src/system/DeviceCommandService.cpp:204`、`src/system/DeviceCommandService.cpp:318`、`src/system/DeviceCommandService.cpp:392`、`src/system/DeviceCommandService.cpp:982`：增加截图命令、完整单行回复读取、目标端执行和共享路径返回。
+- `src/ui/DeviceGrid.h:266`、`src/ui/DeviceGrid.h:379`：声明截图焦点路由、请求、预览和串行确认状态。
+- `src/ui/DeviceGrid.cpp:635`：快捷键编辑项扩展为10项；`src/ui/DeviceGrid.cpp:854`增加独立全局截图Hook；`src/ui/DeviceGrid.cpp:3762`增加设置行；`src/ui/DeviceGrid.cpp:4813`登记全局快捷键；`src/ui/DeviceGrid.cpp:4936`实现远端/本机截图路由；`src/ui/DeviceGrid.cpp:12956`接收Hook消息。
+- `src/ui/RemoteDesktopWindow.h:143`、`src/ui/RemoteDesktopWindow.cpp:6266`、`src/ui/RemoteDesktopWindow.cpp:7489`：远控窗口Hook和Qt按键路径消费截图快捷键并上报当前窗口。
+- `src/system/ScreenshotService.h:9`、`src/system/ScreenshotService.cpp:38`：新增原始主屏采集、固定共享目录、文件名清洗、PNG写入和受控路径校验。
+- `src/ui/ScreenshotReviewDialog.h:11`、`src/ui/ScreenshotReviewDialog.cpp:24`：新增原像素预览、文件名编辑、确定保留和关闭删除窗口。
+
+### Reason
+控制端Viewer画面可能经过缩放和视频编码，直接在控制端截屏会降低清晰度。新流程只发送很短的截图命令，目标设备使用自己的主屏原始像素生成无损PNG并写入`\\192.168.1.100\ggc\喊话截图`，控制端只读取共享路径并负责最终确认。Windows把裸F12保留给调试器，`RegisterHotKey`可能失败，因此截图使用独立低级键盘Hook兜底；普通远控窗口仍优先使用原有键盘Hook，保证自定义组合键不会误传给目标应用。
+
+### Original Code
+```cmake
+# CMakeLists.txt:541-548
+src/ui/RemoteDesktopWindow.cpp
+src/ui/RemoteDesktopWindow.h
+src/ui/NativeRemoteTitleBarSurface.cpp
+
+# 原来没有ScreenshotReviewDialog和ScreenshotService构建项。
+```
+
+```cpp
+// src/system/AppSettings.h:64-68
+static QKeySequence remoteShortcutInputScriptPlayback();
+static void setRemoteShortcutInputScriptPlayback(const QKeySequence& shortcut);
+static QKeySequence deviceShortcutDelete();
+static void setDeviceShortcutDelete(const QKeySequence& shortcut);
+```
+
+```cpp
+// src/system/AppSettings.cpp:404-414
+void AppSettings::setRemoteShortcutInputScriptPlayback(const QKeySequence& shortcut)
+{
+    setShortcutToSettings(QStringLiteral("remoteShortcutInputScriptPlayback"), shortcut, QKeySequence(QStringLiteral("F10")));
+}
+
+QKeySequence AppSettings::deviceShortcutDelete()
+```
+
+```cpp
+// src/system/DeviceCommandService.h:58-62
+static bool requestDeviceListSync(const QString& hostIp, QString* errorMessage = nullptr,
+    uint16_t port = 49102, int timeoutMs = 700);
+// 原来没有requestScreenshot接口。
+```
+
+```cpp
+// src/system/DeviceCommandService.cpp:215-229
+if (!socket.waitForConnected(timeoutMs)
+    || socket.write(payload) != payload.size()
+    || !socket.waitForBytesWritten(timeoutMs)
+    || !socket.waitForReadyRead(timeoutMs)) {
+    return false;
+}
+if (reply) *reply = socket.readAll().trimmed();
+
+// 原来没有screenshot命令编码、目标端截图分支和结果解析。
+```
+
+```cpp
+// src/ui/DeviceGrid.h:261-270, 377-380
+void registerGlobalShortcuts();
+void unregisterGlobalShortcuts();
+void triggerShortcutAction(int shortcutIndex);
+void releaseRemoteShortcutKeyState(int shortcutIndex);
+
+QSet<int> m_registeredGlobalShortcutIds;
+quintptr m_globalShortcutWindowHandle = 0;
+// 原来没有截图路由方法、待处理目标和确认窗口状态。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:632-640
+constexpr int kRemoteShortcutCount = 5;
+constexpr int kRemoteWindowShortcutMouseLockIndex = 5;
+constexpr int kRemoteWindowShortcutRecordingIndex = 6;
+constexpr int kRemoteWindowShortcutPlaybackIndex = 7;
+constexpr int kShortcutEditorCount = 9;
+constexpr int kDeleteDeviceShortcutIndex = 8;
+
+// 原来没有独立截图Hook、截图设置行和远端/本机焦点路由。
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.h:139-144
+void shortcutCloseAllRequested();
+void shortcutClipboardSyncRequested();
+void titleBarContextMenuRequested(const QString& hostIp, const QPoint& globalPosition);
+// 原来没有shortcutScreenshotRequested信号。
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:6257-6267
+if (matchesShortcut(current, platform::AppSettings::remoteShortcutInputScriptPlayback())) {
+    emit shortcutInputScriptPlaybackRequested();
+    return true;
+}
+if (matchesShortcut(current, platform::AppSettings::remoteShortcutFullscreen())) {
+    // 原来F10后直接进入其它快捷键判断，没有截图分支。
+}
+```
+
+```text
+// src/system/ScreenshotService.h
+// src/system/ScreenshotService.cpp
+新增文件，此位置没有旧代码。
+```
+
+```text
+// src/ui/ScreenshotReviewDialog.h
+// src/ui/ScreenshotReviewDialog.cpp
+新增文件，此位置没有旧代码。
+```
+
+### Modified Code
+```cmake
+// CMakeLists.txt:545-546, 588-589
+src/ui/ScreenshotReviewDialog.cpp
+src/ui/ScreenshotReviewDialog.h
+src/system/ScreenshotService.cpp
+src/system/ScreenshotService.h
+```
+
+```cpp
+// src/system/AppSettings.h:66-67
+static QKeySequence screenshotShortcut();
+static void setScreenshotShortcut(const QKeySequence& shortcut);
+```
+
+```cpp
+// src/system/AppSettings.cpp:414-422
+QKeySequence AppSettings::screenshotShortcut()
+{
+    return shortcutFromSettings(QStringLiteral("screenshotShortcut"), QKeySequence(QStringLiteral("F12")));
+}
+
+void AppSettings::setScreenshotShortcut(const QKeySequence& shortcut)
+{
+    setShortcutToSettings(QStringLiteral("screenshotShortcut"), shortcut, QKeySequence(QStringLiteral("F12")));
+}
+```
+
+```cpp
+// src/system/DeviceCommandService.h:61-68
+static bool requestScreenshot(
+    const QString& hostIp,
+    const QString& groupName,
+    const QString& deviceName,
+    QString* filePath,
+    QString* errorMessage = nullptr,
+    uint16_t port = 49102,
+    int timeoutMs = 60000);
+```
+
+```cpp
+// src/system/DeviceCommandService.cpp:227-258, 392-412, 982-1018
+while (!completeReply.contains('\n')) {
+    completeReply.append(socket.readAll());
+    // 持续读取到协议换行，弱网分包不会截断Base64路径。
+}
+
+if (command == "screenshot") {
+    const ScreenshotCaptureResult result = ScreenshotService::capturePrimaryScreen(groupName, deviceName);
+    replyAndClose(result.success
+        ? QByteArrayLiteral("screenshot|") + result.filePath.toUtf8().toBase64() + '\n'
+        : QByteArrayLiteral("error|...") + '\n');
+}
+
+bool DeviceCommandService::requestScreenshot(...) {
+    // 发送命名元数据，验证返回路径只属于固定截图目录。
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.h:266-270, 379-380
+RemoteDesktopWindow* focusedRemoteWindow() const;
+void triggerScreenshotCapture();
+void requestRemoteScreenshot(RemoteDesktopWindow* remoteWindow);
+void captureLocalScreenshot();
+void showScreenshotReview(const QString& filePath, QWidget* preferredParent);
+QSet<QString> m_pendingScreenshotTargets;
+bool m_screenshotReviewActive = false;
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:635-641, 854-949, 4936-5050
+constexpr int kScreenshotShortcutIndex = 8;
+constexpr int kDeleteDeviceShortcutIndex = 9;
+constexpr int kShortcutEditorCount = 10;
+
+g_screenshotShortcutHook = SetWindowsHookExW(
+    WH_KEYBOARD_LL, screenshotShortcutHookProc, GetModuleHandleW(nullptr), 0);
+
+void DeviceGrid::triggerScreenshotCapture()
+{
+    if (m_shuttingDown || m_screenshotReviewActive || !m_pendingScreenshotTargets.isEmpty()) return;
+    if (RemoteDesktopWindow* remoteWindow = focusedRemoteWindow()) {
+        requestRemoteScreenshot(remoteWindow);
+        return;
+    }
+    captureLocalScreenshot();
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.h:143
+void shortcutScreenshotRequested();
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:6266-6273, 7489-7498
+const QKeySequence screenshotShortcut = platform::AppSettings::screenshotShortcut();
+if (matchesShortcut(current, screenshotShortcut)) {
+    beginShortcutReleaseGuard(screenshotShortcut);
+    emit shortcutScreenshotRequested();
+    return true;
+}
+```
+
+```cpp
+// src/system/ScreenshotService.h:9-27
+struct ScreenshotCaptureResult {
+    bool success = false;
+    QString filePath;
+    QString errorMessage;
+};
+
+class ScreenshotService final {
+public:
+    static ScreenshotCaptureResult capturePrimaryScreen(const QString& groupName, const QString& deviceName);
+    static bool isManagedScreenshotPath(const QString& filePath);
+};
+```
+
+```cpp
+// src/system/ScreenshotService.cpp:38-69, 72-132
+return QString::fromUtf8(R"(\\192.168.1.100\ggc\喊话截图)");
+return QStringLiteral("%1_%2_%3").arg(groupName, deviceName,
+    capturedAt.toString(QStringLiteral("yyyyMMdd_HHmmss")));
+
+const QPixmap screenshot = screen->grabWindow(0);
+// 以PNG无损写入共享目录，失败时清理半成品。
+// 路径校验只允许固定目录第一层PNG。
+```
+
+```cpp
+// src/ui/ScreenshotReviewDialog.h:11-23
+class ScreenshotReviewDialog final : public QDialog {
+public:
+    explicit ScreenshotReviewDialog(const QString& filePath, QWidget* parent = nullptr);
+    ~ScreenshotReviewDialog() override;
+private:
+    void keepScreenshot();
+    void deleteScreenshotFile();
+    bool m_retained = false;
+};
+```
+
+```cpp
+// src/ui/ScreenshotReviewDialog.cpp:24-130
+imageLabel->setPixmap(screenshot);
+connect(keepButton, &QPushButton::clicked, this, [this] { keepScreenshot(); });
+connect(deleteButton, &QPushButton::clicked, this, &QDialog::reject);
+
+ScreenshotReviewDialog::~ScreenshotReviewDialog()
+{
+    if (!m_retained) deleteScreenshotFile();
+}
+```
+
+### Steps
+1. 增加固定共享目录截图服务，在执行截图的设备上通过`QScreen::grabWindow(0)`采集主屏原始像素并无损保存PNG。
+2. 使用`分组名_设备名_yyyyMMdd_HHmmss.png`生成默认名称，过滤Windows非法字符、限制名称长度并避让同秒重名。
+3. 扩展49102命令协议，控制端只发送分组名和设备名，目标端截图后仅返回Base64编码的共享路径，不通过远控视频流或命令端口传输图片内容。
+4. 将命令回复读取改为等待完整换行，并把截图默认等待时间扩展到60秒，降低弱网和大分辨率PNG写入时的分包、超时风险。
+5. 在键盘设置页增加第9项“原图截图”，默认F12，可按其它快捷键相同方式修改和持久化；删除设备移动到第10项，原F2/F9/F10索引不变。
+6. 增加独立Windows低级键盘Hook，解决裸F12可能无法通过`RegisterHotKey`注册的问题；普通远控窗口继续由现有Hook消费并释放组合键。
+7. 根据真实活动窗口选择截图目标：普通和平铺远控窗口向该目标发送截图命令；主窗口、桌面、其它程序或无远控焦点时截图控制端本机；只读监控窗口按当前绑定目标处理。
+8. 后台等待远端截图，共享文件可读后在控制端显示原像素滚动预览；同一时刻只允许一张截图处于请求或确认阶段。
+9. 确认窗口允许修改基础文件名并固定`.png`；只有“确定”成功后保留，点击“删除”、Esc、标题栏关闭或程序退出均删除未确认文件。
+10. 强化失败清理和路径边界，损坏PNG、写入半成品、非法返回路径以及控制端退出后的未确认截图不会被保留。
+
+### Verification
+- 已执行`git diff --check`，未发现空白错误。
+- 已使用`rg`核对`0..9`快捷键索引、10行设置数组、设置读写接口、普通/平铺远控信号连接和Windows Hook消息映射一致。
+- 已静态核对目标端截图命令只传命名元数据，返回路径必须位于`\\192.168.1.100\ggc\喊话截图`第一层且扩展名为PNG。
+- 已静态核对无远控焦点走本机主屏截图，活动远控窗口走目标端截图，F12不会作为普通键鼠事件继续转发到目标应用。
+- 已静态核对确认窗口只有成功确定才设置保留状态，删除、Esc、关闭和析构均执行受控路径删除。
+- 已静态核对弱网回复按换行完整读取，单个截图请求最多等待60秒，控制端等待发生在后台线程。
+- 已确认本轮只会暂存本条记录列出的13个源码/构建文件和`WJY_CODE_CHANGE_LOG.md`，不会包含工作区其它未跟踪文件。
+- 按用户要求，本次未构建、未链接、未运行测试或启动程序。
