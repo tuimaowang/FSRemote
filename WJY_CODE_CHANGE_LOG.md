@@ -14645,3 +14645,92 @@ indexes.append(deviceIndex);
 - 已静态核对白名单使用最终显示名称完整匹配，默认空数组不会排除任何额外设备。
 - 已确认本次只准备提交 `DeviceGrid.cpp`、`DeviceGrid.h` 和 `WJY_CODE_CHANGE_LOG.md`，不会包含用户当前对输入脚本和 WebRTC 文件的未提交修改。
 - 按用户要求，本次未构建、未链接、未运行测试或启动程序。
+
+## 2026-08-11 13:48 - 修复F10随机粘贴覆盖原剪贴板
+
+### Changed Location
+- `src/system/InputScriptExecutionService.h:115`：为F10独立执行器增加随机粘贴准备、延迟恢复、条件恢复和状态清理接口。
+- `src/system/InputScriptExecutionService.h:131`：保存临时剪贴板恢复定时器、粘贴前原文、Windows序号和待恢复状态。
+- `src/system/InputScriptExecutionService.cpp:37`：新增带Windows自定义格式标记的文本剪贴板写入函数。
+- `src/system/InputScriptExecutionService.cpp:354`：创建独立的80毫秒单次恢复定时器。
+- `src/system/InputScriptExecutionService.cpp:684`：脚本遇到Ctrl+V时改为基于粘贴前原文生成本次随机文本，V抬起后调度恢复。
+- `src/system/InputScriptExecutionService.cpp:721`：实现连续粘贴去累积、外部剪贴板变化保护、恢复重试以及停止和退出兜底。
+- `third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:1618`：登记与F10执行器一致的临时剪贴板格式名。
+- `third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:1931`：Host轮询跳过带F10临时标记的随机文本，防止同步到主控和其它窗口。
+
+### Reason
+原实现直接读取目标端当前文本，再用`原文本 + 分隔符 + 随机串`永久覆盖系统剪贴板。下一轮Ctrl+V会把已经追加过随机串的内容再次作为源文本，形成连续累积；开启剪贴板同步时，临时随机内容还可能被Host轮询广播到主控端。新实现将随机文本限定为一次粘贴期间的临时值，并只在剪贴板序号未被用户或目标程序改变时恢复粘贴前原文。
+
+### Original Code
+```cpp
+// src/system/InputScriptExecutionService.cpp:602-616
+QClipboard* clipboard = QGuiApplication::clipboard();
+const QString sourceText = clipboard ? clipboard->text() : QString();
+if (!sourceText.isEmpty() && clipboard) {
+    // 生成随机字符串。
+    clipboard->setText(sourceText + m_request.pasteRandomSeparator + randomText);
+}
+```
+
+```cpp
+// src/system/InputScriptExecutionService.h:115-125
+// 此位置原来只有injectEvent、releaseHeldInputs和播放状态字段，
+// 没有独立的随机粘贴恢复接口或剪贴板原文快照。
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:1918-1923
+const DWORD sequence = ::GetClipboardSequenceNumber();
+if (sequence == 0 || sequence == last_clipboard_sequence_) return;
+if (sequence == g_clipboard_ignore_sequence.load()) {
+    last_clipboard_sequence_ = sequence;
+    return;
+}
+```
+
+### Modified Code
+```cpp
+// src/system/InputScriptExecutionService.cpp:684-700
+if (m_request.pasteRandomSuffixEnabled && event.virtualKey == 'V' && m_ctrlDown) {
+    if (!prepareRandomPasteClipboard()) return false;
+}
+if (!sendKey(event.virtualKey, true)) return false;
+
+if (event.virtualKey == 'V' && m_pasteClipboardRestorePending) {
+    schedulePasteClipboardRestore();
+}
+```
+
+```cpp
+// src/system/InputScriptExecutionService.cpp:721-786
+if (!m_pasteClipboardRestorePending) {
+    m_pasteClipboardOriginalText = clipboard ? clipboard->text() : QString();
+}
+// 每次基于固定原文生成新的临时随机文本，并记录Windows剪贴板序号。
+// 80ms后仅在序号仍一致时恢复原文；检测到外部复制则放弃恢复权。
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:1931-1941
+const UINT transientFormat = input_script_transient_clipboard_format();
+if (transientFormat != 0 && ::IsClipboardFormatAvailable(transientFormat)) {
+    last_clipboard_sequence_ = sequence;
+    return;
+}
+```
+
+### Steps
+1. 在F10目标端独立执行器中增加专用单次恢复定时器，恢复逻辑不依赖Viewer窗口或网络连接。
+2. 第一次随机Ctrl+V保存目标端粘贴前文本；连续粘贴始终基于该原文生成新随机后缀，不读取上一次临时结果。
+3. 临时文本写入Windows剪贴板时附加`FSRemote.InputScript.TransientClipboard.v1`自定义格式标记。
+4. V抬起80毫秒后检查剪贴板序号；序号一致才恢复原文，用户或目标程序期间产生的新剪贴板内容不会被覆盖。
+5. 剪贴板短暂被占用时保留恢复状态并重试；脚本停止、注入失败和目标程序退出也执行恢复兜底。
+6. Host剪贴板轮询识别临时标记并跳过随机文本；恢复后的真实原文不带标记，可以继续按正常同步逻辑处理。
+
+### Verification
+- 已执行`git diff --check`，未发现空白错误。
+- 已使用`rg`核对新增方法声明、定义和调用均完整存在。
+- 已静态核对连续Ctrl+V不会把上一次随机结果作为下一次源文本。
+- 已静态核对恢复前比较Windows剪贴板序号，外部新内容不会被旧脚本覆盖。
+- 已静态核对临时随机文本带自定义格式，Host轮询不会把它广播到主控或其它监控窗口。
+- 按用户此前要求，本次未构建、未链接、未运行测试或启动程序。

@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <utility>
 
@@ -36,6 +37,79 @@ constexpr qsizetype kCopyChunkBytes = 256 * 1024;
 constexpr qsizetype kMaximumEventsPerTick = 128;
 constexpr int kMaximumLoopIntervalMs = 60 * 60 * 1000;
 constexpr qint64 kMaximumSharedScriptBytes = 32LL * 1024LL * 1024LL;
+// =====wjy====
+constexpr int kPasteClipboardRestoreDelayMs = 80; // wjy: SendInput入队后短暂保留随机文本，随后恢复原文；明显短于Host的350ms剪贴板轮询周期。
+#if defined(Q_OS_WIN)
+constexpr wchar_t kInputScriptTransientClipboardFormatName[] = L"FSRemote.InputScript.TransientClipboard.v1"; // wjy: EXE与Host DLL通过同名Windows剪贴板格式识别仅供F10使用的临时内容。
+
+UINT inputScriptTransientClipboardFormat()
+{
+    static const UINT format = ::RegisterClipboardFormatW(kInputScriptTransientClipboardFormatName); // wjy: Windows为同一格式名返回系统级稳定ID，不需要让独立执行器依赖远控输入对象。
+    return format;
+}
+
+bool setInputScriptWindowsClipboardText(const QString& text, bool markTransient, DWORD* sequence)
+{
+    if (sequence) *sequence = 0;
+    const UINT markerFormat = markTransient ? inputScriptTransientClipboardFormat() : 0;
+    if (markTransient && markerFormat == 0) return false; // wjy: 临时写入无法注册标记时不修改剪贴板，避免随机内容被同步线程当作真实变化广播。
+
+    const SIZE_T textBytes = static_cast<SIZE_T>(text.size() + 1) * sizeof(wchar_t);
+    HGLOBAL textMemory = ::GlobalAlloc(GMEM_MOVEABLE, textBytes);
+    HGLOBAL markerMemory = markTransient ? ::GlobalAlloc(GMEM_MOVEABLE, 1) : nullptr;
+    if (!textMemory || (markTransient && !markerMemory)) {
+        if (textMemory) ::GlobalFree(textMemory);
+        if (markerMemory) ::GlobalFree(markerMemory);
+        return false;
+    }
+
+    void* textTarget = ::GlobalLock(textMemory);
+    void* markerTarget = markerMemory ? ::GlobalLock(markerMemory) : nullptr;
+    if (!textTarget || (markerMemory && !markerTarget)) {
+        if (textTarget) ::GlobalUnlock(textMemory);
+        if (markerTarget) ::GlobalUnlock(markerMemory);
+        ::GlobalFree(textMemory);
+        ::GlobalFree(markerMemory);
+        return false;
+    }
+    std::memcpy(textTarget, text.utf16(), static_cast<size_t>(text.size()) * sizeof(char16_t));
+    static_cast<wchar_t*>(textTarget)[text.size()] = L'\0'; // wjy: CF_UNICODETEXT必须以UTF-16空字符结尾，中文和其它Unicode文本均保持原样。
+    if (markerTarget) *static_cast<unsigned char*>(markerTarget) = 1;
+    ::GlobalUnlock(textMemory);
+    if (markerMemory) ::GlobalUnlock(markerMemory);
+
+    bool opened = false;
+    for (int attempt = 0; attempt < 5 && !opened; ++attempt) {
+        opened = ::OpenClipboard(nullptr) != FALSE;
+        if (!opened) ::Sleep(1); // wjy: Host轮询可能短暂持有剪贴板，最多重试5ms而不让一次偶发竞争直接终止脚本。
+    }
+    if (!opened) {
+        ::GlobalFree(textMemory);
+        ::GlobalFree(markerMemory);
+        return false;
+    }
+    if (!::EmptyClipboard()) {
+        ::CloseClipboard();
+        ::GlobalFree(textMemory);
+        ::GlobalFree(markerMemory);
+        return false;
+    }
+
+    const bool markerStored = !markTransient
+        || ::SetClipboardData(markerFormat, markerMemory) != nullptr; // wjy: 只有随机临时文本提交标记；恢复原文不带标记，可按正常剪贴板内容同步。
+    if (markTransient && markerStored) markerMemory = nullptr;
+    const bool textStored = markerStored && ::SetClipboardData(CF_UNICODETEXT, textMemory) != nullptr;
+    if (textStored) textMemory = nullptr;
+    ::CloseClipboard();
+    if (textMemory) ::GlobalFree(textMemory);
+    if (markerMemory) ::GlobalFree(markerMemory);
+    if (!textStored) return false;
+
+    if (sequence) *sequence = ::GetClipboardSequenceNumber(); // wjy: 恢复时只接受这一序号，任何外部复制都会使恢复自动失效。
+    return true;
+}
+#endif
+// ===end====
 
 bool hashFile(
     const QString& filePath,
@@ -281,6 +355,14 @@ InputScriptExecutionService::InputScriptExecutionService(QObject* parent)
     m_playbackTimer->setSingleShot(true);
     m_playbackTimer->setTimerType(Qt::PreciseTimer); // wjy: 被控端使用本机高精度单次定时器按绝对录制时间调度，控制网络抖动不再参与事件间隔。
     connect(m_playbackTimer, &QTimer::timeout, this, [this] { processDueEvents(); });
+    // =====wjy====
+    m_pasteClipboardRestoreTimer = new QTimer(this);
+    m_pasteClipboardRestoreTimer->setSingleShot(true);
+    m_pasteClipboardRestoreTimer->setTimerType(Qt::PreciseTimer);
+    connect(m_pasteClipboardRestoreTimer, &QTimer::timeout, this, [this] {
+        restorePasteClipboardIfNeeded(); // wjy: 恢复独立于播放队列，即使最后一个Ctrl+V后脚本立即结束也不会永久留下随机字符串。
+    });
+    // ===end====
 }
 
 InputScriptExecutionService::~InputScriptExecutionService()
@@ -331,6 +413,9 @@ RemoteInputScriptCommandResult InputScriptExecutionService::start(
     if (m_prepareThread.joinable()) {
         m_prepareThread.join(); // wjy: 只有上一轮已发布非活动终态后才会进入新 start，同步回收已结束线程不会等待共享目录 IO。
     }
+    // =====wjy====
+    restorePasteClipboardIfNeeded(); // wjy: 极短时间内开始下一份脚本前先收尾上一轮临时剪贴板，新的运行从目标端真实文本开始。
+    // ===end====
     resetPlaybackData();
     m_request = request;
     m_request.runId = request.runId.trimmed();
@@ -600,21 +685,7 @@ bool InputScriptExecutionService::injectEvent(const ui::RemoteInputEvent& event)
             || event.virtualKey == VK_LCONTROL
             || event.virtualKey == VK_RCONTROL;
         if (m_request.pasteRandomSuffixEnabled && event.virtualKey == 'V' && m_ctrlDown) {
-            QClipboard* clipboard = QGuiApplication::clipboard();
-            const QString sourceText = clipboard ? clipboard->text() : QString();
-            if (!sourceText.isEmpty() && clipboard) {
-                const QString alphabet = m_request.pasteRandomMode == 1
-                    ? QStringLiteral("0123456789")
-                    : (m_request.pasteRandomMode == 2
-                        ? QStringLiteral("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
-                        : QStringLiteral("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
-                QString randomText;
-                randomText.reserve(m_request.pasteRandomLength);
-                for (int index = 0; index < m_request.pasteRandomLength; ++index) {
-                    randomText.append(alphabet.at(QRandomGenerator::global()->bounded(alphabet.size())));
-                }
-                clipboard->setText(sourceText + m_request.pasteRandomSeparator + randomText); // wjy: 随机粘贴直接修改被控端本机剪贴板，主控剪贴板和网络时延不再参与脚本内容。
-            }
+            if (!prepareRandomPasteClipboard()) return false; // wjy: V按下前完成带标记的临时写入；失败时停止脚本，禁止悄悄粘贴错误内容。
         }
         if (!sendKey(event.virtualKey, true)) return false;
         m_heldKeys.insert(event.virtualKey);
@@ -624,6 +695,11 @@ bool InputScriptExecutionService::injectEvent(const ui::RemoteInputEvent& event)
     case ui::RemoteInputEventType::KeyUp: {
         if (!sendKey(event.virtualKey, false)) return false;
         m_heldKeys.remove(event.virtualKey);
+        // =====wjy====
+        if (event.virtualKey == 'V' && m_pasteClipboardRestorePending) {
+            schedulePasteClipboardRestore(); // wjy: V抬起已进入系统输入队列后开始80ms恢复倒计时，窗口尽量短且不抢在粘贴前恢复。
+        }
+        // ===end====
         if (event.virtualKey == VK_CONTROL
             || event.virtualKey == VK_LCONTROL
             || event.virtualKey == VK_RCONTROL) {
@@ -641,6 +717,84 @@ bool InputScriptExecutionService::injectEvent(const ui::RemoteInputEvent& event)
     return false;
 }
 
+// =====wjy====
+bool InputScriptExecutionService::prepareRandomPasteClipboard()
+{
+#if defined(Q_OS_WIN)
+    if (m_pasteClipboardRestoreTimer) m_pasteClipboardRestoreTimer->stop(); // wjy: 连续Ctrl+V共用同一原文，新一次临时写入接管上一恢复倒计时。
+    const DWORD currentSequence = ::GetClipboardSequenceNumber();
+    if (m_pasteClipboardRestorePending
+        && currentSequence != m_pasteClipboardTemporarySequence) {
+        clearPasteClipboardState(); // wjy: 用户或目标程序已改写剪贴板时立即放弃旧恢复权，绝不覆盖外部新内容。
+    }
+
+    QClipboard* clipboard = QGuiApplication::clipboard();
+    if (!m_pasteClipboardRestorePending) {
+        m_pasteClipboardOriginalText = clipboard ? clipboard->text() : QString(); // wjy: 每组连续粘贴只保存一次真实原文，循环执行不会把旧随机串继续当作源文本。
+    }
+    if (m_pasteClipboardOriginalText.isEmpty()) {
+        return true; // wjy: 没有文本时保持普通Ctrl+V语义，不凭空制造仅含分隔符和随机串的内容。
+    }
+
+    const QString alphabet = m_request.pasteRandomMode == 1
+        ? QStringLiteral("0123456789")
+        : (m_request.pasteRandomMode == 2
+            ? QStringLiteral("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
+            : QStringLiteral("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+    QString randomText;
+    randomText.reserve(m_request.pasteRandomLength);
+    for (int index = 0; index < m_request.pasteRandomLength; ++index) {
+        randomText.append(alphabet.at(QRandomGenerator::global()->bounded(alphabet.size()))); // wjy: 每次V按下单独生成新后缀，同一轮和跨循环都不会复用旧随机值。
+    }
+
+    DWORD temporarySequence = 0;
+    if (!setInputScriptWindowsClipboardText(
+            m_pasteClipboardOriginalText + m_request.pasteRandomSeparator + randomText,
+            true,
+            &temporarySequence)) {
+        clearPasteClipboardState();
+        return false;
+    }
+    m_pasteClipboardTemporarySequence = temporarySequence;
+    m_pasteClipboardRestorePending = true; // wjy: 只有文本和临时标记都成功进入Windows剪贴板后才建立恢复责任。
+    return true;
+#else
+    return true;
+#endif
+}
+
+void InputScriptExecutionService::schedulePasteClipboardRestore()
+{
+    if (!m_pasteClipboardRestorePending || !m_pasteClipboardRestoreTimer) return;
+    m_pasteClipboardRestoreTimer->start(kPasteClipboardRestoreDelayMs); // wjy: 重复调用会刷新单次定时器，连续粘贴只在最后一个V抬起后恢复。
+}
+
+void InputScriptExecutionService::restorePasteClipboardIfNeeded()
+{
+#if defined(Q_OS_WIN)
+    if (m_pasteClipboardRestoreTimer) m_pasteClipboardRestoreTimer->stop();
+    if (!m_pasteClipboardRestorePending) return;
+    const DWORD currentSequence = ::GetClipboardSequenceNumber();
+    if (currentSequence == m_pasteClipboardTemporarySequence) {
+        DWORD restoredSequence = 0;
+        if (!setInputScriptWindowsClipboardText(m_pasteClipboardOriginalText, false, &restoredSequence)
+            && !m_shuttingDown && m_pasteClipboardRestoreTimer) {
+            m_pasteClipboardRestoreTimer->start(kPasteClipboardRestoreDelayMs);
+            return; // wjy: 剪贴板被其它线程短暂占用时保留原文和所有权并重试，不能清状态后永久留下随机字符串。
+        } // wjy: 恢复版本移除临时标记，Host只可能同步真实原文，绝不会把随机字符串广播出去。
+    }
+    clearPasteClipboardState(); // wjy: 无论恢复成功还是检测到外部变化，本次执行器都永久放弃旧剪贴板所有权。
+#endif
+}
+
+void InputScriptExecutionService::clearPasteClipboardState()
+{
+    m_pasteClipboardOriginalText.clear();
+    m_pasteClipboardTemporarySequence = 0;
+    m_pasteClipboardRestorePending = false;
+}
+// ===end====
+
 void InputScriptExecutionService::releaseHeldInputs()
 {
 #if defined(Q_OS_WIN)
@@ -652,6 +806,9 @@ void InputScriptExecutionService::releaseHeldInputs()
     for (const int virtualKey : heldKeys) sendKey(virtualKey, false);
     moveAbsolute(m_lastNormalizedX, m_lastNormalizedY);
     for (const int button : heldButtons) sendMouseButton(button, false); // wjy: 停止、自然结束和失败都由被控端本地补齐抬起，主控断线不会在目标桌面留下按住状态。
+    // =====wjy====
+    schedulePasteClipboardRestore(); // wjy: 脚本缺少V抬起、被停止或注入失败时，兜底释放输入后仍恢复随机粘贴前的目标端文本。
+    // ===end====
 #endif
 }
 
@@ -723,6 +880,9 @@ void InputScriptExecutionService::shutdown()
     if (m_playbackTimer) m_playbackTimer->stop();
     releaseHeldInputs();
     resetPlaybackData();
+    // =====wjy====
+    restorePasteClipboardIfNeeded(); // wjy: 目标程序退出不能把临时随机字符串遗留在系统剪贴板，退出路径不再等待80ms定时器。
+    // ===end====
     if (m_prepareThread.joinable()) m_prepareThread.join(); // wjy: 目标程序退出前汇合共享目录读取线程，防止后台回调访问已经析构的 Qt 对象。
     setRuntimeState(RemoteInputScriptState::Idle);
     m_statusChangedCallback = {};

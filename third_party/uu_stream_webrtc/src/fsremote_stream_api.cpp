@@ -1618,6 +1618,15 @@ bool read_windows_clipboard_utf8(std::string* utf8)
 }
 
 std::atomic_uint32_t g_clipboard_ignore_sequence = 0; // wjy: 写入远端剪贴板后忽略一次本机回读，防止环回广播。
+// =====wjy====
+constexpr wchar_t kInputScriptTransientClipboardFormatName[] = L"FSRemote.InputScript.TransientClipboard.v1"; // wjy: 与目标端F10独立执行器约定同一Windows剪贴板格式名，仅用于识别临时随机粘贴内容。
+
+UINT input_script_transient_clipboard_format()
+{
+    static const UINT format = ::RegisterClipboardFormatW(kInputScriptTransientClipboardFormatName); // wjy: DLL自行注册同名格式即可获得与EXE一致的系统ID，不复用脚本执行对象或其生命周期。
+    return format;
+}
+// ===end====
 
 void apply_remote_clipboard_text(const std::string& encoded)
 {
@@ -1922,6 +1931,13 @@ public:
             if (clipboard_callbacks_.empty()) return;
             const DWORD sequence = ::GetClipboardSequenceNumber();
             if (sequence == 0 || sequence == last_clipboard_sequence_) return;
+            // =====wjy====
+            const UINT transientFormat = input_script_transient_clipboard_format();
+            if (transientFormat != 0 && ::IsClipboardFormatAvailable(transientFormat)) {
+                last_clipboard_sequence_ = sequence;
+                return; // wjy: F10随机粘贴的临时写入和原文恢复都只服务目标端前台程序，不广播到主控或其它监控窗口。
+            }
+            // ===end====
             if (sequence == g_clipboard_ignore_sequence.load()) {
                 last_clipboard_sequence_ = sequence;
                 return; // wjy: 刚写入的远端剪贴板内容不回推，避免环路。

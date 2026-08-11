@@ -115,6 +115,12 @@ private:
     void scheduleNextEvent();
     void finishLoop();
     bool injectEvent(const ui::RemoteInputEvent& event);
+    // =====wjy====
+    bool prepareRandomPasteClipboard(); // wjy: 每次脚本Ctrl+V都从本次粘贴前的目标端文本生成临时随机内容，禁止读取上一次已经追加的结果。
+    void schedulePasteClipboardRestore(); // wjy: V抬起后延迟恢复，给前台程序留出消费粘贴消息和剪贴板数据的时间。
+    void restorePasteClipboardIfNeeded(); // wjy: 仅当剪贴板仍属于本次临时写入时恢复，期间用户或程序产生的新内容拥有更高优先级。
+    void clearPasteClipboardState(); // wjy: 清理一次随机粘贴的原文、临时序号和待恢复标志，不影响脚本其它播放状态。
+    // ===end====
     void releaseHeldInputs();
     void resetPlaybackData();
     void setRuntimeState(RemoteInputScriptState state, const QString& errorMessage = QString());
@@ -125,6 +131,12 @@ private:
     RemoteInputScriptRuntimeInfo m_status;
     std::function<void()> m_statusChangedCallback;
     QTimer* m_playbackTimer = nullptr;
+    // =====wjy====
+    QTimer* m_pasteClipboardRestoreTimer = nullptr; // wjy: 与播放定时器分离，脚本结束或状态切换后仍能完成最后一次剪贴板恢复。
+    QString m_pasteClipboardOriginalText; // wjy: 保存当前Ctrl+V发生前的目标端原文，每次随机粘贴完成后恢复这一份内容。
+    quint32 m_pasteClipboardTemporarySequence = 0; // wjy: 记录临时写入后的Windows剪贴板序号，恢复前用它检测外部修改。
+    bool m_pasteClipboardRestorePending = false; // wjy: 只有成功写入临时随机文本后才允许调度恢复，普通Ctrl+V不进入该状态。
+    // ===end====
     QElapsedTimer m_playbackClock;
     QVector<ui::RemoteInputScriptEvent> m_events;
     qsizetype m_eventIndex = 0;
