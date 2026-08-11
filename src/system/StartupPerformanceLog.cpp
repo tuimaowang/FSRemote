@@ -1,4 +1,5 @@
 #include "system/StartupPerformanceLog.h"
+#include "system/RuntimeLogManager.h" // wjy: 启动计时日志和INI共同使用统一data根目录。
 
 #include <QCoreApplication>
 #include <QDateTime>
@@ -56,9 +57,9 @@ void initializeStartupPerformanceLog(StartupPerformanceLogState& state)
     state.initialized = true;
     state.elapsed.start();
 
-    const QString executableDirectory = QCoreApplication::applicationDirPath();
-    state.logPath = QDir(executableDirectory).filePath(QString::fromLatin1(kStartupTimingLogFileName));
-    state.settingsPath = QDir(executableDirectory).filePath(QString::fromLatin1(kStartupTimingSettingsFileName));
+    const QString dataDirectory = RuntimeLogManager::dataDirectory(); // wjy: 启动日志和开关配置统一放入 FSRemote.exe/data，根目录不再残留诊断文件。
+    state.logPath = QDir(dataDirectory).filePath(QString::fromLatin1(kStartupTimingLogFileName));
+    state.settingsPath = QDir(dataDirectory).filePath(QString::fromLatin1(kStartupTimingSettingsFileName));
 
     QSettings settings(state.settingsPath, QSettings::IniFormat);
     const QString enabledKey = QStringLiteral("StartupTiming/Enabled");

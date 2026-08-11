@@ -2,6 +2,7 @@
 
 #include "system/AppSettings.h"
 #include "system/DeviceCommandService.h"
+#include "system/RuntimeLogManager.h" // wjy: Qt 输入调试日志与原生输入日志共用 FSRemote.exe/data 中的固定文件。
 #include "stream/StreamRuntime.h"
 #include "ui/D3D11FramePresenter.h"
 #include "ui/NativeRemoteTitleBarSurface.h"
@@ -1497,7 +1498,8 @@ void appendRemoteCompositorTimelineLog(const QString& line)
 
 void appendInputDebugLog(const QString& line)
 {
-    QFile file(QDir::temp().filePath(QStringLiteral("fsremote_input_debug.log")));
+    QFile file(QDir(platform::RuntimeLogManager::dataDirectory())
+        .filePath(QStringLiteral("fsremote_input_debug.log"))); // wjy: 不再写系统 Temp，主程序每次重启会先删除上一轮输入诊断。
     if (!file.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
         return;
     }

@@ -365,6 +365,7 @@ bool restartFsRemote(const UpdateTask& task, bool updated)
 {
     const fs::path executable = task.targetDir / task.restartExecutable;
     std::wstring command = L"\"" + executable.wstring() + L"\" ";
+    command += L"--restart-after-pid " + std::to_wstring(GetCurrentProcessId()) + L" "; // wjy: 新主程序先等待更新器关闭 data/updater.log，再执行本轮统一日志清理。
     command += updated
         ? L"--updated-from \"" + task.fromVersion + L"\" --updated-to \"" + task.toVersion + L"\" --minimized" // wjy: 更新成功后的新主程序直接进入托盘，避免更新重启打断用户当前桌面。
         : L"--update-rollback \"" + task.toVersion + L"\""; // wjy: 成功参数仅记录已安装版本并静默启动，回滚参数继续触发主程序失败警告。
@@ -392,10 +393,17 @@ int wmain(int argc, wchar_t* argv[])
 {
     if (argc != 3 || std::wstring(argv[1]) != L"--task") return 2;
     const fs::path taskPath = fs::absolute(argv[2]);
-    g_log.open(taskPath.parent_path() / L"updater.log", std::ios::app);
     UpdateTask task;
     std::wstring error;
     if (!parseTask(taskPath, &task, &error)) { logLine(error); return 3; }
+    // =====wjy====
+    std::error_code logDirectoryError;
+    const fs::path logDirectory = task.targetDir / L"data"; // wjy: 更新器日志归属目标安装，不再散落在 AppData 的版本任务目录。
+    fs::create_directories(logDirectory, logDirectoryError);
+    if (!logDirectoryError) {
+        g_log.open(logDirectory / L"updater.log", std::ios::out | std::ios::trunc); // wjy: 每次更新器运行从空文件开始；新主程序启动后还会按统一规则清除上一进程日志。
+    }
+    // ===end====
     logLine(L"task parsed pid=" + std::to_wstring(task.processId)); // wjy: 日志明确区分任务解析、等待、安装和重启阶段。
     if (!ensureProcessExited(task.processId)) { logLine(L"main process could not be stopped safely"); return 4; } // wjy: 无论优雅退出还是超时强制结束，都必须确认旧进程已停止后才能进入安装。
     logLine(L"main process exited");

@@ -10,6 +10,7 @@
 #include "system/ParsecVddInstaller.h"
 #include "system/PowerManager.h"
 #include "system/PortableOpenSshManager.h"
+#include "system/RuntimeLogManager.h" // wjy: 主实例确认后统一清理并定位 FSRemote.exe/data 下的运行日志。
 #include "system/StartupManager.h"
 #include "system/SharedStorageAvailabilityService.h"
 #include "system/StartupPerformanceLog.h"
@@ -63,31 +64,36 @@ bool activateExistingInstance()
     return true;
 }
 
-void waitForRestartParentIfRequested()
+qint64 waitForRestartParentIfRequested()
 {
     const QStringList arguments = QCoreApplication::arguments();
     const int pidArgumentIndex = arguments.indexOf(QStringLiteral("--restart-after-pid"));
     if (pidArgumentIndex < 0 || pidArgumentIndex + 1 >= arguments.size()) {
-        return;
+        return 0;
     }
 
     bool validPid = false;
     const qint64 parentPid = arguments.at(pidArgumentIndex + 1).toLongLong(&validPid);
     if (!validPid || parentPid <= 0 || parentPid == QCoreApplication::applicationPid()) {
-        return; // wjy: 参数异常时跳过等待，后续仍由原有单实例逻辑保证不会重复运行。
+        return 0; // wjy: 参数异常时跳过等待，后续仍由原有单实例逻辑保证不会重复运行。
     }
 
 #if defined(Q_OS_WIN)
     const HANDLE parentProcess = ::OpenProcess(SYNCHRONIZE, FALSE, static_cast<DWORD>(parentPid));
     if (!parentProcess) {
-        return; // wjy: 旧进程已经退出时直接继续启动，不额外延迟。
+        return ::GetLastError() == ERROR_INVALID_PARAMETER
+            ? parentPid
+            : -parentPid; // wjy: PID 已消失才视为可继续；权限等其它错误不能冒险清理仍可能被旧进程占用的日志。
     }
-    writeStartupLog(QStringLiteral("[wjy-restart] waiting for parent pid=%1").arg(parentPid));
-    ::WaitForSingleObject(parentProcess, 15000); // wjy: 正常清理最多 8 秒，15 秒上限同时避免异常 PID 导致新实例永久等待。
+    const DWORD waitResult = ::WaitForSingleObject(parentProcess, 15000); // wjy: 正常清理最多 8 秒，15 秒上限同时避免异常 PID 导致新实例永久等待。
     ::CloseHandle(parentProcess);
+    if (waitResult != WAIT_OBJECT_0) {
+        return -parentPid; // wjy: 超时或等待失败时不取得主实例身份，防止旧进程尚未关闭日志句柄就删除当前记录。
+    }
 #else
     Q_UNUSED(parentPid)
 #endif
+    return parentPid; // wjy: 等待阶段禁止提前打开旧日志；返回 PID 后由已完成清理的新主实例统一记录。
 }
 
 void cleanupFixedMachineNumberProcessesAtStartup()
@@ -219,27 +225,45 @@ int main(int argc, char* argv[])
     QElapsedTimer applicationCreationTimer;
     applicationCreationTimer.start(); // wjy: 性能日志依赖 QApplication 获取可执行目录，因此用独立计时器补记 QApplication 构造耗时。
     QApplication app(argc, argv);
-    writeStartupLog(QStringLiteral("[wjy-main] app created qapplication_ms=%1")
-        .arg(applicationCreationTimer.elapsed())); // wjy: 第一条日志明确包含 Qt 平台插件和 QApplication 初始化耗时。
+    const qint64 qApplicationCreationMs = applicationCreationTimer.elapsed(); // wjy: 单实例确认前只保留内存计时，禁止二次启动清空或续写正在运行实例的日志。
 
     QApplication::setApplicationName(QStringLiteral("FSRemote"));
     QApplication::setOrganizationName(QStringLiteral("FSRemote"));
-    writeStartupLog(QStringLiteral("[wjy-main] app metadata set"));
-    writeStartupLog(QStringLiteral("[wjy-main] executable=%1 args=%2")
-        .arg(QCoreApplication::applicationFilePath(), QCoreApplication::arguments().join(QStringLiteral(" | ")))); // wjy: 日志明确记录实际运行路径，优先排除用户仍启动旧目录 EXE 的情况。
 
     // =====wjy====
-    waitForRestartParentIfRequested(); // wjy: 托盘重启产生的新实例必须先等旧进程释放单实例服务、端口和 DLL 资源。
+    const qint64 restartParentPid = waitForRestartParentIfRequested(); // wjy: 托盘或更新器重启先等待旧进程释放文件句柄，但此阶段不能触碰上一轮日志。
     // wjy: 禁止重复启动；二次启动只唤醒已有主窗口。
     if (activateExistingInstance()) {
-        writeStartupLog(QStringLiteral("[wjy-main] another instance is running, activate and exit"));
-        return 0;
+        return 0; // wjy: 二次启动不写文件也不清日志，避免干扰真正主实例的完整运行记录。
+    }
+    if (restartParentPid < 0) {
+        return 1; // wjy: 指定父进程未确认退出且无法激活时安全终止，新进程不能接管端口或清理 data。
     }
     QLocalServer::removeServer(QString::fromLatin1(kSingleInstanceKey));
     QLocalServer singleInstanceServer;
     if (!singleInstanceServer.listen(QString::fromLatin1(kSingleInstanceKey))) {
-        writeStartupLog(QStringLiteral("[wjy-main] single-instance server listen failed"));
+        return 1; // wjy: 未取得单实例服务时不能继续启动，更不能删除可能属于其它实例的日志。
     }
+
+    QElapsedTimer logResetTimer;
+    logResetTimer.start();
+    const platform::RuntimeLogResetResult logReset =
+        platform::RuntimeLogManager::resetForPrimaryProcessStart(); // wjy: 仅成功成为主实例后删除上一轮日志，并清理旧版 Temp/AppData/work 路径。
+    const qint64 logResetMs = logResetTimer.elapsed();
+    writeStartupLog(QStringLiteral("[wjy-main] app created qapplication_ms=%1")
+        .arg(qApplicationCreationMs)); // wjy: 新日志的第一条记录仍保留 QApplication 构造耗时，但落盘发生在旧日志完成清理之后。
+    writeStartupLog(QStringLiteral("[wjy-main] app metadata set"));
+    writeStartupLog(QStringLiteral("[wjy-main] executable=%1 args=%2")
+        .arg(QCoreApplication::applicationFilePath(), QCoreApplication::arguments().join(QStringLiteral(" | ")))); // wjy: 日志明确记录实际运行路径，优先排除用户仍启动旧目录 EXE 的情况。
+    if (restartParentPid > 0) {
+        writeStartupLog(QStringLiteral("[wjy-restart] parent wait completed pid=%1").arg(restartParentPid)); // wjy: 更新器或旧主进程已经退出，当前日志不会再与上一进程共享文件句柄。
+    }
+    writeStartupLog(QStringLiteral("[wjy-main] runtime logs reset data=%1 ready=%2 removed=%3 failed=%4 elapsed_ms=%5")
+        .arg(platform::RuntimeLogManager::dataDirectory())
+        .arg(logReset.dataDirectoryReady ? 1 : 0)
+        .arg(logReset.removedFileCount)
+        .arg(logReset.failedFileCount)
+        .arg(logResetMs)); // wjy: 启动记录明确显示统一目录、删除数量和失败数量，便于核对“每次重启重新记录”是否生效。
     cleanupFixedMachineNumberProcessesAtStartup(); // wjy: 单实例确认后立即清理固定名称的两个旧进程，再继续启动其它服务。
     // ===end====
 

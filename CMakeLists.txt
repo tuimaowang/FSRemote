@@ -506,6 +506,10 @@ if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_UPDATE_TESTS) # wjy: 更新服务测�
         src/system/UpdateService.h
         src/system/SharedStorageAvailabilityService.cpp
         src/system/SharedStorageAvailabilityService.h
+        # =====wjy====
+        src/system/RuntimeLogManager.cpp
+        src/system/RuntimeLogManager.h
+        # ===end====
         src/system/StartupPerformanceLog.cpp
         src/system/StartupPerformanceLog.h
         src/system/AppSettings.cpp
@@ -643,6 +647,10 @@ qt_add_executable(FSRemote WIN32
     src/system/WakeOnLanSender.h
     src/system/WolDetector.cpp
     src/system/WolDetector.h
+    # =====wjy====
+    src/system/RuntimeLogManager.cpp
+    src/system/RuntimeLogManager.h
+    # ===end====
     src/system/WjyDiagnosticLog.cpp
     src/system/WjyDiagnosticLog.h
     # =====wjy====

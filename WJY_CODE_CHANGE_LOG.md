@@ -13167,6 +13167,268 @@ assert(menuOpen != normal);
 - 已静态核对原生标题栏和 `FSREMOTE_LEGACY_PARENT_TITLE_BAR` 回退路径均绘制新按钮。
 - 按用户要求，本次未构建、未链接、未运行测试或启动程序。
 
+## 2026-08-11 15:48 - 统一运行日志到data并在主实例启动时清理
+
+### Changed Location
+- `CMakeLists.txt:508-512, 649-653`：将统一日志管理器加入更新服务测试目标和正式主程序目标。
+- `src/system/RuntimeLogManager.h:1-21`：新增日志根目录与启动清理结果接口。
+- `src/system/RuntimeLogManager.cpp:1-181`：新增data日志清理、旧路径清理和启动计时INI迁移实现。
+- `src/main.cpp:67-98, 223-268`：把日志清理移动到单实例确认之后，并让重启实例等待父进程关闭日志句柄。
+- `src/system/WjyDiagnosticLog.cpp:1-36`：诊断日志从AppData迁移到`FSRemote.exe/data`。
+- `src/system/StartupPerformanceLog.cpp:1-64`：启动计时日志和INI迁移到data。
+- `src/system/StartupPerformanceLog.h:10-13`：更新启动计时日志与配置文件路径说明。
+- `src/ui/DeviceGrid.cpp:20, 1423-1433, 9202, 9268-9298`：控制端脚本输出和目标端脚本日志迁移到data子目录。
+- `src/ui/RemoteDesktopWindow.cpp:5, 1499-1503`：Qt输入调试日志从系统Temp迁移到data。
+- `third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:147-159`：原生输入调试日志复用data日志写入入口。
+- `src/updater/main.cpp:364-371, 392-407`：更新器日志迁移到目标安装目录data，并让新主程序等待更新器退出。
+- `src/system/UpdateService.cpp:777-780`：同步更新更新器日志位置和PID等待说明。
+
+### Reason
+原日志分散在EXE根目录、AppData、系统Temp、更新任务目录和目标端脚本work目录，重启后还会继续保留旧内容。统一管理后，所有当前运行日志只写入`FSRemote.exe/data`或其子目录；真正取得单实例身份的主程序每次启动先删除上一轮日志，再开始记录本轮内容。二次误启动不会删除正在运行实例的日志，更新重启也会先等待更新器释放`updater.log`句柄。
+
+### Original Code
+```cmake
+# CMakeLists.txt:503-516
+add_executable(fsremote_update_service_tests EXCLUDE_FROM_ALL
+    tests/update_service_tests.cpp
+    src/system/UpdateService.cpp
+    src/system/SharedStorageAvailabilityService.cpp
+    src/system/StartupPerformanceLog.cpp
+    src/system/WjyDiagnosticLog.cpp
+)
+
+# 正式FSRemote目标中没有RuntimeLogManager源文件。
+```
+
+```cpp
+// src/system/RuntimeLogManager.h, src/system/RuntimeLogManager.cpp
+// 新增文件，此位置原来没有代码。
+```
+
+```cpp
+// src/main.cpp:66-90, 217-243
+void waitForRestartParentIfRequested()
+{
+    // ...
+    writeStartupLog(QStringLiteral("[wjy-restart] waiting for parent pid=%1").arg(parentPid));
+    ::WaitForSingleObject(parentProcess, 15000);
+}
+
+QApplication app(argc, argv);
+writeStartupLog(QStringLiteral("[wjy-main] app created qapplication_ms=%1")
+    .arg(applicationCreationTimer.elapsed()));
+waitForRestartParentIfRequested();
+if (activateExistingInstance()) {
+    writeStartupLog(QStringLiteral("[wjy-main] another instance is running, activate and exit"));
+    return 0;
+}
+```
+
+```cpp
+// src/system/WjyDiagnosticLog.cpp:28-35
+const QString dataDirectory = QStandardPaths::writableLocation(
+    QStandardPaths::AppLocalDataLocation);
+state.path = QDir(dataDirectory).filePath(QStringLiteral("fsremote_diagnostic.log"));
+```
+
+```cpp
+// src/system/StartupPerformanceLog.cpp:59-62
+const QString executableDirectory = QCoreApplication::applicationDirPath();
+state.logPath = QDir(executableDirectory).filePath(QString::fromLatin1(kStartupTimingLogFileName));
+state.settingsPath = QDir(executableDirectory).filePath(QString::fromLatin1(kStartupTimingSettingsFileName));
+```
+
+```cpp
+// src/system/StartupPerformanceLog.h:12-13
+static QString logFilePath(); // 返回可执行文件目录中的启动计时日志路径。
+static QString settingsFilePath(); // 返回同目录INI开关路径。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:1422-1429, 9264-9290
+QString scriptOutputTempFilePath()
+{
+    // ...
+    return QDir(QDir::tempPath()).filePath(fileName);
+}
+
+$log = Join-Path $work 'fsremote_robocopy.log'
+$runLog = Join-Path $work 'fsremote_script_run.log'
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:1498-1501
+void appendInputDebugLog(const QString& line)
+{
+    QFile file(QDir::temp().filePath(QStringLiteral("fsremote_input_debug.log")));
+}
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:149-168
+char tempPath[MAX_PATH] = {};
+if (::GetTempPathA(MAX_PATH, tempPath) == 0) return;
+std::string path(tempPath);
+path += "fsremote_input_debug.log";
+FILE* file = nullptr;
+fopen_s(&file, path.c_str(), "ab");
+```
+
+```cpp
+// src/updater/main.cpp:365-370, 392-399
+std::wstring command = L"\"" + executable.wstring() + L"\" ";
+command += updated ? L"--updated-from ..." : L"--update-rollback ...";
+
+const fs::path taskPath = fs::absolute(argv[2]);
+g_log.open(taskPath.parent_path() / L"updater.log", std::ios::app);
+if (!parseTask(taskPath, &task, &error)) return 3;
+```
+
+```cpp
+// src/system/UpdateService.cpp:778-779
+writeWjyDiagnosticLog(QStringLiteral("[wjy-update-prepare] updater start end pid=%1")
+    .arg(updaterPid)); // updater.log位于任务目录。
+```
+
+### Modified Code
+```cmake
+# CMakeLists.txt:508-512, 649-653
+# =====wjy====
+src/system/RuntimeLogManager.cpp
+src/system/RuntimeLogManager.h
+# ===end====
+```
+
+```cpp
+// src/system/RuntimeLogManager.h:8-18
+struct RuntimeLogResetResult {
+    int removedFileCount = 0;
+    int failedFileCount = 0;
+    bool dataDirectoryReady = false;
+};
+
+class RuntimeLogManager final {
+public:
+    static QString dataDirectory();
+    static RuntimeLogResetResult resetForPrimaryProcessStart();
+};
+```
+
+```cpp
+// src/system/RuntimeLogManager.cpp:139-181
+QString RuntimeLogManager::dataDirectory()
+{
+    const QString path = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("data"));
+    QDir().mkpath(path);
+    return QDir::cleanPath(path);
+}
+
+RuntimeLogResetResult RuntimeLogManager::resetForPrimaryProcessStart()
+{
+    // 删除data内*.log、*.log.*、*.jsonl；保留JSON配置、密钥、脚本和状态文件。
+    // 清理EXE根目录、Temp、旧AppData/Updates和work中的已知旧日志。
+    // 迁移并保留FSRemote_startup_timing.ini。
+}
+```
+
+```cpp
+// src/main.cpp:67-98, 223-268
+qint64 waitForRestartParentIfRequested()
+{
+    // 等待期间不写文件日志；父进程未确认退出时返回负PID。
+}
+
+const qint64 restartParentPid = waitForRestartParentIfRequested();
+if (activateExistingInstance()) return 0;
+if (restartParentPid < 0) return 1;
+if (!singleInstanceServer.listen(QString::fromLatin1(kSingleInstanceKey))) return 1;
+
+const platform::RuntimeLogResetResult logReset =
+    platform::RuntimeLogManager::resetForPrimaryProcessStart();
+writeStartupLog(QStringLiteral("[wjy-main] app created qapplication_ms=%1")
+    .arg(qApplicationCreationMs));
+```
+
+```cpp
+// src/system/WjyDiagnosticLog.cpp:31-35
+const QString dataDirectory = RuntimeLogManager::dataDirectory();
+state.path = QDir(dataDirectory).filePath(QStringLiteral("fsremote_diagnostic.log"));
+```
+
+```cpp
+// src/system/StartupPerformanceLog.cpp:60-62
+const QString dataDirectory = RuntimeLogManager::dataDirectory();
+state.logPath = QDir(dataDirectory).filePath(QString::fromLatin1(kStartupTimingLogFileName));
+state.settingsPath = QDir(dataDirectory).filePath(QString::fromLatin1(kStartupTimingSettingsFileName));
+```
+
+```cpp
+// src/system/StartupPerformanceLog.h:12-13
+static QString logFilePath(); // 返回FSRemote.exe/data中的启动计时日志路径。
+static QString settingsFilePath(); // 返回data中的INI开关路径，清日志时保留。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:1423-1433, 9268-9298
+QString scriptOutputLogFilePath()
+{
+    const QString outputDirectory = QDir(platform::RuntimeLogManager::dataDirectory())
+        .filePath(QStringLiteral("script_output"));
+    return QDir(outputDirectory).filePath(fileName);
+}
+
+$scriptLogRoot = Join-Path $fsremoteDir 'data\script_logs'
+$scriptLogDirectory = Join-Path $scriptLogRoot $scriptWorkName
+$log = Join-Path $scriptLogDirectory 'fsremote_robocopy.log'
+$runLog = Join-Path $scriptLogDirectory 'fsremote_script_run.log'
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:1500-1503
+QFile file(QDir(platform::RuntimeLogManager::dataDirectory())
+    .filePath(QStringLiteral("fsremote_input_debug.log")));
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:147-159
+const std::string text = std::string(prefix) + line;
+append_log_to_file("fsremote_input_debug.log", text);
+```
+
+```cpp
+// src/updater/main.cpp:364-371, 392-407
+command += L"--restart-after-pid " + std::to_wstring(GetCurrentProcessId()) + L" ";
+
+const fs::path logDirectory = task.targetDir / L"data";
+fs::create_directories(logDirectory, logDirectoryError);
+g_log.open(logDirectory / L"updater.log", std::ios::out | std::ios::trunc);
+```
+
+```cpp
+// src/system/UpdateService.cpp:778-779
+writeWjyDiagnosticLog(QStringLiteral("[wjy-update-prepare] updater start end pid=%1")
+    .arg(updaterPid)); // updater.log写入安装目录data，并等待更新器关闭句柄。
+```
+
+### Steps
+1. 新增`RuntimeLogManager`，把所有运行日志根目录固定为`QCoreApplication::applicationDirPath()/data`。
+2. 清理器只删除data及子目录中的`*.log`、`*.log.*`、`*.jsonl`，保留`devices.json`、OpenSSH密钥和配置、脚本状态JSON/TXT、用户脚本及`control.txt`。
+3. 同时清理旧EXE根目录日志、`%TEMP%`输入与脚本输出日志、旧AppData诊断与更新日志，以及work中的两个旧脚本日志。
+4. 把`FSRemote_startup_timing.ini`迁移到data并保留`StartupTiming/Enabled`，后续重启只删除日志扩展名文件。
+5. 调整主程序启动顺序：先等待重启父进程、激活已有实例、成功监听单实例服务，再清日志并开始写本轮启动记录。
+6. 父进程等待超时、权限错误或单实例监听失败时直接退出，不删除任何正在使用的日志。
+7. 将诊断、启动计时、Qt输入、原生输入、控制端脚本输出、目标端脚本复制/执行和更新器日志迁移到data对应子目录。
+8. 更新器向新主程序追加`--restart-after-pid <更新器PID>`，保证新主程序等更新器关闭`data/updater.log`后再执行清理。
+
+### Verification
+- 已执行`git diff --check`，未发现空白错误。
+- 已使用`rg`复核全部已知`.log`和`.jsonl`写入点：当前写入均位于`FSRemote.exe/data`或其子目录。
+- 已确认`QDir::tempPath`、`QStandardPaths::AppLocalDataLocation`和旧work日志名称只保留在`RuntimeLogManager`旧日志清理逻辑中，不再作为新日志输出位置。
+- 已静态核对二次启动在单实例激活后直接退出，不调用`resetForPrimaryProcessStart()`。
+- 已静态核对更新重启先等待更新器PID，正常主实例取得成功后才清理data。
+- 已确认清理规则不匹配普通`.json`、`.txt`、`.ini`、密钥、脚本和其它用户数据。
+- 按用户要求，本次未构建、未链接、未运行测试或启动程序。
+
 - 用户在 `src/stream/RemoteVideoPolicy.h` 中单独修改的360档参数不属于本次前端任务，未改动且不会随本次提交暂存。
 
 ## 2026-08-10 17:04 - 精简画质菜单并增加高带宽确认

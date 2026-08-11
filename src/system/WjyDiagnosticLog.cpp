@@ -1,11 +1,11 @@
 #include "system/WjyDiagnosticLog.h"
+#include "system/RuntimeLogManager.h" // wjy: 诊断日志通过统一管理器固定写入当前安装目录data。
 
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QMutex>
 #include <QMutexLocker>
-#include <QStandardPaths>
 #include <QThread>
 
 namespace platform {
@@ -28,7 +28,7 @@ DiagnosticLogState& diagnosticLogState()
 bool ensureDiagnosticFileOpen(DiagnosticLogState& state)
 {
     if (state.path.isEmpty()) {
-        const QString dataDirectory = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+        const QString dataDirectory = RuntimeLogManager::dataDirectory(); // wjy: 低频诊断不再写 AppData，统一跟随当前 FSRemote.exe 的 data 目录。
         if (dataDirectory.isEmpty() || !QDir().mkpath(dataDirectory)) {
             return false;
         }

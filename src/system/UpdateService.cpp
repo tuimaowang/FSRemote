@@ -776,7 +776,7 @@ bool UpdateService::prepareRemoteVersionInstall(const QString& targetVersion, QS
         return false;
     }
     writeWjyDiagnosticLog(QStringLiteral("[wjy-update-prepare] updater start end pid=%1")
-        .arg(updaterPid)); // wjy: 独立更新器 PID 与 updater.log 任务目录形成双向关联，便于确认是否成功进入等待阶段。
+        .arg(updaterPid)); // wjy: 独立更新器 PID 会写入安装目录 data/updater.log，并由重启参数保证新主程序等待其关闭日志句柄。
     writeWjyDiagnosticLog(QStringLiteral("[wjy-update-prepare] updateReadyToQuit emit begin"));
     emit updateReadyToQuit(); // wjy: 任务与更新器都已在本地就绪，此后网络断开也不影响安装。
     writeWjyDiagnosticLog(QStringLiteral("[wjy-update-prepare] updateReadyToQuit emit returned")); // wjy: 若只有 begin 没有 returned，说明存在异常直接连接或信号处理未返回；正常跨线程队列会立即返回。

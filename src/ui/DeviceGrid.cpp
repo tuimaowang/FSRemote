@@ -17,6 +17,7 @@
 #include "system/DeviceStatusService.h"
 #include "system/PowerManager.h"
 #include "system/PortableOpenSshManager.h"
+#include "system/RuntimeLogManager.h" // wjy: 脚本输出日志统一从运行日志管理器取得 FSRemote.exe/data 根目录。
 #include "system/StartupManager.h"
 #include "system/UpdateService.h"
 #include "system/WolDetector.h"
@@ -1419,12 +1420,15 @@ QString powerShellEncodedCommand(const QString& script)
     return QString::fromLatin1(utf16LittleEndian.toBase64()); // wjy: powershell -EncodedCommand 要求 UTF-16LE 后再 Base64，避免中文 UNC 路径经过 cmd/ssh 时乱码。
 }
 
-QString scriptOutputTempFilePath()
+QString scriptOutputLogFilePath()
 {
+    const QString outputDirectory = QDir(platform::RuntimeLogManager::dataDirectory())
+        .filePath(QStringLiteral("script_output")); // wjy: 每次脚本运行的控制端输出统一进入 data/script_output，主程序重启时由日志管理器整体清理。
+    QDir().mkpath(outputDirectory); // wjy: 目录创建失败时仍坚持唯一 data 目标，不再回退到可能长期残留的系统临时目录。
     const QString fileName = QStringLiteral("fsremote_script_output_%1_%2.log")
         .arg(QCoreApplication::applicationPid())
         .arg(QDateTime::currentMSecsSinceEpoch());
-    return QDir(QDir::tempPath()).filePath(fileName); // wjy: Each script run owns one local temp output file, decoupling SSH chunks from the painted terminal.
+    return QDir(outputDirectory).filePath(fileName); // wjy: 每个运行仍使用独立文件隔离 SSH 分块与终端绘制，只调整日志归档位置。
 }
 
 bool writeScriptOutputFile(const QString& filePath, const QString& text, QIODevice::OpenMode mode)
@@ -9195,7 +9199,7 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
     state.outputScrollOffset = 0;
     state.outputAutoScroll = true;
     state.outputDirty = false;
-    state.outputFilePath = scriptOutputTempFilePath();
+    state.outputFilePath = scriptOutputLogFilePath(); // wjy: 当前运行状态直接保存 data 内日志路径，切换设备时继续读取同一份输出。
     state.cancelRequested = std::make_shared<std::atomic_bool>(false);
     state.outputTitle = QString::fromUtf8("%1 - %2").arg(targetName, scriptName);
     state.outputText = QString::fromUtf8("$ 执行脚本 %1\n目标设备: %2\n状态: 正在复制并执行...\n")
@@ -9264,10 +9268,13 @@ $workRoot = Join-Path $fsremoteDir 'work'
 New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
 $scriptWorkName = '%4'
 $work = Join-Path $workRoot $scriptWorkName
+$scriptLogRoot = Join-Path $fsremoteDir 'data\script_logs'
+$scriptLogDirectory = Join-Path $scriptLogRoot $scriptWorkName
+New-Item -ItemType Directory -Force -Path $scriptLogDirectory | Out-Null # wjy: 目标端脚本日志独立放入 data，work 中只保留脚本副本、控制文件和运行状态。
 $source = '%1'
 if (-not (Test-Path -LiteralPath $work)) {
     New-Item -ItemType Directory -Force -Path $work | Out-Null
-    $log = Join-Path $work 'fsremote_robocopy.log'
+    $log = Join-Path $scriptLogDirectory 'fsremote_robocopy.log' # wjy: 首次下载日志随下一次目标端主程序启动清理，不污染可长期复用的脚本工作区。
     & robocopy $source $work /E /R:1 /W:1 /NFL /NDL /NJH /NJS "/LOG:$log" | Out-Null
     $copyExit = $LASTEXITCODE
     if ($copyExit -ge 8) {
@@ -9287,7 +9294,7 @@ if (-not (Test-Path -LiteralPath $entry)) {
     exit 9011
 }
 $suffix = '%3'
-$runLog = Join-Path $work 'fsremote_script_run.log'
+$runLog = Join-Path $scriptLogDirectory 'fsremote_script_run.log' # wjy: 脚本标准输出和错误输出统一写入 data/script_logs/<工作区>。
 $exitCodeFile = Join-Path $work 'fsremote_script_exit_code.txt'
 $finishedFile = Join-Path $work 'fsremote_script_finished.txt'
 $controllerPidFile = Join-Path $work 'fsremote_script_controller_pid.txt'

@@ -146,14 +146,6 @@ void append_log(const std::string& line)
 
 void append_input_debug_log(const std::string& line)
 {
-    char tempPath[MAX_PATH] = {};
-    if (::GetTempPathA(MAX_PATH, tempPath) == 0) {
-        return;
-    }
-
-    std::string path(tempPath);
-    path += "fsremote_input_debug.log";
-
     SYSTEMTIME time = {};
     ::GetLocalTime(&time);
     char prefix[96] = {};
@@ -162,15 +154,8 @@ void append_input_debug_log(const std::string& line)
                   time.wHour, time.wMinute, time.wSecond, time.wMilliseconds,
                   static_cast<unsigned long>(::GetCurrentThreadId()));
 
-    std::lock_guard lock(g_log_mutex);
-    FILE* file = nullptr;
-    if (fopen_s(&file, path.c_str(), "ab") != 0 || !file) {
-        return;
-    }
     const std::string text = std::string(prefix) + line;
-    fwrite(text.data(), 1, text.size(), file);
-    fwrite("\r\n", 1, 2, file);
-    fclose(file);
+    append_log_to_file("fsremote_input_debug.log", text); // wjy: 原生输入诊断复用 data 路径和线程锁，与 Qt 输入日志写入同一文件且不再依赖系统 Temp。
 }
 
 bool should_log_input_message(const std::string& message)
