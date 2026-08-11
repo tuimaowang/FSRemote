@@ -71,6 +71,21 @@ enum class RemoteVideoQualityPreset : std::uint8_t {
     P360_1 = 7,
 }; // wjy: 标题栏、持久化和协调器共享同一稳定枚举，禁止再用显示字符串或旧模式枚举推断精确档位。
 
+enum class RemoteMonitorGridPreset : std::uint8_t {
+    Grid4 = 4,
+    Grid9 = 9,
+    Grid12 = 12,
+    Grid16 = 16,
+    Grid20 = 20,
+    Grid25 = 25,
+}; // wjy: 监控模式只允许六种稳定宫格容量，配置和布局计算不再依赖界面显示文本。
+
+struct RemoteMonitorConfiguration {
+    RemoteMonitorGridPreset grid = RemoteMonitorGridPreset::Grid9;
+    RemoteVideoQualityPreset quality = RemoteVideoQualityPreset::P540_30;
+    int rotationIntervalSeconds = 30;
+}; // wjy: 监控模式的宫格、默认画质和分页轮询时间作为一组配置统一传递与保存。
+
 constexpr RemoteVideoProfile makeRemoteVideoProfile(
     const RemoteVideoEncodingPreset& preset,
     std::uint32_t priority)
@@ -106,15 +121,99 @@ inline constexpr std::array<RemoteVideoQualityPreset, 8> kRemoteVideoQualityPres
     RemoteVideoQualityPreset::P360_1,
 }; // wjy: 顺序与标题栏菜单完全一致，从最高档到最低保活档。
 
+inline constexpr std::array<const char*, 8> kRemoteVideoQualityPresetLabels = {
+    "1080/60",
+    "1080/30",
+    "720/60",
+    "720/30",
+    "540/30",
+    "540/25",
+    "360/25",
+    "360/1",
+}; // wjy: 设置页和标题栏共享同一显示顺序，避免新增画质档位时下拉框顺序漂移。
+
+inline constexpr std::array<RemoteMonitorGridPreset, 6> kRemoteMonitorGridPresets = {
+    RemoteMonitorGridPreset::Grid4,
+    RemoteMonitorGridPreset::Grid9,
+    RemoteMonitorGridPreset::Grid12,
+    RemoteMonitorGridPreset::Grid16,
+    RemoteMonitorGridPreset::Grid20,
+    RemoteMonitorGridPreset::Grid25,
+}; // wjy: 设置页宫格选项顺序固定为4、9、12、16、20、25。
+
 inline constexpr RemoteVideoQualityPreset kDefaultRemoteVideoQualityPreset = RemoteVideoQualityPreset::P540_30;
 inline constexpr RemoteVideoQualityPreset kFullscreenRemoteVideoQualityPreset = RemoteVideoQualityPreset::P720_30;
 inline constexpr RemoteVideoQualityPreset kOccludedRemoteVideoQualityPreset = RemoteVideoQualityPreset::P360_1;
+inline constexpr RemoteMonitorGridPreset kDefaultRemoteMonitorGridPreset = RemoteMonitorGridPreset::Grid9;
+inline constexpr int kDefaultRemoteMonitorRotationIntervalSeconds = 30;
 
 inline constexpr bool isValidRemoteVideoQualityPreset(RemoteVideoQualityPreset preset)
 {
     const int value = static_cast<int>(preset);
     return value >= static_cast<int>(RemoteVideoQualityPreset::P1080_60)
         && value <= static_cast<int>(RemoteVideoQualityPreset::P360_1); // wjy: QSettings损坏值必须在进入窗口状态前被拒绝。
+}
+
+inline constexpr bool isValidRemoteMonitorGridPreset(RemoteMonitorGridPreset preset)
+{
+    switch (preset) {
+    case RemoteMonitorGridPreset::Grid4:
+    case RemoteMonitorGridPreset::Grid9:
+    case RemoteMonitorGridPreset::Grid12:
+    case RemoteMonitorGridPreset::Grid16:
+    case RemoteMonitorGridPreset::Grid20:
+    case RemoteMonitorGridPreset::Grid25:
+        return true;
+    }
+    return false; // wjy: 损坏或未知宫格值回退到默认九宫格，不允许产生零列布局。
+}
+
+inline constexpr RemoteMonitorConfiguration normalizedRemoteMonitorConfiguration(
+    RemoteMonitorConfiguration configuration)
+{
+    if (!isValidRemoteMonitorGridPreset(configuration.grid)) {
+        configuration.grid = kDefaultRemoteMonitorGridPreset; // wjy: 配置损坏时保留产品默认九宫格。
+    }
+    if (!isValidRemoteVideoQualityPreset(configuration.quality)) {
+        configuration.quality = kDefaultRemoteVideoQualityPreset; // wjy: 配置损坏时保留540/30默认画质。
+    }
+    configuration.rotationIntervalSeconds = configuration.rotationIntervalSeconds > 0
+        ? std::min(configuration.rotationIntervalSeconds, 86400)
+        : kDefaultRemoteMonitorRotationIntervalSeconds; // wjy: 空值或非正数回退30秒，超大值限制在24小时，避免QTimer忙循环或溢出。
+    return configuration;
+}
+
+inline constexpr int remoteMonitorGridCapacity(RemoteMonitorGridPreset preset)
+{
+    return static_cast<int>(preset); // wjy: 枚举值本身就是单页最大窗口数，持久化读取后无需再次解析字符串。
+}
+
+inline constexpr int remoteMonitorGridColumns(RemoteMonitorGridPreset preset)
+{
+    switch (preset) {
+    case RemoteMonitorGridPreset::Grid4: return 2;
+    case RemoteMonitorGridPreset::Grid9: return 3;
+    case RemoteMonitorGridPreset::Grid12: return 4;
+    case RemoteMonitorGridPreset::Grid16: return 4;
+    case RemoteMonitorGridPreset::Grid20: return 5;
+    case RemoteMonitorGridPreset::Grid25: return 5;
+    }
+    return 3; // wjy: 防御性回退使用九宫格列数，避免异常枚举把窗口挤到同一列。
+}
+
+inline constexpr int remoteMonitorGridRows(RemoteMonitorGridPreset preset)
+{
+    const int capacity = remoteMonitorGridCapacity(preset);
+    const int columns = remoteMonitorGridColumns(preset);
+    return std::max(1, capacity / std::max(1, columns)); // wjy: 六种布局均为完整矩形，行数由容量和列数直接得到。
+}
+
+inline constexpr const char* remoteVideoQualityPresetLabel(RemoteVideoQualityPreset preset)
+{
+    if (!isValidRemoteVideoQualityPreset(preset)) {
+        preset = kDefaultRemoteVideoQualityPreset; // wjy: 设置页异常值只显示540/30，不把内部无效枚举暴露给用户。
+    }
+    return kRemoteVideoQualityPresetLabels[static_cast<std::size_t>(preset)];
 }
 
 inline constexpr RemoteVideoEncodingPreset remoteVideoEncodingPreset(RemoteVideoQualityPreset preset)

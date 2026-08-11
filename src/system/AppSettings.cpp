@@ -298,6 +298,35 @@ void AppSettings::setRemoteDeviceQualityPreset(
     QSettings appSettings = settings();
     appSettings.setValue(remoteDeviceQualityPresetKey(deviceKey), static_cast<int>(preset)); // wjy: 每台设备独立保存精确档位，临时全屏和遮挡档不会调用此入口。
 }
+
+stream::RemoteMonitorConfiguration AppSettings::remoteMonitorConfiguration()
+{
+    QSettings appSettings = settings();
+    stream::RemoteMonitorConfiguration configuration;
+    configuration.grid = static_cast<stream::RemoteMonitorGridPreset>(
+        appSettings.value(
+            QStringLiteral("remoteMonitor/grid"),
+            static_cast<int>(stream::kDefaultRemoteMonitorGridPreset)).toInt()); // wjy: 宫格直接保存稳定枚举值4/9/12/16/20/25。
+    configuration.quality = static_cast<stream::RemoteVideoQualityPreset>(
+        appSettings.value(
+            QStringLiteral("remoteMonitor/quality"),
+            static_cast<int>(stream::kDefaultRemoteVideoQualityPreset)).toInt()); // wjy: 新安装默认540/30，和普通远控窗口默认档一致。
+    configuration.rotationIntervalSeconds = appSettings.value(
+        QStringLiteral("remoteMonitor/rotationIntervalSeconds"),
+        stream::kDefaultRemoteMonitorRotationIntervalSeconds).toInt(); // wjy: 新安装默认每30秒切换下一批监控窗口。
+    return stream::normalizedRemoteMonitorConfiguration(configuration);
+}
+
+void AppSettings::setRemoteMonitorConfiguration(
+    const stream::RemoteMonitorConfiguration& configuration)
+{
+    const stream::RemoteMonitorConfiguration normalized =
+        stream::normalizedRemoteMonitorConfiguration(configuration);
+    QSettings appSettings = settings();
+    appSettings.setValue(QStringLiteral("remoteMonitor/grid"), static_cast<int>(normalized.grid)); // wjy: 三项配置在同一入口写入，设置页和运行中监控状态始终读取同一份值。
+    appSettings.setValue(QStringLiteral("remoteMonitor/quality"), static_cast<int>(normalized.quality));
+    appSettings.setValue(QStringLiteral("remoteMonitor/rotationIntervalSeconds"), normalized.rotationIntervalSeconds);
+}
 // ===end====
 
 // =====wjy====

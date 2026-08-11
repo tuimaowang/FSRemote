@@ -63,7 +63,9 @@ private:
 struct RemoteQualityWindowMetrics {
     uintptr_t windowId = 0;
     stream::RemoteVideoQualityPreset userQualityPreset = stream::kDefaultRemoteVideoQualityPreset; // wjy: 仅在userQualityPresetActive时生效，保存用户手选而不是临时全屏档。
-    bool userQualityPresetActive = false; // wjy: false表示使用普通540/30或全屏720/30自动规则；历史高档被恢复仲裁拒绝时也保持false。
+    bool userQualityPresetActive = false; // wjy: false表示继续判断监控统一档或普通全屏/默认自动规则；历史高档恢复被拒绝时也保持false。
+    stream::RemoteVideoQualityPreset monitorQualityPreset = stream::kDefaultRemoteVideoQualityPreset; // wjy: 监控模式使用设置页全局档位，但仍低于当前窗口手选优先级。
+    bool monitorQualityPresetActive = false; // wjy: 只在主窗口监控模式开启时为true，退出监控立即恢复全屏/默认自动规则。
     bool visible = true;
     bool minimized = false;
     bool fullyOccluded = false; // wjy: Windows 可见区域计算结果；只要仍露出任意像素就保持 false。
@@ -127,7 +129,7 @@ public:
     std::vector<RemoteQualityDecision> evaluate(
         const stream::RemoteQualityConfiguration& configuration,
         const std::vector<RemoteQualityWindowMetrics>& windows,
-        int64_t nowMs); // wjy: 每次按手选、全屏、默认和遮挡优先级直接生成精确档位，不再因焦点或性能采样自动改档。
+        int64_t nowMs); // wjy: 每次按手选、监控模式、全屏、默认和遮挡优先级直接生成精确档位，不再因焦点或性能采样自动改档。
     void removeWindow(uintptr_t windowId); // wjy: 当前策略无窗口滞回状态，保留接口兼容DeviceGrid销毁清理路径。
 
 private:

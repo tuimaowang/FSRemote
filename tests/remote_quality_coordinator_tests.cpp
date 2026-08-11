@@ -69,6 +69,28 @@ int main()
         30,
         24000); // wjy: 没有手选的窗口进入全屏自动切到720/30。
 
+    ui::RemoteQualityWindowMetrics monitorWindow = visibleWindow(5);
+    monitorWindow.fullScreen = true;
+    monitorWindow.monitorQualityPresetActive = true;
+    monitorWindow.monitorQualityPreset = stream::RemoteVideoQualityPreset::P540_25;
+    decisions = coordinator.evaluate(configuration, {monitorWindow}, 1150);
+    verifyPreset(
+        decisions.front(),
+        stream::RemoteVideoQualityPreset::P540_25,
+        stream::RemoteResolutionTier::P540,
+        960,
+        540,
+        25,
+        14000); // wjy: 监控模式统一画质优先于全屏自动720/30，并且修改后无需等待性能滞回。
+    monitorWindow.userQualityPresetActive = true;
+    monitorWindow.userQualityPreset = stream::RemoteVideoQualityPreset::P720_60;
+    decisions = coordinator.evaluate(configuration, {monitorWindow}, 1151);
+    assert(decisions.front().preset == stream::RemoteVideoQualityPreset::P720_60);
+    monitorWindow.userQualityPresetActive = false;
+    monitorWindow.fullyOccluded = true;
+    decisions = coordinator.evaluate(configuration, {monitorWindow}, 1152);
+    assert(decisions.front().preset == stream::RemoteVideoQualityPreset::P360_1); // wjy: 窗口手选仍高于监控统一档，隐藏或完全遮挡则最终使用360/1保活。
+
     second.userQualityPresetActive = true;
     second.userQualityPreset = stream::RemoteVideoQualityPreset::P1080_30;
     decisions = coordinator.evaluate(configuration, {second}, 1200);

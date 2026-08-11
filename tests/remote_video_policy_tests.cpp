@@ -38,6 +38,21 @@ int main()
     assert(stream::remoteVideoQualityPresetExceedsDefault(stream::RemoteVideoQualityPreset::P720_30));
     assert(!stream::remoteVideoQualityPresetExceedsDefault(stream::RemoteVideoQualityPreset::P540_30)); // wjy: 八档枚举必须稳定映射到编码集合，并准确识别历史高档恢复范围。
 
+    stream::RemoteMonitorConfiguration monitorConfiguration;
+    assert(monitorConfiguration.grid == stream::RemoteMonitorGridPreset::Grid9);
+    assert(monitorConfiguration.quality == stream::RemoteVideoQualityPreset::P540_30);
+    assert(monitorConfiguration.rotationIntervalSeconds == 30);
+    assert(stream::remoteMonitorGridCapacity(stream::RemoteMonitorGridPreset::Grid4) == 4);
+    assert(stream::remoteMonitorGridColumns(stream::RemoteMonitorGridPreset::Grid12) == 4);
+    assert(stream::remoteMonitorGridRows(stream::RemoteMonitorGridPreset::Grid20) == 4);
+    monitorConfiguration.grid = static_cast<stream::RemoteMonitorGridPreset>(7);
+    monitorConfiguration.quality = static_cast<stream::RemoteVideoQualityPreset>(99);
+    monitorConfiguration.rotationIntervalSeconds = 0;
+    monitorConfiguration = stream::normalizedRemoteMonitorConfiguration(monitorConfiguration);
+    assert(monitorConfiguration.grid == stream::RemoteMonitorGridPreset::Grid9);
+    assert(monitorConfiguration.quality == stream::RemoteVideoQualityPreset::P540_30);
+    assert(monitorConfiguration.rotationIntervalSeconds == 30); // wjy: 监控配置默认值、六种矩形宫格和损坏配置回退必须保持稳定。
+
     const stream::RemoteVideoProfile focused = stream::kFocusedRemoteVideoProfile; // wjy: 策略测试直接使用生产焦点别名，避免测试里再手工拼一套过时参数。
     // ===end====
     std::vector<stream::RemoteVideoWindowState> states = {

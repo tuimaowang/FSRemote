@@ -117,9 +117,11 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
 
         const stream::RemoteVideoQualityPreset preferredPreset = window.userQualityPresetActive
             ? window.userQualityPreset
-            : decision.fullScreen
-                ? stream::kFullscreenRemoteVideoQualityPreset
-                : stream::kDefaultRemoteVideoQualityPreset; // wjy: 手选最高；无手选时全屏720/30，普通窗口540/30，焦点完全不参与。
+            : window.monitorQualityPresetActive
+                ? window.monitorQualityPreset
+                : decision.fullScreen
+                    ? stream::kFullscreenRemoteVideoQualityPreset
+                    : stream::kDefaultRemoteVideoQualityPreset; // wjy: 手选最高，其次监控模式设置；普通自动规则仍为全屏720/30、非全屏540/30。
         decision.preset = eligibleVisibleWindow
             ? preferredPreset
             : stream::kOccludedRemoteVideoQualityPreset; // wjy: 完全遮挡、最小化或隐藏统一临时降到360/1，重新可见后下一次评估立即恢复原意图。
@@ -134,7 +136,7 @@ std::vector<RemoteQualityDecision> RemoteQualityCoordinator::evaluate(
             ? RemoteQualityDegradationReason::FullyOccluded
             : decision.minimized
                 ? RemoteQualityDegradationReason::Minimized
-                : window.userQualityPresetActive
+                : (window.userQualityPresetActive || window.monitorQualityPresetActive)
                     ? RemoteQualityDegradationReason::ModePreference
                     : RemoteQualityDegradationReason::None;
         decision.requestRemoteProfile = true; // wjy: RemoteDesktopWindow使用完整payload去重，相同档位不会每秒重复发包。

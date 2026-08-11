@@ -78,6 +78,7 @@ public:
     void setRemoteMouseBackendStatus(const QString& statusMessage); // wjy: 只接受 Host 已确认的 system/faker 状态，不在按钮点击时乐观修改真实后端。
     // ===end====
     void setRememberGeometryEnabled(bool enabled);
+    bool rememberGeometryEnabled() const; // wjy: 监控模式保存并恢复窗口原有几何持久化策略，分组平铺窗口不能被强制改成普通窗口行为。
     bool isClosingConnection() const;
     bool acceptsViewerGeneration(quint64 viewerGeneration) const; // wjy: 原生工作线程通过原子代际判断当前回调是否仍属于本窗口现用viewer。
     bool forwardNativeKey(int virtualKey, bool down);
@@ -98,6 +99,7 @@ public:
     void setRemoteUpdateAvailable(bool available); // wjy: 主界面统一探测目标版本后控制标题栏更新按钮，不让远控流线程参与版本检测。
     void setRemoteInputScriptStatus(const platform::RemoteInputScriptRuntimeInfo& runtime); // wjy: DeviceGrid把目标端统一快照投影到同IP的所有普通和平铺窗口。
     void setGlobalQualityConfiguration(const stream::RemoteQualityConfiguration& configuration); // wjy: 保留旧设置页配置快照接口；精确档位不再由全局模式覆盖。
+    void setRemoteMonitorQualityPreset(bool active, stream::RemoteVideoQualityPreset preset); // wjy: 主窗口监控模式向所有已打开窗口发布统一画质，窗口手选仍保持最高优先级。
     bool hasSavedUserQualityPreset() const; // wjy: 判断该设备是否存在程序上次保存的精确手选档位。
     stream::RemoteVideoQualityPreset savedUserQualityPreset() const; // wjy: 返回设备历史手选档，用于DeviceGrid决定是否授予本次高档自动恢复名额。
     bool hasActiveUserQualityPresetAboveDefault() const; // wjy: 运行中用户手选的高档可以多个并存，重新打开历史档时由此判断已有高档窗口。
@@ -218,7 +220,7 @@ private:
     void updateRemoteMouseCaptureState(); // wjy: 根据 Host 请求、F2 手动意图、连接资格和窗口焦点统一计算实际捕获状态。
     void applyRemoteMouseCaptureState(bool active); // wjy: 只负责实际 Raw Input、光标隐藏、回中心和远端释放，不改变两类请求来源。
     void suspendRemoteMouseCapture(); // wjy: 焦点离开、断线、更新或关闭时强制释放实际捕获，同时保留 F2 手动意图供重新获得资格后恢复。
-    stream::RemoteVideoQualityPreset preferredRemoteVideoQualityPreset() const; // wjy: 手选优先；无手选时全屏720/30，普通窗口540/30。
+    stream::RemoteVideoQualityPreset preferredRemoteVideoQualityPreset() const; // wjy: 手选最高，其次监控统一档；无两者时全屏720/30、普通窗口540/30。
     void refreshQualityPreviewText(); // wjy: 窗口状态或手选变化后同步标题栏文字，不把遮挡临时360/1写成用户配置。
     void sendCurrentRemoteQualityDecision(); // wjy: 把内存中的最新决策转换为稳定C ABI结构；连接中只保留最新请求，重连后按新代际补发。
     void sendCurrentViewerAudioDecision(); // wjy: 按Viewer代际和布尔状态去重在线音频切换，连接前只保留协调器最新决策。
@@ -325,8 +327,10 @@ private:
     RemoteInputBroadcastCoordinator* m_inputBroadcastCoordinator = nullptr; // wjy: DeviceGrid 统一持有协调器，生命周期覆盖普通和平铺远控窗口。
     RemoteInputSyncRole m_inputSyncRole = RemoteInputSyncRole::Off;
     stream::RemoteQualityConfiguration m_globalQualityConfiguration; // wjy: 兼容保留旧设置结构，不参与标题栏八档的优先级和持久化计算。
+    stream::RemoteVideoQualityPreset m_monitorQualityPreset = stream::kDefaultRemoteVideoQualityPreset; // wjy: 监控模式设置页选择的统一档位，不写入设备自己的历史手选配置。
     stream::RemoteVideoQualityPreset m_savedUserQualityPreset = stream::kDefaultRemoteVideoQualityPreset; // wjy: 持久化的历史手选档位，恢复名额不足时仍保留作为下次重开的候选。
     stream::RemoteVideoQualityPreset m_userQualityPreset = stream::kDefaultRemoteVideoQualityPreset; // wjy: 当前窗口用户意图，完全遮挡时只由协调器临时覆盖实际请求。
+    bool m_monitorQualityPresetActive = false; // wjy: 主窗口监控按钮开启后为true，退出监控时立即恢复窗口原来的自动或手选档。
     bool m_hasSavedUserQualityPreset = false; // wjy: 配置键存在即代表用户手动选择过，即使档位正好是540/30也要阻止全屏自动720/30。
     bool m_userQualityPresetActive = false; // wjy: 历史恢复获准或本次手选后为true；被历史高档仲裁拒绝的窗口保持false并使用自动基线。
     RemoteQualityDecision m_remoteQualityDecision; // wjy: 保存协调器针对当前窗口的最新目标，Viewer尚未创建时也不会丢失用户选择。

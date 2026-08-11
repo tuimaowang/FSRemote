@@ -565,17 +565,7 @@ uint32_t viewerQualityModeValue(stream::RemoteQualityMode mode)
 
 QString remoteVideoQualityPresetText(stream::RemoteVideoQualityPreset preset)
 {
-    switch (preset) {
-    case stream::RemoteVideoQualityPreset::P1080_60: return QStringLiteral("1080/60");
-    case stream::RemoteVideoQualityPreset::P1080_30: return QStringLiteral("1080/30");
-    case stream::RemoteVideoQualityPreset::P720_60: return QStringLiteral("720/60");
-    case stream::RemoteVideoQualityPreset::P720_30: return QStringLiteral("720/30");
-    case stream::RemoteVideoQualityPreset::P540_30: return QStringLiteral("540/30");
-    case stream::RemoteVideoQualityPreset::P540_25: return QStringLiteral("540/25");
-    case stream::RemoteVideoQualityPreset::P360_25: return QStringLiteral("360/25");
-    case stream::RemoteVideoQualityPreset::P360_1: return QStringLiteral("360/1");
-    }
-    return QStringLiteral("540/30"); // wjy: 异常枚举只显示产品默认档，不把内部无效值暴露到标题栏。
+    return QString::fromLatin1(stream::remoteVideoQualityPresetLabel(preset)); // wjy: 标题栏和监控设置页共用生产档位标签，360/25等名称只维护一份。
 }
 
 bool remoteVideoQualityPresetFromText(
@@ -2473,6 +2463,22 @@ void RemoteDesktopWindow::setGlobalQualityConfiguration(const stream::RemoteQual
     emit remoteQualityInputsChanged(); // wjy: 保留既有在线重算时序，未来兼容字段变化无需关闭重连。
 }
 
+void RemoteDesktopWindow::setRemoteMonitorQualityPreset(
+    bool active,
+    stream::RemoteVideoQualityPreset preset)
+{
+    const stream::RemoteVideoQualityPreset normalizedPreset = stream::isValidRemoteVideoQualityPreset(preset)
+        ? preset
+        : stream::kDefaultRemoteVideoQualityPreset;
+    if (m_monitorQualityPresetActive == active && m_monitorQualityPreset == normalizedPreset) {
+        return;
+    }
+    m_monitorQualityPresetActive = active; // wjy: 开关只保存当前主窗口会话状态，程序重启后监控模式仍默认关闭。
+    m_monitorQualityPreset = normalizedPreset; // wjy: 统一画质只作为监控模式次级意图，不覆盖m_userQualityPreset或设备QSettings。
+    refreshQualityPreviewText();
+    emit remoteQualityInputsChanged(); // wjy: 监控画质或开关变化立即进入现有在线质量去重链路，不重建Viewer。
+}
+
 bool RemoteDesktopWindow::hasSavedUserQualityPreset() const
 {
     return m_hasSavedUserQualityPreset;
@@ -2509,6 +2515,8 @@ RemoteQualityWindowMetrics RemoteDesktopWindow::remoteQualityMetrics()
     metrics.windowId = reinterpret_cast<uintptr_t>(this); // wjy: 顶层窗口对象生命周期内地址稳定，关闭时协调器显式删除对应滞回状态。
     metrics.userQualityPreset = m_userQualityPreset;
     metrics.userQualityPresetActive = m_userQualityPresetActive;
+    metrics.monitorQualityPreset = m_monitorQualityPreset;
+    metrics.monitorQualityPresetActive = m_monitorQualityPresetActive;
     metrics.visible = isVisible() && !m_closeInProgress;
     metrics.minimized = isMinimized();
     // =====wjy====
@@ -4044,6 +4052,9 @@ stream::RemoteVideoQualityPreset RemoteDesktopWindow::preferredRemoteVideoQualit
     if (m_userQualityPresetActive) {
         return m_userQualityPreset; // wjy: 用户手选优先级最高，全屏和焦点变化都不能覆盖。
     }
+    if (m_monitorQualityPresetActive) {
+        return m_monitorQualityPreset; // wjy: 没有窗口手选时，监控模式使用设置页统一档位并实时刷新标题栏文字。
+    }
     return isFullScreen()
         ? stream::kFullscreenRemoteVideoQualityPreset
         : stream::kDefaultRemoteVideoQualityPreset; // wjy: 无手选时普通窗口540/30，全屏自动720/30。
@@ -4212,6 +4223,11 @@ bool RemoteDesktopWindow::normalizedRemotePoint(const QPoint& position, int* x, 
 void RemoteDesktopWindow::setRememberGeometryEnabled(bool enabled)
 {
     m_rememberGeometry = enabled;
+}
+
+bool RemoteDesktopWindow::rememberGeometryEnabled() const
+{
+    return m_rememberGeometry; // wjy: 只暴露当前布尔策略，不触发几何保存或改变窗口状态。
 }
 
 void RemoteDesktopWindow::saveWindowGeometry()

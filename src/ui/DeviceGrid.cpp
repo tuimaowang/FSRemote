@@ -275,6 +275,108 @@ QRect titlebarBandwidthUpdateRect()
     return QRect(132, 0, qMax(0, titlebarSettingsRect().x() - 132), kTitleBarHeight); // wjy: 一秒采样只重绘版本号到设置按钮之间的标题栏，不触碰设备列表和详情内容。
 }
 
+QRect titlebarUpdateRect(); // wjy: 状态组布局需要读取更新按钮左边界，完整定义保留在下方原位置。
+
+struct TitlebarStatusLayout {
+    QRect versionRect;
+    QRect networkTextRect;
+    QRect controlledSessionBadgeRect;
+    QRect monitorModeButtonRect;
+    QRect identityRect;
+    QString networkText;
+};
+
+TitlebarStatusLayout titlebarStatusLayout(
+    bool updateAvailable,
+    const platform::LocalNetworkBandwidthSample& bandwidthSample,
+    int controlledSessionCount)
+{
+    TitlebarStatusLayout layout;
+    const QRect titleWordmarkRect = titleBarCenteredRect(18, 116);
+    QFont versionFont(QStringLiteral("Microsoft YaHei UI"));
+    versionFont.setPixelSize(11);
+    const QFontMetrics versionMetrics(versionFont);
+    const QString versionText = QStringLiteral("v%1").arg(platform::UpdateService::displayVersion());
+    layout.versionRect = QRect(
+        titleWordmarkRect.right() + 8,
+        titleWordmarkRect.y(),
+        versionMetrics.horizontalAdvance(versionText) + 4,
+        titleWordmarkRect.height()); // wjy: 绘制和鼠标命中共用相同版本号宽度，监控按钮不会因版本字符串变化错位。
+
+    layout.networkText = QString::fromUtf8("网 --");
+    if (bandwidthSample.valid) {
+        const double receiveMbps = bandwidthSample.receive.currentMbps;
+        layout.networkText = QString::fromUtf8("↓%1M").arg(
+            QString::number(receiveMbps, 'f', receiveMbps < 10.0 ? 1 : 0)); // wjy: 状态布局使用与实际绘制完全相同的接收带宽文字。
+    }
+
+    QFont networkFont(QStringLiteral("Microsoft YaHei UI"));
+    networkFont.setPixelSize(11);
+    const QFontMetrics networkMetrics(networkFont);
+    QFont countFont(QStringLiteral("Microsoft YaHei UI"));
+    countFont.setPixelSize(10);
+    countFont.setBold(true);
+    const QFontMetrics countMetrics(countFont);
+    const QString countText = QString::number(qMax(0, controlledSessionCount));
+    const int badgeWidth = qMax(18, countMetrics.horizontalAdvance(countText) + 8);
+    constexpr int kNetworkToBadgeGap = 8;
+    constexpr int kBadgeToMonitorGap = 7;
+    constexpr int kMonitorButtonWidth = 72;
+    constexpr int kMinimumIdentityWidth = 150;
+    const int controlsLeft = updateAvailable ? titlebarUpdateRect().x() : titlebarSettingsRect().x();
+    const int networkLeft = layout.versionRect.right() + 10;
+    const int statusRightLimit = controlsLeft - kMinimumIdentityWidth - 10;
+    const int statusWidth = qMax(0, statusRightLimit - networkLeft + 1);
+    if (statusWidth < badgeWidth) {
+        layout.identityRect = QRect(
+            networkLeft,
+            titleWordmarkRect.y(),
+            qMax(0, controlsLeft - 10 - networkLeft),
+            titleWordmarkRect.height());
+        return layout; // wjy: 详情栏收起或窗口极窄时隐藏状态数字和监控按钮，不能覆盖左侧标题或系统按钮。
+    }
+    const int networkTextWidthLimit = qMax(
+        0,
+        statusWidth - badgeWidth - kNetworkToBadgeGap - kBadgeToMonitorGap - kMonitorButtonWidth);
+    const QString visibleNetworkText = networkMetrics.elidedText(
+        layout.networkText,
+        Qt::ElideRight,
+        networkTextWidthLimit);
+    const int visibleNetworkTextWidth = qMin(
+        networkTextWidthLimit,
+        networkMetrics.horizontalAdvance(visibleNetworkText));
+    layout.networkTextRect = QRect(
+        networkLeft,
+        titleWordmarkRect.y(),
+        networkTextWidthLimit,
+        titleWordmarkRect.height());
+    const int badgeLeft = networkLeft
+        + visibleNetworkTextWidth
+        + (visibleNetworkTextWidth > 0 ? kNetworkToBadgeGap : 0);
+    layout.controlledSessionBadgeRect = QRect(
+        badgeLeft,
+        titleWordmarkRect.center().y() - 9,
+        badgeWidth,
+        18);
+    layout.monitorModeButtonRect = QRect(
+        layout.controlledSessionBadgeRect.right() + 1 + kBadgeToMonitorGap,
+        (kTitleBarHeight - 24) / 2,
+        kMonitorButtonWidth,
+        24); // wjy: 监控模式按钮始终紧跟会话数字右侧，标题栏宽度变化时整体作为一个状态组移动。
+    if (layout.monitorModeButtonRect.right() > statusRightLimit) {
+        layout.monitorModeButtonRect = {}; // wjy: 极窄窗口无法容纳完整文字时隐藏按钮，避免覆盖本机身份和系统按钮。
+    }
+    const int identityLeft = layout.monitorModeButtonRect.isValid()
+        ? layout.monitorModeButtonRect.right() + 11
+        : layout.controlledSessionBadgeRect.right() + 11;
+    layout.identityRect = QRect(
+        identityLeft,
+        titleWordmarkRect.y(),
+        qMax(0, controlsLeft - 10 - identityLeft),
+        titleWordmarkRect.height()); // wjy: 本机名和IP使用监控按钮之后的剩余空间，窄窗口只省略文字而不相互覆盖。
+    return layout;
+}
+
 // =====wjy====
 QRect titlebarUpdateRect()
 {
@@ -3185,6 +3287,11 @@ QRect settingsRemoteControlTabRect()
     return QRect(contentLeft() + 144, kDetailScriptTabTop, 84, 36); // wjy: 第三个“远控画质”标签放在键盘右侧，不挤压现有常规/键盘命中区。
 }
 
+QRect settingsRemoteMonitorTabRect()
+{
+    return QRect(contentLeft() + 244, kDetailScriptTabTop, 84, 36); // wjy: “监控模式”紧跟远控画质右侧，形成独立配置界面而不挤进画质说明卡片。
+}
+
 QRect settingsRemoteQualityControlRect(int index)
 {
     const QRect card = settingsScrollViewportRect();
@@ -3194,6 +3301,16 @@ QRect settingsRemoteQualityControlRect(int index)
     const int x = card.x() + 28 + column * (columnWidth + 28) + columnWidth - 150;
     const int y = card.y() + 66 + row * 58;
     return QRect(x, y, 150, 32); // wjy: 保留原设置卡片的首个控件位置，现在只用于全局默认模式下拉框。
+}
+
+QRect settingsRemoteMonitorControlRect(int index)
+{
+    const QRect card = settingsScrollViewportRect();
+    return QRect(
+        card.right() - 198,
+        card.y() + 76 + index * 64,
+        index == 2 ? 112 : 170,
+        34); // wjy: 宫格、画质和轮询秒数按三行右对齐，轮询输入框缩短后为右侧“秒”保留空间。
 }
 // ===end====
 
@@ -3314,6 +3431,7 @@ void drawSettingsPage(
     bool addDeviceExpanded,
     bool keyboardSelected,
     bool remoteControlSelected,
+    bool remoteMonitorSelected,
     const platform::DeviceInfo& localInfo,
     int settingsScrollOffset)
 {
@@ -3331,9 +3449,74 @@ void drawSettingsPage(
     const QRect tabBar(contentLeft(), kDetailScriptTabTop, contentWidth(), 38);
     painter.drawLine(QPointF(tabBar.left(), tabBar.bottom()), QPointF(tabBar.right(), tabBar.bottom())); // wjy: 设置页顶部标签分割线和设备详情页保持一致。
     painter.restore();
-    drawSettingsTab(painter, settingsGeneralTabRect(), QString::fromUtf8("常规"), !keyboardSelected && !remoteControlSelected, tabFont);
+    drawSettingsTab(painter, settingsGeneralTabRect(), QString::fromUtf8("常规"), !keyboardSelected && !remoteControlSelected && !remoteMonitorSelected, tabFont);
     drawSettingsTab(painter, settingsKeyboardTabRect(), QString::fromUtf8("键盘"), keyboardSelected, tabFont);
     drawSettingsTab(painter, settingsRemoteControlTabRect(), QString::fromUtf8("远控画质"), remoteControlSelected, tabFont);
+    drawSettingsTab(painter, settingsRemoteMonitorTabRect(), QString::fromUtf8("监控模式"), remoteMonitorSelected, tabFont); // wjy: 第四个页签专门编辑监控宫格、画质和轮询时间。
+
+    // =====wjy====
+    if (remoteMonitorSelected) {
+        const QRect monitorCard = layout.viewport();
+        painter.save();
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
+        painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
+        painter.drawRoundedRect(QRectF(monitorCard), 4, 4);
+
+        QFont title(textFont);
+        title.setPixelSize(14);
+        title.setBold(true);
+        painter.setFont(title);
+        painter.setPen(QColor(QStringLiteral("#040B18")));
+        painter.drawText(
+            QRectF(monitorCard.x() + 28, monitorCard.y() + 16, monitorCard.width() - 56, 22),
+            Qt::AlignVCenter | Qt::AlignLeft,
+            QString::fromUtf8("监控模式设置"));
+
+        QFont detail(textFont);
+        detail.setPixelSize(11);
+        painter.setFont(detail);
+        painter.setPen(QColor(QStringLiteral("#687384")));
+        painter.drawText(
+            QRectF(monitorCard.x() + 28, monitorCard.y() + 38, monitorCard.width() - 56, 20),
+            Qt::AlignVCenter | Qt::AlignLeft,
+            QString::fromUtf8("分页平铺当前已打开的远控窗口；不足一页只显示剩余窗口，关闭后恢复原布局。")); // wjy: 设置页明确监控对象来自现有窗口，并说明最后一页不会补空连接。
+
+        QFont labelFont(textFont);
+        labelFont.setPixelSize(12);
+        painter.setFont(labelFont);
+        painter.setPen(QColor(QStringLiteral("#111827")));
+        const QStringList labels = {
+            QString::fromUtf8("单页宫格"),
+            QString::fromUtf8("监控清晰度"),
+            QString::fromUtf8("轮询时间"),
+        };
+        for (int index = 0; index < labels.size(); ++index) {
+            const QRect controlRect = settingsRemoteMonitorControlRect(index);
+            painter.drawText(
+                QRectF(monitorCard.x() + 28, controlRect.y(), 130, controlRect.height()),
+                Qt::AlignVCenter | Qt::AlignLeft,
+                labels.at(index)); // wjy: 三项真实控件的标签由同一布局函数定位，缩放窗口时不会错行。
+        }
+        const QRect intervalRect = settingsRemoteMonitorControlRect(2);
+        painter.setPen(QColor(QStringLiteral("#687384")));
+        painter.drawText(
+            QRectF(intervalRect.right() + 10, intervalRect.y(), 34, intervalRect.height()),
+            Qt::AlignVCenter | Qt::AlignLeft,
+            QString::fromUtf8("秒"));
+
+        QFont noteFont(textFont);
+        noteFont.setPixelSize(11);
+        painter.setFont(noteFont);
+        painter.setPen(QColor(QStringLiteral("#687384")));
+        painter.drawText(
+            QRectF(monitorCard.x() + 28, monitorCard.y() + 290, monitorCard.width() - 56, 44),
+            Qt::AlignTop | Qt::AlignLeft | Qt::TextWordWrap,
+            QString::fromUtf8("清晰度修改会立即作用于监控窗口；窗口标题栏手选画质仍保持最高优先级。")); // wjy: 直接说明监控统一档位与既有窗口手选的优先级关系。
+        painter.restore();
+        return;
+    }
+    // ===end====
 
     // =====wjy====
     if (remoteControlSelected) {
@@ -4014,6 +4197,15 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     // ===end====
 
     // =====wjy====
+    m_remoteMonitorTimer = new QTimer(this);
+    m_remoteMonitorTimer->setTimerType(Qt::CoarseTimer); // wjy: 监控分页是秒级操作，不需要高精度唤醒远控窗口。
+    m_remoteMonitorTimer->setInterval(m_remoteMonitorConfiguration.rotationIntervalSeconds * 1000);
+    connect(m_remoteMonitorTimer, &QTimer::timeout, this, [this] {
+        refreshRemoteMonitorMode(true); // wjy: 每次到期重新扫描当前窗口集合并切到下一批，新增或关闭窗口无需重启模式。
+    });
+    // ===end====
+
+    // =====wjy====
     m_titlebarBandwidthTimer = new QTimer(this);
     m_titlebarBandwidthTimer->setTimerType(Qt::CoarseTimer); // wjy: 带宽是秒级诊断指标，不使用高精度唤醒增加多窗口场景主线程压力。
     m_titlebarBandwidthTimer->setInterval(1000);
@@ -4391,6 +4583,11 @@ void DeviceGrid::prepareForApplicationExit()
     if (m_remoteQualityTimer) {
         m_remoteQualityTimer->stop(); // wjy: 退出期间停止质量采样，不再向已经提交stop的窗口发送任何新协议请求。
     }
+    if (m_remoteMonitorTimer) {
+        m_remoteMonitorTimer->stop(); // wjy: 退出阶段只停止分页调度，不再恢复几何或显示窗口，后续统一Viewer关闭流程直接接管。
+    }
+    m_remoteMonitorModeEnabled = false;
+    m_remoteMonitorWindowStates.clear();
     if (m_titlebarBandwidthTimer) {
         m_titlebarBandwidthTimer->stop(); // wjy: 退出准备阶段停止标题栏网卡枚举，不再投递一秒重绘。
         m_titlebarBandwidthMonitor.reset();
@@ -6359,6 +6556,108 @@ void DeviceGrid::setupSettingsControls()
     m_remoteQualityModeCombo->setStyleSheet(qualityControlStyle);
     m_remoteQualityModeCombo->setVisible(false); // wjy: 首次显隐统一交给updateSettingsControls，构造阶段不会闪到常规页上。
 
+    m_remoteMonitorConfiguration = platform::AppSettings::remoteMonitorConfiguration(); // wjy: 监控模式本次默认关闭，但宫格、画质和轮询周期跨程序重启恢复。
+    m_remoteMonitorGridCombo = new QComboBox(this);
+    for (const stream::RemoteMonitorGridPreset preset : stream::kRemoteMonitorGridPresets) {
+        m_remoteMonitorGridCombo->addItem(
+            QString::fromUtf8("%1宫格").arg(stream::remoteMonitorGridCapacity(preset)),
+            static_cast<int>(preset)); // wjy: 下拉框数据保存稳定枚举值，显示文案变化不会破坏持久化。
+    }
+    m_remoteMonitorGridCombo->setCurrentIndex(qMax(
+        0,
+        m_remoteMonitorGridCombo->findData(static_cast<int>(m_remoteMonitorConfiguration.grid))));
+    m_remoteMonitorGridCombo->setStyleSheet(qualityControlStyle);
+    m_remoteMonitorGridCombo->setVisible(false);
+
+    m_remoteMonitorQualityCombo = new QComboBox(this);
+    for (const stream::RemoteVideoQualityPreset preset : stream::kRemoteVideoQualityPresets) {
+        m_remoteMonitorQualityCombo->addItem(
+            QString::fromLatin1(stream::remoteVideoQualityPresetLabel(preset)),
+            static_cast<int>(preset)); // wjy: 监控设置复用标题栏八档顺序，包含用户确认后的360/25档。
+    }
+    m_remoteMonitorQualityCombo->setCurrentIndex(qMax(
+        0,
+        m_remoteMonitorQualityCombo->findData(static_cast<int>(m_remoteMonitorConfiguration.quality))));
+    m_remoteMonitorQualityCombo->setStyleSheet(qualityControlStyle);
+    m_remoteMonitorQualityCombo->setVisible(false);
+
+    m_remoteMonitorIntervalEdit = new QLineEdit(this);
+    m_remoteMonitorIntervalEdit->setValidator(new QIntValidator(1, 86400, m_remoteMonitorIntervalEdit));
+    m_remoteMonitorIntervalEdit->setText(QString::number(m_remoteMonitorConfiguration.rotationIntervalSeconds));
+    m_remoteMonitorIntervalEdit->setAlignment(Qt::AlignCenter);
+    m_remoteMonitorIntervalEdit->setPlaceholderText(QStringLiteral("30"));
+    m_remoteMonitorIntervalEdit->setStyleSheet(QStringLiteral(
+        "QLineEdit{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;padding:0 8px;"
+        "font-family:'Microsoft YaHei UI';font-size:13px;color:#040B18;}"
+        "QLineEdit:focus{border:1px solid #3A7BFC;}"));
+    m_remoteMonitorIntervalEdit->setVisible(false);
+
+    connect(m_remoteMonitorGridCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0 || !m_remoteMonitorGridCombo) {
+            return;
+        }
+        m_remoteMonitorConfiguration.grid = static_cast<stream::RemoteMonitorGridPreset>(
+            m_remoteMonitorGridCombo->itemData(index).toInt());
+        m_remoteMonitorConfiguration = stream::normalizedRemoteMonitorConfiguration(m_remoteMonitorConfiguration);
+        platform::AppSettings::setRemoteMonitorConfiguration(m_remoteMonitorConfiguration);
+        m_remoteMonitorPageIndex = 0; // wjy: 单页容量改变后从第一批重新排布，避免旧页下标跳过前面的窗口。
+        if (m_remoteMonitorModeEnabled) {
+            refreshRemoteMonitorMode(false); // wjy: 宫格修改立即重排当前桌面，不等待下一次轮询。
+        }
+        update();
+    });
+    connect(m_remoteMonitorQualityCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index < 0 || !m_remoteMonitorQualityCombo) {
+            return;
+        }
+        const stream::RemoteVideoQualityPreset selectedPreset = static_cast<stream::RemoteVideoQualityPreset>(
+            m_remoteMonitorQualityCombo->itemData(index).toInt());
+        if (selectedPreset == stream::RemoteVideoQualityPreset::P1080_60
+            || selectedPreset == stream::RemoteVideoQualityPreset::P720_60) {
+            QMessageBox confirmation(this);
+            confirmation.setIcon(QMessageBox::Warning);
+            confirmation.setWindowTitle(QString::fromUtf8("高带宽提示"));
+            confirmation.setText(QString::fromUtf8("此分辨率设置会大幅消耗带宽，造成卡顿，是否设置？"));
+            QPushButton* confirmButton = confirmation.addButton(QString::fromUtf8("是"), QMessageBox::AcceptRole);
+            confirmation.addButton(QString::fromUtf8("否"), QMessageBox::RejectRole);
+            confirmation.exec();
+            if (confirmation.clickedButton() != confirmButton) {
+                const QSignalBlocker blocker(m_remoteMonitorQualityCombo);
+                m_remoteMonitorQualityCombo->setCurrentIndex(qMax(
+                    0,
+                    m_remoteMonitorQualityCombo->findData(static_cast<int>(m_remoteMonitorConfiguration.quality))));
+                return; // wjy: 监控模式批量高帧率同样执行带宽确认，取消后恢复原下拉选项且不改在线窗口。
+            }
+        }
+        m_remoteMonitorConfiguration.quality = selectedPreset;
+        m_remoteMonitorConfiguration = stream::normalizedRemoteMonitorConfiguration(m_remoteMonitorConfiguration);
+        platform::AppSettings::setRemoteMonitorConfiguration(m_remoteMonitorConfiguration);
+        applyRemoteMonitorQualityPreset(); // wjy: 运行中修改监控画质立即同步所有窗口，远控连接和分页计时不重启。
+        update();
+    });
+    const auto saveRemoteMonitorInterval = [this] {
+        if (!m_remoteMonitorIntervalEdit) {
+            return;
+        }
+        bool parsed = false;
+        int seconds = m_remoteMonitorIntervalEdit->text().trimmed().toInt(&parsed);
+        if (!parsed) {
+            seconds = stream::kDefaultRemoteMonitorRotationIntervalSeconds;
+        }
+        m_remoteMonitorConfiguration.rotationIntervalSeconds = seconds;
+        m_remoteMonitorConfiguration = stream::normalizedRemoteMonitorConfiguration(m_remoteMonitorConfiguration);
+        m_remoteMonitorIntervalEdit->setText(QString::number(m_remoteMonitorConfiguration.rotationIntervalSeconds));
+        platform::AppSettings::setRemoteMonitorConfiguration(m_remoteMonitorConfiguration);
+        if (m_remoteMonitorTimer) {
+            m_remoteMonitorTimer->setInterval(m_remoteMonitorConfiguration.rotationIntervalSeconds * 1000);
+            if (m_remoteMonitorModeEnabled) {
+                m_remoteMonitorTimer->start(); // wjy: 修改轮询秒数后从当前时刻重新计时，不立即跳到下一页。
+            }
+        }
+    };
+    connect(m_remoteMonitorIntervalEdit, &QLineEdit::editingFinished, this, saveRemoteMonitorInterval);
+    connect(m_remoteMonitorIntervalEdit, &QLineEdit::returnPressed, this, saveRemoteMonitorInterval);
+
     // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] after batch add controls create")); // wjy: 批量新增输入框和按钮创建完成。
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before updateSettingsControls in setup")); // wjy: 判断是否崩在首次刷新设置控件显隐状态。
@@ -6858,6 +7157,32 @@ void DeviceGrid::updateSettingsControls()
             false,
             true); // wjy: 简化页只管理默认模式下拉框，其余预设值作为只读说明绘制，不再创建复杂参数控件。
     }
+
+    const bool monitorVisible = m_settingsSelected && m_settingsTab == SettingsTab::RemoteMonitor;
+    if (m_remoteMonitorGridCombo) {
+        applySettingsControlGeometry(
+            m_remoteMonitorGridCombo,
+            settingsRemoteMonitorControlRect(0),
+            monitorVisible,
+            monitorVisible,
+            true); // wjy: 宫格下拉框只在独立监控页显示，选择后立即重排运行中的监控桌面。
+    }
+    if (m_remoteMonitorQualityCombo) {
+        applySettingsControlGeometry(
+            m_remoteMonitorQualityCombo,
+            settingsRemoteMonitorControlRect(1),
+            monitorVisible,
+            monitorVisible,
+            true); // wjy: 画质下拉框不依赖监控是否开启，用户可先配置再按标题栏按钮启动。
+    }
+    if (m_remoteMonitorIntervalEdit) {
+        applySettingsControlGeometry(
+            m_remoteMonitorIntervalEdit,
+            settingsRemoteMonitorControlRect(2),
+            monitorVisible,
+            monitorVisible,
+            true); // wjy: 轮询秒数输入框与手绘“秒”单位保持同一行。
+    }
     // ===end====
 
 // ===end====
@@ -6906,13 +7231,23 @@ void DeviceGrid::registerRemoteQualityWindow(RemoteDesktopWindow* window)
     }
     window->restoreSavedUserQualityPreset(anotherAboveDefaultPresetIsOpen); // wjy: 第一个重新打开的历史高档窗口获得恢复名额，其余本次从540/30自动基线开始。
     window->setGlobalQualityConfiguration(m_remoteQualityConfiguration); // wjy: 保留现有设置快照接口，精确档位由窗口手选和固定自动规则决定。
+    window->setRemoteMonitorQualityPreset(
+        m_remoteMonitorModeEnabled,
+        m_remoteMonitorConfiguration.quality); // wjy: 监控期间后来打开的窗口从首帧就使用当前统一画质，不等待30秒轮询。
     connect(window, &RemoteDesktopWindow::remoteQualityInputsChanged,
         this, &DeviceGrid::requestRemoteQualityEvaluation); // wjy: 手选、全屏、显隐和最小化变化即时生效，不等待下一次1秒采样。
     connect(window, &QObject::destroyed, this, [this, window] {
         m_remoteQualityCoordinator.removeWindow(reinterpret_cast<uintptr_t>(window)); // wjy: 协调器当前无滞回状态，仍保留统一销毁通知和重新评估时序。
+        m_remoteMonitorWindowStates.remove(window); // wjy: 窗口销毁立即删除监控恢复快照，后续地址复用不会套用旧状态。
         requestRemoteQualityEvaluation();
+        if (m_remoteMonitorModeEnabled) {
+            QTimer::singleShot(0, this, [this] { refreshRemoteMonitorMode(false); }); // wjy: 销毁信号结束后重新扫描并填补当前页空位。
+        }
     });
     requestRemoteQualityEvaluation();
+    if (m_remoteMonitorModeEnabled) {
+        QTimer::singleShot(0, this, [this] { refreshRemoteMonitorMode(false); }); // wjy: 新窗口完成show流程后再纳入当前页，避免保存构造阶段的无效几何。
+    }
 }
 
 void DeviceGrid::requestRemoteQualityEvaluation()
@@ -9343,6 +9678,9 @@ void DeviceGrid::toggleTopmostRemoteWindowFullscreen()
 
 void DeviceGrid::toggleRemoteWindowTiling()
 {
+    if (m_remoteMonitorModeEnabled) {
+        setRemoteMonitorModeEnabled(false); // wjy: 用户主动执行普通平铺时先退出分页监控并恢复原窗口，避免两套几何所有权互相覆盖。
+    }
     QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
     for (auto it = windows.begin(); it != windows.end();) {
         if (!*it || (*it)->isClosingConnection()) {
@@ -9453,6 +9791,219 @@ void DeviceGrid::toggleRemoteWindowTiling()
     m_remoteWindowCoordinator->setWindowsTiled(true);
 }
 
+// =====wjy====
+void DeviceGrid::toggleRemoteMonitorMode()
+{
+    setRemoteMonitorModeEnabled(!m_remoteMonitorModeEnabled); // wjy: 标题栏单按钮在开启和恢复原布局之间切换，不引入额外弹窗。
+}
+
+void DeviceGrid::setRemoteMonitorModeEnabled(bool enabled)
+{
+    if (m_remoteMonitorModeEnabled == enabled) {
+        if (enabled) {
+            refreshRemoteMonitorMode(false); // wjy: 重复开启请求用于重新扫描窗口集合，不重置用户配置。
+        }
+        return;
+    }
+
+    if (enabled && m_remoteWindowCoordinator->windowsTiled()) {
+        if (openedRemoteWindows().isEmpty()) {
+            m_remoteWindowCoordinator->clearRestoreGeometries();
+            m_remoteWindowCoordinator->setWindowsTiled(false); // wjy: 空窗口残留的平铺标志直接复位，避免后来新窗口第一次Ctrl+P只清状态不执行布局。
+        } else {
+            toggleRemoteWindowTiling(); // wjy: 监控模式先退出普通平铺并恢复真实原几何，再建立自己的可逆窗口快照。
+        }
+    }
+
+    m_remoteMonitorModeEnabled = enabled;
+    m_remoteMonitorPageIndex = 0;
+    if (enabled) {
+        refreshRemoteMonitorMode(false);
+        if (m_remoteMonitorTimer) {
+            m_remoteMonitorTimer->setInterval(m_remoteMonitorConfiguration.rotationIntervalSeconds * 1000);
+            m_remoteMonitorTimer->start(); // wjy: 开启后从当前第一批开始完整计时，默认30秒后切换下一批。
+        }
+    } else {
+        if (m_remoteMonitorTimer) {
+            m_remoteMonitorTimer->stop();
+        }
+        for (auto it = m_remoteMonitorWindowStates.begin(); it != m_remoteMonitorWindowStates.end(); ++it) {
+            const RemoteMonitorWindowState& saved = it.value();
+            RemoteDesktopWindow* remoteWindow = saved.window.data();
+            if (!remoteWindow || remoteWindow->isClosingConnection()) {
+                continue;
+            }
+            remoteWindow->setRemoteMonitorQualityPreset(false, m_remoteMonitorConfiguration.quality); // wjy: 先撤销监控画质，恢复窗口手选或普通自动档。
+            remoteWindow->setRememberGeometryEnabled(false);
+            remoteWindow->hide(); // wjy: 隐藏后恢复状态和矩形，避免从监控格子跳回原位置时产生可见闪烁。
+            remoteWindow->setWindowState(Qt::WindowNoState);
+            if (saved.normalGeometry.isValid()) {
+                remoteWindow->setGeometry(saved.normalGeometry);
+            }
+            if (saved.visible) {
+                if (saved.windowState.testFlag(Qt::WindowMinimized)) {
+                    remoteWindow->showMinimized();
+                } else if (saved.windowState.testFlag(Qt::WindowFullScreen)) {
+                    remoteWindow->showFullScreen();
+                } else if (saved.windowState.testFlag(Qt::WindowMaximized)) {
+                    remoteWindow->showMaximized();
+                } else {
+                    remoteWindow->showNormal();
+                } // wjy: 显式恢复四种顶层状态，避免隐藏窗口直接setWindowState后由不同Qt版本解释不一致。
+            } else {
+                remoteWindow->setWindowState(saved.windowState); // wjy: 原本隐藏的窗口只恢复内部状态，保持不可见。
+            }
+            remoteWindow->setRememberGeometryEnabled(saved.rememberGeometry); // wjy: 原状态恢复完成后恢复进入监控前的持久化策略，分组平铺窗口继续保持不记忆几何。
+        }
+        m_remoteMonitorWindowStates.clear();
+        applyRemoteMonitorQualityPreset(); // wjy: 同步撤销监控期间后来创建但尚未进入快照的窗口画质覆盖。
+        requestRemoteQualityEvaluation();
+    }
+    update(titlebarBandwidthUpdateRect());
+}
+
+void DeviceGrid::refreshRemoteMonitorMode(bool advancePage)
+{
+    if (!m_remoteMonitorModeEnabled || m_shuttingDown) {
+        return;
+    }
+
+    QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
+    for (auto it = windows.begin(); it != windows.end();) {
+        if (!*it || (*it)->isClosingConnection()) {
+            it = windows.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    QCollator naturalCollator;
+    naturalCollator.setCaseSensitivity(Qt::CaseInsensitive);
+    naturalCollator.setNumericMode(true);
+    std::sort(windows.begin(), windows.end(), [&naturalCollator](const QPointer<RemoteDesktopWindow>& left,
+                                                                  const QPointer<RemoteDesktopWindow>& right) {
+        if (!left || !right) {
+            return static_cast<bool>(left);
+        }
+        const QString leftName = left->deviceName();
+        const QString rightName = right->deviceName();
+        const bool leftStartsWithDigit = !leftName.isEmpty() && leftName.front().isDigit();
+        const bool rightStartsWithDigit = !rightName.isEmpty() && rightName.front().isDigit();
+        if (leftStartsWithDigit != rightStartsWithDigit) {
+            return leftStartsWithDigit;
+        }
+        const int nameCompare = naturalCollator.compare(leftName, rightName);
+        if (nameCompare != 0) {
+            return nameCompare < 0;
+        }
+        const int exactNameCompare = QString::compare(leftName, rightName, Qt::CaseSensitive);
+        if (exactNameCompare != 0) {
+            return exactNameCompare < 0;
+        }
+        return QString::compare(left->hostIp(), right->hostIp(), Qt::CaseInsensitive) < 0; // wjy: 每轮扫描都使用与普通平铺相同的自然设备顺序，分页切换不会随机换位。
+    });
+
+    QSet<RemoteDesktopWindow*> currentWindows;
+    for (const QPointer<RemoteDesktopWindow>& window : windows) {
+        if (!window) {
+            continue;
+        }
+        RemoteDesktopWindow* remoteWindow = window.data();
+        currentWindows.insert(remoteWindow);
+        if (!m_remoteMonitorWindowStates.contains(remoteWindow)) {
+            RemoteMonitorWindowState saved;
+            saved.window = remoteWindow;
+            saved.normalGeometry = remoteWindow->normalGeometry().isValid()
+                ? remoteWindow->normalGeometry()
+                : remoteWindow->geometry(); // wjy: 最大化或全屏窗口优先保存Qt提供的普通矩形，退出监控后仍可正确还原。
+            saved.windowState = remoteWindow->windowState();
+            saved.visible = remoteWindow->isVisible();
+            saved.rememberGeometry = remoteWindow->rememberGeometryEnabled();
+            m_remoteMonitorWindowStates.insert(remoteWindow, saved);
+        }
+        remoteWindow->setRemoteMonitorQualityPreset(true, m_remoteMonitorConfiguration.quality); // wjy: 新扫描到的窗口立即接入监控统一画质，窗口手选仍由自身优先级保留。
+    }
+    for (auto it = m_remoteMonitorWindowStates.begin(); it != m_remoteMonitorWindowStates.end();) {
+        if (!it.value().window || !currentWindows.contains(it.key())) {
+            it = m_remoteMonitorWindowStates.erase(it); // wjy: 用户关闭窗口后及时删除恢复快照，地址复用不能继承旧几何。
+        } else {
+            ++it;
+        }
+    }
+
+    if (windows.isEmpty()) {
+        m_remoteMonitorPageIndex = 0;
+        requestRemoteQualityEvaluation();
+        update(titlebarBandwidthUpdateRect());
+        return; // wjy: 没有窗口时保持监控按钮开启，定时器下一轮继续自动扫描后来打开的远控窗口。
+    }
+
+    const int capacity = qMax(1, stream::remoteMonitorGridCapacity(m_remoteMonitorConfiguration.grid));
+    const int pageCount = qMax(1, static_cast<int>(std::ceil(windows.size() / static_cast<double>(capacity))));
+    if (advancePage && pageCount > 1) {
+        m_remoteMonitorPageIndex = (m_remoteMonitorPageIndex + 1) % pageCount;
+    } else {
+        m_remoteMonitorPageIndex = qBound(0, m_remoteMonitorPageIndex, pageCount - 1);
+    }
+
+    QScreen* screen = window() ? window()->screen() : QGuiApplication::primaryScreen();
+    if (!screen) {
+        screen = QGuiApplication::primaryScreen();
+    }
+    const QRect availableRect = screen ? screen->availableGeometry() : QRect(0, 0, 1280, 720);
+    const int columnCount = qMax(1, stream::remoteMonitorGridColumns(m_remoteMonitorConfiguration.grid));
+    const int rowCount = qMax(1, stream::remoteMonitorGridRows(m_remoteMonitorConfiguration.grid));
+    const int tileWidth = qMax(1, availableRect.width() / columnCount);
+    const int tileHeight = qMax(1, availableRect.height() / rowCount);
+    const int pageStart = m_remoteMonitorPageIndex * capacity;
+    const int pageEnd = qMin(pageStart + capacity, windows.size());
+
+    for (int index = 0; index < windows.size(); ++index) {
+        RemoteDesktopWindow* remoteWindow = windows.at(index).data();
+        if (!remoteWindow) {
+            continue;
+        }
+        remoteWindow->setRememberGeometryEnabled(false);
+        if (index < pageStart || index >= pageEnd) {
+            remoteWindow->hide(); // wjy: 非当前页窗口保持连接但隐藏，由质量策略自动降到360/1保活。
+            continue;
+        }
+        const int slot = index - pageStart;
+        const int row = slot / columnCount;
+        const int column = slot % columnCount;
+        QRect target(
+            availableRect.x() + column * tileWidth,
+            availableRect.y() + row * tileHeight,
+            tileWidth,
+            tileHeight);
+        if (column == columnCount - 1) {
+            target.setRight(availableRect.right());
+        }
+        if (row == rowCount - 1) {
+            target.setBottom(availableRect.bottom());
+        }
+        remoteWindow->showNormal();
+        remoteWindow->setGeometry(target);
+        remoteWindow->show();
+        remoteWindow->raise(); // wjy: 当前页只显示实际剩余窗口，未使用的宫格保持空白且不会创建占位连接。
+    }
+    requestRemoteQualityEvaluation();
+    update(titlebarBandwidthUpdateRect());
+}
+
+void DeviceGrid::applyRemoteMonitorQualityPreset()
+{
+    const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
+    for (const QPointer<RemoteDesktopWindow>& window : windows) {
+        if (window) {
+            window->setRemoteMonitorQualityPreset(
+                m_remoteMonitorModeEnabled,
+                m_remoteMonitorConfiguration.quality); // wjy: 设置修改一次广播到全部窗口，相同档位由窗口层直接去重。
+        }
+    }
+    requestRemoteQualityEvaluation();
+}
+// ===end====
+
 void DeviceGrid::closeTopmostRemoteWindow()
 {
     RemoteDesktopWindow* window = topmostRemoteWindow();
@@ -9464,6 +10015,9 @@ void DeviceGrid::closeTopmostRemoteWindow()
 
 void DeviceGrid::closeAllRemoteWindows()
 {
+    if (m_remoteMonitorModeEnabled) {
+        setRemoteMonitorModeEnabled(false); // wjy: 关闭全部窗口前停止分页定时器并清理恢复快照，关闭回调不会再触发下一轮布局。
+    }
     m_remoteWindowCoordinator->closeAllWindows(); // wjy: close-all 的窗口遍历、去重和状态清理由协调器集中负责。
 }
 
@@ -10117,105 +10671,96 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
 
     painter.drawPixmap(titleWordmarkRect, uupix(QStringLiteral("titlebar/title_wordmark.png"))); // wjy: 实际绘制标题名时复用统一矩形，保证左上标题与右侧按钮同高。
     // =====wjy====
-    // wjy: 版本号显示在“丰实远程控制”右侧，默认 1.1.1，每次发布 patch+1。
-    QRect versionRect;
-    {
-        QFont versionFont(QStringLiteral("Microsoft YaHei UI"));
-        versionFont.setPixelSize(11);
-        painter.setFont(versionFont);
-        painter.setPen(QColor(QStringLiteral("#6B7280")));
-        const QString versionText = QStringLiteral("v%1").arg(platform::UpdateService::displayVersion());
-        const QFontMetrics versionMetrics(versionFont);
-        const int versionWidth = versionMetrics.horizontalAdvance(versionText) + 4;
-        versionRect = QRect(titleWordmarkRect.right() + 8, titleWordmarkRect.y(), versionWidth, titleWordmarkRect.height()); // wjy: 保存版本号最终矩形，网络状态必须从它的右边开始布局。
-        painter.drawText(QRectF(versionRect), Qt::AlignVCenter | Qt::AlignLeft, versionText);
-    }
-    {
-        constexpr int kMaximumIdentityReservation = 252; // wjy: 为右侧本机名、IP 和按钮保留现有最大宽度，网络文字不能覆盖身份信息。
-        const int networkLeft = versionRect.right() + 10; // wjy: 用户要求带宽监控紧跟在版本号右侧，并保留 10px 视觉间距。
-        const int identityBoundary = (m_updateAvailable ? titlebarUpdateRect().x() : titlebarSettingsRect().x())
-            - kMaximumIdentityReservation;
-        const QRect networkRect(
-            networkLeft,
-            titleWordmarkRect.y(),
-            qMax(0, identityBoundary - networkLeft - 8),
-            titleWordmarkRect.height()); // wjy: 窗口变窄或更新按钮出现时自动压缩可用宽度，紧凑态不会与窗口按钮重叠。
-        if (networkRect.width() >= 34) {
-            QFont networkFont(QStringLiteral("Microsoft YaHei UI"));
-            networkFont.setPixelSize(11);
-            painter.setFont(networkFont);
-            QColor networkColor(QStringLiteral("#6B7280"));
-            QString networkText = QString::fromUtf8("网 --"); // wjy: 第一次只有计数基线，明确显示采样中占位而不是错误的 0 Mbps。
-            if (m_titlebarBandwidthSample.valid) {
-                const auto formatMbps = [](double value) {
-                    return QString::number(value, 'f', value < 10.0 ? 1 : 0); // wjy: 低速保留一位小数，高速取整以节省标题栏宽度。
-                };
-                const QString receiveText = formatMbps(m_titlebarBandwidthSample.receive.currentMbps);
-                networkText = QString::fromUtf8("↓%1M").arg(receiveText); // wjy: 主窗口标题栏只显示当前接收带宽，不再展示容易干扰查看的理论余量。
-                const bool adapterDropping = m_titlebarBandwidthSample.receiveDiscardsDelta > 0
-                    || m_titlebarBandwidthSample.receiveErrorsDelta > 0;
-                if (adapterDropping
-                    || m_titlebarBandwidthSample.receive.risk == platform::LocalNetworkBandwidthRisk::High
-                    || m_titlebarBandwidthSample.receive.risk == platform::LocalNetworkBandwidthRisk::Saturated) {
-                    networkColor = QColor(QStringLiteral("#DC2626")); // wjy: 高利用率或入站丢弃/错误使用红色，提示带宽或接收队列风险。
-                } else if (m_titlebarBandwidthSample.receive.risk == platform::LocalNetworkBandwidthRisk::Attention) {
-                    networkColor = QColor(QStringLiteral("#D97706")); // wjy: 70%-85% 使用琥珀色，提醒继续观察但不宣称已经拥塞。
-                } else {
-                    networkColor = QColor(QStringLiteral("#2563EB")); // wjy: 正常采样使用克制蓝色，与更新入口颜色体系保持一致。
-                }
-            }
-            const QFontMetrics networkMetrics(networkFont);
-            const int controlledSessionCount = totalRemoteControlSessionCount(); // wjy: 每次标题栏重绘从权威设备状态缓存汇总，不维护容易失同步的第二份总数。
-            const QString controlledSessionText = QString::number(controlledSessionCount); // wjy: 标题栏展示真实总路数，超过10时不截断为设备行颜色档位上限。
-            QFont controlledSessionFont(QStringLiteral("Microsoft YaHei UI"));
-            controlledSessionFont.setPixelSize(10);
-            controlledSessionFont.setBold(true);
-            const QFontMetrics controlledSessionMetrics(controlledSessionFont);
-            const int controlledSessionBadgeWidth = qMax(18, controlledSessionMetrics.horizontalAdvance(controlledSessionText) + 8); // wjy: 徽标宽度随数字位数扩展，单个数字保持18px稳定尺寸。
-            constexpr int kControlledSessionGap = 8;
-            const int networkTextWidthLimit = qMax(0,
-                networkRect.width() - controlledSessionBadgeWidth - kControlledSessionGap); // wjy: 先为右侧人数徽标预留空间，再对带宽文字执行省略，避免两者相互覆盖。
-            const QString visibleNetworkText = networkMetrics.elidedText(
-                networkText,
-                Qt::ElideRight,
-                networkTextWidthLimit);
-            const int visibleNetworkTextWidth = qMin(
-                networkTextWidthLimit,
-                networkMetrics.horizontalAdvance(visibleNetworkText));
-            if (networkTextWidthLimit > 0) {
-                painter.setPen(networkColor);
-                painter.drawText(
-                    QRectF(networkRect.x(), networkRect.y(), networkTextWidthLimit, networkRect.height()),
-                    Qt::AlignVCenter | Qt::AlignLeft,
-                    visibleNetworkText); // wjy: 带宽继续位于左侧，窄窗口时优先缩短文字但不侵占右侧会话数字。
-            }
+    // wjy: 版本号、带宽、会话数、监控按钮和本机身份由同一布局快照计算，标题栏缩放时不会互相覆盖。
+    const int controlledSessionCount = totalRemoteControlSessionCount();
+    const TitlebarStatusLayout statusLayout = titlebarStatusLayout(
+        m_updateAvailable,
+        m_titlebarBandwidthSample,
+        controlledSessionCount);
+    QFont versionFont(QStringLiteral("Microsoft YaHei UI"));
+    versionFont.setPixelSize(11);
+    painter.setFont(versionFont);
+    painter.setPen(QColor(QStringLiteral("#6B7280")));
+    painter.drawText(
+        QRectF(statusLayout.versionRect),
+        Qt::AlignVCenter | Qt::AlignLeft,
+        QStringLiteral("v%1").arg(platform::UpdateService::displayVersion()));
 
-            const int controlledSessionBadgeLeft = networkRect.x()
-                + visibleNetworkTextWidth
-                + (visibleNetworkTextWidth > 0 ? kControlledSessionGap : 0);
-            const QRectF controlledSessionBadgeRect(
-                controlledSessionBadgeLeft,
-                networkRect.center().y() - 9,
-                controlledSessionBadgeWidth,
-                18); // wjy: 数字徽标紧跟当前带宽右侧，并与标题栏文字垂直居中。
-            if (controlledSessionBadgeRect.right() <= networkRect.right() + 1) {
-                const QColor controlledSessionAccent = controlledSessionCount > 0
-                    ? remoteControlCountAccent(controlledSessionCount)
-                    : QColor(QStringLiteral("#9CA3AF")); // wjy: 有会话时沿用设备行人数色阶，零路使用中性灰色。
-                const QColor controlledSessionFill = controlledSessionCount > 0
-                    ? remoteControlCountFill(controlledSessionCount)
-                    : QColor(QStringLiteral("#F3F4F6"));
-                painter.save();
-                painter.setRenderHint(QPainter::Antialiasing);
-                painter.setPen(QPen(controlledSessionAccent, 1.0));
-                painter.setBrush(controlledSessionFill);
-                painter.drawRoundedRect(controlledSessionBadgeRect.adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
-                painter.setFont(controlledSessionFont);
-                painter.setPen(controlledSessionAccent);
-                painter.drawText(controlledSessionBadgeRect, Qt::AlignCenter, controlledSessionText); // wjy: 徽标只显示汇总数字，不增加解释文字占用标题栏空间。
-                painter.restore();
-            }
+    QFont networkFont(QStringLiteral("Microsoft YaHei UI"));
+    networkFont.setPixelSize(11);
+    painter.setFont(networkFont);
+    QColor networkColor(QStringLiteral("#6B7280"));
+    if (m_titlebarBandwidthSample.valid) {
+        const bool adapterDropping = m_titlebarBandwidthSample.receiveDiscardsDelta > 0
+            || m_titlebarBandwidthSample.receiveErrorsDelta > 0;
+        if (adapterDropping
+            || m_titlebarBandwidthSample.receive.risk == platform::LocalNetworkBandwidthRisk::High
+            || m_titlebarBandwidthSample.receive.risk == platform::LocalNetworkBandwidthRisk::Saturated) {
+            networkColor = QColor(QStringLiteral("#DC2626"));
+        } else if (m_titlebarBandwidthSample.receive.risk == platform::LocalNetworkBandwidthRisk::Attention) {
+            networkColor = QColor(QStringLiteral("#D97706"));
+        } else {
+            networkColor = QColor(QStringLiteral("#2563EB"));
         }
+    }
+    if (statusLayout.networkTextRect.width() > 0) {
+        const QFontMetrics networkMetrics(networkFont);
+        painter.setPen(networkColor);
+        painter.drawText(
+            QRectF(statusLayout.networkTextRect),
+            Qt::AlignVCenter | Qt::AlignLeft,
+            networkMetrics.elidedText(
+                statusLayout.networkText,
+                Qt::ElideRight,
+                statusLayout.networkTextRect.width())); // wjy: 窄窗口先省略带宽文字，数字和监控按钮仍保持完整命中区。
+    }
+
+    QFont controlledSessionFont(QStringLiteral("Microsoft YaHei UI"));
+    controlledSessionFont.setPixelSize(10);
+    controlledSessionFont.setBold(true);
+    const QColor controlledSessionAccent = controlledSessionCount > 0
+        ? remoteControlCountAccent(controlledSessionCount)
+        : QColor(QStringLiteral("#9CA3AF"));
+    const QColor controlledSessionFill = controlledSessionCount > 0
+        ? remoteControlCountFill(controlledSessionCount)
+        : QColor(QStringLiteral("#F3F4F6"));
+    if (statusLayout.controlledSessionBadgeRect.isValid()) {
+        painter.save();
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(QPen(controlledSessionAccent, 1.0));
+        painter.setBrush(controlledSessionFill);
+        painter.drawRoundedRect(
+            QRectF(statusLayout.controlledSessionBadgeRect).adjusted(0.5, 0.5, -0.5, -0.5),
+            4,
+            4);
+        painter.setFont(controlledSessionFont);
+        painter.setPen(controlledSessionAccent);
+        painter.drawText(
+            statusLayout.controlledSessionBadgeRect,
+            Qt::AlignCenter,
+            QString::number(controlledSessionCount));
+        painter.restore();
+    }
+
+    if (!m_detailPanelCollapsed && statusLayout.monitorModeButtonRect.isValid()) {
+        painter.save();
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(QPen(
+            m_remoteMonitorModeEnabled ? QColor(QStringLiteral("#2563EB")) : QColor(QStringLiteral("#CBD5E1")),
+            1));
+        painter.setBrush(m_remoteMonitorModeEnabled
+                ? QColor(QStringLiteral("#3A7BFC"))
+                : QColor(QStringLiteral("#FFFFFF")));
+        painter.drawRoundedRect(QRectF(statusLayout.monitorModeButtonRect), 4, 4);
+        QFont monitorFont(QStringLiteral("Microsoft YaHei UI"));
+        monitorFont.setPixelSize(11);
+        monitorFont.setBold(m_remoteMonitorModeEnabled);
+        painter.setFont(monitorFont);
+        painter.setPen(m_remoteMonitorModeEnabled
+                ? QColor(QStringLiteral("#FFFFFF"))
+                : QColor(QStringLiteral("#334155")));
+        painter.drawText(statusLayout.monitorModeButtonRect, Qt::AlignCenter, QString::fromUtf8("监控模式")); // wjy: 开启时使用蓝底白字，用户能直接确认当前分页监控是否正在运行。
+        painter.restore();
     }
     // ===end====
     if (!m_detailPanelCollapsed && m_settingsSelected) {
@@ -10242,19 +10787,27 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
         identityFont.setPixelSize(12);
         painter.setFont(identityFont);
         painter.setPen(QColor(QStringLiteral("#4B5563")));
-        const int identityRight = (m_updateAvailable ? titlebarUpdateRect().x() : titlebarSettingsRect().x()) - 10; // wjy: 更新按钮出现时，本机名称和 IP 自动向左让位，避免文字重叠。
         // =====wjy====
-        // wjy: 完整标题栏保持“本机名 本机IP 设置”；紧凑态整体跳过，避免文字与窗口控制按钮重叠。
+        // wjy: 完整标题栏保持“状态组 本机名 本机IP 设置”；空间不足时优先省略身份文字，监控按钮保持完整。
         const QFontMetrics identityMetrics(identityFont);
         const QString localNameText = m_localDeviceInfo.name.trimmed();
         const QString localIpText = m_localDeviceInfo.ip.trimmed();
-        const int localIpWidth = qMin(114, identityMetrics.horizontalAdvance(localIpText));
-        const int localNameWidth = qMin(118, identityMetrics.horizontalAdvance(localNameText));
+        const int identityAvailableWidth = statusLayout.identityRect.width();
+        const int localIpWidth = qMin(
+            qMin(114, identityMetrics.horizontalAdvance(localIpText)),
+            qMax(0, identityAvailableWidth * 55 / 100));
+        const int localNameWidth = qMin(
+            qMin(118, identityMetrics.horizontalAdvance(localNameText)),
+            qMax(0, identityAvailableWidth - localIpWidth - (localIpWidth > 0 ? 10 : 0)));
         const int identityY = (kTitleBarHeight - kTitleBarVisualHeight) / 2;
-        const QRect localIpRect(identityRight - localIpWidth, identityY, localIpWidth, kTitleBarVisualHeight);
+        const QRect localIpRect(statusLayout.identityRect.right() - localIpWidth + 1, identityY, localIpWidth, kTitleBarVisualHeight);
         const QRect localNameRect(localIpRect.x() - 10 - localNameWidth, identityY, localNameWidth, kTitleBarVisualHeight);
-        painter.drawText(QRectF(localNameRect), Qt::AlignVCenter | Qt::AlignRight, identityMetrics.elidedText(localNameText, Qt::ElideRight, localNameWidth));
-        painter.drawText(QRectF(localIpRect), Qt::AlignVCenter | Qt::AlignRight, identityMetrics.elidedText(localIpText, Qt::ElideLeft, localIpWidth));
+        if (localNameWidth > 0) {
+            painter.drawText(QRectF(localNameRect), Qt::AlignVCenter | Qt::AlignRight, identityMetrics.elidedText(localNameText, Qt::ElideRight, localNameWidth));
+        }
+        if (localIpWidth > 0) {
+            painter.drawText(QRectF(localIpRect), Qt::AlignVCenter | Qt::AlignRight, identityMetrics.elidedText(localIpText, Qt::ElideLeft, localIpWidth));
+        }
         // ===end====
         // =====wjy====
         drawRotatedUiIcon(
@@ -10497,6 +11050,7 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
             m_settingsAddDeviceExpanded,
             m_settingsTab == SettingsTab::Keyboard,
             m_settingsTab == SettingsTab::RemoteControl,
+            m_settingsTab == SettingsTab::RemoteMonitor,
             m_localDeviceInfo,
             m_settingsScrollOffset);
         } else if (!m_remoteAssistSelected
@@ -11221,6 +11775,12 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         m_wallpaperRotationIntervalEdit->clearFocus();
         setFocus(Qt::MouseFocusReason); // wjy: 点击分钟输入框外部时立即保存新周期并从当前时刻重新计时。
     }
+    if (m_remoteMonitorIntervalEdit
+        && m_remoteMonitorIntervalEdit->hasFocus()
+        && !m_remoteMonitorIntervalEdit->geometry().contains(event->pos())) {
+        m_remoteMonitorIntervalEdit->clearFocus();
+        setFocus(Qt::MouseFocusReason); // wjy: 点击监控轮询输入框外部时立即保存秒数并重启当前计时周期。
+    }
     if (m_batchSubnetEdit
         && m_batchSubnetEdit->hasFocus()
         && !m_batchSubnetEdit->geometry().contains(event->pos())) {
@@ -11380,10 +11940,15 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
     }
 // ===end====
 
+    const QRect monitorModeTitlebarRect = titlebarStatusLayout(
+        m_updateAvailable,
+        m_titlebarBandwidthSample,
+        totalRemoteControlSessionCount()).monitorModeButtonRect; // wjy: 拖窗和按钮点击复用绘制时的动态监控按钮矩形。
     if (event->button() == Qt::LeftButton
         && event->pos().y() >= 0
         && event->pos().y() < kTitleBarHeight //窗口拖动
         && !(!m_detailPanelCollapsed && m_updateAvailable && titlebarUpdateRect().contains(event->pos())) // wjy: 只有完整标题栏中真实可见的更新按钮排除拖窗命中。
+        && !(!m_detailPanelCollapsed && monitorModeTitlebarRect.contains(event->pos()))
         && !(!m_detailPanelCollapsed && titlebarSettingsRect().contains(event->pos()))
         && !(!m_detailPanelCollapsed && refreshRect().contains(event->pos())) // wjy: 紧凑态隐藏设置和刷新后，对应旧矩形重新成为可拖动标题栏空白。
         && !minimizeRect().contains(event->pos())
@@ -11696,10 +12261,15 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
         && settingsVerticalScrollbarTrackRect().adjusted(-5, -2, 5, 2).contains(event->pos()); // wjy: 常规页和键盘页整条滚动轨道均可拖拽或点击跳转，悬停时提前给出手型反馈。
     // ===end====
     const bool detailPanelButtonHovered = detailPanelToggleButtonRect(m_detailPanelCollapsed).contains(event->pos());
+    const QRect monitorModeTitlebarRect = titlebarStatusLayout(
+        m_updateAvailable,
+        m_titlebarBandwidthSample,
+        totalRemoteControlSessionCount()).monitorModeButtonRect;
     const bool titlebarButtonHovered = !m_detailPanelCollapsed
         && ((m_updateAvailable && titlebarUpdateRect().contains(event->pos()))
+            || monitorModeTitlebarRect.contains(event->pos())
             || titlebarSettingsRect().contains(event->pos())
-            || refreshRect().contains(event->pos())); // wjy: 左上标题恢复为普通拖动区域，只有设置、更新和刷新入口显示按钮手型。
+            || refreshRect().contains(event->pos())); // wjy: 监控、设置、更新和刷新入口统一显示按钮手型。
     const bool wakeButtonHovered = false;
     const SettingsLayoutSnapshot settingsLayout = settingsLayoutSnapshot(
         m_settingsLocalInfoExpanded,
@@ -11732,7 +12302,8 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
         && m_settingsSelected
         && (settingsGeneralTabRect().contains(event->pos())
             || settingsKeyboardTabRect().contains(event->pos())
-            || settingsRemoteControlTabRect().contains(event->pos())); // wjy: 第三个远控画质标签使用相同手型反馈和点击语义。
+            || settingsRemoteControlTabRect().contains(event->pos())
+            || settingsRemoteMonitorTabRect().contains(event->pos())); // wjy: 远控画质和监控模式两个页签使用相同手型反馈。
     const bool detailTabHovered = !m_detailPanelCollapsed
         && !m_settingsSelected
         && !m_remoteAssistSelected
@@ -12297,6 +12868,16 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         }
         // ===end====
 
+        const QRect monitorModeTitlebarRect = titlebarStatusLayout(
+            m_updateAvailable,
+            m_titlebarBandwidthSample,
+            totalRemoteControlSessionCount()).monitorModeButtonRect;
+        if (!m_detailPanelCollapsed && monitorModeTitlebarRect.contains(event->pos())) {
+            toggleRemoteMonitorMode(); // wjy: 标题栏会话数字右侧按钮直接切换分页监控，不进入设置页或弹出菜单。
+            event->accept();
+            return;
+        }
+
         if (!m_detailPanelCollapsed && titlebarSettingsRect().contains(event->pos())) {
             finishDeviceGroupRename(true);
             finishDeviceRename(true);
@@ -12532,12 +13113,15 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 m_settingsTab == SettingsTab::Keyboard); // wjy: 设置页点击命中与手绘/子控件布局共享同一滚动快照。
             if (settingsGeneralTabRect().contains(event->pos())
                 || settingsKeyboardTabRect().contains(event->pos())
-                || settingsRemoteControlTabRect().contains(event->pos())) {
-                m_settingsTab = settingsRemoteControlTabRect().contains(event->pos())
-                    ? SettingsTab::RemoteControl
-                    : (settingsKeyboardTabRect().contains(event->pos())
-                        ? SettingsTab::Keyboard
-                        : SettingsTab::General); // wjy: 三个设置标签互斥切换，远控画质页不会误落入常规页点击处理。
+                || settingsRemoteControlTabRect().contains(event->pos())
+                || settingsRemoteMonitorTabRect().contains(event->pos())) {
+                m_settingsTab = settingsRemoteMonitorTabRect().contains(event->pos())
+                    ? SettingsTab::RemoteMonitor
+                    : (settingsRemoteControlTabRect().contains(event->pos())
+                        ? SettingsTab::RemoteControl
+                        : (settingsKeyboardTabRect().contains(event->pos())
+                            ? SettingsTab::Keyboard
+                            : SettingsTab::General)); // wjy: 四个设置标签互斥切换，监控配置不会落入常规页开关命中。
                 m_settingsScrollOffset = 0;
                 if (m_settingsTab == SettingsTab::General) {
                     refreshRollbackVersions(); // wjy: 切回常规页时按缓存期限请求后台刷新，不在页签点击事件中同步遍历共享目录。

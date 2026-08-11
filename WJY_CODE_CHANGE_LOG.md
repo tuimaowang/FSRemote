@@ -13475,3 +13475,276 @@ assert(restoreA && !restoreB);
 - 已静态核对A/B/C规则：运行中多高档允许；重新打开历史高档时只恢复一个；已有C高档时A、B均从默认开始。
 - 已更新纯策略测试源码覆盖默认、全屏、手选、遮挡、恢复和多窗口场景。
 - 按用户此前要求，本次未构建、未链接、未运行测试或启动程序。
+
+## 2026-08-11 09:27 - 新增分页监控模式与可配置宫格轮询
+
+### Changed Location
+- `src/stream/RemoteVideoPolicy.h:74-211`: 增加监控宫格枚举、默认九宫格/540-30/30秒配置、布局行列换算和统一画质标签。
+- `src/system/AppSettings.h:46-47`、`src/system/AppSettings.cpp:302-328`: 使用现有QSettings持久化监控宫格、画质和轮询秒数。
+- `src/ui/DeviceGrid.h:87-120、190-204、316-360`: 增加监控设置页、窗口恢复快照、定时器和运行状态。
+- `src/ui/DeviceGrid.cpp:274-389、3290-3521、4200-4205、6559-6658、7133-7168、7216-7249、9795-9998、10643-10733、11910-13118`: 接入标题栏按钮、独立设置界面、分页平铺、窗口扫描、关闭恢复和鼠标命中。
+- `src/ui/RemoteDesktopWindow.h:80-81、102、330-333`、`src/ui/RemoteDesktopWindow.cpp:566-569、2466-2519、4050-4061、4223-4231`: 增加监控统一画质输入并同步标题栏显示，同时暴露只读几何记忆状态供监控退出恢复。
+- `src/ui/RemoteQualityCoordinator.h:63-70、124-129`、`src/ui/RemoteQualityCoordinator.cpp:117-141`: 将监控画质插入手选与全屏自动档之间。
+- `tests/remote_video_policy_tests.cpp:41-56`: 覆盖默认监控配置、六种宫格和损坏值回退。
+- `tests/remote_quality_coordinator_tests.cpp:72-94`: 覆盖监控画质、窗口手选和遮挡保活优先级。
+
+### Reason
+主窗口此前只能手动把全部远控窗口一次性平铺，没有长期巡视入口，也不能按固定单页容量轮换大量窗口。本次新增“监控模式”：自动扫描本控制端当前已打开的远控窗口，默认按九宫格显示，每30秒切换下一页；最后一页只显示剩余窗口。监控接管前保存每个窗口的普通几何、最大化/全屏/最小化状态和显隐，关闭监控后原样恢复。设置页增加独立监控界面，宫格、统一画质和轮询秒数都可持久化，其中宫格和画质在监控运行中立即生效。
+
+### Original Code
+```cpp
+// src/stream/RemoteVideoPolicy.h:63-72（修改前）
+enum class RemoteVideoQualityPreset : std::uint8_t {
+    P1080_60 = 0,
+    P1080_30 = 1,
+    P720_60 = 2,
+    P720_30 = 3,
+    P540_30 = 4,
+    P540_25 = 5,
+    P360_25 = 6,
+    P360_1 = 7,
+};
+```
+
+```cpp
+// src/system/AppSettings.h:42-45（修改前）
+static stream::RemoteQualityConfiguration remoteQualityConfiguration();
+static void setRemoteQualityConfiguration(const stream::RemoteQualityConfiguration& configuration);
+static bool remoteDeviceQualityPreset(const QString& deviceKey, stream::RemoteVideoQualityPreset* preset);
+static void setRemoteDeviceQualityPreset(const QString& deviceKey, stream::RemoteVideoQualityPreset preset);
+```
+
+```cpp
+// src/system/AppSettings.cpp:270-300（修改前）
+// 新增代码，原位置没有监控宫格、统一画质和轮询秒数的读写接口。
+```
+
+```cpp
+// src/ui/DeviceGrid.h:87-91（修改前）
+enum class SettingsTab {
+    General,
+    Keyboard,
+    RemoteControl,
+};
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:3172-3186（修改前）
+QRect settingsRemoteControlTabRect()
+{
+    return QRect(contentLeft() + 144, kDetailScriptTabTop, 84, 36);
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.h:100-104（修改前）
+void setGlobalQualityConfiguration(const stream::RemoteQualityConfiguration& configuration);
+bool hasSavedUserQualityPreset() const;
+stream::RemoteVideoQualityPreset savedUserQualityPreset() const;
+bool hasActiveUserQualityPresetAboveDefault() const;
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:4042-4049（修改前）
+stream::RemoteVideoQualityPreset RemoteDesktopWindow::preferredRemoteVideoQualityPreset() const
+{
+    if (m_userQualityPresetActive) return m_userQualityPreset;
+    return isFullScreen()
+        ? stream::kFullscreenRemoteVideoQualityPreset
+        : stream::kDefaultRemoteVideoQualityPreset;
+}
+```
+
+```cpp
+// src/ui/RemoteQualityCoordinator.h:63-68（修改前）
+stream::RemoteVideoQualityPreset userQualityPreset = stream::kDefaultRemoteVideoQualityPreset;
+bool userQualityPresetActive = false;
+bool visible = true;
+bool minimized = false;
+```
+
+```cpp
+// src/ui/RemoteQualityCoordinator.cpp:118-123（修改前）
+const stream::RemoteVideoQualityPreset preferredPreset = window.userQualityPresetActive
+    ? window.userQualityPreset
+    : decision.fullScreen
+        ? stream::kFullscreenRemoteVideoQualityPreset
+        : stream::kDefaultRemoteVideoQualityPreset;
+```
+
+```cpp
+// tests/remote_video_policy_tests.cpp:33-39（修改前）
+assert(stream::remoteVideoEncodingPreset(stream::RemoteVideoQualityPreset::P1080_60).targetFps == 60);
+assert(stream::remoteVideoQualityPresetExceedsDefault(stream::RemoteVideoQualityPreset::P720_30));
+assert(!stream::remoteVideoQualityPresetExceedsDefault(stream::RemoteVideoQualityPreset::P540_30));
+```
+
+```cpp
+// tests/remote_quality_coordinator_tests.cpp:62-69（修改前）
+second.fullScreen = true;
+decisions = coordinator.evaluate(configuration, {second}, 1100);
+assert(decisions.front().preset == stream::RemoteVideoQualityPreset::P720_30);
+```
+
+### Modified Code
+```cpp
+// src/stream/RemoteVideoPolicy.h:74-87、135-211
+enum class RemoteMonitorGridPreset : std::uint8_t {
+    Grid4 = 4,
+    Grid9 = 9,
+    Grid12 = 12,
+    Grid16 = 16,
+    Grid20 = 20,
+    Grid25 = 25,
+};
+
+struct RemoteMonitorConfiguration {
+    RemoteMonitorGridPreset grid = RemoteMonitorGridPreset::Grid9;
+    RemoteVideoQualityPreset quality = RemoteVideoQualityPreset::P540_30;
+    int rotationIntervalSeconds = 30;
+};
+```
+
+```cpp
+// src/system/AppSettings.h:46-47
+static stream::RemoteMonitorConfiguration remoteMonitorConfiguration();
+static void setRemoteMonitorConfiguration(
+    const stream::RemoteMonitorConfiguration& configuration);
+```
+
+```cpp
+// src/system/AppSettings.cpp:302-328
+stream::RemoteMonitorConfiguration AppSettings::remoteMonitorConfiguration()
+{
+    QSettings appSettings = settings();
+    stream::RemoteMonitorConfiguration configuration;
+    configuration.grid = static_cast<stream::RemoteMonitorGridPreset>(
+        appSettings.value(
+            QStringLiteral("remoteMonitor/grid"),
+            static_cast<int>(stream::kDefaultRemoteMonitorGridPreset)).toInt());
+    configuration.quality = static_cast<stream::RemoteVideoQualityPreset>(
+        appSettings.value(
+            QStringLiteral("remoteMonitor/quality"),
+            static_cast<int>(stream::kDefaultRemoteVideoQualityPreset)).toInt());
+    configuration.rotationIntervalSeconds = appSettings.value(
+        QStringLiteral("remoteMonitor/rotationIntervalSeconds"),
+        stream::kDefaultRemoteMonitorRotationIntervalSeconds).toInt();
+    return stream::normalizedRemoteMonitorConfiguration(configuration);
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.h:87-120、201-204
+enum class SettingsTab {
+    General,
+    Keyboard,
+    RemoteControl,
+    RemoteMonitor,
+};
+
+struct RemoteMonitorWindowState {
+    QPointer<RemoteDesktopWindow> window;
+    QRect normalGeometry;
+    Qt::WindowStates windowState = Qt::WindowNoState;
+    bool visible = true;
+    bool rememberGeometry = true;
+};
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:9795-9998
+void DeviceGrid::refreshRemoteMonitorMode(bool advancePage)
+{
+    QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
+    const int capacity = qMax(1,
+        stream::remoteMonitorGridCapacity(m_remoteMonitorConfiguration.grid));
+    const int pageStart = m_remoteMonitorPageIndex * capacity;
+    const int pageEnd = qMin(pageStart + capacity, windows.size());
+    for (int index = 0; index < windows.size(); ++index) {
+        RemoteDesktopWindow* remoteWindow = windows.at(index).data();
+        if (index < pageStart || index >= pageEnd) {
+            remoteWindow->hide();
+            continue;
+        }
+        remoteWindow->showNormal();
+        remoteWindow->setGeometry(target);
+        remoteWindow->show();
+        remoteWindow->raise();
+    }
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.h:101、329-332
+void setRemoteMonitorQualityPreset(bool active, stream::RemoteVideoQualityPreset preset);
+stream::RemoteVideoQualityPreset m_monitorQualityPreset = stream::kDefaultRemoteVideoQualityPreset;
+bool m_monitorQualityPresetActive = false;
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:4050-4061
+if (m_userQualityPresetActive) {
+    return m_userQualityPreset;
+}
+if (m_monitorQualityPresetActive) {
+    return m_monitorQualityPreset;
+}
+return isFullScreen()
+    ? stream::kFullscreenRemoteVideoQualityPreset
+    : stream::kDefaultRemoteVideoQualityPreset;
+```
+
+```cpp
+// src/ui/RemoteQualityCoordinator.h:63-70
+stream::RemoteVideoQualityPreset userQualityPreset = stream::kDefaultRemoteVideoQualityPreset;
+bool userQualityPresetActive = false;
+stream::RemoteVideoQualityPreset monitorQualityPreset = stream::kDefaultRemoteVideoQualityPreset;
+bool monitorQualityPresetActive = false;
+```
+
+```cpp
+// src/ui/RemoteQualityCoordinator.cpp:117-124
+const stream::RemoteVideoQualityPreset preferredPreset = window.userQualityPresetActive
+    ? window.userQualityPreset
+    : window.monitorQualityPresetActive
+        ? window.monitorQualityPreset
+        : decision.fullScreen
+            ? stream::kFullscreenRemoteVideoQualityPreset
+            : stream::kDefaultRemoteVideoQualityPreset;
+```
+
+```cpp
+// tests/remote_video_policy_tests.cpp:41-56
+stream::RemoteMonitorConfiguration monitorConfiguration;
+assert(monitorConfiguration.grid == stream::RemoteMonitorGridPreset::Grid9);
+assert(monitorConfiguration.quality == stream::RemoteVideoQualityPreset::P540_30);
+assert(monitorConfiguration.rotationIntervalSeconds == 30);
+assert(stream::remoteMonitorGridColumns(stream::RemoteMonitorGridPreset::Grid12) == 4);
+```
+
+```cpp
+// tests/remote_quality_coordinator_tests.cpp:72-94
+monitorWindow.monitorQualityPresetActive = true;
+monitorWindow.monitorQualityPreset = stream::RemoteVideoQualityPreset::P540_25;
+decisions = coordinator.evaluate(configuration, {monitorWindow}, 1150);
+assert(decisions.front().preset == stream::RemoteVideoQualityPreset::P540_25);
+```
+
+### Steps
+1. 在主窗口标题栏会话数字右侧增加“监控模式”按钮，开启状态使用蓝底白字，绘制、拖窗排除和点击命中共用同一动态布局快照。
+2. 开启监控时扫描当前控制端所有已打开远控窗口，保存每个窗口进入监控前的普通几何、窗口状态和显隐。
+3. 默认按3列3行九宫格显示第一页；12宫格使用4×3，20宫格使用5×4，其余使用2×2、4×4、5×5。
+4. 超过单页容量时按默认30秒轮询下一页；最后一页只显示剩余窗口，非当前页窗口隐藏但保持连接并自动降到360/1。
+5. 关闭监控后停止定时器，撤销监控统一画质，并恢复每个窗口原来的普通、最小化、最大化、全屏、隐藏状态和几何记忆策略。
+6. 在“远控画质”右侧新增“监控模式”设置页，提供4/9/12/16/20/25宫格、八档画质和1至86400秒轮询输入。
+7. 宫格修改立即重排，画质修改立即在线生效，轮询时间修改后从当前时刻重新计时；三项配置使用QSettings跨程序重启保存。
+8. 保持既有画质优先级：窗口标题栏手选最高，其次监控统一画质，再次是全屏720/30和普通540/30；隐藏或完全遮挡最终使用360/1。
+9. 监控设置选择1080/60或720/60时复用高带宽确认，取消后恢复原选项且不修改在线窗口。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已使用 `rg` 静态核对监控配置的声明、持久化、设置控件、定时器、分页入口、窗口画质输入和测试引用完整存在。
+- 已静态核对标题栏监控按钮的绘制矩形同时用于鼠标手型、拖窗排除和释放点击，不存在黑区或隐藏热区分叉。
+- 已静态核对监控关闭路径会停止定时器、撤销画质覆盖、恢复窗口几何/状态/显隐并清空恢复快照。
+- 已更新纯策略测试源码，覆盖默认九宫格、六种布局、30秒默认值、监控画质优先级、手选优先级和360/1保活。
+- 按用户此前要求，本次未构建、未链接、未运行测试或启动程序。
