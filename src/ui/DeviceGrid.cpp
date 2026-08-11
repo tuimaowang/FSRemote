@@ -5683,7 +5683,7 @@ void DeviceGrid::applyRemoteScriptRuntimeState(
             ? state.cancelRequested
             : std::make_shared<std::atomic_bool>(false); // wjy: 控制端重启恢复的任务也创建本地取消标志，停止流程可沿用现有 SSH 退出机制。
         if (state.outputFilePath.trimmed().isEmpty()) {
-            state.outputFilePath = scriptOutputTempFilePath(); // wjy: 新控制端没有旧临时日志文件时创建独立缓存，避免和其它设备输出混写。
+            state.outputFilePath = scriptOutputLogFilePath(); // wjy: 新控制端恢复远端任务时在data/script_output创建独立日志，避免和其它设备输出混写。
         }
         const QString restoredScriptName = runtime.scriptName.trimmed().isEmpty()
             ? runtime.workName

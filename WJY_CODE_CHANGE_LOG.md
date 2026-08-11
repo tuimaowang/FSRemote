@@ -15292,3 +15292,37 @@ ScreenshotReviewDialog::~ScreenshotReviewDialog()
 - 已静态核对弱网回复按换行完整读取，单个截图请求最多等待60秒，控制端等待发生在后台线程。
 - 已确认本轮只会暂存本条记录列出的13个源码/构建文件和`WJY_CODE_CHANGE_LOG.md`，不会包含工作区其它未跟踪文件。
 - 按用户要求，本次未构建、未链接、未运行测试或启动程序。
+
+## 2026-08-11 15:57 - 修复脚本状态恢复路径残留旧日志函数名
+
+### Changed Location
+- `src/ui/DeviceGrid.cpp:5683-5688`：将远端脚本状态恢复时遗漏的旧函数调用改为data日志函数。
+
+### Reason
+上一轮把`scriptOutputTempFilePath()`重命名为`scriptOutputLogFilePath()`时，只修改了脚本主动启动路径，遗漏了控制端重启后恢复目标端脚本状态的分支。编译器因此找不到旧标识符，并连带把`QString`赋值报告为不明确。统一调用新函数后，两条错误会同时消失。
+
+### Original Code
+```cpp
+// src/ui/DeviceGrid.cpp:5683-5688
+if (state.outputFilePath.trimmed().isEmpty()) {
+    state.outputFilePath = scriptOutputTempFilePath(); // 新控制端没有旧临时日志文件时创建独立缓存。
+}
+```
+
+### Modified Code
+```cpp
+// src/ui/DeviceGrid.cpp:5683-5688
+if (state.outputFilePath.trimmed().isEmpty()) {
+    state.outputFilePath = scriptOutputLogFilePath(); // wjy: 新控制端恢复远端任务时在data/script_output创建独立日志，避免和其它设备输出混写。
+}
+```
+
+### Steps
+1. 搜索`DeviceGrid.cpp`中的新旧脚本输出路径函数名，确认只有状态恢复分支仍调用已删除的旧函数。
+2. 将残留调用替换为`scriptOutputLogFilePath()`，保持脚本主动执行和重启恢复都写入`data/script_output`。
+3. 同步更新行内WJY注释，删除“临时日志”旧语义。
+
+### Verification
+- 已执行`rg -n "scriptOutputTempFilePath|scriptOutputLogFilePath" src/ui/DeviceGrid.cpp`，旧函数名匹配为0，新函数定义和两处调用一致。
+- 已执行`git diff --check`，未发现空白错误。
+- 按此前要求未执行构建、链接或运行测试。
