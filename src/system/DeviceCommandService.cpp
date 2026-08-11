@@ -20,6 +20,7 @@
 #include <QJsonObject>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QThread> // wjy: 远控密钥登记仅在后台线程对瞬态主动断开做一次短延迟重试。
 #include <QTimer>
 #include <QUrl>
 
@@ -135,8 +136,81 @@ bool renameLocalComputer(const QString& newName, QString* errorMessage)
 #endif
 }
 
-bool sendCommandPayload(const QString& hostIp, const QByteArray& payload, QString* errorMessage, uint16_t port, int timeoutMs)
+// =====wjy====
+bool readSingleLineReply(
+    QTcpSocket& socket,
+    QByteArray* reply,
+    QString* errorMessage,
+    int timeoutMs,
+    QAbstractSocket::SocketError* transportError = nullptr)
 {
+    if (reply) reply->clear();
+    if (transportError) *transportError = QAbstractSocket::UnknownSocketError;
+
+    QElapsedTimer replyTimer;
+    replyTimer.start();
+    QByteArray completeReply;
+    while (true) {
+        completeReply.append(socket.readAll()); // wjy: 每次等待前先排空Qt接收缓冲区，断开事件和数据同时到达时也不会漏掉最后一个包。
+        const int newlineIndex = completeReply.indexOf('\n');
+        if (newlineIndex >= 0) {
+            if (reply) *reply = completeReply.left(newlineIndex).trimmed();
+            if (errorMessage) errorMessage->clear();
+            return true; // wjy: 协议只在收到完整换行结尾后成功，避免弱网分包导致只解析半条回复。
+        }
+        if (completeReply.size() > 64 * 1024) {
+            if (errorMessage) *errorMessage = QStringLiteral("目标端回复超过允许长度。");
+            return false;
+        }
+
+        const int remainingMs = timeoutMs - static_cast<int>(replyTimer.elapsed());
+        if (remainingMs <= 0) {
+            if (transportError) *transportError = QAbstractSocket::SocketTimeoutError;
+            if (errorMessage) *errorMessage = QStringLiteral("等待目标端回复超时。");
+            return false;
+        }
+        if (socket.waitForReadyRead(remainingMs)) {
+            continue;
+        }
+
+        completeReply.append(socket.readAll()); // wjy: waitForReadyRead可能因RemoteHostClosed返回false，但目标端的ok行已经进入缓冲区，必须最后再读取一次。
+        const int finalNewlineIndex = completeReply.indexOf('\n');
+        if (finalNewlineIndex >= 0) {
+            if (reply) *reply = completeReply.left(finalNewlineIndex).trimmed();
+            if (errorMessage) errorMessage->clear();
+            return true; // wjy: 接受“完整回复与主动断开同时到达”，避免把已经登记成功的远控密钥误报成失败。
+        }
+
+        QAbstractSocket::SocketError socketError = socket.error();
+        if (socketError == QAbstractSocket::UnknownSocketError
+            && socket.state() == QAbstractSocket::UnconnectedState) {
+            socketError = QAbstractSocket::RemoteHostClosedError; // wjy: 某些Qt/Windows组合只留下断开状态，统一归类后授权入口仍能执行一次安全重试。
+        }
+        if (transportError) *transportError = socketError;
+        if (errorMessage) {
+            if (socketError == QAbstractSocket::RemoteHostClosedError
+                || socket.state() == QAbstractSocket::UnconnectedState) {
+                *errorMessage = QStringLiteral("目标端在完整回复前关闭了连接。"); // wjy: 确实没有完整回复时提供稳定中文原因，不再直接显示Qt英文错误文本。
+            } else {
+                const QString socketErrorText = socket.errorString().trimmed();
+                *errorMessage = socketErrorText.isEmpty()
+                    ? QStringLiteral("等待目标端回复失败。")
+                    : socketErrorText;
+            }
+        }
+        return false;
+    }
+}
+
+bool sendCommandPayload(
+    const QString& hostIp,
+    const QByteArray& payload,
+    QString* errorMessage,
+    uint16_t port,
+    int timeoutMs,
+    QAbstractSocket::SocketError* transportError = nullptr)
+{
+    if (transportError) *transportError = QAbstractSocket::UnknownSocketError;
     if (hostIp.trimmed().isEmpty()) {
         if (errorMessage) {
             *errorMessage = QStringLiteral("目标 IP 为空");
@@ -154,12 +228,14 @@ bool sendCommandPayload(const QString& hostIp, const QByteArray& payload, QStrin
     configureLanTcpSocket(socket); // wjy: 公钥授权、改名和列表同步等统一命令必须直连目标 49102。
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)) {
+        if (transportError) *transportError = socket.error();
         if (errorMessage) {
             *errorMessage = socket.errorString().trimmed();
         }
         return false;
     }
     if (socket.write(payload) != payload.size()) {
+        if (transportError) *transportError = socket.error();
         if (errorMessage) {
             *errorMessage = socket.errorString().trimmed();
         }
@@ -167,21 +243,19 @@ bool sendCommandPayload(const QString& hostIp, const QByteArray& payload, QStrin
         return false;
     }
     if (!socket.waitForBytesWritten(timeoutMs)) {
+        if (transportError) *transportError = socket.error();
         if (errorMessage) {
             *errorMessage = socket.errorString().trimmed();
         }
         socket.disconnectFromHost();
         return false;
     }
-    if (!socket.waitForReadyRead(timeoutMs)) {
-        if (errorMessage) {
-            *errorMessage = socket.errorString().trimmed();
-        }
+    QByteArray reply;
+    if (!readSingleLineReply(socket, &reply, errorMessage, timeoutMs, transportError)) {
         socket.disconnectFromHost();
         return false;
     }
 
-    const QByteArray reply = socket.readAll().trimmed();
     socket.disconnectFromHost();
     const QList<QByteArray> parts = reply.split('|');
     const QByteArray status = parts.value(0).trimmed().toLower();
@@ -199,6 +273,7 @@ bool sendCommandPayload(const QString& hostIp, const QByteArray& payload, QStrin
     }
     return false;
 }
+// ===end====
 
 // =====wjy====
 bool sendCommandAndReadReply(
@@ -224,33 +299,11 @@ bool sendCommandAndReadReply(
         return false;
     }
 
-    QElapsedTimer replyTimer;
-    replyTimer.start();
-    QByteArray completeReply;
-    while (!completeReply.contains('\n')) {
-        completeReply.append(socket.readAll());
-        if (completeReply.contains('\n')) break;
-        if (completeReply.size() > 64 * 1024) {
-            if (errorMessage) *errorMessage = QStringLiteral("目标端回复超过允许长度。");
-            socket.disconnectFromHost();
-            return false;
-        }
-        const int remainingMs = timeoutMs - static_cast<int>(replyTimer.elapsed());
-        if (remainingMs <= 0 || !socket.waitForReadyRead(remainingMs)) {
-            if (errorMessage) {
-                const QString socketError = socket.errorString().trimmed();
-                *errorMessage = socketError.isEmpty()
-                    ? QStringLiteral("等待目标端回复超时。")
-                    : socketError;
-            }
-            socket.disconnectFromHost();
-            return false;
-        }
+    if (!readSingleLineReply(socket, reply, errorMessage, timeoutMs)) {
+        socket.disconnectFromHost();
+        return false; // wjy: 截图和键鼠脚本同样接受“完整回复后立即断开”，避免共享命令通道重复出现相同竞态。
     }
-    const int newlineIndex = completeReply.indexOf('\n');
-    if (reply) *reply = completeReply.left(newlineIndex).trimmed(); // wjy: 弱网分包时持续读取到协议换行，避免Base64截图路径只收到前半段。
     socket.disconnectFromHost();
-    if (errorMessage) errorMessage->clear();
     return true; // wjy: F10和截图命令共用完整单行回复读取，等待只发生在调用方后台线程。
 }
 
@@ -969,7 +1022,17 @@ bool DeviceCommandService::authorizeTerminalKey(const QString& hostIp, const QSt
 {
 // =====wjy====
     const QByteArray payload = authorizeTerminalKeyCommand(publicKey);
-    return sendCommandPayload(hostIp, payload, errorMessage, port, timeoutMs); // wjy: 打开终端前先把本机公钥登记到目标机，解决多台设备各自生成 key 后互不信任的问题。
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        QAbstractSocket::SocketError transportError = QAbstractSocket::UnknownSocketError;
+        if (sendCommandPayload(hostIp, payload, errorMessage, port, timeoutMs, &transportError)) {
+            return true; // wjy: 收到目标端完整ok行后立即结束，公钥只登记一次。
+        }
+        if (transportError != QAbstractSocket::RemoteHostClosedError || attempt > 0) {
+            return false; // wjy: 目标端明确返回error、连接拒绝或超时都保留真实原因，只有主动断开类瞬态错误允许重试。
+        }
+        QThread::msleep(120); // wjy: 公钥追加操作幂等，短暂等待后重连一次可覆盖目标命令连接刚好切换或释放身份锁的窗口。
+    }
+    return false;
 // ===end====
 }
 

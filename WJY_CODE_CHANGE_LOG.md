@@ -15326,3 +15326,122 @@ if (state.outputFilePath.trimmed().isEmpty()) {
 - 已执行`rg -n "scriptOutputTempFilePath|scriptOutputLogFilePath" src/ui/DeviceGrid.cpp`，旧函数名匹配为0，新函数定义和两处调用一致。
 - 已执行`git diff --check`，未发现空白错误。
 - 按此前要求未执行构建、链接或运行测试。
+
+## 2026-08-11 17:22 - 修复远控密钥登记被主动断开误报
+
+### Changed Location
+- `src/system/DeviceCommandService.cpp:140-308`：新增共享单行回复读取器，完整读取换行协议，并处理回复与主动断开同时到达的竞态。
+- `src/system/DeviceCommandService.cpp:1021-1036`：远控密钥登记在真实主动断开时执行一次幂等重试。
+- `src/system/DeviceCommandService.h:53`：将密钥登记默认等待从 1.5 秒调整为 10 秒。
+- `src/ui/DeviceGrid.cpp:9060-9061`：同步更新脚本授权路径的等待时间说明。
+
+### Reason
+目标端 `CommandConnection::replyAndClose()` 在写出 `ok\n` 后立即调用 `disconnectFromHost()`。旧控制端授权逻辑只调用一次 `waitForReadyRead()`：当 Windows/Qt 将最后一包数据和断开事件几乎同时交付时，该函数可能返回 `false` 并报告 `The remote host closed the connection`，但完整的 `ok\n` 已经位于 socket 接收缓冲区。控制端没有在失败后再次读取缓冲区，因此会把实际已经成功写入 `authorized_keys` 的操作误报成登记失败。
+
+此外，目标端公钥写入和 WebRTC 会话验签共用身份互斥锁，而单次 `ssh-keygen -Y verify` 的超时上限为 8 秒。原密钥登记等待仅 1.5 秒，在其它会话恰好进行验签时也可能过早失败。本次将该后台等待调整为 10 秒，并只对没有完整回复的 `RemoteHostClosedError` 自动重试一次；目标端明确返回的文件写入错误不会被掩盖或重复重试。
+
+### Original Code
+```cpp
+// src/system/DeviceCommandService.cpp:153-198（修改前）
+socket.connectToHost(hostIp.trimmed(), port);
+if (!socket.waitForConnected(timeoutMs)) {
+    *errorMessage = socket.errorString().trimmed();
+    return false;
+}
+socket.write(payload);
+socket.waitForBytesWritten(timeoutMs);
+if (!socket.waitForReadyRead(timeoutMs)) {
+    *errorMessage = socket.errorString().trimmed();
+    return false;
+}
+const QByteArray reply = socket.readAll().trimmed();
+return reply.split('|').value(0).trimmed().toLower() == "ok";
+```
+
+```cpp
+// src/system/DeviceCommandService.cpp:968-973（修改前）
+const QByteArray payload = authorizeTerminalKeyCommand(publicKey);
+return sendCommandPayload(hostIp, payload, errorMessage, port, timeoutMs);
+```
+
+```cpp
+// src/system/DeviceCommandService.h:53（修改前）
+static bool authorizeTerminalKey(
+    const QString& hostIp,
+    const QString& publicKey,
+    QString* errorMessage = nullptr,
+    uint16_t port = 49102,
+    int timeoutMs = 1500);
+```
+
+### Modified Code
+```cpp
+// src/system/DeviceCommandService.cpp:140-203（修改后）
+bool readSingleLineReply(
+    QTcpSocket& socket,
+    QByteArray* reply,
+    QString* errorMessage,
+    int timeoutMs,
+    QAbstractSocket::SocketError* transportError)
+{
+    QByteArray completeReply;
+    while (true) {
+        completeReply.append(socket.readAll());
+        if (completeReply.contains('\n')) {
+            *reply = completeReply.left(completeReply.indexOf('\n')).trimmed();
+            return true;
+        }
+        const int remainingMs = timeoutMs - static_cast<int>(replyTimer.elapsed());
+        if (remainingMs <= 0) return false;
+        if (socket.waitForReadyRead(remainingMs)) continue;
+
+        completeReply.append(socket.readAll());
+        if (completeReply.contains('\n')) {
+            *reply = completeReply.left(completeReply.indexOf('\n')).trimmed();
+            return true;
+        }
+        return false;
+    }
+}
+```
+
+```cpp
+// src/system/DeviceCommandService.cpp:1024-1035（修改后）
+const QByteArray payload = authorizeTerminalKeyCommand(publicKey);
+for (int attempt = 0; attempt < 2; ++attempt) {
+    QAbstractSocket::SocketError transportError = QAbstractSocket::UnknownSocketError;
+    if (sendCommandPayload(hostIp, payload, errorMessage, port, timeoutMs, &transportError)) {
+        return true;
+    }
+    if (transportError != QAbstractSocket::RemoteHostClosedError || attempt > 0) {
+        return false;
+    }
+    QThread::msleep(120);
+}
+```
+
+```cpp
+// src/system/DeviceCommandService.h:53（修改后）
+static bool authorizeTerminalKey(
+    const QString& hostIp,
+    const QString& publicKey,
+    QString* errorMessage = nullptr,
+    uint16_t port = 49102,
+    int timeoutMs = 10000);
+```
+
+### Steps
+1. 将短命令和截图/键鼠脚本原有的回复读取统一为 `readSingleLineReply()`，协议成功边界固定为收到换行符。
+2. 在 `waitForReadyRead()` 返回失败后再次调用 `readAll()`，优先消费与断开事件同时到达的最后一包数据。
+3. 只有最终仍没有完整行时才发布连接错误，并将无明确错误码的已断开状态规范为 `RemoteHostClosedError`。
+4. 为公钥登记保留传输错误类型；目标端明确 `error|...` 不重试，真实主动断开只等待 120 毫秒后重试一次。
+5. 将公钥登记默认等待调整为 10 秒，覆盖目标端单次最长 8 秒验签和身份锁交接时间。
+6. 让截图和键鼠脚本命令同时复用修复后的读行逻辑，避免同一 TCP 关闭竞态在其它单行回复中重复出现。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已使用 `rg` 确认 `authorizeTerminalKey()` 的三个现有调用点均使用默认 10 秒后台等待，没有 UI 线程同步调用。
+- 已静态核对完整 `ok\n` 即使与 `RemoteHostClosedError` 同时到达也会优先判定成功。
+- 已静态核对目标端明确返回 `error|原因\n` 时传输错误保持非重试状态，真实写入错误继续反馈给用户。
+- 已静态核对真正没有完整回复的主动断开最多重试一次，公钥追加逻辑通过重复检测保持幂等。
+- 按此前要求未执行构建、链接或运行测试。

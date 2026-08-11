@@ -9058,7 +9058,7 @@ bool DeviceGrid::executeDeviceScriptFolder(int deviceIndex, const QString& scrip
                                     : authorizationError;
                             } else {
                                 preflight.authorizationSucceeded = platform::DeviceCommandService::authorizeTerminalKey(
-                                    targetIp, publicKey, &authorizationError); // wjy: 最多 1.5 秒的目标密钥登记等待只占用后台任务。
+                                    targetIp, publicKey, &authorizationError); // wjy: 最多10秒的完整回复等待只占用后台任务，可覆盖目标端一次最长8秒的串行验签。
                                 if (!preflight.authorizationSucceeded) {
                                     preflight.errorMessage = authorizationError.isEmpty()
                                         ? QString::fromUtf8("无法建立目标设备脚本执行授权。")

@@ -50,7 +50,7 @@ public:
     static bool send(const QString& hostIp, DeviceControlAction action, uint16_t port = 49102, int timeoutMs = 1500);
     static bool sendWakeProxy(const QString& hostIp, const QString& macAddress, QString* errorMessage = nullptr, uint16_t port = 49102, int timeoutMs = 1500);
     static bool renameDevice(const QString& hostIp, const QString& newName, QString* errorMessage = nullptr, uint16_t port = 49102, int timeoutMs = 1500);
-    static bool authorizeTerminalKey(const QString& hostIp, const QString& publicKey, QString* errorMessage = nullptr, uint16_t port = 49102, int timeoutMs = 1500);
+    static bool authorizeTerminalKey(const QString& hostIp, const QString& publicKey, QString* errorMessage = nullptr, uint16_t port = 49102, int timeoutMs = 10000); // wjy: 密钥登记在后台等待完整回复，10秒覆盖目标端一次最长8秒验签及锁交接开销。
     // =====wjy====
     static RemoteUpdateStatus queryUpdateStatus(const QString& hostIp, QString* errorMessage = nullptr, uint16_t port = 49102, int timeoutMs = 700); // wjy: 远控窗口短轮询目标更新阶段，避免把正常重启误显示为普通断线。
     // ===end====
