@@ -42,9 +42,19 @@ void writeStatusServerLog(const QString& message)
 // ===end====
 
 // =====wjy====
-void configureLanStatusSocket(QTcpSocket& socket)
+bool configureLanStatusSocket(QTcpSocket& socket, const QString& hostIp)
 {
     socket.setProxy(QNetworkProxy(QNetworkProxy::NoProxy)); // wjy: 49101 状态校准只面向局域网设备，禁止 Qt 使用 Clash、PAC 或系统代理处理原始 TCP。
+    const QString sourceIp = DeviceInfoService::physicalLanIpv4ForTarget(hostIp); // wjy: 状态查询必须和 49102 命令使用相同的真实物理源地址，不能让 Meta/TUN 制造假离线。
+    if (sourceIp.isEmpty()) {
+        return true; // wjy: 无可用物理地址时保留原系统路由行为，兼容特殊网络环境。
+    }
+    if (!socket.bind(QHostAddress(sourceIp), 0)) {
+        writeStatusServerLog(QStringLiteral("[wjy-status] bind failed source=%1 target=%2 error=%3")
+            .arg(sourceIp, hostIp.trimmed(), socket.errorString().trimmed()));
+        return false; // wjy: 绑定失败直接按不可达处理，禁止悄悄回落到 198.18.0.1 等虚拟源地址。
+    }
+    return true;
 }
 // ===end====
 
@@ -317,7 +327,9 @@ DeviceStatusInfo queryStatusInfo(const QString& hostIp, uint16_t port, int timeo
     }
 
     QTcpSocket socket;
-    configureLanStatusSocket(socket); // wjy: 手动状态校准直接连接目标设备，代理配置不能再制造假离线或无效代理错误。
+    if (!configureLanStatusSocket(socket, hostIp)) {
+        return info; // wjy: 状态查询未绑定到真实局域网接口时保持离线，等待下一轮重新枚举物理网卡。
+    }
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)) {
         return info;

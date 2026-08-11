@@ -15445,3 +15445,221 @@ static bool authorizeTerminalKey(
 - 已静态核对目标端明确返回 `error|原因\n` 时传输错误保持非重试状态，真实写入错误继续反馈给用户。
 - 已静态核对真正没有完整回复的主动断开最多重试一次，公钥追加逻辑通过重复检测保持幂等。
 - 按此前要求未执行构建、链接或运行测试。
+
+## 2026-08-11 17:55 - 固定局域网 TCP 物理出口规避 Meta 路由
+
+### Changed Location
+- `src/system/NetworkInterfacePolicy.h:19-26`：将名称为 `Meta` 的以太网样式代理/TUN 适配器纳入虚拟网卡排除策略。
+- `tests/network_interface_policy_tests.cpp:26-35`：增加 `Meta` 网卡被排除的纯策略回归用例。
+- `src/system/DeviceInfoService.h:32-34`：公开按目标地址选择物理局域网 IPv4 的接口。
+- `src/system/DeviceInfoService.cpp:158-166`：主设备信息枚举时排除 `Meta` 等虚拟适配器。
+- `src/system/DeviceInfoService.cpp:252-338`：新增同网段优先、主物理接口次优先的 TCP 源地址选择逻辑，并用三秒线程安全快照复用网卡枚举。
+- `src/system/DeviceCommandService.cpp:58-78`：49102 命令 socket 在连接前绑定物理源地址并记录目标/源地址日志。
+- `src/system/DeviceCommandService.cpp:243-247,310-314,838-842,877-881,931-935,992-996`：授权、同步、截图/脚本、关机重启、更新和开机代理六类命令统一接入物理出口绑定。
+- `src/system/DeviceStatusService.cpp:44-59`：49101 状态查询 socket 接入相同物理出口策略。
+- `src/system/DeviceStatusService.cpp:329-333`：绑定失败时停止当前状态查询，不再静默回退到虚拟默认路由。
+
+### Reason
+CLTEST 控制 A10 时，目标端已经把 CLTEST 公钥成功写入 `authorized_keys`，但控制端仍提示“目标端在完整回复前关闭了连接”。故障现场对 49102 进行原始 TCP 检查后发现，CLTEST 的未绑定 socket 实际源地址为 `198.18.0.1`，来自名为 `Meta` 的 TUN/代理网卡；`device_sync`、`update_status`、`input_script_status` 和 `authorize_ssh_key` 均在约 0.5 秒后收到零字节 EOF。把相同 socket 显式绑定到真实有线地址 `192.168.1.154` 后，A10 能在 3-133 毫秒内正常返回完整回复。
+
+`QNetworkProxy::NoProxy` 只能绕过 Qt 应用层代理，不能覆盖 Windows 路由表。CLTEST 存在两个同优先级默认路由时，系统仍可能把局域网 TCP 交给 `Meta`。重启 CLTEST 后暂时恢复，符合 TUN 网卡和默认路由重新注册后顺序变化的特征，但不能消除后续复发。因此本次在 `connectToHost()` 前显式绑定真实物理 IPv4，并让 49101 与 49102 使用同一策略。
+
+### Original Code
+```cpp
+// src/system/NetworkInterfacePolicy.h:19（修改前）
+const QString identity = (systemName + QLatin1Char(' ') + displayName).toCaseFolded();
+```
+
+```cpp
+// tests/network_interface_policy_tests.cpp:26-30（修改前）
+&& expect(platform::isVirtualLanInterface(
+              QNetworkInterface::Ethernet,
+              QStringLiteral("vEthernet (Default Switch)"),
+              QStringLiteral("Hyper-V Virtual Ethernet Adapter")),
+          "Hyper-V switch adapter must be rejected")
+```
+
+```cpp
+// src/system/DeviceInfoService.h:28-32（修改前）
+class DeviceInfoService final {
+public:
+    static QString localDeviceName();
+    static DeviceInfo local();
+};
+```
+
+```cpp
+// src/system/DeviceInfoService.cpp:153-160（修改前）
+for (auto* adapter = adapters; adapter; adapter = adapter->Next) {
+    if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK || adapter->IfType == IF_TYPE_TUNNEL) {
+        continue;
+    }
+    if (adapter->PhysicalAddressLength < 6) {
+        continue;
+    }
+```
+
+```cpp
+// src/system/DeviceInfoService.cpp:234-237（修改前）
+DeviceInfo DeviceInfoService::local()
+{
+    return currentDeviceInfo();
+}
+```
+
+```cpp
+// src/system/DeviceCommandService.cpp:58-61（修改前）
+void configureLanTcpSocket(QTcpSocket& socket)
+{
+    socket.setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
+}
+```
+
+```cpp
+// src/system/DeviceCommandService.cpp:227-229（修改前，其余五处相同模式）
+QTcpSocket socket;
+configureLanTcpSocket(socket);
+socket.connectToHost(hostIp.trimmed(), port);
+```
+
+```cpp
+// src/system/DeviceStatusService.cpp:45-48,319-321（修改前）
+void configureLanStatusSocket(QTcpSocket& socket)
+{
+    socket.setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
+}
+
+QTcpSocket socket;
+configureLanStatusSocket(socket);
+socket.connectToHost(hostIp.trimmed(), port);
+```
+
+### Modified Code
+```cpp
+// src/system/NetworkInterfacePolicy.h:19-26（修改后）
+const QString normalizedSystemName = systemName.trimmed().toCaseFolded();
+const QString normalizedDisplayName = displayName.trimmed().toCaseFolded();
+if (normalizedSystemName == QStringLiteral("meta")
+    || normalizedDisplayName == QStringLiteral("meta")) {
+    return true;
+}
+const QString identity = normalizedSystemName + QLatin1Char(' ') + normalizedDisplayName;
+```
+
+```cpp
+// tests/network_interface_policy_tests.cpp:31-35（修改后）
+&& expect(platform::isVirtualLanInterface(
+               QNetworkInterface::Ethernet,
+               QStringLiteral("ethernet_3"),
+               QStringLiteral("Meta")),
+           "Clash Meta Ethernet-style adapter must be rejected")
+```
+
+```cpp
+// src/system/DeviceInfoService.h:32-34（修改后）
+// =====wjy====
+static QString physicalLanIpv4ForTarget(const QString& targetIp);
+// ===end====
+```
+
+```cpp
+// src/system/DeviceInfoService.cpp:158-166（修改后）
+// =====wjy====
+const QString adapterSystemName = QString::fromLatin1(adapter->AdapterName ? adapter->AdapterName : "");
+const QString adapterDisplayName = adapter->FriendlyName
+    ? QString::fromWCharArray(adapter->FriendlyName)
+    : QString();
+if (isVirtualLanInterface(QNetworkInterface::Unknown, adapterSystemName, adapterDisplayName)) {
+    continue;
+}
+// ===end====
+```
+
+```cpp
+// src/system/DeviceInfoService.cpp:253-337（修改后，节选）
+QString DeviceInfoService::physicalLanIpv4ForTarget(const QString& targetIp)
+{
+    const QHostAddress targetAddress(targetIp.trimmed());
+    bool targetOk = false;
+    const quint32 targetValue = targetAddress.toIPv4Address(&targetOk);
+    if (targetOk && targetAddress.isLoopback()) return targetAddress.toString();
+
+    static std::mutex cacheMutex;
+    static QList<Candidate> cachedCandidates;
+    std::lock_guard cacheLock(cacheMutex);
+    if (!cacheInitialized || now >= cacheExpiresAt) {
+        cacheExpiresAt = now + std::chrono::seconds(3);
+        cachedCandidates.clear();
+        const QString preferredIp = currentDeviceInfo().ip.trimmed();
+        // 枚举并缓存已启用的物理 IPv4；排除 Meta、VPN、VMware 和 Hyper-V。
+    }
+    for (const Candidate& candidate : cachedCandidates) {
+        // 同网段得分 100000，主物理接口得分 10000，RFC1918 地址得分 1000。
+    }
+    return selectedIp;
+}
+```
+
+```cpp
+// src/system/DeviceCommandService.cpp:59-77（修改后）
+bool configureLanTcpSocket(QTcpSocket& socket, const QString& hostIp, QString* errorMessage)
+{
+    socket.setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
+    const QString sourceIp = DeviceInfoService::physicalLanIpv4ForTarget(hostIp);
+    if (sourceIp.isEmpty()) return true;
+    if (!socket.bind(QHostAddress(sourceIp), 0)) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("无法绑定局域网源地址 %1：%2")
+                .arg(sourceIp, socket.errorString().trimmed());
+        }
+        return false;
+    }
+    writeCommandServerLog(QStringLiteral("[wjy-command] bound source=%1 target=%2")
+        .arg(sourceIp, hostIp.trimmed()));
+    return true;
+}
+```
+
+```cpp
+// src/system/DeviceCommandService.cpp:243-248（修改后，其余五处相同策略）
+QTcpSocket socket;
+if (!configureLanTcpSocket(socket, hostIp, errorMessage)) {
+    if (transportError) *transportError = socket.error();
+    return false;
+}
+socket.connectToHost(hostIp.trimmed(), port);
+```
+
+```cpp
+// src/system/DeviceStatusService.cpp:45-57,329-333（修改后）
+bool configureLanStatusSocket(QTcpSocket& socket, const QString& hostIp)
+{
+    socket.setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
+    const QString sourceIp = DeviceInfoService::physicalLanIpv4ForTarget(hostIp);
+    if (sourceIp.isEmpty()) return true;
+    return socket.bind(QHostAddress(sourceIp), 0);
+}
+
+QTcpSocket socket;
+if (!configureLanStatusSocket(socket, hostIp)) return info;
+socket.connectToHost(hostIp.trimmed(), port);
+```
+
+### Steps
+1. 在共享虚拟网卡策略中精确识别名称为 `Meta` 的适配器，并增加不依赖真实网卡环境的策略测试。
+2. 在 Windows 主设备信息枚举中复用虚拟网卡策略，防止 `GetBestInterfaceEx()` 指向 `Meta` 时把 `198.18.0.1` 选为主局域网地址。
+3. 新增目标感知的物理 IPv4 选择：目标同网段时选对应接口，跨网段时选带真实网关的主物理接口，同时保留 `127.0.0.1` 回环测试。
+4. 为物理接口列表增加三秒线程安全快照，使最多八个并发状态探测线程只触发一次 `GetAdaptersAddresses()` 和 `QNetworkInterface::allInterfaces()` 枚举。
+5. 在六个 49102 客户端入口的 `connectToHost()` 前调用 `QTcpSocket::bind()`，绑定失败时停止发送并反馈中文原因。
+6. 让 49101 状态查询复用相同出口，避免命令已恢复但设备状态仍被 `Meta` 制造成离线。
+7. 在 49102 诊断日志记录实际 `source` 和 `target`，后续可直接确认 CLTEST 是否使用 `192.168.1.154` 而不是 `198.18.0.1`。
+8. 检查 49100 Viewer 后确认其属于原生 Winsock/DLL 独立链路；本次身份登记修复不扩大其 ABI 和音视频连接范围，待 49102 实机回归后再按实际结果处理。
+
+### Verification
+- 故障现场已验证：CLTEST 未绑定 TCP 源地址时显示 `LOCAL=198.18.0.1`，四类 49102 命令均收到零字节 EOF。
+- 故障现场已验证：同一测试显式绑定 `192.168.1.154` 后，`device_sync` 返回 `ok\n`、`update_status` 返回 `complete\n`、`input_script_status` 返回完整状态数据。
+- 已执行 `git diff --check`，未发现空白错误。
+- 已使用 `rg` 确认 `configureLanTcpSocket(socket, hostIp, ...)` 共六个调用点，旧的无目标参数调用为 0。
+- 已使用 `rg` 确认 49101 查询也已传入目标 IP，旧的 `configureLanStatusSocket(socket)` 调用为 0。
+- 已静态核对并发刷新路径最多启动八个 worker；物理网卡快照由互斥锁保护并在三秒内复用，单轮刷新不会按设备数重复枚举网卡。
+- 按用户要求未执行构建、链接或运行测试；新增策略测试已写入源码但未编译运行。

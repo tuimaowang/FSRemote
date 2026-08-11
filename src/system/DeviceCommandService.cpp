@@ -13,6 +13,7 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QHostAddress>
 #include <QNetworkProxy>
 #include <QPointer>
 #include <QProcess>
@@ -55,9 +56,24 @@ void writeCommandServerLog(const QString& message)
 // ===end====
 
 // =====wjy====
-void configureLanTcpSocket(QTcpSocket& socket)
+bool configureLanTcpSocket(QTcpSocket& socket, const QString& hostIp, QString* errorMessage = nullptr)
 {
     socket.setProxy(QNetworkProxy(QNetworkProxy::NoProxy)); // wjy: 设备命令只连接局域网目标，强制绕过 Clash、PAC 和 Qt 默认代理，避免原始 TCP 被无效代理类型拦截。
+    const QString sourceIp = DeviceInfoService::physicalLanIpv4ForTarget(hostIp); // wjy: NoProxy 只绕过 Qt 代理，仍需选出真实物理 IPv4 才能绕过 Windows Meta/TUN 默认路由。
+    if (sourceIp.isEmpty()) {
+        return true; // wjy: 没有可识别物理地址时保留系统默认连接能力，兼容非 Windows 或特殊单网卡环境。
+    }
+    if (!socket.bind(QHostAddress(sourceIp), 0)) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("无法绑定局域网源地址 %1：%2").arg(sourceIp, socket.errorString().trimmed()); // wjy: 绑定失败明确反馈，禁止静默回退到可能错误的 Meta 出口。
+        }
+        writeCommandServerLog(QStringLiteral("[wjy-command] bind failed source=%1 target=%2 error=%3")
+            .arg(sourceIp, hostIp.trimmed(), socket.errorString().trimmed()));
+        return false;
+    }
+    writeCommandServerLog(QStringLiteral("[wjy-command] bound source=%1 target=%2")
+        .arg(sourceIp, hostIp.trimmed())); // wjy: 授权失败时日志直接显示实际源 IP，便于确认是否已避开 198.18.0.1。
+    return true;
 }
 // ===end====
 
@@ -225,7 +241,10 @@ bool sendCommandPayload(
     }
 
     QTcpSocket socket;
-    configureLanTcpSocket(socket); // wjy: 公钥授权、改名和列表同步等统一命令必须直连目标 49102。
+    if (!configureLanTcpSocket(socket, hostIp, errorMessage)) {
+        if (transportError) *transportError = socket.error();
+        return false; // wjy: 物理源地址绑定失败时不允许无绑定重试，避免命令再次被 Meta/TUN 截走。
+    }
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)) {
         if (transportError) *transportError = socket.error();
@@ -289,7 +308,9 @@ bool sendCommandAndReadReply(
         return false;
     }
     QTcpSocket socket;
-    configureLanTcpSocket(socket);
+    if (!configureLanTcpSocket(socket, hostIp, errorMessage)) {
+        return false; // wjy: 截图和键鼠脚本命令与授权命令使用同一物理出口约束。
+    }
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)
         || socket.write(payload) != payload.size()
@@ -815,7 +836,9 @@ bool DeviceCommandService::send(const QString& hostIp, DeviceControlAction actio
     }
 
     QTcpSocket socket;
-    configureLanTcpSocket(socket); // wjy: 关机和重启命令不经过任何应用层代理，失败时返回真实局域网连接结果。
+    if (!configureLanTcpSocket(socket, hostIp)) {
+        return false; // wjy: 无法绑定真实局域网源地址时不发送关机或重启命令。
+    }
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)) {
         return false;
@@ -852,7 +875,9 @@ RemoteUpdateRequestResult DeviceCommandService::requestUpdate(
     }
 
     QTcpSocket socket;
-    configureLanTcpSocket(socket); // wjy: 用户明确触发的远程更新直接连接目标命令端口，不受系统代理开关影响。
+    if (!configureLanTcpSocket(socket, hostIp, errorMessage)) {
+        return RemoteUpdateRequestResult::Failed; // wjy: 更新请求同样禁止通过 Meta/TUN 虚拟默认路由发送。
+    }
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)) {
         if (errorMessage) *errorMessage = socket.errorString().trimmed();
@@ -904,7 +929,9 @@ RemoteUpdateStatus DeviceCommandService::queryUpdateStatus(const QString& hostIp
     }
 
     QTcpSocket socket;
-    configureLanTcpSocket(socket); // wjy: 更新状态查询与更新请求使用相同直连策略，避免查询和执行得到不同网络结果。
+    if (!configureLanTcpSocket(socket, hostIp, errorMessage)) {
+        return RemoteUpdateStatus::Unreachable; // wjy: 状态查询与更新请求保持相同物理出口，避免两条路径结果不一致。
+    }
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)) {
         if (errorMessage) *errorMessage = socket.errorString().trimmed();
@@ -963,7 +990,9 @@ bool DeviceCommandService::sendWakeProxy(const QString& hostIp, const QString& m
     }
 
     QTcpSocket socket;
-    configureLanTcpSocket(socket); // wjy: 远程开机代理命令固定走局域网直连，不向代理暴露目标 IP 和 MAC 信息。
+    if (!configureLanTcpSocket(socket, hostIp, errorMessage)) {
+        return false; // wjy: 代发开机包也必须从真实局域网网卡连接代理设备。
+    }
     socket.connectToHost(hostIp.trimmed(), port);
     if (!socket.waitForConnected(timeoutMs)) {
         if (errorMessage) {

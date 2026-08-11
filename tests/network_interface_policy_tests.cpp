@@ -28,6 +28,11 @@ bool virtualAdaptersAreRejectedWithoutHidingPhysicalLanAdapters()
                       QStringLiteral("vEthernet (Default Switch)"),
                       QStringLiteral("Hyper-V Virtual Ethernet Adapter")),
                   "Hyper-V switch adapter must be rejected")
+        && expect(platform::isVirtualLanInterface(
+                       QNetworkInterface::Ethernet,
+                       QStringLiteral("ethernet_3"),
+                       QStringLiteral("Meta")),
+                   "Clash Meta Ethernet-style adapter must be rejected")
         && expect(!platform::isVirtualLanInterface(
                        QNetworkInterface::Ethernet,
                        QStringLiteral("ethernet_1"),

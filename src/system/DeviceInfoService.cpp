@@ -1,6 +1,10 @@
 #include "system/DeviceInfoService.h"
+#include "system/NetworkInterfacePolicy.h"
 
 #include <QHostAddress>
+
+#include <chrono>
+#include <mutex>
 
 #if defined(Q_OS_WIN)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -154,6 +158,15 @@ DeviceInfo currentDeviceInfo()
         if (adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK || adapter->IfType == IF_TYPE_TUNNEL) {
             continue;
         }
+        // =====wjy====
+        const QString adapterSystemName = QString::fromLatin1(adapter->AdapterName ? adapter->AdapterName : ""); // wjy: Windows 内部适配器名用于识别被伪装成 Ethernet 的代理/TUN 网卡。
+        const QString adapterDisplayName = adapter->FriendlyName
+            ? QString::fromWCharArray(adapter->FriendlyName)
+            : QString(); // wjy: 友好名称能直接识别现场名为 Meta 的虚拟出口。
+        if (isVirtualLanInterface(QNetworkInterface::Unknown, adapterSystemName, adapterDisplayName)) {
+            continue; // wjy: 默认路由即使指向 Meta，也禁止它获得最高分并成为本机主局域网地址。
+        }
+        // ===end====
         if (adapter->PhysicalAddressLength < 6) {
             continue;
         }
@@ -235,5 +248,93 @@ DeviceInfo DeviceInfoService::local()
 {
     return currentDeviceInfo();
 }
+
+// =====wjy====
+QString DeviceInfoService::physicalLanIpv4ForTarget(const QString& targetIp)
+{
+    const QHostAddress targetAddress(targetIp.trimmed()); // wjy: 当前协议传入 IPv4；解析失败时仍可回退到主物理局域网地址。
+    bool targetOk = false;
+    const quint32 targetValue = targetAddress.toIPv4Address(&targetOk);
+    if (targetOk && targetAddress.isLoopback()) {
+        return targetAddress.toString(); // wjy: 本机回环测试必须继续绑定 127.0.0.1，不能错误改走物理网卡。
+    }
+
+    struct Candidate {
+        QString ip;
+        quint32 address = 0;
+        quint32 netmask = 0;
+        int baseScore = 0;
+    };
+    static std::mutex cacheMutex; // wjy: 设备刷新最多并发八个线程，网卡枚举必须串行刷新同一份短期快照。
+    static QList<Candidate> cachedCandidates;
+    static bool cacheInitialized = false;
+    static std::chrono::steady_clock::time_point cacheExpiresAt;
+
+    std::lock_guard cacheLock(cacheMutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (!cacheInitialized || now >= cacheExpiresAt) {
+        cacheInitialized = true;
+        cacheExpiresAt = now + std::chrono::seconds(3); // wjy: 一轮并发状态刷新复用一次枚举，插拔/切换网卡最迟三秒后重新选择。
+        cachedCandidates.clear();
+        const QString preferredIp = currentDeviceInfo().ip.trimmed(); // wjy: 快照刷新时只调用一次较重的 Windows 适配器枚举，避免每台设备重复 GetAdaptersAddresses。
+        for (const QNetworkInterface& networkInterface : QNetworkInterface::allInterfaces()) {
+            const auto flags = networkInterface.flags();
+            if (!flags.testFlag(QNetworkInterface::IsUp)
+                || !flags.testFlag(QNetworkInterface::IsRunning)
+                || flags.testFlag(QNetworkInterface::IsLoopBack)
+                || flags.testFlag(QNetworkInterface::IsPointToPoint)
+                || isVirtualLanInterface(
+                    networkInterface.type(),
+                    networkInterface.name(),
+                    networkInterface.humanReadableName())) {
+                continue; // wjy: 只允许当前可用的真实局域网接口进入快照，排除 VPN、Meta、VMware 和 Hyper-V。
+            }
+
+            for (const QNetworkAddressEntry& entry : networkInterface.addressEntries()) {
+                bool localOk = false;
+                const quint32 localValue = entry.ip().toIPv4Address(&localOk);
+                if (!localOk
+                    || localValue == 0
+                    || entry.ip().isLoopback()
+                    || (localValue >> 16) == ((169u << 8) | 254u)) {
+                    continue; // wjy: 跳过 IPv6、空地址、回环和 APIPA，避免缓存无法访问目标设备的临时地址。
+                }
+
+                Candidate candidate;
+                candidate.ip = QHostAddress(localValue).toString();
+                candidate.address = localValue;
+                bool maskOk = false;
+                candidate.netmask = entry.netmask().toIPv4Address(&maskOk);
+                if (!maskOk) candidate.netmask = 0;
+                if (!preferredIp.isEmpty() && candidate.ip == preferredIp) {
+                    candidate.baseScore += 10000; // wjy: 跨网段访问 A10 等设备时优先使用 Windows 主物理局域网接口及其真实网关。
+                }
+                if (isPrivateIpv4(localValue)) {
+                    candidate.baseScore += 1000; // wjy: FSRemote 设备地址属于 RFC1918，私有物理地址优先于其它非局域网地址。
+                }
+                if (flags.testFlag(QNetworkInterface::CanBroadcast)) {
+                    candidate.baseScore += 100; // wjy: 可广播接口更符合有线/无线局域网特征，但不会覆盖主接口优先级。
+                }
+                cachedCandidates.append(candidate); // wjy: 快照仅保存选择所需字段，不持有 QNetworkInterface 系统资源。
+            }
+        }
+    }
+
+    QString selectedIp;
+    int selectedScore = -1;
+    for (const Candidate& candidate : cachedCandidates) {
+        int score = candidate.baseScore;
+        if (targetOk && candidate.netmask != 0
+            && (candidate.address & candidate.netmask) == (targetValue & candidate.netmask)) {
+            score += 100000; // wjy: 目标与某块物理网卡同网段时直接选择该接口，不受其它默认网关优先级影响。
+        }
+        if (score > selectedScore) {
+            selectedScore = score;
+            selectedIp = candidate.ip; // wjy: 每个目标只对轻量快照评分，后续 QTcpSocket 在 connectToHost 前绑定该源 IP。
+        }
+    }
+    return selectedIp;
+}
+// ===end====
 
 } // namespace platform
