@@ -10001,7 +10001,7 @@ void DeviceGrid::refreshRemoteMonitorMode(bool advancePage)
         const int deviceIndex = deviceIndexes.at(index);
         const QString key = remoteMonitorDeviceKey(deviceIndex);
         if (key.isEmpty()) continue;
-        pageDeviceIndexes.append(deviceIndex); // wjy: 4宫格当前页最多分配4个设备，剩余固定槽位保持隐藏且不连接视频。
+        pageDeviceIndexes.append(deviceIndex); // wjy: 当前页最多分配宫格容量对应的设备，剩余固定槽位保留原位置并清空视频源。
     }
 
     QVector<QString> authorizationIds;
@@ -10041,13 +10041,37 @@ void DeviceGrid::refreshRemoteMonitorMode(bool advancePage)
     for (int slotIndex = 0; slotIndex < m_remoteMonitorSlots.size(); ++slotIndex) {
         RemoteMonitorSlot& slot = m_remoteMonitorSlots[slotIndex];
         RemoteMonitorWindow* remoteWindow = slot.window.data();
-        if (!remoteWindow || remoteWindow->isClosingConnection()) continue;
+        if (!remoteWindow) continue;
+
+        // =====wjy====
+        const int row = slotIndex / columnCount; // wjy: 槽位序号永久映射到固定行，轮询只更换该位置内部的视频源。
+        const int column = slotIndex % columnCount; // wjy: 槽位序号永久映射到固定列，不跟随当前设备页重新排列窗口对象。
+        QRect target(
+            availableRect.x() + column * tileWidth,
+            availableRect.y() + row * tileHeight,
+            tileWidth,
+            tileHeight); // wjy: 每个槽位使用稳定的桌面宫格矩形，空槽和等待授权槽也保留相同外壳位置。
+        if (column == columnCount - 1) {
+            target.setRight(availableRect.right()); // wjy: 最后一列吸收整数除法余量，避免桌面右侧留下缝隙。
+        }
+        if (row == rowCount - 1) {
+            target.setBottom(availableRect.bottom()); // wjy: 最后一行吸收整数除法余量，避免桌面底部留下缝隙。
+        }
+        if (remoteWindow->geometry() != target) {
+            remoteWindow->setGeometry(target); // wjy: 只有屏幕或宫格配置导致目标矩形变化时才触发原生窗口定位，普通轮询不重复SetWindowPos。
+        }
+        if (!remoteWindow->isVisible()) {
+            remoteWindow->show(); // wjy: 固定槽位只在首次创建或异常隐藏后的恢复时显示，不在每轮切源时重新显示顶层窗口。
+            remoteWindow->raise(); // wjy: 首次展示时按槽位顺序建立一次层级；后续轮询不再抢占Z序或制造重新开窗的视觉效果。
+        }
+        // ===end====
+
+        if (remoteWindow->isClosingConnection()) continue;
 
         if (slotIndex >= pageDeviceIndexes.size()) {
             slot.deviceKey.clear();
             remoteWindow->clearSource();
-            remoteWindow->hide(); // wjy: 最后一页不足宫格容量时空槽停止Viewer并隐藏，但窗口对象和累计计时继续保留供下一轮复用。
-            continue;
+            continue; // wjy: 最后一页的空槽仅停止Viewer并显示等待状态，窗口外壳、位置、层级和累计计时全部保持不变。
         }
 
         const int deviceIndex = pageDeviceIndexes.at(slotIndex);
@@ -10057,8 +10081,7 @@ void DeviceGrid::refreshRemoteMonitorMode(bool advancePage)
         if (!m_authorizedRemoteControlIps.contains(ip)) {
             slot.deviceKey.clear();
             remoteWindow->clearSource();
-            remoteWindow->hide(); // wjy: 授权尚未完成时不继续显示上一页设备，回调只需重新刷新即可填入同一槽位。
-            continue;
+            continue; // wjy: 授权等待期间清除上一设备画面但不隐藏槽位，回调只在同一窗口内部接入新Viewer。
         }
 
         if (slot.deviceKey != key
@@ -10067,28 +10090,10 @@ void DeviceGrid::refreshRemoteMonitorMode(bool advancePage)
             slot.deviceKey = key;
             remoteWindow->switchSource(deviceDisplayName(device), ip); // wjy: 页切换只替换槽位内部Viewer，顶层窗口、D3D表面和会话计时器保持不变。
         }
-
-        const int row = slotIndex / columnCount;
-        const int column = slotIndex % columnCount;
-        QRect target(
-            availableRect.x() + column * tileWidth,
-            availableRect.y() + row * tileHeight,
-            tileWidth,
-            tileHeight);
-        if (column == columnCount - 1) {
-            target.setRight(availableRect.right());
-        }
-        if (row == rowCount - 1) {
-            target.setBottom(availableRect.bottom());
-        }
-        remoteWindow->showNormal();
-        remoteWindow->setGeometry(target);
-        remoteWindow->show();
-        remoteWindow->raise(); // wjy: 当前页设备始终占用固定槽位位置，轮询不会产生新窗口闪烁或系统层级重新注册。
     }
 
     if (deviceIndexes.isEmpty()) {
-        m_remoteMonitorPageIndex = 0; // wjy: 无设备时全部固定槽位已经清源并隐藏，保留模式等待后续设备上线。
+        m_remoteMonitorPageIndex = 0; // wjy: 无设备时全部固定槽位保持可见等待状态，后续设备上线只向现有窗口接入视频源。
     }
     requestRemoteQualityEvaluation();
     update(titlebarBandwidthUpdateRect());

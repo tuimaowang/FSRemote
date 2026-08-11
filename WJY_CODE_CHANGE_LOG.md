@@ -13166,6 +13166,7 @@ assert(menuOpen != normal);
 - 已使用 `rg` 确认新增菜单函数只更新 `m_qualityPreviewText`，没有新增 `remoteQualityInputsChanged()` 调用。
 - 已静态核对原生标题栏和 `FSREMOTE_LEGACY_PARENT_TITLE_BAR` 回退路径均绘制新按钮。
 - 按用户要求，本次未构建、未链接、未运行测试或启动程序。
+
 - 用户在 `src/stream/RemoteVideoPolicy.h` 中单独修改的360档参数不属于本次前端任务，未改动且不会随本次提交暂存。
 
 ## 2026-08-10 17:04 - 精简画质菜单并增加高带宽确认
@@ -14386,4 +14387,98 @@ for (int slotIndex = 0; slotIndex < m_remoteMonitorSlots.size(); ++slotIndex) {
 - 已静态核对 `m_sessionClock.start()` 只在窗口构造阶段调用，监控切源路径没有重启或重置计时器。
 - 已静态核对旧 Viewer 代际在切源前失效，并且新 Viewer 只在旧 stop 完成后启动。
 - 已静态核对槽位构造完成后不再逐窗口调用 `refreshRemoteMonitorMode()`，避免大宫格首次开启产生重复事件队列。
+- 按用户要求，本次未构建、未链接、未运行测试或启动程序。
+
+## 2026-08-11 11:57 - 固定监控窗口显示状态并移除轮询重显
+
+### Changed Location
+- `src/ui/DeviceGrid.cpp:10004`：更新当前页设备集合说明，明确未分配槽位保留固定窗口位置。
+- `src/ui/DeviceGrid.cpp:10041-10096`：把宫格布局与视频源分配分离，监控窗口只在首次展示时显示，轮询期间不再隐藏、恢复或重复置顶。
+
+### Reason
+固定槽位版本虽然只在 `ensureRemoteMonitorWindowSlots()` 中创建 `RemoteMonitorWindow`，但每轮刷新仍对当前页窗口执行 `showNormal()`、`show()` 和 `raise()`；最后一页空槽与等待授权槽还会先 `hide()`，下一页再重新显示。顶层窗口对象没有重新 `new`，但 Windows 层面的反复重显、恢复和调整 Z 序会产生类似重新创建窗口的闪烁和抢焦点效果。
+
+本次让宫格容量对应的窗口外壳在首次创建后持续可见并固定在原槽位。30 秒轮询只调用 `switchSource()` 或 `clearSource()` 更换窗口内部 Viewer；仅当屏幕或宫格配置使目标矩形实际变化时才重新设置窗口几何。
+
+### Original Code
+```cpp
+// src/ui/DeviceGrid.cpp:10041-10087（修改前）
+RemoteMonitorWindow* remoteWindow = slot.window.data();
+if (!remoteWindow || remoteWindow->isClosingConnection()) continue;
+
+if (slotIndex >= pageDeviceIndexes.size()) {
+    slot.deviceKey.clear();
+    remoteWindow->clearSource();
+    remoteWindow->hide();
+    continue;
+}
+
+// 分配视频源后，每轮都会重新恢复、定位、显示和置顶窗口。
+remoteWindow->showNormal();
+remoteWindow->setGeometry(target);
+remoteWindow->show();
+remoteWindow->raise();
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:10057-10061（修改前）
+if (!m_authorizedRemoteControlIps.contains(ip)) {
+    slot.deviceKey.clear();
+    remoteWindow->clearSource();
+    remoteWindow->hide();
+    continue;
+}
+```
+
+### Modified Code
+```cpp
+// src/ui/DeviceGrid.cpp:10041-10069（修改后）
+RemoteMonitorWindow* remoteWindow = slot.window.data();
+if (!remoteWindow) continue;
+
+const int row = slotIndex / columnCount;
+const int column = slotIndex % columnCount;
+QRect target(
+    availableRect.x() + column * tileWidth,
+    availableRect.y() + row * tileHeight,
+    tileWidth,
+    tileHeight);
+if (remoteWindow->geometry() != target) {
+    remoteWindow->setGeometry(target);
+}
+if (!remoteWindow->isVisible()) {
+    remoteWindow->show();
+    remoteWindow->raise();
+}
+
+if (remoteWindow->isClosingConnection()) continue;
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:10071-10084（修改后）
+if (slotIndex >= pageDeviceIndexes.size()) {
+    slot.deviceKey.clear();
+    remoteWindow->clearSource();
+    continue;
+}
+
+if (!m_authorizedRemoteControlIps.contains(ip)) {
+    slot.deviceKey.clear();
+    remoteWindow->clearSource();
+    continue;
+}
+```
+
+### Steps
+1. 将每个槽位的行列映射和目标矩形计算移动到视频源分配之前，使空槽、授权等待槽和在线槽都使用固定位置。
+2. 为 `setGeometry()` 增加矩形变化判断，普通轮询不再重复触发原生窗口定位。
+3. 删除轮询路径中的 `showNormal()`，并把 `show()`、`raise()` 限制为窗口首次展示或异常隐藏后的恢复路径。
+4. 删除空槽和授权等待路径中的 `hide()`，仅清理旧 Viewer，让窗口外壳持续显示“等待监控设备”。
+5. 保留关闭监控模式和宫格容量缩小时的既有窗口关闭逻辑，这两种显式场景仍会释放不再需要的槽位。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已使用 `rg` 确认 `new RemoteMonitorWindow` 仍只存在于 `ensureRemoteMonitorWindowSlots()`。
+- 已使用 `rg` 确认 `refreshRemoteMonitorMode()` 中不存在 `hide()` 和 `showNormal()`，`show()`、`raise()` 只位于 `!isVisible()` 首次展示分支。
+- 已静态核对轮询换页继续复用 `switchSource()`，空槽继续复用 `clearSource()`，均不会销毁 `RemoteMonitorWindow`。
 - 按用户要求，本次未构建、未链接、未运行测试或启动程序。
