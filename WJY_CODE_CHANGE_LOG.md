@@ -14564,3 +14564,84 @@ if (!screen) {
 - 已静态核对主窗口从 A 屏移动到 B 屏时，保存的 `m_remoteMonitorScreenName` 不会改变，轮询继续使用 A 屏几何。
 - 已静态核对锁定显示器失效后才会执行回退并更新名称，避免窗口落在已经断开的屏幕区域。
 - 按用户要求，本次未构建、未链接、未运行测试或启动程序。
+
+## 2026-08-11 13:48 - 监控轮询仅保留指定 Busy 设备
+
+### Changed Location
+- `src/ui/DeviceGrid.cpp:1417-1438`：新增可手动维护的监控排除白名单，以及英文首字母和白名单匹配辅助函数。
+- `src/ui/DeviceGrid.cpp:9880-9903`：将轮询候选集改为只接受符合名称规则的 Busy 设备。
+- `src/ui/DeviceGrid.h:202-205`：同步更新监控刷新与候选集接口说明。
+
+### Reason
+原监控集合同时包含 `Online` 和 `Busy` 设备，会查看大量当前没有被控制的普通在线电脑。用户要求监控模式只轮询已经被控的 Busy 设备，同时排除名称以英文字母开头的设备，并提供一个后续可直接修改源码的设备名名单，名单中的设备即使 Busy 也不参与轮询。
+
+本次把用户所称的“白名单”实现为排除白名单。名单按最终界面显示设备名执行完整匹配并忽略英文大小写；英文开头规则只识别 ASCII `A-Z` 和 `a-z`，不会把中文、数字或其它字符开头的名称误判为英文。
+
+### Original Code
+```cpp
+// src/ui/DeviceGrid.cpp:9860-9869（修改前）
+for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+    const DeviceEntry& device = g_devices.at(deviceIndex);
+    const QString ip = device.ip.trimmed();
+    const platform::DevicePresenceState presence = devicePresenceForIndex(deviceIndex);
+    if (ip.isEmpty() || deviceRecordMatchesLocal(device)
+        || (presence != platform::DevicePresenceState::Online
+            && presence != platform::DevicePresenceState::Busy)) {
+        continue;
+    }
+    indexes.append(deviceIndex);
+}
+```
+
+### Modified Code
+```cpp
+// src/ui/DeviceGrid.cpp:1417-1438（修改后）
+const QStringList kRemoteMonitorExclusionWhitelist = {
+    // QStringLiteral("这里填写不参与监控轮询的完整设备名"),
+};
+
+bool remoteMonitorNameStartsWithEnglishLetter(const QString& deviceName)
+{
+    const QString normalizedName = deviceName.trimmed();
+    if (normalizedName.isEmpty()) return false;
+    const QChar firstCharacter = normalizedName.front();
+    return (firstCharacter >= QLatin1Char('A') && firstCharacter <= QLatin1Char('Z'))
+        || (firstCharacter >= QLatin1Char('a') && firstCharacter <= QLatin1Char('z'));
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:9884-9903（修改后）
+const DeviceEntry& device = g_devices.at(deviceIndex);
+const QString ip = device.ip.trimmed();
+const platform::DevicePresenceState presence = devicePresenceForIndex(deviceIndex);
+const QString displayName = deviceDisplayName(device);
+if (ip.isEmpty() || deviceRecordMatchesLocal(device)) {
+    continue;
+}
+if (presence != platform::DevicePresenceState::Busy) {
+    continue;
+}
+if (remoteMonitorNameStartsWithEnglishLetter(displayName)) {
+    continue;
+}
+if (remoteMonitorNameIsWhitelistedForExclusion(displayName)) {
+    continue;
+}
+indexes.append(deviceIndex);
+```
+
+### Steps
+1. 在设备显示名辅助函数旁增加空的 `kRemoteMonitorExclusionWhitelist` 数组，并保留可直接复制修改的示例项。
+2. 增加 ASCII 英文首字母判断，名称首字符为 `A-Z` 或 `a-z` 时排除。
+3. 增加排除白名单完整名称匹配，去除首尾空格并忽略英文大小写。
+4. 将设备状态条件从 `Online || Busy` 收紧为仅 `Busy`。
+5. 保留有效 IP、本机排除、稳定自然排序、分页和固定槽位切源逻辑。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已使用 `rg` 确认候选集仅接受 `DevicePresenceState::Busy`，不再接受普通 `Online`。
+- 已静态核对英文首字母过滤只覆盖 ASCII 英文字母，中文和数字开头的 Busy 设备仍可进入轮询。
+- 已静态核对白名单使用最终显示名称完整匹配，默认空数组不会排除任何额外设备。
+- 已确认本次只准备提交 `DeviceGrid.cpp`、`DeviceGrid.h` 和 `WJY_CODE_CHANGE_LOG.md`，不会包含用户当前对输入脚本和 WebRTC 文件的未提交修改。
+- 按用户要求，本次未构建、未链接、未运行测试或启动程序。

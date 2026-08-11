@@ -199,10 +199,10 @@ private:
     void toggleRemoteWindowTiling();
     void toggleRemoteMonitorMode(); // wjy: 主窗口标题栏按钮开启独立设备轮询或关闭全部监控窗口，普通远控窗口不参与切换。
     void setRemoteMonitorModeEnabled(bool enabled); // wjy: 统一管理监控设备扫描、分页定时器和独立只读Viewer生命周期。
-    void refreshRemoteMonitorMode(bool advancePage); // wjy: 从全部在线设备中选出当前页，把目标顺序分配给固定宫格槽位并只切换Viewer视频源。
+    void refreshRemoteMonitorMode(bool advancePage); // wjy: 从符合Busy、名称和排除白名单规则的设备中选出当前页，并只切换固定槽位Viewer视频源。
     void applyRemoteMonitorQualityPreset(); // wjy: 将设置页监控画质只同步到独立监控窗口，普通远控保留自身自动或手选档。
     int titlebarRemoteSessionCount() const; // wjy: 标题栏显示普通远控会话数加当前页监控Viewer数，宫格容量直接限制监控增量。
-    QVector<int> remoteMonitorDeviceIndexes() const; // wjy: 返回所有在线/占用且具有有效IP的非本机设备，并使用稳定自然名称顺序轮询。
+    QVector<int> remoteMonitorDeviceIndexes() const; // wjy: 仅返回Busy且名称非英文开头、未进入排除白名单的有效远端设备，并按稳定自然名称轮询。
     QString remoteMonitorDeviceKey(int deviceIndex) const; // wjy: 优先使用设备稳定ID，兼容旧记录时回退规范化IP作为固定槽位的当前来源键。
     void ensureRemoteMonitorWindowSlots(int slotCount); // wjy: 仅在开启监控或宫格容量变化时增减专用窗口，普通轮询不会创建新窗口。
     QVector<QPointer<RemoteDesktopWindow>> openedRemoteMonitorWindows() const; // wjy: 清理空指针后返回当前独立监控窗口快照。

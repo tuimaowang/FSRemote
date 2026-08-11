@@ -1413,6 +1413,30 @@ QString deviceDisplayName(const DeviceEntry& device)
     return name.isEmpty() ? device.ip.trimmed() : name;
 }
 
+// =====wjy====
+const QStringList kRemoteMonitorExclusionWhitelist = {
+    // QStringLiteral("这里填写不参与监控轮询的完整设备名"),
+}; // wjy: 后续直接在数组中追加设备名；匹配忽略英文大小写，但必须与界面显示的完整名称一致。
+
+bool remoteMonitorNameStartsWithEnglishLetter(const QString& deviceName)
+{
+    const QString normalizedName = deviceName.trimmed(); // wjy: 使用最终显示名并去掉首尾空格，避免空格掩盖英文首字母。
+    if (normalizedName.isEmpty()) {
+        return false;
+    }
+    const QChar firstCharacter = normalizedName.front();
+    return (firstCharacter >= QLatin1Char('A') && firstCharacter <= QLatin1Char('Z'))
+        || (firstCharacter >= QLatin1Char('a') && firstCharacter <= QLatin1Char('z')); // wjy: 只排除ASCII英文开头，中文、数字和其它字符开头仍可按Busy状态参与轮询。
+}
+
+bool remoteMonitorNameIsWhitelistedForExclusion(const QString& deviceName)
+{
+    return kRemoteMonitorExclusionWhitelist.contains(
+        deviceName.trimmed(),
+        Qt::CaseInsensitive); // wjy: 白名单语义按用户要求为“不参与轮询”，完整名称匹配可避免相似设备被误排除。
+}
+// ===end====
+
 bool proxyWakeCapableState(platform::DevicePresenceState state)
 {
     return state == platform::DevicePresenceState::Online
@@ -9861,11 +9885,21 @@ QVector<int> DeviceGrid::remoteMonitorDeviceIndexes() const
         const DeviceEntry& device = g_devices.at(deviceIndex);
         const QString ip = device.ip.trimmed();
         const platform::DevicePresenceState presence = devicePresenceForIndex(deviceIndex);
-        if (ip.isEmpty() || deviceRecordMatchesLocal(device)
-            || (presence != platform::DevicePresenceState::Online
-                && presence != platform::DevicePresenceState::Busy)) {
-            continue; // wjy: 轮询集合覆盖全部在线/占用远端设备，不受本机已开远控窗口和分组折叠状态限制；本机自身不建立回环视频。
+        const QString displayName = deviceDisplayName(device);
+        // =====wjy====
+        if (ip.isEmpty() || deviceRecordMatchesLocal(device)) {
+            continue; // wjy: 没有有效IP或匹配本机的记录无法建立远端监控Viewer，继续保持原有排除规则。
         }
+        if (presence != platform::DevicePresenceState::Busy) {
+            continue; // wjy: 监控模式现在只查看已经存在普通远控会话的Busy设备，普通Online设备完全不进入轮询页。
+        }
+        if (remoteMonitorNameStartsWithEnglishLetter(displayName)) {
+            continue; // wjy: 最终显示设备名以A-Z或a-z开头时直接排除，不受后续排序和宫格容量影响。
+        }
+        if (remoteMonitorNameIsWhitelistedForExclusion(displayName)) {
+            continue; // wjy: 用户维护的排除白名单拥有最后过滤权，名单中的Busy设备也不会创建或占用监控槽位。
+        }
+        // ===end====
         indexes.append(deviceIndex);
     }
 
