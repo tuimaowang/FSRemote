@@ -699,9 +699,13 @@ struct RemoteTitleBarIdentityLayout {
 RemoteTitleBarIdentityLayout remoteTitleBarIdentityLayout(
     int windowWidth,
     const QString& deviceName,
-    const QString& hostIp)
+    const QString& hostIp,
+    bool allowLogo = true,
+    int trailingReserve = 0)
 {
     RemoteTitleBarIdentityLayout layout;
+    layout.showLogo = allowLogo;
+    layout.textX = allowLogo ? 34 : 8; // wjy: 监控专用标题栏不绘制品牌图标，设备名从8px左边距开始，栏内只保留三项文字。
     layout.font = QFont(QStringLiteral("Microsoft YaHei UI"));
     layout.font.setPixelSize(12);
     const auto textWidth = [&deviceName, &hostIp](const QFont& font) {
@@ -709,7 +713,7 @@ RemoteTitleBarIdentityLayout remoteTitleBarIdentityLayout(
         return metrics.horizontalAdvance(deviceName)
             + (hostIp.isEmpty() ? 0 : 10 + metrics.horizontalAdvance(hostIp));
     };
-    if (layout.textX + textWidth(layout.font) + 6 > windowWidth) {
+    if (layout.showLogo && layout.textX + textWidth(layout.font) + 6 > windowWidth) {
         layout.showLogo = false;
         layout.textX = 6; // wjy: 窄窗口先移除非必要 Logo，为设备名和 IP 尽量保留显示宽度。
     }
@@ -721,6 +725,13 @@ RemoteTitleBarIdentityLayout remoteTitleBarIdentityLayout(
     layout.nameWidth = metrics.horizontalAdvance(deviceName);
     layout.ipX = layout.textX + layout.nameWidth + (hostIp.isEmpty() ? 0 : 10);
     layout.ipWidth = metrics.horizontalAdvance(hostIp);
+    if (trailingReserve > 0) {
+        const int availableWidth = std::max(0, windowWidth - trailingReserve - layout.textX - 6);
+        const int gap = hostIp.isEmpty() ? 0 : 10;
+        layout.ipWidth = std::min(layout.ipWidth, std::max(0, availableWidth - gap));
+        layout.nameWidth = std::min(layout.nameWidth, std::max(0, availableWidth - gap - layout.ipWidth));
+        layout.ipX = layout.textX + layout.nameWidth + gap; // wjy: 监控标题栏为右侧连续计时固定预留空间，超长设备名只在自身矩形内裁切，不覆盖时间。
+    }
     layout.right = std::min(windowWidth - 1, layout.ipX + layout.ipWidth + 6);
     return layout;
 }
@@ -1975,13 +1986,15 @@ RemoteDesktopWindow::RemoteDesktopWindow(
     RemoteViewerLifecycleManager* lifecycleManager,
     RemoteInputBroadcastCoordinator* inputBroadcastCoordinator,
     QWidget* parent,
-    bool monitorReadOnly)
+    bool monitorReadOnly,
+    RemoteDesktopWindowStyle windowStyle)
     : QWidget(parent)
     , m_deviceName(deviceName)
     , m_hostIp(hostIp)
     , m_lifecycleManager(lifecycleManager) // wjy: 生命周期管理器由DeviceGrid统一持有，保证窗口关闭和应用退出期间指针始终有效。
     , m_inputBroadcastCoordinator(inputBroadcastCoordinator) // wjy: 普通与平铺窗口借用同一个协调器，单主控约束覆盖全部远控窗口。
     , m_monitorReadOnly(monitorReadOnly) // wjy: 首次异步启动Viewer之前固定角色，监控连接不会短暂以普通远控身份进入Host。
+    , m_windowStyle(windowStyle) // wjy: 监控槽位从构造开始使用精简标题栏和固定窗口生命周期，普通窗口继续走原完整样式。
     , m_globalQualityConfiguration(platform::AppSettings::remoteQualityConfiguration()) // wjy: 保留全局设置快照兼容接口；精确档位由标题栏手选和固定自动规则决定。
 {
     // =====wjy====
@@ -2227,7 +2240,9 @@ RemoteDesktopWindow::RemoteDesktopWindow(
     }
     // ===end====
     updateNativeTitleBarSurface(true); // wjy: 构造完成后立即提交第一张完整标题栏，窗口首次显示不依赖父QWidget异步paintEvent。
-    QTimer::singleShot(0, this, &RemoteDesktopWindow::startViewerConnection);
+    if (m_windowStyle != RemoteDesktopWindowStyle::Monitor || !m_hostIp.trimmed().isEmpty()) {
+        QTimer::singleShot(0, this, &RemoteDesktopWindow::startViewerConnection); // wjy: 空监控槽位先只创建窗口和持续计时器，分配设备源后才申请Viewer初始化名额。
+    }
     if (!m_monitorReadOnly) {
         QTimer::singleShot(0, this, &RemoteDesktopWindow::requestRemoteInputScriptStatus); // wjy: 普通窗口重开立即直查目标执行器；监控窗口不发送任何脚本控制协议。
     }
@@ -2412,12 +2427,116 @@ bool RemoteDesktopWindow::isWaitingShortcutRelease() const
 // =====wjy====
 QString RemoteDesktopWindow::hostIp() const
 {
-    return m_hostIp.trimmed(); // wjy: 更新操作按窗口固定目标 IP 匹配，不跟随主界面选择变化。
+    return m_hostIp.trimmed(); // wjy: 普通窗口保持固定目标IP；专用监控槽位在安全切源时更新为当前Viewer目标。
 }
 
 QString RemoteDesktopWindow::deviceName() const
 {
-    return m_deviceName.trimmed(); // wjy: 返回创建窗口时固定的设备名，供平铺排序使用。
+    return m_deviceName.trimmed(); // wjy: 普通窗口返回创建时设备名；固定监控槽位返回当前切换到的视频源设备名。
+}
+
+void RemoteDesktopWindow::switchMonitorSource(const QString& deviceName, const QString& hostIp)
+{
+    if (m_windowStyle != RemoteDesktopWindowStyle::Monitor || !m_monitorReadOnly
+        || m_closeInProgress || m_applicationExitInProgress) {
+        return; // wjy: 只有专用只读监控槽位允许换源，普通远控和退出中的窗口不得改变已绑定目标。
+    }
+
+    const QString targetName = deviceName.trimmed();
+    const QString targetIp = hostIp.trimmed();
+    const bool sameTarget = m_hostIp.compare(targetIp, Qt::CaseInsensitive) == 0;
+    if (sameTarget) {
+        if (m_deviceName != targetName) {
+            m_deviceName = targetName;
+            setWindowTitle(m_deviceName);
+            requestTitleBarUpdate(); // wjy: 设备改名但IP未变时只刷新标题文字，不停止已经在线的视频流。
+        }
+        if (!targetIp.isEmpty() && !m_viewerHandle && !m_viewerStopInProgress
+            && !m_viewerStartQueued && !m_viewerStartAdmissionActive) {
+            startViewerConnection(); // wjy: 同一目标此前启动失败或尚未启动时补一次连接，正常在线刷新保持完全无操作。
+        }
+        return;
+    }
+
+    cancelNetworkReconnect(); // wjy: 旧设备的网络退避不得在槽位已切到新IP后重新连接旧Host。
+    m_remoteUpdateState = RemoteUpdateState::None;
+    m_remoteUpdateReconnectRequested = false;
+    m_monitorSourceRestartRequested = !targetIp.isEmpty(); // wjy: 连续轮询期间只保存最新目标；旧Viewer停止后直接读取当前名称和IP启动。
+    m_deviceName = targetName;
+    m_hostIp = targetIp;
+    setWindowTitle(m_deviceName);
+
+    stopFirstFrameWatchdog();
+    invalidateViewerCallbacks(); // wjy: 先推进Viewer代际并清空待呈现帧，旧设备迟到画面无法进入新设备标题下方。
+    m_remoteFrame = QImage();
+    m_remoteTextureSize = QSize();
+    m_textureFrameActive = false;
+    m_hasReceivedVideoInCurrentViewer = false;
+    m_hasPresentedVideoInCurrentViewer = false;
+    m_receiveFps = 0.0;
+    m_encodedMbps = 0.0;
+    m_rawBgraMbps = 0.0;
+    if (m_texturePresenter) {
+        m_texturePresenter->reset(); // wjy: 清掉D3D最后一帧，切源等待期只显示新目标的连接状态，不短暂保留旧设备画面。
+    }
+    m_connectionStatusCode = targetIp.isEmpty() ? 0 : 5;
+    m_connectionStatus = targetIp.isEmpty()
+        ? QString::fromUtf8("等待监控设备")
+        : QString::fromUtf8("正在切换监控设备");
+    requestTitleBarUpdate(); // wjy: 只更新设备名和IP；m_sessionClock不重启，因此槽位时间跨设备切换持续累计。
+    update();
+    if (m_texturePresenter && m_texturePresenter->usesCompositorSurface()) {
+        presentCompositorOverlay();
+    }
+
+    if (m_viewerHandle || m_viewerStopInProgress || m_viewerStartQueued || m_viewerStartAdmissionActive) {
+        stopViewerConnectionAsync(false); // wjy: 旧Viewer必须完成stop后才启动新源，同一槽位不会同时持有两个WebRTC会话。
+        return;
+    }
+    if (m_monitorSourceRestartRequested) {
+        m_monitorSourceRestartRequested = false;
+        startViewerConnection(); // wjy: 空槽首次分配设备时没有旧Viewer可停，直接复用现有初始化准入队列启动新源。
+    }
+}
+
+void RemoteDesktopWindow::clearMonitorSource()
+{
+    switchMonitorSource(QString(), QString()); // wjy: 空槽通过同一代际和异步stop流程清理，窗口计时器与顶层窗口对象继续保留。
+}
+
+bool RemoteDesktopWindow::hasMonitorSource() const
+{
+    return m_windowStyle == RemoteDesktopWindowStyle::Monitor && !m_hostIp.trimmed().isEmpty(); // wjy: 槽位是否计数只取当前目标IP，不把空窗口或旧Viewer停止过程算作监控设备。
+}
+
+RemoteMonitorWindow::RemoteMonitorWindow(
+    RemoteViewerLifecycleManager* lifecycleManager,
+    QWidget* parent)
+    : RemoteDesktopWindow(
+          QString(),
+          QString(),
+          lifecycleManager,
+          nullptr,
+          parent,
+          true,
+          RemoteDesktopWindowStyle::Monitor)
+{
+    setRememberGeometryEnabled(false); // wjy: 监控槽位始终由宫格布局决定位置和尺寸，不读写任何设备的普通远控几何。
+}
+
+void RemoteMonitorWindow::switchSource(const QString& deviceName, const QString& hostIp)
+{
+    switchMonitorSource(deviceName, hostIp);
+}
+
+void RemoteMonitorWindow::clearSource()
+{
+    clearMonitorSource();
+}
+
+bool RemoteMonitorWindow::hasSource() const
+{
+    return hasMonitorSource();
 }
 
 void RemoteDesktopWindow::setRemoteUpdateAvailable(bool available)
@@ -2961,6 +3080,10 @@ void RemoteDesktopWindow::stopViewerConnectionAsync(bool deleteAfterStop)
         releaseViewerStartupAdmission(); // wjy: 没有原生句柄说明初始化尚未开始或已经失败，可立即释放启动预算。
         if (!m_applicationExitInProgress && (m_deleteAfterViewerStop || m_closeInProgress)) {
             deleteLater();
+        } else if (m_monitorSourceRestartRequested && m_windowStyle == RemoteDesktopWindowStyle::Monitor
+            && !m_hostIp.trimmed().isEmpty()) {
+            m_monitorSourceRestartRequested = false;
+            startViewerConnection(); // wjy: 空句柄或排队启动被切源取消后，直接使用槽位最新IP重新进入共享初始化队列。
         } else if (m_remoteUpdateReconnectRequested) {
             startViewerAfterUpdate();
         } else if (m_networkReconnectActive) {
@@ -3023,7 +3146,11 @@ void RemoteDesktopWindow::finishViewerStop(const QString& errorMessage)
         deleteLater();
         return;
     }
-    if (m_remoteUpdateReconnectRequested) {
+    if (m_monitorSourceRestartRequested && m_windowStyle == RemoteDesktopWindowStyle::Monitor
+        && !m_hostIp.trimmed().isEmpty()) {
+        m_monitorSourceRestartRequested = false;
+        startViewerConnection(); // wjy: 旧设备Viewer已完整停止并释放回调上下文后，同一顶层槽位连接最新监控源。
+    } else if (m_remoteUpdateReconnectRequested) {
         startViewerAfterUpdate(); // wjy: stop返回后再申请新的初始化名额，旧回调和新会话不会重叠。
     } else if (m_networkReconnectActive) {
         scheduleNetworkReconnect(); // wjy: 只有旧Viewer析构和工作线程join完成后才允许启动新代际。
@@ -3309,6 +3436,9 @@ bool RemoteDesktopWindow::restoreSavedGeometryForDrag(
 
 RemoteTitleBarLayoutSnapshot RemoteDesktopWindow::titleBarLayoutSnapshot() const
 {
+    if (m_windowStyle == RemoteDesktopWindowStyle::Monitor) {
+        return {}; // wjy: 专用监控标题栏没有更新、画质、键鼠、同步、音频、剪贴板和系统按钮，也不会留下透明点击热区。
+    }
     const RemoteTitleBarIdentityLayout identity = remoteTitleBarIdentityLayout(width(), m_deviceName, m_hostIp);
     return ::ui::remoteTitleBarLayoutSnapshot(
         width(), titleBarHeight(), identity.right, m_remoteUpdateAvailable, kWindowResizeMargin); // wjy: 同一快照同时约束绘制和点击，任何被设备信息覆盖的控件都返回空矩形。
@@ -3326,12 +3456,14 @@ RemoteTitleBarVisualState RemoteDesktopWindow::titleBarVisualState() const
     state.deviceName = m_deviceName;
     state.hostIp = m_hostIp;
     state.connectionStatus = m_connectionStatus;
-    state.networkWarningText = m_networkWarningVisible ? zh("网络不佳") : QString(); // wjy: 原生DIB和DComp完整标题栏都从同一快照取得静态网络提示。
+    state.networkWarningText = m_windowStyle == RemoteDesktopWindowStyle::Control && m_networkWarningVisible
+        ? zh("网络不佳")
+        : QString(); // wjy: 监控标题栏严格只保留设备名、IP和时间，连接提示统一放在视频内容区域。
     // =====wjy====
-    if (m_inputScriptRecording) {
+    if (m_windowStyle == RemoteDesktopWindowStyle::Control && m_inputScriptRecording) {
         state.scriptStatusText = QString::fromUtf8("录制中");
         state.scriptStatusColor = QColor(QStringLiteral("#DC2626")); // wjy: 录制使用稳定红色静态文字，不闪烁也不依赖一秒性能统计刷新。
-    } else if (inputScriptPlaybackActive()) {
+    } else if (m_windowStyle == RemoteDesktopWindowStyle::Control && inputScriptPlaybackActive()) {
         state.scriptStatusText = m_remoteInputScriptStatus.state == platform::RemoteInputScriptState::Preparing
             ? QString::fromUtf8("准备回放")
             : QString::fromUtf8("脚本播放");
@@ -3345,7 +3477,8 @@ RemoteTitleBarVisualState RemoteDesktopWindow::titleBarVisualState() const
         .arg(elapsedSeconds / 3600, 2, 10, QLatin1Char('0'))
         .arg((elapsedSeconds / 60) % 60, 2, 10, QLatin1Char('0'))
         .arg(elapsedSeconds % 60, 2, 10, QLatin1Char('0')); // wjy: 会话计时在状态快照阶段格式化，原生绘制器不读取窗口时钟。
-    if (m_connectionStatusCode == FSREMOTE_STATUS_RECEIVING_VIDEO && !remoteUpdateActive()) {
+    if (m_windowStyle == RemoteDesktopWindowStyle::Control
+        && m_connectionStatusCode == FSREMOTE_STATUS_RECEIVING_VIDEO && !remoteUpdateActive()) {
         const QString fpsText = m_receiveFps > 0.0
             ? QString::number(qRound(m_receiveFps))
             : QStringLiteral("--");
@@ -3357,7 +3490,12 @@ RemoteTitleBarVisualState RemoteDesktopWindow::titleBarVisualState() const
             .arg(bitrateText); // wjy: 去掉数字与单位之间的空格并使用中点分隔，保留FPS/码率语义同时缩短标题栏占用。
     }
 
-    const RemoteTitleBarIdentityLayout identity = remoteTitleBarIdentityLayout(width(), m_deviceName, m_hostIp);
+    const RemoteTitleBarIdentityLayout identity = remoteTitleBarIdentityLayout(
+        width(),
+        m_deviceName,
+        m_hostIp,
+        m_windowStyle != RemoteDesktopWindowStyle::Monitor,
+        m_windowStyle == RemoteDesktopWindowStyle::Monitor ? 78 : 0); // wjy: 监控栏始终为HH:MM:SS保留78px，切源后长名称和IP不会遮住累计时间。
     state.identityShowLogo = identity.showLogo;
     state.identityFont = identity.font;
     state.identityTextX = identity.textX;
@@ -6671,6 +6809,14 @@ void RemoteDesktopWindow::paintEvent(QPaintEvent* event)
 
     painter.fillRect(QRectF(0, 0, width(), barH), QColor(QStringLiteral("#E9EEF2")));
 
+    if (m_windowStyle == RemoteDesktopWindowStyle::Monitor) {
+        const QImage monitorTitleBar = RemoteTitleBarRenderer::render(titleBarVisualState());
+        if (!monitorTitleBar.isNull()) {
+            painter.drawImage(QPoint(0, 0), monitorTitleBar); // wjy: Qt回退路径也只绘制设备名、IP和连续计时，不复用普通远控按钮代码。
+        }
+        return;
+    }
+
     // wjy: 不再绘制覆盖整个远控窗口外沿的浅色圆角描边，避免黑色视频右侧出现明显白边；窗口缩放命中和圆角Mask保持不变。
 
     // =====wjy====
@@ -6961,6 +7107,10 @@ void RemoteDesktopWindow::closeEvent(QCloseEvent* event)
 
 void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
 {
+    if (m_windowStyle == RemoteDesktopWindowStyle::Monitor) {
+        event->accept();
+        return; // wjy: 监控槽位由宫格统一定位，标题栏和画面均不响应本机点击、拖动、缩放或远端输入。
+    }
     emit activated(this);
     // =====wjy====
     if (event->button() == Qt::RightButton && isTitleBarBlankArea(event->pos())) {
@@ -7068,6 +7218,10 @@ void RemoteDesktopWindow::mousePressEvent(QMouseEvent* event)
 // =====wjy====
 void RemoteDesktopWindow::mouseDoubleClickEvent(QMouseEvent* event)
 {
+    if (m_windowStyle == RemoteDesktopWindowStyle::Monitor) {
+        event->accept();
+        return; // wjy: 专用监控窗口禁止双击最大化，轮询过程中始终保持宫格槽位几何。
+    }
     emit activated(this);
     if (event->button() == Qt::LeftButton && isTitleBarBlankArea(event->pos())) {
         // =====wjy====
@@ -7083,6 +7237,10 @@ void RemoteDesktopWindow::mouseDoubleClickEvent(QMouseEvent* event)
 
 void RemoteDesktopWindow::mouseMoveEvent(QMouseEvent* event)
 {
+    if (m_windowStyle == RemoteDesktopWindowStyle::Monitor) {
+        event->accept();
+        return; // wjy: 鼠标经过监控视频时不更新按钮悬停、边缘缩放光标或远端指针位置。
+    }
     // =====wjy====
     if (m_resizingWindow && (event->buttons() & Qt::LeftButton)) {
         if (m_systemWindowOperationActive) {
@@ -7169,6 +7327,10 @@ void RemoteDesktopWindow::mouseMoveEvent(QMouseEvent* event)
 
 void RemoteDesktopWindow::mouseReleaseEvent(QMouseEvent* event)
 {
+    if (m_windowStyle == RemoteDesktopWindowStyle::Monitor) {
+        event->accept();
+        return; // wjy: 监控窗口不产生本地窗体操作或远端按钮抬起事件。
+    }
     if (event->button() == Qt::LeftButton) {
         // =====wjy====
         if (m_qualityButtonPressed) {
@@ -7256,6 +7418,10 @@ void RemoteDesktopWindow::mouseReleaseEvent(QMouseEvent* event)
 
 void RemoteDesktopWindow::wheelEvent(QWheelEvent* event)
 {
+    if (m_windowStyle == RemoteDesktopWindowStyle::Monitor) {
+        event->accept();
+        return; // wjy: 只读监控视频忽略本机滚轮，不占用任何远端输入能力。
+    }
     int x = 0;
     int y = 0;
     if (normalizedRemotePoint(event->position().toPoint(), &x, &y)) {

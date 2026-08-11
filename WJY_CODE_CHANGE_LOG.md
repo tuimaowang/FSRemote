@@ -14184,3 +14184,206 @@ const int controlledSessionCount = titlebarRemoteSessionCount();
 - 已静态核对授权循环和布局循环只遍历 `pageDeviceIndexes`，非当前页不再调用 Viewer 创建或隐藏保活。
 - 已静态核对异步授权回调使用 `currentPageKeys` 拒绝已经轮换出去的设备。
 - 按用户要求，本次未构建、未链接、未运行测试或启动程序。
+
+## 2026-08-11 11:34 - 新增固定槽位监控窗口并改为切换视频源
+
+### Changed Location
+- `src/ui/RemoteDesktopWindow.h:50-67、125-133、342-346、529-541`：新增监控窗口样式、切源接口、切源状态和专用 `RemoteMonitorWindow` 类型。
+- `src/ui/RemoteDesktopWindow.cpp:699-738、1983-2246`：监控标题栏取消 Logo，空槽构造时不启动 Viewer，并让槽位计时从窗口创建后持续运行。
+- `src/ui/RemoteDesktopWindow.cpp:2438-2539、3079-3157`：实现旧 Viewer 安全停止后连接最新 IP 的监控切源状态机。
+- `src/ui/RemoteDesktopWindow.cpp:3437-3507、6812-6820、7110-7425`：监控标题栏仅显示设备名、IP、时间，并屏蔽本机鼠标、拖动、缩放和双击操作。
+- `src/ui/DeviceGrid.h:57、113-118、204-210、335`：使用固定监控槽位替代按设备持有窗口的哈希表。
+- `src/ui/DeviceGrid.cpp:7257-7262、9629-9659、9843-9950、9982-10099`：仅在开启监控或宫格容量变化时增减窗口，普通轮询只调用槽位 `switchSource()`，并合并首次槽位创建后的重复刷新。
+
+### Reason
+上一版虽然把同时连接数限制到了当前宫格页，但每次轮询仍会关闭上一页顶层窗口并为下一页创建新窗口，导致窗口层级、D3D 表面和计时器反复建立。用户要求监控刷新不创建新窗口，只切换视频源，并为监控模式使用单独的精简窗口样式：标题栏只显示设备名、IP 和持续累计时间，切换设备时计时不归零。
+
+本次将监控窗口改为按宫格位置长期存在的固定槽位。不同设备仍必须建立各自的 WebRTC Viewer，但旧连接和新连接在同一个窗口对象内顺序切换；Viewer 代际、回调上下文和停止任务继续复用现有安全生命周期，旧设备迟到帧不会出现在新设备标题下方。
+
+### Original Code
+```cpp
+// src/ui/RemoteDesktopWindow.h:49-59
+class RemoteDesktopWindow final : public QWidget, public RemoteInputEndpoint {
+public:
+    explicit RemoteDesktopWindow(
+        const QString& deviceName,
+        const QString& hostIp,
+        RemoteViewerLifecycleManager* lifecycleManager,
+        RemoteInputBroadcastCoordinator* inputBroadcastCoordinator,
+        QWidget* parent = nullptr,
+        bool monitorReadOnly = false);
+};
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:2229-2232
+updateNativeTitleBarSurface(true);
+QTimer::singleShot(0, this, &RemoteDesktopWindow::startViewerConnection);
+if (!m_monitorReadOnly) {
+    QTimer::singleShot(0, this, &RemoteDesktopWindow::requestRemoteInputScriptStatus);
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.h:327-328
+QHash<QString, QPointer<RemoteDesktopWindow>> m_remoteMonitorWindows;
+QSet<QString> m_pendingRemoteMonitorDeviceIds;
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:9901-9938
+void DeviceGrid::createRemoteMonitorWindowForDevice(int deviceIndex)
+{
+    auto* monitorWindow = new RemoteDesktopWindow(
+        deviceDisplayName(device),
+        ip,
+        m_remoteViewerLifecycleManager.get(),
+        nullptr,
+        nullptr,
+        true);
+    m_remoteMonitorWindows.insert(key, monitorWindow);
+    registerRemoteQualityWindow(monitorWindow, true);
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:10012-10027、10095-10117
+for (auto it = m_remoteMonitorWindows.begin(); it != m_remoteMonitorWindows.end();) {
+    if (!pageTargetKeys.contains(it.key())) {
+        obsoleteWindows.append(it.value());
+        it = m_remoteMonitorWindows.erase(it);
+        continue;
+    }
+    ++it;
+}
+for (const QPointer<RemoteDesktopWindow>& obsoleteWindow : obsoleteWindows) {
+    if (obsoleteWindow) obsoleteWindow->close();
+}
+for (int slot = 0; slot < pageDeviceIndexes.size(); ++slot) {
+    RemoteDesktopWindow* remoteWindow = m_remoteMonitorWindows.value(
+        remoteMonitorDeviceKey(pageDeviceIndexes.at(slot))).data();
+    remoteWindow->show();
+}
+```
+
+### Modified Code
+```cpp
+// src/ui/RemoteDesktopWindow.h:50-67、529-541
+enum class RemoteDesktopWindowStyle {
+    Control,
+    Monitor,
+};
+
+class RemoteMonitorWindow final : public RemoteDesktopWindow {
+public:
+    explicit RemoteMonitorWindow(RemoteViewerLifecycleManager* lifecycleManager, QWidget* parent = nullptr);
+    void switchSource(const QString& deviceName, const QString& hostIp);
+    void clearSource();
+    bool hasSource() const;
+};
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:2438-2500
+void RemoteDesktopWindow::switchMonitorSource(const QString& deviceName, const QString& hostIp)
+{
+    const QString targetName = deviceName.trimmed();
+    const QString targetIp = hostIp.trimmed();
+    cancelNetworkReconnect();
+    m_monitorSourceRestartRequested = !targetIp.isEmpty();
+    m_deviceName = targetName;
+    m_hostIp = targetIp;
+    invalidateViewerCallbacks();
+    m_remoteFrame = QImage();
+    if (m_texturePresenter) m_texturePresenter->reset();
+    if (m_viewerHandle || m_viewerStopInProgress || m_viewerStartQueued || m_viewerStartAdmissionActive) {
+        stopViewerConnectionAsync(false);
+        return;
+    }
+    if (m_monitorSourceRestartRequested) {
+        m_monitorSourceRestartRequested = false;
+        startViewerConnection();
+    }
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3083-3087、3149-3153
+if (m_monitorSourceRestartRequested && m_windowStyle == RemoteDesktopWindowStyle::Monitor
+    && !m_hostIp.trimmed().isEmpty()) {
+    m_monitorSourceRestartRequested = false;
+    startViewerConnection();
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:3437-3507
+if (m_windowStyle == RemoteDesktopWindowStyle::Monitor) {
+    return {};
+}
+
+state.networkWarningText = m_windowStyle == RemoteDesktopWindowStyle::Control && m_networkWarningVisible
+    ? zh("网络不佳")
+    : QString();
+if (m_windowStyle == RemoteDesktopWindowStyle::Control
+    && m_connectionStatusCode == FSREMOTE_STATUS_RECEIVING_VIDEO) {
+    state.performanceText = QStringLiteral("%1FPS · %2Mbps").arg(fpsText).arg(bitrateText);
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.h:113-118、335
+struct RemoteMonitorSlot {
+    QPointer<RemoteMonitorWindow> window;
+    QString deviceKey;
+};
+QVector<RemoteMonitorSlot> m_remoteMonitorSlots;
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:9902-9937、10043-10088
+void DeviceGrid::ensureRemoteMonitorWindowSlots(int slotCount)
+{
+    if (m_remoteMonitorSlots.size() < slotCount) {
+        m_remoteMonitorSlots.resize(slotCount);
+    }
+    for (RemoteMonitorSlot& slot : m_remoteMonitorSlots) {
+        if (!slot.window) {
+            slot.window = new RemoteMonitorWindow(m_remoteViewerLifecycleManager.get());
+        }
+    }
+}
+
+for (int slotIndex = 0; slotIndex < m_remoteMonitorSlots.size(); ++slotIndex) {
+    RemoteMonitorSlot& slot = m_remoteMonitorSlots[slotIndex];
+    RemoteMonitorWindow* remoteWindow = slot.window.data();
+    if (slotIndex >= pageDeviceIndexes.size()) {
+        remoteWindow->clearSource();
+        remoteWindow->hide();
+        continue;
+    }
+    remoteWindow->switchSource(deviceDisplayName(device), ip);
+    remoteWindow->setGeometry(target);
+    remoteWindow->show();
+}
+```
+
+### Steps
+1. 将 `RemoteDesktopWindow` 从不可继承类调整为可复用流内核，并增加普通远控与监控两种固定窗口样式。
+2. 新增 `RemoteMonitorWindow` 类型，构造时不绑定设备、不启动 Viewer，但立即启动槽位会话时钟。
+3. 新增监控切源状态：切换时先更新新设备名和 IP、清除旧帧、推进 Viewer 代际，再异步停止旧 Viewer。
+4. 在旧 Viewer 停止完成回调中启动当前最新目标；30 秒内发生多次切换时只连接最后一次设备。
+5. 监控标题栏移除 Logo、更新、画质、键鼠、同步、音频、剪贴板、最小化、关闭、FPS、码率和网络状态，只保留设备名、IP、`HH:MM:SS`。
+6. 监控窗口拦截本机鼠标按下、移动、释放、双击和滚轮，不允许拖动、缩放、最大化或向远端发送输入。
+7. 将 `DeviceGrid` 的设备窗口哈希替换为固定槽位数组；只有开启监控、关闭监控或宫格容量变化时增减顶层窗口。
+8. 轮询页变化时按槽位调用 `switchSource()`；最后一页空槽只清源并隐藏，槽位窗口和累计时间不销毁、不归零。
+9. 删除每个新槽位各自排队的二次刷新，首次创建 25 宫格时仍只由当前一次刷新完成全部分源和布局。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已使用 `rg` 确认 `m_remoteMonitorWindows` 和 `createRemoteMonitorWindowForDevice` 已从源码移除。
+- 已静态核对 `new RemoteMonitorWindow` 只存在于 `ensureRemoteMonitorWindowSlots()`，`refreshRemoteMonitorMode()` 的正常轮询路径只调用 `switchSource()` 或 `clearSource()`。
+- 已静态核对 `m_sessionClock.start()` 只在窗口构造阶段调用，监控切源路径没有重启或重置计时器。
+- 已静态核对旧 Viewer 代际在切源前失效，并且新 Viewer 只在旧 stop 完成后启动。
+- 已静态核对槽位构造完成后不再逐窗口调用 `refreshRemoteMonitorMode()`，避免大宫格首次开启产生重复事件队列。
+- 按用户要求，本次未构建、未链接、未运行测试或启动程序。

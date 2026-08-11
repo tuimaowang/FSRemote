@@ -46,7 +46,14 @@ class NativeRemoteTitleBarSurface;
 class RemoteViewerLifecycleManager; // wjy: DeviceGrid持有的共享管理器统一限制Viewer初始化并发并等待全部stop任务。
 struct RemoteDesktopViewerCallbackContext; // wjy: 每个原生viewer拥有独立回调上下文和代际，旧会话停止完成前上下文仍保持有效。
 
-class RemoteDesktopWindow final : public QWidget, public RemoteInputEndpoint {
+// =====wjy====
+enum class RemoteDesktopWindowStyle {
+    Control, // wjy: 普通远控窗口保留完整标题栏、键鼠、剪贴板、音频和设备操作入口。
+    Monitor, // wjy: 监控槽位只显示设备名、IP和连续计时，设备轮询时复用窗口并切换Viewer源。
+};
+// ===end====
+
+class RemoteDesktopWindow : public QWidget, public RemoteInputEndpoint {
     Q_OBJECT
 
 public:
@@ -56,7 +63,8 @@ public:
         RemoteViewerLifecycleManager* lifecycleManager,
         RemoteInputBroadcastCoordinator* inputBroadcastCoordinator,
         QWidget* parent = nullptr,
-        bool monitorReadOnly = false); // wjy: 监控窗口在构造阶段固定只读角色，首个Viewer握手前就禁止键鼠、剪贴板和控制租约。
+        bool monitorReadOnly = false,
+        RemoteDesktopWindowStyle windowStyle = RemoteDesktopWindowStyle::Control); // wjy: 监控窗口在构造阶段固定只读角色和精简样式，首个Viewer握手前就禁止键鼠、剪贴板和控制租约。
     ~RemoteDesktopWindow() override;
     void enqueueRemoteFrame(QImage image, quint64 viewerGeneration); // wjy: BGRA回调携带viewer代际，重连后迟到旧帧会在写入pending前被拒绝。
     int enqueueRemoteTextureFrame(
@@ -93,8 +101,8 @@ public:
     int titleBarHeight() const; // wjy: 整组布局计算需要扣除每个远控窗口的实际标题栏高度。
     // ===end====
     // =====wjy====
-    QString hostIp() const; // wjy: 设备菜单更新成功后按固定 IP 找到所有对应远控窗口。
-    QString deviceName() const; // wjy: 平铺排序读取窗口绑定的设备名，避免依赖窗口标题显示状态。
+    QString hostIp() const; // wjy: 普通窗口返回固定目标IP；监控槽位返回当前视频源IP供分页判断是否需要切换。
+    QString deviceName() const; // wjy: 普通平铺读取绑定名称；监控槽位返回当前视频源名称供标题栏和重复刷新去重。
     void beginRemoteUpdateWait(); // wjy: 远控窗口进入更新遮罩、暂停输入并自动等待目标设备重启。
     bool isRemoteUpdateActive() const; // wjy: 供设备状态刷新识别“预期更新离线”，避免把正在等待重启的远控窗口当作普通断线关闭。
     void setRemoteUpdateAvailable(bool available); // wjy: 主界面统一探测目标版本后控制标题栏更新按钮，不让远控流线程参与版本检测。
@@ -115,6 +123,13 @@ public:
     bool isClipboardSyncEnabled() const;
     void pushLocalClipboardIfNeeded();
     void applyRemoteClipboardPayload(const QString& encodedBase64);
+    // ===end====
+
+protected:
+    // =====wjy====
+    void switchMonitorSource(const QString& deviceName, const QString& hostIp); // wjy: 固定监控槽位更新标题身份并在旧Viewer完全停止后连接最新目标，窗口和计时器都不重建。
+    void clearMonitorSource(); // wjy: 最后一页空槽或监控关闭前清空视频源，停止Viewer但保留槽位窗口供后续轮询复用。
+    bool hasMonitorSource() const; // wjy: DeviceGrid统计当前页实际占用槽位时只读取是否绑定有效IP。
     // ===end====
 
 signals:
@@ -326,7 +341,9 @@ private:
     LatestTextureFrameSlot m_pendingTextureFrames; // wjy: 每个远控窗口最多保留一个纹理描述符和一个Qt drain任务，20路高帧率时队列仍有硬上限。
     RemoteViewerLifecycleManager* m_lifecycleManager = nullptr; // wjy: 由DeviceGrid持有且晚于全部远控窗口停止，窗口只借用它提交可等待任务。
     RemoteInputBroadcastCoordinator* m_inputBroadcastCoordinator = nullptr; // wjy: DeviceGrid 统一持有协调器，生命周期覆盖普通和平铺远控窗口。
-    bool m_monitorReadOnly = false; // wjy: 独立监控窗口只允许本地窗体管理和视频观看，永不成为远端输入源或同步目标。
+    bool m_monitorReadOnly = false; // wjy: 独立监控窗口只允许视频观看，不接受本机键鼠、窗体拖拽，也永不成为远端输入源或同步目标。
+    RemoteDesktopWindowStyle m_windowStyle = RemoteDesktopWindowStyle::Control; // wjy: 窗口类型在构造阶段固定，普通远控和监控槽位共用流内核但使用不同标题栏和本地交互。
+    bool m_monitorSourceRestartRequested = false; // wjy: 监控切源期间记录“旧Viewer停止后启动最新IP”，连续翻页只保留最后一次目标。
     RemoteInputSyncRole m_inputSyncRole = RemoteInputSyncRole::Off;
     stream::RemoteQualityConfiguration m_globalQualityConfiguration; // wjy: 兼容保留旧设置结构，不参与标题栏八档的优先级和持久化计算。
     stream::RemoteVideoQualityPreset m_monitorQualityPreset = stream::kDefaultRemoteVideoQualityPreset; // wjy: 独立只读监控窗口使用的统一档位，不写入设备自己的历史手选配置。
@@ -507,5 +524,18 @@ private:
     void updateNativeTitleBarButtonOrigin(); // wjy: 在原生合成缓冲内同步按钮段位置；交互缩放期间不切换标题栏表面所有者。
     // ===end====
 };
+
+// =====wjy====
+class RemoteMonitorWindow final : public RemoteDesktopWindow {
+public:
+    explicit RemoteMonitorWindow(
+        RemoteViewerLifecycleManager* lifecycleManager,
+        QWidget* parent = nullptr); // wjy: 创建一个无初始视频源的固定监控槽位，计时从槽位创建后持续累计。
+
+    void switchSource(const QString& deviceName, const QString& hostIp); // wjy: 对外只暴露监控语义，不允许调用方修改只读角色或普通远控功能。
+    void clearSource(); // wjy: 清空不足一页的槽位并停止旧Viewer，窗口对象继续保留。
+    bool hasSource() const; // wjy: 标题栏总数只叠加当前已绑定设备的监控槽位。
+};
+// ===end====
 
 } // namespace ui
