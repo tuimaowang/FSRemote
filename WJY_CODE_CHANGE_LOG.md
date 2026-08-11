@@ -14482,3 +14482,85 @@ if (!m_authorizedRemoteControlIps.contains(ip)) {
 - 已使用 `rg` 确认 `refreshRemoteMonitorMode()` 中不存在 `hide()` 和 `showNormal()`，`show()`、`raise()` 只位于 `!isVisible()` 首次展示分支。
 - 已静态核对轮询换页继续复用 `switchSource()`，空槽继续复用 `clearSource()`，均不会销毁 `RemoteMonitorWindow`。
 - 按用户要求，本次未构建、未链接、未运行测试或启动程序。
+
+## 2026-08-11 12:48 - 锁定监控模式首次铺屏显示器
+
+### Changed Location
+- `src/ui/DeviceGrid.h:337`：新增当前监控会话锁定的显示器名称状态。
+- `src/ui/DeviceGrid.cpp:9965-9982`：开启监控时记录主窗口所在显示器，关闭监控时清理锁定状态。
+- `src/ui/DeviceGrid.cpp:10039-10055`：轮询布局优先解析锁定显示器，目标屏幕失效时才执行回退。
+
+### Reason
+上一版虽然不再重复显示或创建监控窗口，但 `refreshRemoteMonitorMode()` 每次仍通过 `window()->screen()` 获取主窗口当前显示器。因此主窗口从 A 屏移动到 B 屏后，下一次 30 秒轮询会计算出 B 屏的宫格矩形，几何变化判断随即把所有固定监控窗口搬到 B 屏。
+
+本次把显示器选择改为监控会话级状态：开启时锁定主窗口所在屏幕，普通设备轮询、授权回调和宫格刷新都继续使用该屏幕。只有锁定显示器被拔除、重命名或不再由 Qt 提供时，才回退到当前可用屏幕并重新锁定。
+
+### Original Code
+```cpp
+// src/ui/DeviceGrid.cpp:9962-9968（修改前）
+m_remoteMonitorModeEnabled = enabled;
+m_remoteMonitorPageIndex = 0;
+if (enabled) {
+    refreshRemoteMonitorMode(false);
+    if (m_remoteMonitorTimer) {
+        m_remoteMonitorTimer->start();
+    }
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:10031-10035（修改前）
+QScreen* screen = window() ? window()->screen() : QGuiApplication::primaryScreen();
+if (!screen) {
+    screen = QGuiApplication::primaryScreen();
+}
+const QRect availableRect = screen ? screen->availableGeometry() : QRect(0, 0, 1280, 720);
+```
+
+### Modified Code
+```cpp
+// src/ui/DeviceGrid.h:337（修改后）
+QString m_remoteMonitorScreenName;
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:9965-9972（修改后）
+QScreen* monitorScreen = window() ? window()->screen() : QGuiApplication::primaryScreen();
+if (!monitorScreen) {
+    monitorScreen = QGuiApplication::primaryScreen();
+}
+m_remoteMonitorScreenName = monitorScreen ? monitorScreen->name() : QString();
+refreshRemoteMonitorMode(false);
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:10039-10055（修改后）
+QScreen* screen = nullptr;
+for (QScreen* candidateScreen : QGuiApplication::screens()) {
+    if (candidateScreen && candidateScreen->name() == m_remoteMonitorScreenName) {
+        screen = candidateScreen;
+        break;
+    }
+}
+if (!screen) {
+    screen = window() ? window()->screen() : QGuiApplication::primaryScreen();
+    if (!screen) {
+        screen = QGuiApplication::primaryScreen();
+    }
+    m_remoteMonitorScreenName = screen ? screen->name() : QString();
+}
+```
+
+### Steps
+1. 在 `DeviceGrid` 中增加监控目标显示器名称，生命周期与一次监控模式开启周期一致。
+2. 开启监控时读取一次主窗口所在显示器名称，不再让定时轮询直接依赖主窗口的实时 `screen()`。
+3. 每次布局时从 `QGuiApplication::screens()` 解析锁定显示器，并继续使用其 `availableGeometry()`。
+4. 仅当锁定屏幕无法解析时才回退到主窗口当前屏幕或主屏，随后锁定新的有效目标。
+5. 关闭监控模式时清空屏幕名称，使下次开启能够选择届时主窗口所在的屏幕。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已使用 `rg` 确认 `refreshRemoteMonitorMode()` 的正常路径不再直接把 `window()->screen()` 作为首选屏幕。
+- 已静态核对主窗口从 A 屏移动到 B 屏时，保存的 `m_remoteMonitorScreenName` 不会改变，轮询继续使用 A 屏几何。
+- 已静态核对锁定显示器失效后才会执行回退并更新名称，避免窗口落在已经断开的屏幕区域。
+- 按用户要求，本次未构建、未链接、未运行测试或启动程序。

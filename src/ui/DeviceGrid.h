@@ -334,6 +334,7 @@ private:
     QTimer* m_remoteMonitorTimer = nullptr; // wjy: 仅监控模式开启时运行，默认每30秒切换下一批远控窗口。
     QVector<RemoteMonitorSlot> m_remoteMonitorSlots; // wjy: 固定宫格槽位按位置持有专用监控窗口，设备页切换只调用switchSource。
     QSet<QString> m_pendingRemoteMonitorDeviceIds; // wjy: 当前页公钥授权期间按稳定设备ID去重，异步返回时再次校验设备仍在当前页。
+    QString m_remoteMonitorScreenName; // wjy: 开启监控时锁定目标显示器名称，主窗口之后跨屏移动不会带动固定槽位迁移。
     bool m_remoteMonitorModeEnabled = false; // wjy: 程序启动默认关闭，只由标题栏按钮控制当前会话。
     int m_remoteMonitorPageIndex = 0; // wjy: 当前监控页按在线设备目标集合计算，设备上下线或宫格变化时自动夹紧。
     // ===end====

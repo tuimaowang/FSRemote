@@ -9962,6 +9962,13 @@ void DeviceGrid::setRemoteMonitorModeEnabled(bool enabled)
     m_remoteMonitorModeEnabled = enabled;
     m_remoteMonitorPageIndex = 0;
     if (enabled) {
+        // =====wjy====
+        QScreen* monitorScreen = window() ? window()->screen() : QGuiApplication::primaryScreen(); // wjy: 开启瞬间读取主窗口所在显示器，作为这一轮监控会话的固定铺屏目标。
+        if (!monitorScreen) {
+            monitorScreen = QGuiApplication::primaryScreen(); // wjy: 极端启动阶段主窗口尚未关联屏幕时回退到系统主屏。
+        }
+        m_remoteMonitorScreenName = monitorScreen ? monitorScreen->name() : QString(); // wjy: 保存稳定显示器名称而非持续读取主窗口screen，避免主窗口跨屏后30秒轮询搬动全部槽位。
+        // ===end====
         refreshRemoteMonitorMode(false); // wjy: 开启时按宫格容量创建固定监控槽位并分配第一页来源，已有普通和平铺远控保持原状态。
         if (m_remoteMonitorTimer) {
             m_remoteMonitorTimer->setInterval(m_remoteMonitorConfiguration.rotationIntervalSeconds * 1000);
@@ -9972,6 +9979,7 @@ void DeviceGrid::setRemoteMonitorModeEnabled(bool enabled)
             m_remoteMonitorTimer->stop();
         }
         closeRemoteMonitorWindows(); // wjy: 关闭按钮直接关闭全部监控模式创建的窗口，不再恢复进入监控前的普通窗口布局。
+        m_remoteMonitorScreenName.clear(); // wjy: 下次重新开启时按届时主窗口所在屏幕建立新的固定监控布局。
         requestRemoteQualityEvaluation();
     }
     update(titlebarBandwidthUpdateRect());
@@ -10028,10 +10036,22 @@ void DeviceGrid::refreshRemoteMonitorMode(bool advancePage)
             });
     }
 
-    QScreen* screen = window() ? window()->screen() : QGuiApplication::primaryScreen();
-    if (!screen) {
-        screen = QGuiApplication::primaryScreen();
+    // =====wjy====
+    QScreen* screen = nullptr;
+    for (QScreen* candidateScreen : QGuiApplication::screens()) {
+        if (candidateScreen && candidateScreen->name() == m_remoteMonitorScreenName) {
+            screen = candidateScreen;
+            break; // wjy: 普通轮询始终解析开启时锁定的显示器，不受主窗口当前移动到哪个屏幕影响。
+        }
     }
+    if (!screen) {
+        screen = window() ? window()->screen() : QGuiApplication::primaryScreen(); // wjy: 目标显示器被拔除或重命名后才选择主窗口当前屏幕作为恢复目标。
+        if (!screen) {
+            screen = QGuiApplication::primaryScreen(); // wjy: 主窗口暂时没有屏幕关联时继续使用系统主屏兜底。
+        }
+        m_remoteMonitorScreenName = screen ? screen->name() : QString(); // wjy: 回退成功后锁定新目标，后续轮询再次保持固定，不会每30秒跟随主窗口漂移。
+    }
+    // ===end====
     const QRect availableRect = screen ? screen->availableGeometry() : QRect(0, 0, 1280, 720);
     const int columnCount = qMax(1, stream::remoteMonitorGridColumns(m_remoteMonitorConfiguration.grid));
     const int rowCount = qMax(1, stream::remoteMonitorGridRows(m_remoteMonitorConfiguration.grid));
