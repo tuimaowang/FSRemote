@@ -14021,3 +14021,166 @@ assert(decisions.front().preset == stream::RemoteVideoQualityPreset::P540_25);
 - 已静态核对监控关闭路径会停止定时器、撤销画质覆盖、恢复窗口几何/状态/显隐并清空恢复快照。
 - 已更新纯策略测试源码，覆盖默认九宫格、六种布局、30秒默认值、监控画质优先级、手选优先级和360/1保活。
 - 按用户此前要求，本次未构建、未链接、未运行测试或启动程序。
+
+## 2026-08-11 11:03 - 限制监控模式只连接当前宫格页
+
+### Changed Location
+- `src/ui/DeviceGrid.h:194-199`：将监控刷新职责改为只创建当前页 Viewer，并新增标题栏统一会话计数接口。
+- `src/ui/DeviceGrid.h:327-328`：明确监控窗口容器只持有当前宫格页，异步授权结果必须重新校验当前页。
+- `src/ui/DeviceGrid.cpp:4517`：设备状态变化后重算当前页 Viewer 和标题栏实际监控增量。
+- `src/ui/DeviceGrid.cpp:9843-9855`：标题栏改为显示普通远控会话数加当前页有效监控 Viewer 数。
+- `src/ui/DeviceGrid.cpp:9981-10120`：分页前先选出当前页设备，只授权、创建和布局这一页，并关闭上一页连接。
+- `src/ui/DeviceGrid.cpp:10804、12075、12396、13003`：绘制、拖窗排除、悬停和点击命中统一使用新的标题栏计数口径。
+
+### Reason
+此前监控模式会为全部在线设备一次性创建只读 Viewer，只把非当前页窗口隐藏并降到 `360/1`，同时标题栏直接显示全部待轮询设备数。因此即使选择 4 宫格，开启后连接和标题栏数字仍会按全部在线设备增长。现在把宫格容量同时作为可见窗口和实际监控 Viewer 的上限：4 宫格只保留当前页最多 4 路，轮询时关闭上一页再建立下一页；标题栏在原普通远控会话数基础上只叠加当前页有效监控数。
+
+### Original Code
+```cpp
+// src/ui/DeviceGrid.h:194-199、327-328
+void refreshRemoteMonitorMode(bool advancePage); // 按全部在线设备目录同步监控窗口并显示当前宫格页。
+int remoteMonitorDeviceCount() const; // 统计全部监控目标数量。
+void createRemoteMonitorWindowForDevice(int deviceIndex); // 为设备创建只读视频窗口。
+QHash<QString, QPointer<RemoteDesktopWindow>> m_remoteMonitorWindows; // 持有全部设备Viewer。
+QSet<QString> m_pendingRemoteMonitorDeviceIds; // 为全部轮询目标去重授权任务。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:9843-9856
+int DeviceGrid::remoteMonitorDeviceCount() const
+{
+    int count = 0;
+    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+        const DeviceEntry& device = g_devices.at(deviceIndex);
+        const platform::DevicePresenceState presence = devicePresenceForIndex(deviceIndex);
+        if (!device.ip.trimmed().isEmpty() && !deviceRecordMatchesLocal(device)
+            && (presence == platform::DevicePresenceState::Online
+                || presence == platform::DevicePresenceState::Busy)) {
+            ++count;
+        }
+    }
+    return count;
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:9988-10033、10085-10112
+const QVector<int> deviceIndexes = remoteMonitorDeviceIndexes();
+for (const int deviceIndex : deviceIndexes) {
+    targetKeys.insert(remoteMonitorDeviceKey(deviceIndex));
+}
+for (const int deviceIndex : deviceIndexes) {
+    // 已授权设备会在此调用 createRemoteMonitorWindowForDevice(deviceIndex)。
+}
+for (int index = 0; index < deviceIndexes.size(); ++index) {
+    RemoteDesktopWindow* remoteWindow = m_remoteMonitorWindows.value(
+        remoteMonitorDeviceKey(deviceIndexes.at(index))).data();
+    if (index < pageStart || index >= pageEnd) {
+        remoteWindow->hide();
+        continue;
+    }
+    remoteWindow->show();
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:10799-10801
+const int controlledSessionCount = m_remoteMonitorModeEnabled
+    ? remoteMonitorDeviceCount()
+    : totalRemoteControlSessionCount();
+```
+
+### Modified Code
+```cpp
+// src/ui/DeviceGrid.h:194-199、327-328
+void refreshRemoteMonitorMode(bool advancePage); // wjy: 从全部在线设备中选出当前宫格页，只为这一页建立独立只读Viewer并在轮询时替换上一页。
+int titlebarRemoteSessionCount() const; // wjy: 标题栏显示普通远控会话数加当前页监控Viewer数，宫格容量直接限制监控增量。
+void createRemoteMonitorWindowForDevice(int deviceIndex); // wjy: 仅为当前宫格页创建不发布控制租约、不加入键鼠同步器的只读视频窗口。
+QHash<QString, QPointer<RemoteDesktopWindow>> m_remoteMonitorWindows; // wjy: 只持有当前宫格页的只读Viewer，分页替换时移除并关闭上一页连接。
+QSet<QString> m_pendingRemoteMonitorDeviceIds; // wjy: 当前页公钥授权期间按稳定设备ID去重，异步返回时再次校验设备仍在当前页。
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:9843-9855
+int DeviceGrid::titlebarRemoteSessionCount() const
+{
+    qint64 total = totalRemoteControlSessionCount();
+    if (m_remoteMonitorModeEnabled) {
+        for (auto it = m_remoteMonitorWindows.constBegin(); it != m_remoteMonitorWindows.constEnd(); ++it) {
+            RemoteDesktopWindow* monitorWindow = it.value().data();
+            if (monitorWindow && !monitorWindow->isClosingConnection()) {
+                ++total;
+            }
+        }
+    }
+    return static_cast<int>(qMin<qint64>(total, std::numeric_limits<int>::max()));
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:9987-10046
+const QVector<int> deviceIndexes = remoteMonitorDeviceIndexes();
+const int capacity = qMax(1, stream::remoteMonitorGridCapacity(m_remoteMonitorConfiguration.grid));
+const int pageStart = m_remoteMonitorPageIndex * capacity;
+const int pageEnd = qMin(pageStart + capacity, deviceIndexes.size());
+for (int index = pageStart; index < pageEnd; ++index) {
+    const int deviceIndex = deviceIndexes.at(index);
+    pageDeviceIndexes.append(deviceIndex);
+    pageTargetKeys.insert(remoteMonitorDeviceKey(deviceIndex));
+}
+for (auto it = m_remoteMonitorWindows.begin(); it != m_remoteMonitorWindows.end();) {
+    const bool stillMatches = pageTargetKeys.contains(it.key());
+    if (!stillMatches) {
+        obsoleteWindows.append(it.value());
+        it = m_remoteMonitorWindows.erase(it);
+        continue;
+    }
+    ++it;
+}
+for (const int deviceIndex : pageDeviceIndexes) {
+    if (m_authorizedRemoteControlIps.contains(g_devices.at(deviceIndex).ip.trimmed())) {
+        createRemoteMonitorWindowForDevice(deviceIndex);
+    }
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:10056-10075
+const QSet<QString> currentPageKeys = [&] {
+    QSet<QString> keys;
+    const QVector<int> currentIndexes = remoteMonitorDeviceIndexes();
+    const int currentCapacity = qMax(1, stream::remoteMonitorGridCapacity(m_remoteMonitorConfiguration.grid));
+    const int currentPageStart = m_remoteMonitorPageIndex * currentCapacity;
+    const int currentPageEnd = qMin(currentPageStart + currentCapacity, currentIndexes.size());
+    for (int index = currentPageStart; index < currentPageEnd; ++index) {
+        keys.insert(remoteMonitorDeviceKey(currentIndexes.at(index)));
+    }
+    return keys;
+}();
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:10095-10116、10804
+for (int slot = 0; slot < pageDeviceIndexes.size(); ++slot) {
+    RemoteDesktopWindow* remoteWindow = m_remoteMonitorWindows.value(
+        remoteMonitorDeviceKey(pageDeviceIndexes.at(slot))).data();
+    if (!remoteWindow || remoteWindow->isClosingConnection()) continue;
+    remoteWindow->show();
+}
+const int controlledSessionCount = titlebarRemoteSessionCount();
+```
+
+### Steps
+1. 把完整在线设备集合限制为页数和稳定轮询顺序的数据源，不再对完整集合逐台建连。
+2. 根据当前宫格容量生成本页设备、稳定键和 IP 快照，只对本页执行公钥授权与 Viewer 创建。
+3. 翻页、宫格缩小、设备离线或 IP 变化时，先从监控索引移除旧窗口，再关闭旧 Viewer，避免标题栏同时累计两页。
+4. 异步授权返回时重新计算当前页设备键，只允许仍位于当前页的设备创建 Viewer，防止快速翻页后旧授权结果回补旧页。
+5. 删除非当前页隐藏并使用 `360/1` 保活的分支，改为轮询时真正关闭上一页连接。
+6. 标题栏数字改为普通远控会话总数加当前页有效监控 Viewer 数，并让绘制和三个鼠标命中入口共用该接口。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已使用 `rg` 确认旧的 `remoteMonitorDeviceCount` 已无引用，标题栏四个布局入口全部改用 `titlebarRemoteSessionCount`。
+- 已静态核对授权循环和布局循环只遍历 `pageDeviceIndexes`，非当前页不再调用 Viewer 创建或隐藏保活。
+- 已静态核对异步授权回调使用 `currentPageKeys` 拒绝已经轮换出去的设备。
+- 按用户要求，本次未构建、未链接、未运行测试或启动程序。

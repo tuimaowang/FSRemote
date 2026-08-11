@@ -191,12 +191,12 @@ private:
     void toggleRemoteWindowTiling();
     void toggleRemoteMonitorMode(); // wjy: 主窗口标题栏按钮开启独立设备轮询或关闭全部监控窗口，普通远控窗口不参与切换。
     void setRemoteMonitorModeEnabled(bool enabled); // wjy: 统一管理监控设备扫描、分页定时器和独立只读Viewer生命周期。
-    void refreshRemoteMonitorMode(bool advancePage); // wjy: 按全部在线设备目录同步监控窗口并显示当前宫格页，不依赖本机已经打开的远控窗口。
+    void refreshRemoteMonitorMode(bool advancePage); // wjy: 从全部在线设备中选出当前宫格页，只为这一页建立独立只读Viewer并在轮询时替换上一页。
     void applyRemoteMonitorQualityPreset(); // wjy: 将设置页监控画质只同步到独立监控窗口，普通远控保留自身自动或手选档。
-    int remoteMonitorDeviceCount() const; // wjy: 标题栏高频绘制和鼠标命中只统计目标数量，不执行分页所需的自然排序。
+    int titlebarRemoteSessionCount() const; // wjy: 标题栏显示普通远控会话数加当前页监控Viewer数，宫格容量直接限制监控增量。
     QVector<int> remoteMonitorDeviceIndexes() const; // wjy: 返回所有在线/占用且具有有效IP的非本机设备，并使用稳定自然名称顺序轮询。
     QString remoteMonitorDeviceKey(int deviceIndex) const; // wjy: 优先使用设备稳定ID，兼容旧记录时回退规范化IP作为监控窗口键。
-    void createRemoteMonitorWindowForDevice(int deviceIndex); // wjy: 创建不发布控制租约、不加入键鼠同步器的只读视频窗口。
+    void createRemoteMonitorWindowForDevice(int deviceIndex); // wjy: 仅为当前宫格页创建不发布控制租约、不加入键鼠同步器的只读视频窗口。
     QVector<QPointer<RemoteDesktopWindow>> openedRemoteMonitorWindows() const; // wjy: 清理空指针后返回当前独立监控窗口快照。
     QVector<QPointer<RemoteDesktopWindow>> qualityManagedRemoteWindows() const; // wjy: 质量协调器同时覆盖普通与监控窗口，其它快捷键和关闭命令仍只操作普通远控。
     void closeRemoteMonitorWindows(); // wjy: 关闭监控模式时停止并释放全部只读Viewer，不恢复进入前的任何窗口布局。
@@ -324,8 +324,8 @@ private:
     platform::LocalNetworkBandwidthSample m_titlebarBandwidthSample; // wjy: UI 线程保存最新完整样本，paintEvent 只格式化文字而不查询系统 API。
     QTimer* m_titlebarBandwidthTimer = nullptr; // wjy: 每秒更新一次版本号右侧的当前接收 Mbps 与被控会话总数。
     QTimer* m_remoteMonitorTimer = nullptr; // wjy: 仅监控模式开启时运行，默认每30秒切换下一批远控窗口。
-    QHash<QString, QPointer<RemoteDesktopWindow>> m_remoteMonitorWindows; // wjy: 按稳定设备键独立持有只读Viewer，不混入普通/平铺远控协调器。
-    QSet<QString> m_pendingRemoteMonitorDeviceIds; // wjy: 批量公钥授权期间按稳定设备ID去重，状态刷新不会重复创建后台授权任务。
+    QHash<QString, QPointer<RemoteDesktopWindow>> m_remoteMonitorWindows; // wjy: 只持有当前宫格页的只读Viewer，分页替换时移除并关闭上一页连接。
+    QSet<QString> m_pendingRemoteMonitorDeviceIds; // wjy: 当前页公钥授权期间按稳定设备ID去重，异步返回时再次校验设备仍在当前页。
     bool m_remoteMonitorModeEnabled = false; // wjy: 程序启动默认关闭，只由标题栏按钮控制当前会话。
     int m_remoteMonitorPageIndex = 0; // wjy: 当前监控页按在线设备目标集合计算，设备上下线或宫格变化时自动夹紧。
     // ===end====
