@@ -61,7 +61,8 @@ public:
         FsRemoteFrameCallback frameCallback,
         FsRemoteTextureFrameCallback textureCallback,
         FsRemoteStatusCallback statusCallback,
-        void* user);
+        void* user,
+        bool monitorReadOnly = false); // wjy: 监控窗口必须走DLL只读准入入口；普通远控继续兼容旧版纹理Viewer导出。
     void stop(FsRemoteStreamHandle handle);
     bool sendInput(FsRemoteStreamHandle handle, const QByteArray& message);
     bool setViewerQuality(FsRemoteStreamHandle handle, const FsRemoteViewerQualityConfig& config); // wjy: 新DLL在线发送质量请求，旧DLL缺失导出时返回false但不停止当前流。
@@ -99,6 +100,16 @@ private:
         FsRemoteTextureFrameCallback,
         FsRemoteStatusCallback,
         void*);
+    // =====wjy====
+    using StartViewerWithTextureRoleFn = FsRemoteStreamHandle(FSREMOTE_STREAM_CALL*)(
+        const char*,
+        uint16_t,
+        FsRemoteFrameCallback,
+        FsRemoteTextureFrameCallback,
+        FsRemoteStatusCallback,
+        void*,
+        FsRemoteViewerRole); // wjy: 角色参数由DLL同步复制，Viewer工作线程不读取Qt窗口临时状态。
+    // ===end====
     using StopFn = void(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
     using SendInputFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, const char*);
     using SetViewerQualityFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, const FsRemoteViewerQualityConfig*);
@@ -121,6 +132,7 @@ private:
     StartViewerFn m_startViewer = nullptr;
     StartViewerWithStatusFn m_startViewerWithStatus = nullptr;
     StartViewerWithTextureFn m_startViewerWithTexture = nullptr;
+    StartViewerWithTextureRoleFn m_startViewerWithTextureRole = nullptr; // wjy: 缺失时普通远控可回退，监控不得降级为占名额的控制会话。
     StopFn m_stop = nullptr;
     SendInputFn m_sendInput = nullptr;
     SetViewerQualityFn m_setViewerQuality = nullptr;

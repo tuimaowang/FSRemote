@@ -91,6 +91,8 @@ StreamRuntime::StreamRuntime()
     m_startViewer = reinterpret_cast<StartViewerFn>(library->resolve("fsremote_stream_start_viewer"));
     m_startViewerWithStatus = reinterpret_cast<StartViewerWithStatusFn>(library->resolve("fsremote_stream_start_viewer_with_status"));
     m_startViewerWithTexture = reinterpret_cast<StartViewerWithTextureFn>(library->resolve("fsremote_stream_start_viewer_with_texture"));
+    m_startViewerWithTextureRole = reinterpret_cast<StartViewerWithTextureRoleFn>(
+        library->resolve("fsremote_stream_start_viewer_with_texture_role")); // wjy: 只读监控由认证角色保证，不能仅依赖Qt层不发送键鼠。
     m_stop = reinterpret_cast<StopFn>(library->resolve("fsremote_stream_stop"));
     m_sendInput = reinterpret_cast<SendInputFn>(library->resolve("fsremote_stream_send_input"));
     m_setViewerQuality = reinterpret_cast<SetViewerQualityFn>(library->resolve("fsremote_stream_set_viewer_quality")); // wjy: 可选导出支持无重连画质更新，旧DLL继续使用原始流。
@@ -189,9 +191,28 @@ FsRemoteStreamHandle StreamRuntime::startViewer(
     FsRemoteFrameCallback frameCallback,
     FsRemoteTextureFrameCallback textureCallback,
     FsRemoteStatusCallback statusCallback,
-    void* user)
+    void* user,
+    bool monitorReadOnly)
 {
     const QByteArray ip = hostIp.toUtf8();
+    // =====wjy====
+    if (m_startViewerWithTextureRole) {
+        return m_startViewerWithTextureRole(
+            ip.constData(),
+            port,
+            frameCallback,
+            textureCallback,
+            statusCallback,
+            user,
+            monitorReadOnly ? FSREMOTE_VIEWER_ROLE_MONITOR : FSREMOTE_VIEWER_ROLE_CONTROL); // wjy: 普通和监控会话从认证握手开始隔离权限与人数统计。
+    }
+    if (monitorReadOnly) {
+        if (statusCallback) {
+            statusCallback(user, FSREMOTE_STATUS_ERROR, "Read-only monitor viewer is unavailable in this DLL"); // wjy: 旧DLL只能请求控制角色，明确失败可避免监控窗口偷偷占用远控名额。
+        }
+        return nullptr;
+    }
+    // ===end====
     if (m_startViewerWithTexture) {
         return m_startViewerWithTexture(ip.constData(), port, frameCallback, textureCallback, statusCallback, user);
     }

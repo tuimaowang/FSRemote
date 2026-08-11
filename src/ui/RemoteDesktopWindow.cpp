@@ -1974,23 +1974,27 @@ RemoteDesktopWindow::RemoteDesktopWindow(
     const QString& hostIp,
     RemoteViewerLifecycleManager* lifecycleManager,
     RemoteInputBroadcastCoordinator* inputBroadcastCoordinator,
-    QWidget* parent)
+    QWidget* parent,
+    bool monitorReadOnly)
     : QWidget(parent)
     , m_deviceName(deviceName)
     , m_hostIp(hostIp)
     , m_lifecycleManager(lifecycleManager) // wjy: 生命周期管理器由DeviceGrid统一持有，保证窗口关闭和应用退出期间指针始终有效。
     , m_inputBroadcastCoordinator(inputBroadcastCoordinator) // wjy: 普通与平铺窗口借用同一个协调器，单主控约束覆盖全部远控窗口。
+    , m_monitorReadOnly(monitorReadOnly) // wjy: 首次异步启动Viewer之前固定角色，监控连接不会短暂以普通远控身份进入Host。
     , m_globalQualityConfiguration(platform::AppSettings::remoteQualityConfiguration()) // wjy: 保留全局设置快照兼容接口；精确档位由标题栏手选和固定自动规则决定。
 {
     // =====wjy====
     m_remoteInputScriptStatus.supported = false;
     m_remoteInputScriptStatus.state = platform::RemoteInputScriptState::Unknown; // wjy: 新窗口先显示未知，DeviceGrid缓存、49102直查或UDP快照任一到达后再恢复目标端真实状态。
     appendViewerDebugLog(QStringLiteral("RemoteDesktopWindow ctor device=%1 host=%2").arg(deviceName, hostIp)); // wjy: mark each remote desktop window creation.
-    m_hasSavedUserQualityPreset = platform::AppSettings::remoteDeviceQualityPreset(
-        m_hostIp,
-        &m_savedUserQualityPreset); // wjy: 构造阶段只读取历史手选意图，是否允许本次恢复由DeviceGrid结合其它已打开窗口仲裁。
-    if (m_hasSavedUserQualityPreset) {
-        m_userQualityPreset = m_savedUserQualityPreset;
+    if (!m_monitorReadOnly) {
+        m_hasSavedUserQualityPreset = platform::AppSettings::remoteDeviceQualityPreset(
+            m_hostIp,
+            &m_savedUserQualityPreset); // wjy: 只有普通远控读取设备历史手选，监控统一使用设置页画质且不参与高档恢复仲裁。
+        if (m_hasSavedUserQualityPreset) {
+            m_userQualityPreset = m_savedUserQualityPreset;
+        }
     }
     // ===end====
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
@@ -2064,10 +2068,11 @@ RemoteDesktopWindow::RemoteDesktopWindow(
     // ===end====
     setWindowTitle(m_deviceName);
     setMouseTracking(true);
-    setFocusPolicy(Qt::StrongFocus);
+    setFocusPolicy(m_monitorReadOnly ? Qt::NoFocus : Qt::StrongFocus); // wjy: 监控视频区不获取键盘焦点，普通窗口继续支持完整远控输入。
     updateWindowMask();
     // =====wjy====
-    m_clipboardSyncEnabled = platform::AppSettings::remoteClipboardSyncEnabled(); // wjy: 新窗口继承设置页默认剪切板同步开关。
+    m_clipboardSyncEnabled = !m_monitorReadOnly
+        && platform::AppSettings::remoteClipboardSyncEnabled(); // wjy: 只读监控不轮询或发送本机剪贴板，普通窗口继续继承全局默认。
     m_clipboardPollTimer = new QTimer(this);
     m_clipboardPollTimer->setInterval(350);
     connect(m_clipboardPollTimer, &QTimer::timeout, this, [this] {
@@ -2116,7 +2121,9 @@ RemoteDesktopWindow::RemoteDesktopWindow(
         }
         updateTitleBarHover(parentPosition); // wjy: D3D内容区内连续鼠标移动最多在离开标题栏按钮时刷新一次，不再逐事件重画标题栏。
         updateResizeCursor(parentPosition); // wjy: D3D 子控件会截获远控画面内的移动事件，必须在转发前同步本地边缘光标状态。
-        sendRemoteMouseMove(parentPosition, buttons);
+        if (!m_monitorReadOnly) {
+            sendRemoteMouseMove(parentPosition, buttons); // wjy: D3D子表面直接收到的鼠标移动也必须经过只读门禁，不能绕开父窗口事件处理。
+        }
     });
     m_texturePresenter->setMouseButtonCallbacks(
         [this](const QPoint& parentPosition, Qt::MouseButton button, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
@@ -2215,13 +2222,15 @@ RemoteDesktopWindow::RemoteDesktopWindow(
     // ===end====
 
     // =====wjy====
-    if (m_inputBroadcastCoordinator) {
+    if (m_inputBroadcastCoordinator && !m_monitorReadOnly) {
         m_inputBroadcastCoordinator->registerEndpoint(this, this); // wjy: 完成控件和定时器初始化后登记，角色回调只刷新已经可用的标题栏状态。
     }
     // ===end====
     updateNativeTitleBarSurface(true); // wjy: 构造完成后立即提交第一张完整标题栏，窗口首次显示不依赖父QWidget异步paintEvent。
     QTimer::singleShot(0, this, &RemoteDesktopWindow::startViewerConnection);
-    QTimer::singleShot(0, this, &RemoteDesktopWindow::requestRemoteInputScriptStatus); // wjy: 窗口重开立即直查目标执行器，主控进程重启后无需等待旧窗口内存或下一次手动刷新。
+    if (!m_monitorReadOnly) {
+        QTimer::singleShot(0, this, &RemoteDesktopWindow::requestRemoteInputScriptStatus); // wjy: 普通窗口重开立即直查目标执行器；监控窗口不发送任何脚本控制协议。
+    }
 }
 
 RemoteDesktopWindow::~RemoteDesktopWindow()
@@ -2473,8 +2482,8 @@ void RemoteDesktopWindow::setRemoteMonitorQualityPreset(
     if (m_monitorQualityPresetActive == active && m_monitorQualityPreset == normalizedPreset) {
         return;
     }
-    m_monitorQualityPresetActive = active; // wjy: 开关只保存当前主窗口会话状态，程序重启后监控模式仍默认关闭。
-    m_monitorQualityPreset = normalizedPreset; // wjy: 统一画质只作为监控模式次级意图，不覆盖m_userQualityPreset或设备QSettings。
+    m_monitorQualityPresetActive = active; // wjy: 该开关只作用于独立监控窗口，程序重启后由主窗口重新创建并注册。
+    m_monitorQualityPreset = normalizedPreset; // wjy: 统一画质不写入m_userQualityPreset或设备QSettings，普通远控历史档保持独立。
     refreshQualityPreviewText();
     emit remoteQualityInputsChanged(); // wjy: 监控画质或开关变化立即进入现有在线质量去重链路，不重建Viewer。
 }
@@ -3937,12 +3946,14 @@ bool RemoteDesktopWindow::isClipboardSyncEnabled() const
 
 void RemoteDesktopWindow::toggleClipboardSync()
 {
+    if (m_monitorReadOnly) return; // wjy: 监控窗口不允许通过标题栏重新开启剪贴板发送或接收。
     setClipboardSyncEnabled(!m_clipboardSyncEnabled);
     platform::AppSettings::setRemoteClipboardSyncEnabled(m_clipboardSyncEnabled);
 }
 
 void RemoteDesktopWindow::toggleViewerAudio()
 {
+    if (m_monitorReadOnly) return; // wjy: 监控会话只协商视频能力，标题栏点击不能启动本地音频连接。
     m_viewerAudioEnabled = !m_viewerAudioEnabled;
     sendCurrentViewerAudioDecision();
     requestTitleBarUpdate(audioToggleRect());
@@ -3954,6 +3965,7 @@ void RemoteDesktopWindow::toggleViewerAudio()
 // =====wjy====
 void RemoteDesktopWindow::showQualityPreviewMenu()
 {
+    if (m_monitorReadOnly) return; // wjy: 监控画质只由主窗口设置页统一控制，单窗口不能写入设备历史手选档。
     const QRect buttonRect = qualityPreviewRect();
     if (buttonRect.isEmpty()) {
         return;
@@ -4053,7 +4065,7 @@ stream::RemoteVideoQualityPreset RemoteDesktopWindow::preferredRemoteVideoQualit
         return m_userQualityPreset; // wjy: 用户手选优先级最高，全屏和焦点变化都不能覆盖。
     }
     if (m_monitorQualityPresetActive) {
-        return m_monitorQualityPreset; // wjy: 没有窗口手选时，监控模式使用设置页统一档位并实时刷新标题栏文字。
+        return m_monitorQualityPreset; // wjy: 独立监控窗口不激活设备手选档，始终使用设置页统一档位并实时刷新标题栏文字。
     }
     return isFullScreen()
         ? stream::kFullscreenRemoteVideoQualityPreset
@@ -4134,7 +4146,7 @@ bool RemoteDesktopWindow::remoteQualityIsDegraded() const
 
 void RemoteDesktopWindow::pushLocalClipboardIfNeeded()
 {
-    if (!m_clipboardSyncEnabled || !m_viewerHandle || m_closeInProgress) {
+    if (m_monitorReadOnly || !m_clipboardSyncEnabled || !m_viewerHandle || m_closeInProgress) {
         return;
     }
     QClipboard* clipboard = QGuiApplication::clipboard();
@@ -4155,6 +4167,7 @@ void RemoteDesktopWindow::pushLocalClipboardIfNeeded()
 
 void RemoteDesktopWindow::applyRemoteClipboardPayload(const QString& encodedBase64)
 {
+    if (m_monitorReadOnly) return; // wjy: 只读监控不能用远端内容改写本机剪贴板，也不保留脚本粘贴缓存。
     QString text;
     if (!RemoteClipboardCodec::decode(encodedBase64, &text)
         || text == m_lastAppliedRemoteClipboardText) {
@@ -4240,9 +4253,9 @@ void RemoteDesktopWindow::saveWindowGeometry()
 
 bool RemoteDesktopWindow::sendInputMessage(const QByteArray& message)
 {
-    if (remoteUpdateActive() || !m_viewerHandle
+    if (m_monitorReadOnly || remoteUpdateActive() || !m_viewerHandle
         || !RemoteConnectionState::acceptsRemoteInput(m_connectionStatusCode)) {
-        return false; // wjy: 更新、断网、退避重连或没有有效Viewer时统一丢弃输入，不向失效句柄积压键鼠和剪贴板消息。
+        return false; // wjy: 监控、更新、断网、退避重连或没有有效Viewer时统一丢弃输入，不向只读或失效句柄发送任何控制消息。
     }
     const bool shouldLog = shouldLogInputMessage(message);
     const bool ok = stream::StreamRuntime::instance().sendInput(m_viewerHandle, message);
@@ -4259,6 +4272,9 @@ bool RemoteDesktopWindow::sendInputMessage(const QByteArray& message)
 bool RemoteDesktopWindow::dispatchRemoteInputEvent(const RemoteInputEvent& event)
 {
     // =====wjy====
+    if (m_monitorReadOnly) {
+        return false; // wjy: 所有Qt、Raw Input和同步广播路径最终汇入此门禁，监控窗口不能成为输入源。
+    }
     if (inputScriptPlaybackActive() && event.type != RemoteInputEventType::CaptureRelease) {
         return false; // wjy: 目标端执行期间屏蔽所有人工键鼠，CaptureRelease仍可用于撤销脚本接管前遗留的相对鼠标状态。
     }
@@ -4280,6 +4296,7 @@ bool RemoteDesktopWindow::dispatchRemoteInputEvent(const RemoteInputEvent& event
 // =====wjy====
 void RemoteDesktopWindow::toggleInputScriptRecording()
 {
+    if (m_monitorReadOnly) return; // wjy: 监控窗口不记录键鼠脚本，避免只读页面产生控制意图文件。
     if (inputScriptPlaybackActive()) {
         appendViewerDebugLog(QStringLiteral("input script record ignored while playback host=%1").arg(m_hostIp));
         QApplication::beep(); // wjy: 录制与回放互斥，播放中F9只给出本地提示且不改变正在执行的脚本。
@@ -4461,6 +4478,7 @@ void RemoteDesktopWindow::recordRemoteInputEvent(const RemoteInputEvent& event)
 
 void RemoteDesktopWindow::toggleInputScriptPlayback()
 {
+    if (m_monitorReadOnly) return; // wjy: 监控窗口不能要求目标端启动或停止键鼠脚本。
     if (inputScriptPlaybackActive()) {
         stopRemoteInputScriptPlayback();
         return;
@@ -4657,7 +4675,7 @@ bool RemoteDesktopWindow::inputScriptPlaybackActive() const
 
 void RemoteDesktopWindow::requestRemoteInputScriptStatus()
 {
-    if (m_closeInProgress || m_hostIp.trimmed().isEmpty()) {
+    if (m_monitorReadOnly || m_closeInProgress || m_hostIp.trimmed().isEmpty()) {
         return;
     }
     const QString hostIp = m_hostIp.trimmed();
@@ -4688,7 +4706,8 @@ void RemoteDesktopWindow::setInputScriptDialogActive(bool active)
 
 bool RemoteDesktopWindow::synchronizedInputEligible() const
 {
-    return m_viewerHandle != nullptr
+    return !m_monitorReadOnly
+        && m_viewerHandle != nullptr
         && RemoteConnectionState::acceptsRemoteInput(m_connectionStatusCode)
         && !m_closeInProgress
         && !remoteUpdateActive()
@@ -4717,6 +4736,7 @@ void RemoteDesktopWindow::synchronizedInputRoleChanged(RemoteInputSyncRole role)
 
 void RemoteDesktopWindow::toggleInputSynchronization()
 {
+    if (m_monitorReadOnly) return; // wjy: 监控窗口既不能成为同步主控，也不能加入其它普通窗口的输入扇出集合。
     if (m_inputBroadcastCoordinator) {
         m_inputBroadcastCoordinator->toggleMaster(this); // wjy: 协调器根据当前角色执行开启、切主控或关闭，并在内部完成释放屏障。
     }
@@ -4736,6 +4756,7 @@ void RemoteDesktopWindow::setRemoteMouseCaptureActive(bool active)
 // =====wjy====
 void RemoteDesktopWindow::toggleManualMouseLock()
 {
+    if (m_monitorReadOnly) return; // wjy: 只读视频不捕获、隐藏或回中本机鼠标。
     m_manualMouseLockActive = !m_manualMouseLockActive; // wjy: F2 维护独立手动意图，不伪造 Host 的游戏检测状态。
     updateRemoteMouseCaptureState(); // wjy: 当前连接且有焦点时立即切换；失焦或断线时只保存意图，恢复资格后自动生效。
     requestTitleBarUpdate(); // wjy: 标题栏静态“鼠标锁定”文字只在开关变化时刷新，不引入逐鼠标事件重绘。
@@ -4749,7 +4770,8 @@ void RemoteDesktopWindow::toggleManualMouseLock()
 
 void RemoteDesktopWindow::updateRemoteMouseCaptureState()
 {
-    const bool shouldCapture = (m_remoteMouseCaptureRequested || m_manualMouseLockActive)
+    const bool shouldCapture = !m_monitorReadOnly
+        && (m_remoteMouseCaptureRequested || m_manualMouseLockActive)
         && synchronizedInputEligible()
         && isActiveWindow(); // wjy: 只有当前活动且可输入的远控窗口能占用进程唯一 Raw Input 鼠标目标。
     applyRemoteMouseCaptureState(shouldCapture);
@@ -4855,6 +4877,7 @@ void RemoteDesktopWindow::setRemoteMouseBackendStatus(const QString& statusMessa
 // =====wjy====
 void RemoteDesktopWindow::toggleRemoteMouseBackend()
 {
+    if (m_monitorReadOnly) return; // wjy: 监控窗口不允许改变目标机系统/Faker键鼠注入后端。
     if (m_remoteMouseBackendPending) return;
     requestRemoteMouseBackend(m_remoteMouseBackend == RemoteMouseBackend::System
             ? RemoteMouseBackend::Faker
@@ -4914,6 +4937,7 @@ void RemoteDesktopWindow::queryRemoteMouseBackend()
 
 bool RemoteDesktopWindow::sendRemoteMouseMove(const QPoint& position, Qt::MouseButtons buttons)
 {
+    if (m_monitorReadOnly) return false; // wjy: 视频子表面和父窗口的移动事件共享此最终门禁，监控鼠标只留在本机。
     if (m_remoteMouseCaptureActive) {
         // =====wjy====
 #if defined(Q_OS_WIN)
@@ -5077,7 +5101,9 @@ void RemoteDesktopWindow::recenterRemoteMouseCapture()
 void RemoteDesktopWindow::setKeyboardForwardingActive(bool active)
 {
 #if defined(Q_OS_WIN)
-    if (m_waitingShortcutRelease && !m_closeInProgress) {
+    if (m_monitorReadOnly) {
+        uninstallKeyboardHook(this); // wjy: 即使首帧或焦点回调请求激活，监控窗口也始终不安装全局键盘Hook。
+    } else if (m_waitingShortcutRelease && !m_closeInProgress) {
         installKeyboardHook(this); // wjy: 等待组合键松开时保留 hook，但 hook 只记录 keyup，不转发远端。
     } else if (active && !m_inputScriptDialogActive && !m_closeInProgress && !remoteUpdateActive()
         && !inputScriptPlaybackActive() && isActiveWindow() && m_viewerHandle
@@ -6046,7 +6072,7 @@ void RemoteDesktopWindow::invalidateViewerCallbacks()
 
 bool RemoteDesktopWindow::forwardNativeKey(int virtualKey, bool down)
 {
-    if (m_closeInProgress || remoteUpdateActive() || virtualKey <= 0) {
+    if (m_monitorReadOnly || m_closeInProgress || remoteUpdateActive() || virtualKey <= 0) {
         return false;
     }
     if (inputScriptPlaybackActive()) {
@@ -6377,7 +6403,8 @@ void RemoteDesktopWindow::startViewerConnectionWithAdmission()
                 onRemoteFrame,
                 onRemoteTextureFrame,
                 onViewerStatus,
-                callbackContext.get()); // wjy: 真正的原生初始化只能从管理器授予名额后的入口发生，同时最多4路。
+                callbackContext.get(),
+                m_monitorReadOnly); // wjy: 监控角色随Viewer创建进入DLL认证握手，Host从首个协议包起就按只读会话处理。
         } catch (const std::exception& exception) {
             m_viewerHandle = nullptr;
             setConnectionStatus(90, QString::fromUtf8("启动远控连接失败：%1")

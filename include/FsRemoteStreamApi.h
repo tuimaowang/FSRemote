@@ -36,6 +36,13 @@ typedef int(FSREMOTE_STREAM_CALL* FsRemoteTextureFrameCallback)(
     double encoded_mbps);
 
 // =====wjy====
+enum FsRemoteViewerRole {
+    FSREMOTE_VIEWER_ROLE_CONTROL = 0, // wjy: 普通远控请求视频、音频和控制权限，并计入目标端远控人数。
+    FSREMOTE_VIEWER_ROLE_MONITOR = 1, // wjy: 监控窗口只请求视频，目标端不授予输入权限且不计入远控人数。
+};
+// ===end====
+
+// =====wjy====
 enum FsRemoteTextureFrameResult {
     FSREMOTE_TEXTURE_FRAME_FALLBACK = 0, // wjy: 当前纹理无法进入安全GPU路径，解码器继续生成BGRA软件帧保证画面不中断。
     FSREMOTE_TEXTURE_FRAME_ACCEPTED = 1, // wjy: 控制端已经接管共享纹理，生产端将纹理所有权交给D3D11 Presenter。
@@ -184,6 +191,16 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_text
     FsRemoteTextureFrameCallback texture_callback,
     FsRemoteStatusCallback status_callback,
     void* user);
+// =====wjy====
+FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_texture_role(
+    const char* host_ip,
+    uint16_t port,
+    FsRemoteFrameCallback frame_callback,
+    FsRemoteTextureFrameCallback texture_callback,
+    FsRemoteStatusCallback status_callback,
+    void* user,
+    enum FsRemoteViewerRole role); // wjy: 连接创建前固定普通控制或只读监控角色，认证完成后不能切换权限。
+// ===end====
 void FSREMOTE_STREAM_CALL fsremote_stream_stop(FsRemoteStreamHandle handle);
 int FSREMOTE_STREAM_CALL fsremote_stream_send_input(FsRemoteStreamHandle handle, const char* message);
 // =====wjy====

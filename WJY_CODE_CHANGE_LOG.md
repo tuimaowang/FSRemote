@@ -13476,6 +13476,279 @@ assert(restoreA && !restoreB);
 - 已更新纯策略测试源码覆盖默认、全屏、手选、遮挡、恢复和多窗口场景。
 - 按用户此前要求，本次未构建、未链接、未运行测试或启动程序。
 
+## 2026-08-11 10:20 - 监控模式改为全设备只读轮询会话
+
+### Changed Location
+- `include/FsRemoteStreamApi.h:39、195`: 新增普通控制与只读监控 Viewer 角色及显式角色启动 ABI。
+- `src/stream/StreamRuntime.h:58、100、135`: 缓存角色化 DLL 导出，并为纹理 Viewer 增加只读参数。
+- `src/stream/StreamRuntime.cpp:94、188`: 优先调用角色化 Viewer 入口；旧 DLL 不允许把监控降级成控制会话。
+- `third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:656、2324、2381、2935、3637`: Viewer 握手请求 `view`，Host 排除监控人数和控制者名称，并允许同机 `control`/`view` 共存。
+- `src/ui/RemoteDesktopWindow.h:53、329`: 构造阶段固定监控只读属性。
+- `src/ui/RemoteDesktopWindow.cpp:1972、3947、4253、4707、6388`: 关闭监控窗口的键鼠、剪贴板、音频、脚本和同步输入，并把只读角色传入 DLL。
+- `src/ui/DeviceGrid.h:189、324`: 使用设备 ID 到独立监控窗口的映射替代普通窗口恢复快照。
+- `src/ui/DeviceGrid.cpp:4472、7226、9628、9843、9902、9955、9982、10797`: 按全部在线远端设备创建、分页、统计和关闭只读监控窗口，并纳入统一画质与退出清理。
+
+### Reason
+上一版监控模式只接管本机已经打开的普通远控窗口，标题栏数字仍显示控制会话人数，关闭后还会恢复旧窗口布局。该行为无法覆盖其它设备，也会让监控 Viewer 以普通控制身份进入目标端会话统计。
+
+本次把监控改为独立只读会话：目标集合来自设备目录中所有在线或占用的远端设备，不依赖本机普通远控窗口；Host 从认证握手开始只授予视频能力，拒绝键鼠输入，并从远控人数、控制者名称和被控提示中排除监控会话。
+
+### Original Code
+```cpp
+// include/FsRemoteStreamApi.h:169-186
+FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_texture(
+    const char* host_ip,
+    uint16_t port,
+    FsRemoteFrameCallback frame_callback,
+    FsRemoteTextureFrameCallback texture_callback,
+    FsRemoteStatusCallback status_callback,
+    void* user);
+```
+
+```cpp
+// src/stream/StreamRuntime.cpp:186-199
+FsRemoteStreamHandle StreamRuntime::startViewer(
+    const QString& hostIp,
+    uint16_t port,
+    FsRemoteFrameCallback frameCallback,
+    FsRemoteTextureFrameCallback textureCallback,
+    FsRemoteStatusCallback statusCallback,
+    void* user)
+{
+    const QByteArray ip = hostIp.toUtf8();
+    if (m_startViewerWithTexture) {
+        return m_startViewerWithTexture(ip.constData(), port, frameCallback, textureCallback, statusCallback, user);
+    }
+    return startViewer(hostIp, port, frameCallback, statusCallback, user);
+}
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:671-674、2324-2330
+const std::string requested_role = "control";
+const std::string offered_capabilities = "video,audio,control";
+
+if (session->admission.ownership != "control_granted"
+    && session->admission.requested_role != "control") {
+    // still include any active session that holds video so multi-viewer is visible
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.h:53-58
+explicit RemoteDesktopWindow(
+    const QString& deviceName,
+    const QString& hostIp,
+    RemoteViewerLifecycleManager* lifecycleManager,
+    RemoteInputBroadcastCoordinator* inputBroadcastCoordinator,
+    QWidget* parent = nullptr);
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:4241-4248
+bool RemoteDesktopWindow::sendInputMessage(const QByteArray& message)
+{
+    if (remoteUpdateActive() || !m_viewerHandle
+        || !RemoteConnectionState::acceptsRemoteInput(m_connectionStatusCode)) {
+        return false;
+    }
+    return stream::StreamRuntime::instance().sendInput(m_viewerHandle, message);
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.h:113-119、329-332
+struct RemoteMonitorWindowState {
+    QPointer<RemoteDesktopWindow> window;
+    QRect normalGeometry;
+    Qt::WindowStates windowState = Qt::WindowNoState;
+    bool visible = true;
+    bool rememberGeometry = true;
+};
+
+QHash<RemoteDesktopWindow*, RemoteMonitorWindowState> m_remoteMonitorWindowStates;
+bool m_remoteMonitorModeEnabled = false;
+int m_remoteMonitorPageIndex = 0;
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:9865-9878、9933-9941
+QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
+for (auto it = windows.begin(); it != windows.end();) {
+    if (!*it || (*it)->isClosingConnection()) {
+        it = windows.erase(it);
+    } else {
+        ++it;
+    }
+}
+
+if (windows.isEmpty()) {
+    m_remoteMonitorPageIndex = 0;
+    return;
+}
+```
+
+### Modified Code
+```cpp
+// include/FsRemoteStreamApi.h:39-43、195-202
+enum FsRemoteViewerRole {
+    FSREMOTE_VIEWER_ROLE_CONTROL = 0,
+    FSREMOTE_VIEWER_ROLE_MONITOR = 1,
+};
+
+FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_texture_role(
+    const char* host_ip,
+    uint16_t port,
+    FsRemoteFrameCallback frame_callback,
+    FsRemoteTextureFrameCallback texture_callback,
+    FsRemoteStatusCallback status_callback,
+    void* user,
+    enum FsRemoteViewerRole role);
+```
+
+```cpp
+// src/stream/StreamRuntime.cpp:188-219
+FsRemoteStreamHandle StreamRuntime::startViewer(
+    const QString& hostIp,
+    uint16_t port,
+    FsRemoteFrameCallback frameCallback,
+    FsRemoteTextureFrameCallback textureCallback,
+    FsRemoteStatusCallback statusCallback,
+    void* user,
+    bool monitorReadOnly)
+{
+    if (m_startViewerWithTextureRole) {
+        return m_startViewerWithTextureRole(
+            ip.constData(), port, frameCallback, textureCallback, statusCallback, user,
+            monitorReadOnly ? FSREMOTE_VIEWER_ROLE_MONITOR : FSREMOTE_VIEWER_ROLE_CONTROL);
+    }
+    if (monitorReadOnly) return nullptr;
+    return m_startViewerWithTexture
+        ? m_startViewerWithTexture(ip.constData(), port, frameCallback, textureCallback, statusCallback, user)
+        : startViewer(hostIp, port, frameCallback, statusCallback, user);
+}
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:674-677、2328-2331、2391-2397
+const bool monitor_read_only = viewer_role == FSREMOTE_VIEWER_ROLE_MONITOR;
+const std::string requested_role = monitor_read_only ? "view" : "control";
+const std::string offered_capabilities = monitor_read_only ? "video" : "video,audio,control";
+
+if (session->admission.ownership != "control_granted") continue;
+
+if (session->admission.public_key != current->admission.public_key
+    || session->admission.requested_role != current->admission.requested_role) {
+    continue;
+}
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.h:53-59、329
+explicit RemoteDesktopWindow(
+    const QString& deviceName,
+    const QString& hostIp,
+    RemoteViewerLifecycleManager* lifecycleManager,
+    RemoteInputBroadcastCoordinator* inputBroadcastCoordinator,
+    QWidget* parent = nullptr,
+    bool monitorReadOnly = false);
+
+bool m_monitorReadOnly = false;
+```
+
+```cpp
+// src/ui/RemoteDesktopWindow.cpp:4253-4277、4707-4714、6400-6407
+if (m_monitorReadOnly || remoteUpdateActive() || !m_viewerHandle
+    || !RemoteConnectionState::acceptsRemoteInput(m_connectionStatusCode)) {
+    return false;
+}
+
+return !m_monitorReadOnly
+    && m_viewerHandle != nullptr
+    && RemoteConnectionState::acceptsRemoteInput(m_connectionStatusCode);
+
+m_viewerHandle = stream::StreamRuntime::instance().startViewer(
+    m_hostIp.trimmed(), 49100, onRemoteFrame, onRemoteTextureFrame,
+    onViewerStatus, callbackContext.get(), m_monitorReadOnly);
+```
+
+```cpp
+// src/ui/DeviceGrid.h:189-202、324-329
+int remoteMonitorDeviceCount() const;
+QVector<int> remoteMonitorDeviceIndexes() const;
+void createRemoteMonitorWindowForDevice(int deviceIndex);
+QVector<QPointer<RemoteDesktopWindow>> openedRemoteMonitorWindows() const;
+void closeRemoteMonitorWindows();
+
+QHash<QString, QPointer<RemoteDesktopWindow>> m_remoteMonitorWindows;
+QSet<QString> m_pendingRemoteMonitorDeviceIds;
+bool m_remoteMonitorModeEnabled = false;
+int m_remoteMonitorPageIndex = 0;
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:9843-9856、9902-9938、9982-10031
+int DeviceGrid::remoteMonitorDeviceCount() const
+{
+    int count = 0;
+    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+        const DeviceEntry& device = g_devices.at(deviceIndex);
+        const platform::DevicePresenceState presence = devicePresenceForIndex(deviceIndex);
+        if (!device.ip.trimmed().isEmpty() && !deviceRecordMatchesLocal(device)
+            && (presence == platform::DevicePresenceState::Online
+                || presence == platform::DevicePresenceState::Busy)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+auto* monitorWindow = new RemoteDesktopWindow(
+    deviceDisplayName(device), ip, m_remoteViewerLifecycleManager.get(),
+    nullptr, nullptr, true);
+m_remoteMonitorWindows.insert(key, monitorWindow);
+registerRemoteQualityWindow(monitorWindow, true);
+
+const QVector<int> deviceIndexes = remoteMonitorDeviceIndexes();
+for (const int deviceIndex : deviceIndexes) {
+    if (m_authorizedRemoteControlIps.contains(ip)) {
+        createRemoteMonitorWindowForDevice(deviceIndex);
+    } else {
+        authorizationIds.append(device.id);
+    }
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:10797-10803
+const int controlledSessionCount = m_remoteMonitorModeEnabled
+    ? remoteMonitorDeviceCount()
+    : totalRemoteControlSessionCount();
+```
+
+### Steps
+1. 在公开流 API 中新增 `CONTROL` 和 `MONITOR` Viewer 角色，以及角色化纹理 Viewer 启动入口。
+2. `StreamRuntime` 动态解析新导出；普通远控兼容旧 DLL，监控模式缺少新导出时明确失败，禁止退化成控制会话。
+3. Viewer 准入握手在监控模式下请求 `view` 且只声明 `video` 能力，角色被签名上下文绑定。
+4. Host 继续只统计 `control_granted` 会话，并修正控制者名称列表，使只读监控不出现在人数、名称或被控提示中。
+5. 同一公钥的 `control` 和 `view` 会话按角色分别处理重连，普通远控与监控窗口可以同时观看同一设备。
+6. `RemoteDesktopWindow` 在构造阶段固定只读属性，关闭键盘 Hook、鼠标转发、剪贴板、音频、画质手选、键鼠脚本和输入同步。
+7. `DeviceGrid` 从全部在线或占用的非本机设备构造稳定轮询集合，不再读取 `openedRemoteWindows()` 作为监控来源。
+8. 监控窗口按设备 ID 独立保存，不登记普通窗口协调器、不调用 `publishRemoteControllerTarget()`，并使用设置页统一画质。
+9. 设备上下线时立即同步监控窗口；轮询定时器按配置宫格切页，非当前页继续以360/1保活。
+10. 关闭监控模式时关闭全部独立监控窗口，不恢复旧布局；程序退出时把尚在异步关闭的监控 Viewer 纳入统一停止和等待流程。
+11. 标题栏数字在监控开启时显示全部在线轮询设备数，关闭后恢复真实控制会话人数。
+12. 更新监控设置页说明，明确目标来自全部在线远端设备，监控窗口不使用设备历史手选画质。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已使用 `rg` 核对角色化 Viewer ABI 在声明、动态解析、实现和调用处名称一致。
+- 已静态核对监控窗口创建路径未调用 `publishRemoteControllerTarget()`，也未注册 `RemoteInputBroadcastCoordinator`。
+- 已静态核对 Viewer 与 Host 两端均有只读门禁：Viewer 不发送输入，Host 的 `view_only` 会话不登记输入分发且不会进入控制人数与控制者列表。
+- 已静态核对普通远控仍使用原协调器、控制租约、历史画质和快捷键集合，监控开启不会修改普通窗口画质或布局。
+- 已静态核对设备离线、关闭监控和程序退出三条路径都会停止并清理独立监控 Viewer。
+- 按用户要求，本次未构建、未链接、未运行测试或启动程序。
+
 ## 2026-08-11 09:27 - 新增分页监控模式与可配置宫格轮询
 
 ### Changed Location

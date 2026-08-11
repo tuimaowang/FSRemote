@@ -110,16 +110,6 @@ private:
     // ===end====
 
     // =====wjy====
-    struct RemoteMonitorWindowState {
-        QPointer<RemoteDesktopWindow> window; // wjy: QPointer在轮询期间窗口被用户关闭时自动失效，恢复阶段不会访问悬空地址。
-        QRect normalGeometry; // wjy: 进入监控前保存普通窗口矩形，退出后精确恢复用户原布局。
-        Qt::WindowStates windowState = Qt::WindowNoState; // wjy: 同时保存最小化、最大化和全屏状态，监控结束不强制所有窗口变成普通态。
-        bool visible = true; // wjy: 原本隐藏的窗口退出监控后继续隐藏，不因分页展示改变用户状态。
-        bool rememberGeometry = true; // wjy: 普通窗口和平铺批次的几何持久化策略不同，退出监控后必须恢复原值。
-    };
-    // ===end====
-
-    // =====wjy====
     enum class ScreenEdgeDock {
         None, // wjy: 主窗口当前没有停靠，不启用自动隐藏监视和位置动画。
         Top, // wjy: 顶部停靠时沿 y 轴向屏幕外收起，保持现有顶部行为不变。
@@ -199,10 +189,17 @@ private:
     RemoteDesktopWindow* topmostRemoteWindow() const;
     void toggleTopmostRemoteWindowFullscreen();
     void toggleRemoteWindowTiling();
-    void toggleRemoteMonitorMode(); // wjy: 主窗口标题栏按钮开启或关闭分页监控，关闭时恢复全部窗口原几何和状态。
-    void setRemoteMonitorModeEnabled(bool enabled); // wjy: 统一管理监控定时器、画质覆盖和窗口恢复，避免多个入口各自改状态。
-    void refreshRemoteMonitorMode(bool advancePage); // wjy: 重新扫描已打开远控窗口并按当前宫格显示一页，定时触发时前进到下一页。
-    void applyRemoteMonitorQualityPreset(); // wjy: 将设置页监控画质同步到全部已打开窗口并立即进入质量协调器。
+    void toggleRemoteMonitorMode(); // wjy: 主窗口标题栏按钮开启独立设备轮询或关闭全部监控窗口，普通远控窗口不参与切换。
+    void setRemoteMonitorModeEnabled(bool enabled); // wjy: 统一管理监控设备扫描、分页定时器和独立只读Viewer生命周期。
+    void refreshRemoteMonitorMode(bool advancePage); // wjy: 按全部在线设备目录同步监控窗口并显示当前宫格页，不依赖本机已经打开的远控窗口。
+    void applyRemoteMonitorQualityPreset(); // wjy: 将设置页监控画质只同步到独立监控窗口，普通远控保留自身自动或手选档。
+    int remoteMonitorDeviceCount() const; // wjy: 标题栏高频绘制和鼠标命中只统计目标数量，不执行分页所需的自然排序。
+    QVector<int> remoteMonitorDeviceIndexes() const; // wjy: 返回所有在线/占用且具有有效IP的非本机设备，并使用稳定自然名称顺序轮询。
+    QString remoteMonitorDeviceKey(int deviceIndex) const; // wjy: 优先使用设备稳定ID，兼容旧记录时回退规范化IP作为监控窗口键。
+    void createRemoteMonitorWindowForDevice(int deviceIndex); // wjy: 创建不发布控制租约、不加入键鼠同步器的只读视频窗口。
+    QVector<QPointer<RemoteDesktopWindow>> openedRemoteMonitorWindows() const; // wjy: 清理空指针后返回当前独立监控窗口快照。
+    QVector<QPointer<RemoteDesktopWindow>> qualityManagedRemoteWindows() const; // wjy: 质量协调器同时覆盖普通与监控窗口，其它快捷键和关闭命令仍只操作普通远控。
+    void closeRemoteMonitorWindows(); // wjy: 关闭监控模式时停止并释放全部只读Viewer，不恢复进入前的任何窗口布局。
     void closeTopmostRemoteWindow();
     void closeAllRemoteWindows();
     void refreshLocalDeviceInfo();
@@ -249,7 +246,7 @@ private:
     void startDesktopWallpaperRotation(bool userInitiated); // wjy: 先异步探测 SMB，连接成功才进入真实壁纸任务。
     void performDesktopWallpaperRotation(bool userInitiated); // wjy: 已通过连接门禁后在后台选择并应用下一张共享图片。
     void saveRemoteQualitySettingsFromControls(); // wjy: 收集远控画质页字段、统一归一化持久化并立即通知跟随全局的窗口。
-    void registerRemoteQualityWindow(RemoteDesktopWindow* window); // wjy: 普通和平铺窗口共用同一套质量注册、销毁清理和即时重算逻辑。
+    void registerRemoteQualityWindow(RemoteDesktopWindow* window, bool monitorWindow = false); // wjy: 普通窗口恢复设备手选档；监控窗口只使用统一监控档位并纳入同一质量协调器。
     void requestRemoteQualityEvaluation(); // wjy: 合并同一事件循环内多次窗口变化，最多排队一个全局质量计算任务。
     void evaluateRemoteQuality(); // wjy: 每秒汇总窗口并在状态事件时即时重算，手选/监控/自动按优先级恢复，完全遮挡临时360/1。
     void saveShortcutKeySetting(int shortcutIndex, const QString& shortcutText); // wjy: Save one keyboard shortcut when its editor loses focus or receives Enter.
@@ -327,9 +324,10 @@ private:
     platform::LocalNetworkBandwidthSample m_titlebarBandwidthSample; // wjy: UI 线程保存最新完整样本，paintEvent 只格式化文字而不查询系统 API。
     QTimer* m_titlebarBandwidthTimer = nullptr; // wjy: 每秒更新一次版本号右侧的当前接收 Mbps 与被控会话总数。
     QTimer* m_remoteMonitorTimer = nullptr; // wjy: 仅监控模式开启时运行，默认每30秒切换下一批远控窗口。
-    QHash<RemoteDesktopWindow*, RemoteMonitorWindowState> m_remoteMonitorWindowStates; // wjy: 保存监控接管前的窗口几何、状态和显隐，关闭模式后原样恢复。
+    QHash<QString, QPointer<RemoteDesktopWindow>> m_remoteMonitorWindows; // wjy: 按稳定设备键独立持有只读Viewer，不混入普通/平铺远控协调器。
+    QSet<QString> m_pendingRemoteMonitorDeviceIds; // wjy: 批量公钥授权期间按稳定设备ID去重，状态刷新不会重复创建后台授权任务。
     bool m_remoteMonitorModeEnabled = false; // wjy: 程序启动默认关闭，只由标题栏按钮控制当前会话。
-    int m_remoteMonitorPageIndex = 0; // wjy: 当前监控页从0开始，窗口数量或宫格变化时夹紧或重置。
+    int m_remoteMonitorPageIndex = 0; // wjy: 当前监控页按在线设备目标集合计算，设备上下线或宫格变化时自动夹紧。
     // ===end====
     bool m_remoteQualityEvaluationQueued = false; // wjy: 多窗口同时最小化或创建时合并为一个Qt任务，避免事件队列放大。
     qint64 m_lastRemoteResourceDiagnosticAtMs = 0; // wjy: 资源快照限制为30秒一次，避免稳定性诊断本身成为性能热点。
@@ -357,7 +355,7 @@ private:
     QComboBox* m_remoteQualityModeCombo = nullptr; // wjy: 远控画质设置只保留默认模式，下方固定预设由手绘说明展示。
     stream::RemoteMonitorConfiguration m_remoteMonitorConfiguration; // wjy: 缓存监控宫格、统一画质和轮询周期，设置变更立即作用于运行中监控。
     QComboBox* m_remoteMonitorGridCombo = nullptr; // wjy: 设置页提供4/9/12/16/20/25六种单页容量。
-    QComboBox* m_remoteMonitorQualityCombo = nullptr; // wjy: 设置页选择监控模式统一画质，窗口自身手选仍优先。
+    QComboBox* m_remoteMonitorQualityCombo = nullptr; // wjy: 设置页选择独立监控窗口的统一画质，不读取普通远控按设备保存的手选档。
     QLineEdit* m_remoteMonitorIntervalEdit = nullptr; // wjy: 轮询秒数默认30，失焦或回车后持久化并重启计时。
     // ===end====
     QSet<int> m_registeredGlobalShortcutIds;

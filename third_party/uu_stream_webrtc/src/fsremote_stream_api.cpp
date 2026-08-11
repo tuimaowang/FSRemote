@@ -657,6 +657,7 @@ bool perform_viewer_admission(
     uintptr_t socket,
     FsRemoteStatusCallback status_callback,
     void* user,
+    FsRemoteViewerRole viewer_role,
     SessionAdmission* admission,
     std::string* error)
 {
@@ -670,8 +671,11 @@ bool perform_viewer_admission(
     }
     const std::string client_id = random_hex(16);
     const std::string client_nonce = random_hex(32);
-    const std::string requested_role = "control";
-    const std::string offered_capabilities = "video,audio,control";
+    // =====wjy====
+    const bool monitor_read_only = viewer_role == FSREMOTE_VIEWER_ROLE_MONITOR;
+    const std::string requested_role = monitor_read_only ? "view" : "control"; // wjy: 只读角色进入签名上下文，握手途中无法被篡改成控制会话。
+    const std::string offered_capabilities = monitor_read_only ? "video" : "video,audio,control"; // wjy: 监控不协商音频和输入能力，Host不会分配控制或音频资格。
+    // ===end====
     uu::SessionMessage hello;
     hello.type = uu::SessionMessageType::ClientHello;
     hello.fields = {
@@ -2323,11 +2327,8 @@ public:
         std::string names;
         for (const auto& [id, session] : sessions_) {
             if (!session || session->cancelled || session->completed) continue; // wjy: 已触发断线清理的会话不再出现在控制端名称气泡中。
-            // wjy: 气泡优先展示“有控制权”的端；没有设备名时回退 client_id 前 8 位。
-            if (session->admission.ownership != "control_granted"
-                && session->admission.requested_role != "control") {
-                // still include any active session that holds video so multi-viewer is visible
-            }
+            if (session->admission.ownership != "control_granted") continue; // wjy: 只读监控只贡献视频订阅，不出现在控制者名称或被控提示中。
+            // wjy: 气泡只展示真正有控制权的端；没有设备名时回退 client_id 前 8 位。
             std::string name = session->admission.client_device_name;
             if (name.empty()) {
                 name = session->admission.client_id.empty()
@@ -2391,8 +2392,9 @@ private:
                     || session.get() == current.get()
                     || session->cancelled
                     || session->completed
-                    || session->admission.public_key != current->admission.public_key) {
-                    continue; // wjy: 公钥代表同一已授权控制设备，只替换它自己的旧连接，不影响其它控制端并发。
+                    || session->admission.public_key != current->admission.public_key
+                    || session->admission.requested_role != current->admission.requested_role) {
+                    continue; // wjy: 同一公钥的control和view可同时存在，只替换相同角色自己的旧连接，不让监控挤掉普通远控。
                 }
                 superseded.push_back(session); // wjy: 同一控制设备重连时，新会话接管，旧会话立即退出人数和气泡。
             }
@@ -2934,13 +2936,15 @@ public:
         FsRemoteFrameCallback frameCallback,
         FsRemoteTextureFrameCallback textureCallback,
         FsRemoteStatusCallback statusCallback,
-        void* user)
+        void* user,
+        FsRemoteViewerRole viewerRole)
         : host_ip_(std::move(hostIp))
         , port_(port)
         , frame_callback_(frameCallback)
         , texture_callback_(textureCallback)
         , status_callback_(statusCallback)
         , user_(user)
+        , viewer_role_(viewerRole) // wjy: Viewer线程启动前固定角色，后续网络重连仍使用同一种准入权限。
     {
         worker_ = std::thread([this] {
             try {
@@ -3260,7 +3264,7 @@ private:
         report_status(status_callback_, user_, FSREMOTE_STATUS_TCP_CONNECTED, "TCP connected");
         // =====wjy====
         set_socket_timeout(socket, 5000);
-        if (!perform_viewer_admission(socket, status_callback_, user_, &admission_, &error)) {
+        if (!perform_viewer_admission(socket, status_callback_, user_, viewer_role_, &admission_, &error)) {
             append_viewer_log("viewer admission failed error=" + error); // wjy: 认证失败不启动音频、不初始化 WebRTC，UI 保留具体拒绝状态。
             return;
         }
@@ -3470,6 +3474,7 @@ private:
     FsRemoteTextureFrameCallback texture_callback_ = nullptr;
     FsRemoteStatusCallback status_callback_ = nullptr;
     void* user_ = nullptr;
+    FsRemoteViewerRole viewer_role_ = FSREMOTE_VIEWER_ROLE_CONTROL; // wjy: 普通API保持控制角色，新监控API显式覆盖为只读。
     SessionAdmission admission_; // wjy: 准入结果生命周期覆盖整个 ViewerInstance，供后续音频令牌、控制权和状态处理复用。
     std::atomic_bool control_allowed_ = false; // wjy: 原子权限位跨 UI 与 viewer worker 线程读取，避免直接并发访问 admission_ 字符串。
     std::atomic_bool ice_disconnected_ = false; // wjy: 去重同一轮ICE断开/恢复通知，避免网络线程高频回调反复重置UI计时器。
@@ -3568,7 +3573,7 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer(
     }
 
     try {
-        return new ViewerInstance(host_ip, port, callback, nullptr, nullptr, user);
+        return new ViewerInstance(host_ip, port, callback, nullptr, nullptr, user, FSREMOTE_VIEWER_ROLE_CONTROL);
     } catch (const std::exception& ex) {
         set_error(ex.what());
         return nullptr;
@@ -3594,7 +3599,7 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_stat
     }
 
     try {
-        return new ViewerInstance(host_ip, port, frame_callback, nullptr, status_callback, user);
+        return new ViewerInstance(host_ip, port, frame_callback, nullptr, status_callback, user, FSREMOTE_VIEWER_ROLE_CONTROL);
     } catch (const std::exception& ex) {
         set_error(ex.what());
         report_status(status_callback, user, 90, ex.what());
@@ -3620,13 +3625,44 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_text
     }
 
     try {
-        return new ViewerInstance(host_ip, port, frame_callback, texture_callback, status_callback, user);
+        return new ViewerInstance(host_ip, port, frame_callback, texture_callback, status_callback, user, FSREMOTE_VIEWER_ROLE_CONTROL);
     } catch (const std::exception& ex) {
         set_error(ex.what());
         report_status(status_callback, user, 90, ex.what());
         return nullptr;
     }
 }
+
+// =====wjy====
+FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_texture_role(
+    const char* host_ip,
+    uint16_t port,
+    FsRemoteFrameCallback frame_callback,
+    FsRemoteTextureFrameCallback texture_callback,
+    FsRemoteStatusCallback status_callback,
+    void* user,
+    FsRemoteViewerRole role)
+{
+    install_crash_logger();
+    append_viewer_log(std::string("api start_viewer_with_texture_role ip=") + (host_ip ? host_ip : "<null>")
+        + " port=" + std::to_string(port)
+        + " role=" + std::to_string(static_cast<int>(role))); // wjy: 日志明确区分普通控制和只读监控连接，现场可核对是否错误占用控制人数。
+    if (!host_ip || !*host_ip || !frame_callback
+        || (role != FSREMOTE_VIEWER_ROLE_CONTROL && role != FSREMOTE_VIEWER_ROLE_MONITOR)) {
+        set_error("invalid role-aware texture viewer arguments");
+        report_status(status_callback, user, FSREMOTE_STATUS_ERROR, "Invalid role-aware texture viewer arguments");
+        return nullptr;
+    }
+
+    try {
+        return new ViewerInstance(host_ip, port, frame_callback, texture_callback, status_callback, user, role); // wjy: 角色随实例按值复制，认证线程不读取调用方临时内存。
+    } catch (const std::exception& ex) {
+        set_error(ex.what());
+        report_status(status_callback, user, FSREMOTE_STATUS_ERROR, ex.what());
+        return nullptr;
+    }
+}
+// ===end====
 
 void FSREMOTE_STREAM_CALL fsremote_stream_stop(FsRemoteStreamHandle handle)
 {

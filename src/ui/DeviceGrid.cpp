@@ -3480,7 +3480,7 @@ void drawSettingsPage(
         painter.drawText(
             QRectF(monitorCard.x() + 28, monitorCard.y() + 38, monitorCard.width() - 56, 20),
             Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("分页平铺当前已打开的远控窗口；不足一页只显示剩余窗口，关闭后恢复原布局。")); // wjy: 设置页明确监控对象来自现有窗口，并说明最后一页不会补空连接。
+            QString::fromUtf8("自动轮询全部在线远端设备；不足一页只显示剩余设备，关闭后关闭全部监控窗口。")); // wjy: 设置页明确监控对象来自设备目录，不再暗示依赖本机普通远控窗口或恢复旧布局。
 
         QFont labelFont(textFont);
         labelFont.setPixelSize(12);
@@ -3512,7 +3512,7 @@ void drawSettingsPage(
         painter.drawText(
             QRectF(monitorCard.x() + 28, monitorCard.y() + 290, monitorCard.width() - 56, 44),
             Qt::AlignTop | Qt::AlignLeft | Qt::TextWordWrap,
-            QString::fromUtf8("清晰度修改会立即作用于监控窗口；窗口标题栏手选画质仍保持最高优先级。")); // wjy: 直接说明监控统一档位与既有窗口手选的优先级关系。
+            QString::fromUtf8("清晰度修改会立即作用于全部监控窗口；监控窗口不使用设备历史手选画质。")); // wjy: 独立只读监控只接受设置页统一档位，普通远控的历史手选记录互不影响。
         painter.restore();
         return;
     }
@@ -4201,7 +4201,7 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     m_remoteMonitorTimer->setTimerType(Qt::CoarseTimer); // wjy: 监控分页是秒级操作，不需要高精度唤醒远控窗口。
     m_remoteMonitorTimer->setInterval(m_remoteMonitorConfiguration.rotationIntervalSeconds * 1000);
     connect(m_remoteMonitorTimer, &QTimer::timeout, this, [this] {
-        refreshRemoteMonitorMode(true); // wjy: 每次到期重新扫描当前窗口集合并切到下一批，新增或关闭窗口无需重启模式。
+        refreshRemoteMonitorMode(true); // wjy: 每次到期重新扫描全部在线设备并切到下一批，设备上下线和普通远控窗口变化互不依赖。
     });
     // ===end====
 
@@ -4478,6 +4478,8 @@ void DeviceGrid::applyRealtimeDeviceState(
         return;
     }
 
+    const platform::DevicePresenceState previousPresence =
+        m_deviceStatuses.value(ip, platform::DevicePresenceState::Unknown); // wjy: 监控目标只在上下线边界变化时重扫，普通心跳不会反复创建布局任务。
     m_deviceStatuses.insert(ip, state.presence);
     m_deviceRemoteSessionCounts.insert(ip, qBound(0, state.remoteSessionCount, 10)); // wjy: 徽标人数只接收目标主机快照里的会话数。
     m_deviceRemoteControllerNames.insert(ip, state.remoteControllerLabels.join(QLatin1Char(',')));
@@ -4511,6 +4513,9 @@ void DeviceGrid::applyRealtimeDeviceState(
     }
     update(deviceListViewportRect(m_deviceGroupExpanded));
     update(titlebarBandwidthUpdateRect()); // wjy: 远控会话数变化时立即刷新标题栏汇总数字，不等待下一秒带宽采样顺带重绘。
+    if (m_remoteMonitorModeEnabled && previousPresence != state.presence) {
+        QTimer::singleShot(0, this, [this] { refreshRemoteMonitorMode(false); }); // wjy: 任意设备上线、占用或离线时立即同步独立监控窗口和标题栏轮询总数。
+    }
 }
 
 void DeviceGrid::applyRemoteInputScriptRuntimeState(
@@ -4587,7 +4592,7 @@ void DeviceGrid::prepareForApplicationExit()
         m_remoteMonitorTimer->stop(); // wjy: 退出阶段只停止分页调度，不再恢复几何或显示窗口，后续统一Viewer关闭流程直接接管。
     }
     m_remoteMonitorModeEnabled = false;
-    m_remoteMonitorWindowStates.clear();
+    m_pendingRemoteMonitorDeviceIds.clear(); // wjy: 退出后所有授权回调都因shuttingDown失效，先清空去重集合避免保留无意义设备ID。
     if (m_titlebarBandwidthTimer) {
         m_titlebarBandwidthTimer->stop(); // wjy: 退出准备阶段停止标题栏网卡枚举，不再投递一秒重绘。
         m_titlebarBandwidthMonitor.reset();
@@ -4613,8 +4618,14 @@ void DeviceGrid::prepareForApplicationExit()
     unregisterGlobalShortcuts();
 
     // =====wjy====
-    const QVector<QPointer<RemoteDesktopWindow>> windows =
-        m_remoteWindowCoordinator->shutdownWindows(); // wjy: 协调器统一去重普通、平铺和激活顺序引用，退出时每个窗口只处理一次。
+    QVector<QPointer<RemoteDesktopWindow>> windows =
+        m_remoteWindowCoordinator->shutdownWindows(); // wjy: 协调器先返回全部普通和平铺远控窗口。
+    for (const QPointer<RemoteDesktopWindow>& monitorWindow : openedRemoteMonitorWindows()) {
+        if (monitorWindow && !windows.contains(monitorWindow)) {
+            windows.append(monitorWindow); // wjy: 独立监控Viewer不在普通协调器中，退出时显式合并到同一stop和join批次。
+        }
+    }
+    m_remoteMonitorWindows.clear(); // wjy: 后续销毁回调不能再次把退出中的监控窗口加入分页集合。
     // ===end====
     writeDeviceGridStartupLog(QStringLiteral("[wjy-exit] remote windows count=%1").arg(windows.size()));
     for (const QPointer<RemoteDesktopWindow>& window : windows) {
@@ -4729,7 +4740,7 @@ void DeviceGrid::triggerShortcutAction(int shortcutIndex)
     case 4: {
         // =====wjy====
         // wjy: Ctrl+B 默认切换剪切板同步；作用于当前最上方远控窗口，并写回全局默认。
-        const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
+        const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows(); // wjy: 剪贴板快捷键只操作普通远控窗口，独立监控Viewer始终保持只读。
         RemoteDesktopWindow* target = nullptr;
         for (const QPointer<RemoteDesktopWindow>& window : windows) {
             if (window && !window->isClosingConnection()) {
@@ -7212,42 +7223,45 @@ void DeviceGrid::saveRemoteQualitySettingsFromControls()
 // ===end====
 
 // =====wjy====
-void DeviceGrid::registerRemoteQualityWindow(RemoteDesktopWindow* window)
+void DeviceGrid::registerRemoteQualityWindow(RemoteDesktopWindow* window, bool monitorWindow)
 {
     if (!window) {
         return;
     }
-    bool anotherAboveDefaultPresetIsOpen = false;
-    if (window->hasSavedUserQualityPreset()
-        && stream::remoteVideoQualityPresetExceedsDefault(window->savedUserQualityPreset())) {
-        const QVector<QPointer<RemoteDesktopWindow>> openedWindows = openedRemoteWindows();
-        for (const QPointer<RemoteDesktopWindow>& openedWindow : openedWindows) {
-            if (openedWindow && openedWindow.data() != window
-                && openedWindow->hasActiveUserQualityPresetAboveDefault()) {
-                anotherAboveDefaultPresetIsOpen = true;
-                break; // wjy: 只限制历史高档自动恢复；当前已打开窗口之后继续手选高档不进入此仲裁。
+    // =====wjy====
+    if (!monitorWindow) {
+        bool anotherAboveDefaultPresetIsOpen = false;
+        if (window->hasSavedUserQualityPreset()
+            && stream::remoteVideoQualityPresetExceedsDefault(window->savedUserQualityPreset())) {
+            const QVector<QPointer<RemoteDesktopWindow>> openedWindows = openedRemoteWindows();
+            for (const QPointer<RemoteDesktopWindow>& openedWindow : openedWindows) {
+                if (openedWindow && openedWindow.data() != window
+                    && openedWindow->hasActiveUserQualityPresetAboveDefault()) {
+                    anotherAboveDefaultPresetIsOpen = true;
+                    break; // wjy: 只限制普通远控的历史高档自动恢复，独立监控窗口不读取设备手选记录。
+                }
             }
         }
+        window->restoreSavedUserQualityPreset(anotherAboveDefaultPresetIsOpen); // wjy: 普通窗口继续按原规则恢复历史档，监控窗口跳过该步骤并固定使用设置页统一画质。
     }
-    window->restoreSavedUserQualityPreset(anotherAboveDefaultPresetIsOpen); // wjy: 第一个重新打开的历史高档窗口获得恢复名额，其余本次从540/30自动基线开始。
     window->setGlobalQualityConfiguration(m_remoteQualityConfiguration); // wjy: 保留现有设置快照接口，精确档位由窗口手选和固定自动规则决定。
     window->setRemoteMonitorQualityPreset(
-        m_remoteMonitorModeEnabled,
-        m_remoteMonitorConfiguration.quality); // wjy: 监控期间后来打开的窗口从首帧就使用当前统一画质，不等待30秒轮询。
+        monitorWindow,
+        m_remoteMonitorConfiguration.quality); // wjy: 只有独立监控窗口启用监控档位，普通窗口不会因主窗口开启监控而改变画质。
     connect(window, &RemoteDesktopWindow::remoteQualityInputsChanged,
         this, &DeviceGrid::requestRemoteQualityEvaluation); // wjy: 手选、全屏、显隐和最小化变化即时生效，不等待下一次1秒采样。
-    connect(window, &QObject::destroyed, this, [this, window] {
+    connect(window, &QObject::destroyed, this, [this, window, monitorWindow] {
         m_remoteQualityCoordinator.removeWindow(reinterpret_cast<uintptr_t>(window)); // wjy: 协调器当前无滞回状态，仍保留统一销毁通知和重新评估时序。
-        m_remoteMonitorWindowStates.remove(window); // wjy: 窗口销毁立即删除监控恢复快照，后续地址复用不会套用旧状态。
         requestRemoteQualityEvaluation();
-        if (m_remoteMonitorModeEnabled) {
-            QTimer::singleShot(0, this, [this] { refreshRemoteMonitorMode(false); }); // wjy: 销毁信号结束后重新扫描并填补当前页空位。
+        if (monitorWindow && m_remoteMonitorModeEnabled) {
+            QTimer::singleShot(0, this, [this] { refreshRemoteMonitorMode(false); }); // wjy: 独立监控窗口意外关闭后重新扫描目标集合，普通远控关闭不触发监控重排。
         }
     });
     requestRemoteQualityEvaluation();
-    if (m_remoteMonitorModeEnabled) {
-        QTimer::singleShot(0, this, [this] { refreshRemoteMonitorMode(false); }); // wjy: 新窗口完成show流程后再纳入当前页，避免保存构造阶段的无效几何。
+    if (monitorWindow && m_remoteMonitorModeEnabled) {
+        QTimer::singleShot(0, this, [this] { refreshRemoteMonitorMode(false); }); // wjy: 新监控窗口完成show流程后再按当前分页统一排布。
     }
+    // ===end====
 }
 
 void DeviceGrid::requestRemoteQualityEvaluation()
@@ -7268,7 +7282,7 @@ void DeviceGrid::evaluateRemoteQuality()
         return;
     }
     try {
-        const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
+        const QVector<QPointer<RemoteDesktopWindow>> windows = qualityManagedRemoteWindows(); // wjy: 画质协调覆盖普通与独立监控Viewer，但快捷键、控制租约和关闭命令仍按各自集合处理。
         std::vector<RemoteQualityWindowMetrics> metrics;
         metrics.reserve(static_cast<std::size_t>(windows.size()));
         for (const QPointer<RemoteDesktopWindow>& window : windows) {
@@ -9611,6 +9625,40 @@ QVector<QPointer<RemoteDesktopWindow>> DeviceGrid::openedRemoteWindows() const
     return m_remoteWindowCoordinator->openedWindows(); // wjy: 普通/平铺/激活窗口的去重和 closing 过滤由协调器统一完成。
 }
 
+// =====wjy====
+QVector<QPointer<RemoteDesktopWindow>> DeviceGrid::openedRemoteMonitorWindows() const
+{
+    QVector<QPointer<RemoteDesktopWindow>> windows;
+    QSet<RemoteDesktopWindow*> seen;
+    windows.reserve(m_remoteMonitorWindows.size());
+    for (auto it = m_remoteMonitorWindows.constBegin(); it != m_remoteMonitorWindows.constEnd(); ++it) {
+        RemoteDesktopWindow* window = it.value().data();
+        if (!window || seen.contains(window)) {
+            continue; // wjy: QPointer已失效或重复引用不进入快照；正在异步stop的窗口仍保留，程序退出必须等待其底层任务。
+        }
+        seen.insert(window);
+        windows.append(window);
+    }
+    return windows;
+}
+
+QVector<QPointer<RemoteDesktopWindow>> DeviceGrid::qualityManagedRemoteWindows() const
+{
+    QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
+    QSet<RemoteDesktopWindow*> seen;
+    for (const QPointer<RemoteDesktopWindow>& window : windows) {
+        if (window) seen.insert(window.data());
+    }
+    for (const QPointer<RemoteDesktopWindow>& monitorWindow : openedRemoteMonitorWindows()) {
+        if (monitorWindow && !seen.contains(monitorWindow.data())) {
+            seen.insert(monitorWindow.data());
+            windows.append(monitorWindow); // wjy: 只在画质协调层合并监控Viewer，普通快捷键和控制租约仍看不到该集合。
+        }
+    }
+    return windows;
+}
+// ===end====
+
 void DeviceGrid::setRemoteUpdateAvailability(const QString& hostIp, bool available)
 {
     const QString targetIp = hostIp.trimmed();
@@ -9679,7 +9727,7 @@ void DeviceGrid::toggleTopmostRemoteWindowFullscreen()
 void DeviceGrid::toggleRemoteWindowTiling()
 {
     if (m_remoteMonitorModeEnabled) {
-        setRemoteMonitorModeEnabled(false); // wjy: 用户主动执行普通平铺时先退出分页监控并恢复原窗口，避免两套几何所有权互相覆盖。
+        setRemoteMonitorModeEnabled(false); // wjy: 用户主动执行普通平铺时先关闭全部独立监控窗口，随后只排列普通远控窗口。
     }
     QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
     for (auto it = windows.begin(); it != windows.end();) {
@@ -9792,33 +9840,131 @@ void DeviceGrid::toggleRemoteWindowTiling()
 }
 
 // =====wjy====
+int DeviceGrid::remoteMonitorDeviceCount() const
+{
+    int count = 0;
+    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+        const DeviceEntry& device = g_devices.at(deviceIndex);
+        const platform::DevicePresenceState presence = devicePresenceForIndex(deviceIndex);
+        if (!device.ip.trimmed().isEmpty() && !deviceRecordMatchesLocal(device)
+            && (presence == platform::DevicePresenceState::Online
+                || presence == platform::DevicePresenceState::Busy)) {
+            ++count; // wjy: 标题栏数字表示所有需要轮询的在线远端设备，不看本机已经控制了多少窗口。
+        }
+    }
+    return count;
+}
+
+QVector<int> DeviceGrid::remoteMonitorDeviceIndexes() const
+{
+    QVector<int> indexes;
+    indexes.reserve(g_devices.size());
+    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
+        const DeviceEntry& device = g_devices.at(deviceIndex);
+        const QString ip = device.ip.trimmed();
+        const platform::DevicePresenceState presence = devicePresenceForIndex(deviceIndex);
+        if (ip.isEmpty() || deviceRecordMatchesLocal(device)
+            || (presence != platform::DevicePresenceState::Online
+                && presence != platform::DevicePresenceState::Busy)) {
+            continue; // wjy: 轮询集合覆盖全部在线/占用远端设备，不受本机已开远控窗口和分组折叠状态限制；本机自身不建立回环视频。
+        }
+        indexes.append(deviceIndex);
+    }
+
+    QCollator naturalCollator;
+    naturalCollator.setCaseSensitivity(Qt::CaseInsensitive);
+    naturalCollator.setNumericMode(true);
+    std::sort(indexes.begin(), indexes.end(), [&naturalCollator](int leftIndex, int rightIndex) {
+        const DeviceEntry& left = g_devices.at(leftIndex);
+        const DeviceEntry& right = g_devices.at(rightIndex);
+        const QString leftName = deviceDisplayName(left);
+        const QString rightName = deviceDisplayName(right);
+        const bool leftStartsWithDigit = !leftName.isEmpty() && leftName.front().isDigit();
+        const bool rightStartsWithDigit = !rightName.isEmpty() && rightName.front().isDigit();
+        if (leftStartsWithDigit != rightStartsWithDigit) return leftStartsWithDigit;
+        const int naturalCompare = naturalCollator.compare(leftName, rightName);
+        if (naturalCompare != 0) return naturalCompare < 0;
+        const int exactCompare = QString::compare(leftName, rightName, Qt::CaseSensitive);
+        if (exactCompare != 0) return exactCompare < 0;
+        return QString::compare(left.ip.trimmed(), right.ip.trimmed(), Qt::CaseInsensitive) < 0; // wjy: 每轮按稳定自然设备名和IP排序，设备上下线后其它格子的相对顺序保持可预测。
+    });
+    return indexes;
+}
+
+QString DeviceGrid::remoteMonitorDeviceKey(int deviceIndex) const
+{
+    if (deviceIndex < 0 || deviceIndex >= g_devices.size()) return {};
+    const DeviceEntry& device = g_devices.at(deviceIndex);
+    const QString stableId = device.id.trimmed();
+    return stableId.isEmpty() ? device.ip.trimmed().toLower() : stableId; // wjy: 新目录使用稳定ID，旧记录缺ID时仍可按规范化IP管理一个监控窗口。
+}
+
+void DeviceGrid::createRemoteMonitorWindowForDevice(int deviceIndex)
+{
+    if (!m_remoteMonitorModeEnabled || m_shuttingDown
+        || deviceIndex < 0 || deviceIndex >= g_devices.size()) {
+        return;
+    }
+    const DeviceEntry& device = g_devices.at(deviceIndex);
+    const QString key = remoteMonitorDeviceKey(deviceIndex);
+    const QString ip = device.ip.trimmed();
+    if (key.isEmpty() || ip.isEmpty()) return;
+
+    QPointer<RemoteDesktopWindow> existing = m_remoteMonitorWindows.value(key);
+    if (existing && !existing->isClosingConnection()
+        && existing->hostIp().compare(ip, Qt::CaseInsensitive) == 0) {
+        return; // wjy: 同一设备已经存在有效只读Viewer时复用，状态心跳和分页切换不会重复建连。
+    }
+    if (existing) {
+        m_remoteMonitorWindows.remove(key);
+        existing->close(); // wjy: 设备稳定ID对应的IP被修改时关闭旧连接，再按新IP创建，避免画面串到历史地址。
+    }
+
+    auto* monitorWindow = new RemoteDesktopWindow(
+        deviceDisplayName(device),
+        ip,
+        m_remoteViewerLifecycleManager.get(),
+        nullptr,
+        nullptr,
+        true); // wjy: 不传键鼠同步协调器并固定monitorReadOnly，Viewer握手直接申请view角色。
+    monitorWindow->setRememberGeometryEnabled(false); // wjy: 宫格几何只属于当前监控会话，不写入普通远控窗口的设备位置配置。
+    m_remoteMonitorWindows.insert(key, monitorWindow);
+    connect(monitorWindow, &QObject::destroyed, this, [this, key, monitorWindow] {
+        const auto it = m_remoteMonitorWindows.find(key);
+        if (it != m_remoteMonitorWindows.end() && it.value().data() == monitorWindow) {
+            m_remoteMonitorWindows.erase(it); // wjy: 只删除仍指向该对象的设备键，新IP重建后的窗口不会被旧销毁回调误删。
+        }
+    });
+    registerRemoteQualityWindow(monitorWindow, true); // wjy: 监控窗口跳过历史手选恢复，只使用设置页统一画质和遮挡保活策略。
+}
+
+void DeviceGrid::closeRemoteMonitorWindows()
+{
+    const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteMonitorWindows();
+    m_pendingRemoteMonitorDeviceIds.clear(); // wjy: 模式关闭后不再等待旧授权结果；窗口索引保留到QObject销毁，确保程序紧接着退出时仍可统一join。
+    for (const QPointer<RemoteDesktopWindow>& window : windows) {
+        if (window) window->close(); // wjy: 关闭模式直接停止全部独立只读Viewer，不恢复或影响普通远控窗口布局。
+    }
+}
+
 void DeviceGrid::toggleRemoteMonitorMode()
 {
-    setRemoteMonitorModeEnabled(!m_remoteMonitorModeEnabled); // wjy: 标题栏单按钮在开启和恢复原布局之间切换，不引入额外弹窗。
+    setRemoteMonitorModeEnabled(!m_remoteMonitorModeEnabled); // wjy: 标题栏单按钮在创建轮询窗口和关闭全部监控窗口之间切换，不引入额外弹窗。
 }
 
 void DeviceGrid::setRemoteMonitorModeEnabled(bool enabled)
 {
     if (m_remoteMonitorModeEnabled == enabled) {
         if (enabled) {
-            refreshRemoteMonitorMode(false); // wjy: 重复开启请求用于重新扫描窗口集合，不重置用户配置。
+            refreshRemoteMonitorMode(false); // wjy: 重复开启请求重新扫描全部在线设备，不依赖普通远控窗口是否已经打开。
         }
         return;
-    }
-
-    if (enabled && m_remoteWindowCoordinator->windowsTiled()) {
-        if (openedRemoteWindows().isEmpty()) {
-            m_remoteWindowCoordinator->clearRestoreGeometries();
-            m_remoteWindowCoordinator->setWindowsTiled(false); // wjy: 空窗口残留的平铺标志直接复位，避免后来新窗口第一次Ctrl+P只清状态不执行布局。
-        } else {
-            toggleRemoteWindowTiling(); // wjy: 监控模式先退出普通平铺并恢复真实原几何，再建立自己的可逆窗口快照。
-        }
     }
 
     m_remoteMonitorModeEnabled = enabled;
     m_remoteMonitorPageIndex = 0;
     if (enabled) {
-        refreshRemoteMonitorMode(false);
+        refreshRemoteMonitorMode(false); // wjy: 开启时从设备目录创建独立只读Viewer，已有普通和平铺远控保持原状态。
         if (m_remoteMonitorTimer) {
             m_remoteMonitorTimer->setInterval(m_remoteMonitorConfiguration.rotationIntervalSeconds * 1000);
             m_remoteMonitorTimer->start(); // wjy: 开启后从当前第一批开始完整计时，默认30秒后切换下一批。
@@ -9827,36 +9973,7 @@ void DeviceGrid::setRemoteMonitorModeEnabled(bool enabled)
         if (m_remoteMonitorTimer) {
             m_remoteMonitorTimer->stop();
         }
-        for (auto it = m_remoteMonitorWindowStates.begin(); it != m_remoteMonitorWindowStates.end(); ++it) {
-            const RemoteMonitorWindowState& saved = it.value();
-            RemoteDesktopWindow* remoteWindow = saved.window.data();
-            if (!remoteWindow || remoteWindow->isClosingConnection()) {
-                continue;
-            }
-            remoteWindow->setRemoteMonitorQualityPreset(false, m_remoteMonitorConfiguration.quality); // wjy: 先撤销监控画质，恢复窗口手选或普通自动档。
-            remoteWindow->setRememberGeometryEnabled(false);
-            remoteWindow->hide(); // wjy: 隐藏后恢复状态和矩形，避免从监控格子跳回原位置时产生可见闪烁。
-            remoteWindow->setWindowState(Qt::WindowNoState);
-            if (saved.normalGeometry.isValid()) {
-                remoteWindow->setGeometry(saved.normalGeometry);
-            }
-            if (saved.visible) {
-                if (saved.windowState.testFlag(Qt::WindowMinimized)) {
-                    remoteWindow->showMinimized();
-                } else if (saved.windowState.testFlag(Qt::WindowFullScreen)) {
-                    remoteWindow->showFullScreen();
-                } else if (saved.windowState.testFlag(Qt::WindowMaximized)) {
-                    remoteWindow->showMaximized();
-                } else {
-                    remoteWindow->showNormal();
-                } // wjy: 显式恢复四种顶层状态，避免隐藏窗口直接setWindowState后由不同Qt版本解释不一致。
-            } else {
-                remoteWindow->setWindowState(saved.windowState); // wjy: 原本隐藏的窗口只恢复内部状态，保持不可见。
-            }
-            remoteWindow->setRememberGeometryEnabled(saved.rememberGeometry); // wjy: 原状态恢复完成后恢复进入监控前的持久化策略，分组平铺窗口继续保持不记忆几何。
-        }
-        m_remoteMonitorWindowStates.clear();
-        applyRemoteMonitorQualityPreset(); // wjy: 同步撤销监控期间后来创建但尚未进入快照的窗口画质覆盖。
+        closeRemoteMonitorWindows(); // wjy: 关闭按钮直接关闭全部监控模式创建的窗口，不再恢复进入监控前的普通窗口布局。
         requestRemoteQualityEvaluation();
     }
     update(titlebarBandwidthUpdateRect());
@@ -9868,77 +9985,85 @@ void DeviceGrid::refreshRemoteMonitorMode(bool advancePage)
         return;
     }
 
-    QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
-    for (auto it = windows.begin(); it != windows.end();) {
-        if (!*it || (*it)->isClosingConnection()) {
-            it = windows.erase(it);
-        } else {
-            ++it;
-        }
+    const QVector<int> deviceIndexes = remoteMonitorDeviceIndexes();
+    QSet<QString> targetKeys;
+    QHash<QString, QString> targetIps;
+    for (const int deviceIndex : deviceIndexes) {
+        const QString key = remoteMonitorDeviceKey(deviceIndex);
+        if (key.isEmpty()) continue;
+        targetKeys.insert(key);
+        targetIps.insert(key, g_devices.at(deviceIndex).ip.trimmed()); // wjy: 当前在线设备键和IP快照用于关闭离线、删除或改地址后的旧监控连接。
     }
-    QCollator naturalCollator;
-    naturalCollator.setCaseSensitivity(Qt::CaseInsensitive);
-    naturalCollator.setNumericMode(true);
-    std::sort(windows.begin(), windows.end(), [&naturalCollator](const QPointer<RemoteDesktopWindow>& left,
-                                                                  const QPointer<RemoteDesktopWindow>& right) {
-        if (!left || !right) {
-            return static_cast<bool>(left);
-        }
-        const QString leftName = left->deviceName();
-        const QString rightName = right->deviceName();
-        const bool leftStartsWithDigit = !leftName.isEmpty() && leftName.front().isDigit();
-        const bool rightStartsWithDigit = !rightName.isEmpty() && rightName.front().isDigit();
-        if (leftStartsWithDigit != rightStartsWithDigit) {
-            return leftStartsWithDigit;
-        }
-        const int nameCompare = naturalCollator.compare(leftName, rightName);
-        if (nameCompare != 0) {
-            return nameCompare < 0;
-        }
-        const int exactNameCompare = QString::compare(leftName, rightName, Qt::CaseSensitive);
-        if (exactNameCompare != 0) {
-            return exactNameCompare < 0;
-        }
-        return QString::compare(left->hostIp(), right->hostIp(), Qt::CaseInsensitive) < 0; // wjy: 每轮扫描都使用与普通平铺相同的自然设备顺序，分页切换不会随机换位。
-    });
 
-    QSet<RemoteDesktopWindow*> currentWindows;
-    for (const QPointer<RemoteDesktopWindow>& window : windows) {
-        if (!window) {
+    QVector<QPointer<RemoteDesktopWindow>> obsoleteWindows;
+    for (auto it = m_remoteMonitorWindows.begin(); it != m_remoteMonitorWindows.end();) {
+        RemoteDesktopWindow* monitorWindow = it.value().data();
+        const bool stillMatches = monitorWindow
+            && !monitorWindow->isClosingConnection()
+            && targetKeys.contains(it.key())
+            && monitorWindow->hostIp().compare(targetIps.value(it.key()), Qt::CaseInsensitive) == 0;
+        if (stillMatches) {
+            ++it;
             continue;
         }
-        RemoteDesktopWindow* remoteWindow = window.data();
-        currentWindows.insert(remoteWindow);
-        if (!m_remoteMonitorWindowStates.contains(remoteWindow)) {
-            RemoteMonitorWindowState saved;
-            saved.window = remoteWindow;
-            saved.normalGeometry = remoteWindow->normalGeometry().isValid()
-                ? remoteWindow->normalGeometry()
-                : remoteWindow->geometry(); // wjy: 最大化或全屏窗口优先保存Qt提供的普通矩形，退出监控后仍可正确还原。
-            saved.windowState = remoteWindow->windowState();
-            saved.visible = remoteWindow->isVisible();
-            saved.rememberGeometry = remoteWindow->rememberGeometryEnabled();
-            m_remoteMonitorWindowStates.insert(remoteWindow, saved);
-        }
-        remoteWindow->setRemoteMonitorQualityPreset(true, m_remoteMonitorConfiguration.quality); // wjy: 新扫描到的窗口立即接入监控统一画质，窗口手选仍由自身优先级保留。
+        if (monitorWindow) obsoleteWindows.append(monitorWindow);
+        it = m_remoteMonitorWindows.erase(it); // wjy: 先从索引移除再关闭，销毁回调不会影响正在遍历的新目标集合。
     }
-    for (auto it = m_remoteMonitorWindowStates.begin(); it != m_remoteMonitorWindowStates.end();) {
-        if (!it.value().window || !currentWindows.contains(it.key())) {
-            it = m_remoteMonitorWindowStates.erase(it); // wjy: 用户关闭窗口后及时删除恢复快照，地址复用不能继承旧几何。
-        } else {
-            ++it;
+    for (const QPointer<RemoteDesktopWindow>& obsoleteWindow : obsoleteWindows) {
+        if (obsoleteWindow) obsoleteWindow->close(); // wjy: 设备离线、删除或IP变化后立即停止对应只读Viewer，下一页不再保留空会话。
+    }
+
+    QVector<QString> authorizationIds;
+    for (const int deviceIndex : deviceIndexes) {
+        const DeviceEntry& device = g_devices.at(deviceIndex);
+        const QString key = remoteMonitorDeviceKey(deviceIndex);
+        const QString deviceId = device.id.trimmed();
+        const QString ip = device.ip.trimmed();
+        const QPointer<RemoteDesktopWindow> existing = m_remoteMonitorWindows.value(key);
+        if (existing && !existing->isClosingConnection()
+            && existing->hostIp().compare(ip, Qt::CaseInsensitive) == 0) {
+            continue;
+        }
+        if (m_authorizedRemoteControlIps.contains(ip)) {
+            createRemoteMonitorWindowForDevice(deviceIndex); // wjy: 本进程已登记过公钥时直接创建只读Viewer，不再访问49102。
+        } else if (!deviceId.isEmpty() && !m_pendingRemoteMonitorDeviceIds.contains(deviceId)) {
+            m_pendingRemoteMonitorDeviceIds.insert(deviceId);
+            authorizationIds.append(deviceId); // wjy: 新在线设备批量登记同一控制端公钥，授权动作本身不发布控制租约或占用远控人数。
         }
     }
 
-    if (windows.isEmpty()) {
+    if (!authorizationIds.isEmpty()) {
+        const QVector<QString> requestedIds = authorizationIds;
+        authorizeRemoteControlDevices(authorizationIds, false,
+            [this, requestedIds](const QVector<QString>& authorizedIds) {
+                for (const QString& requestedId : requestedIds) {
+                    m_pendingRemoteMonitorDeviceIds.remove(requestedId); // wjy: 成功和失败目标都释放本批去重位，后续状态轮询可按需重试。
+                }
+                if (!m_remoteMonitorModeEnabled || m_shuttingDown) return;
+                const QSet<QString> currentKeys = [&] {
+                    QSet<QString> keys;
+                    for (const int index : remoteMonitorDeviceIndexes()) keys.insert(remoteMonitorDeviceKey(index));
+                    return keys;
+                }(); // wjy: 授权期间设备可能离线或被删除，回到UI线程后重新确认仍属于当前轮询集合。
+                for (const QString& authorizedId : authorizedIds) {
+                    const int currentIndex = g_deviceCatalog.deviceIndexForId(authorizedId);
+                    if (currentIndex >= 0 && currentKeys.contains(remoteMonitorDeviceKey(currentIndex))) {
+                        createRemoteMonitorWindowForDevice(currentIndex);
+                    }
+                }
+                refreshRemoteMonitorMode(false); // wjy: 整批窗口创建完成后统一按当前页重排，避免每个授权结果各自闪动桌面。
+            });
+    }
+
+    if (deviceIndexes.isEmpty()) {
         m_remoteMonitorPageIndex = 0;
         requestRemoteQualityEvaluation();
         update(titlebarBandwidthUpdateRect());
-        return; // wjy: 没有窗口时保持监控按钮开启，定时器下一轮继续自动扫描后来打开的远控窗口。
+        return; // wjy: 暂无在线远端设备时保持模式开启，后续实时状态上线会立即创建第一页。
     }
 
     const int capacity = qMax(1, stream::remoteMonitorGridCapacity(m_remoteMonitorConfiguration.grid));
-    const int pageCount = qMax(1, static_cast<int>(std::ceil(windows.size() / static_cast<double>(capacity))));
+    const int pageCount = qMax(1, static_cast<int>(std::ceil(deviceIndexes.size() / static_cast<double>(capacity))));
     if (advancePage && pageCount > 1) {
         m_remoteMonitorPageIndex = (m_remoteMonitorPageIndex + 1) % pageCount;
     } else {
@@ -9955,16 +10080,15 @@ void DeviceGrid::refreshRemoteMonitorMode(bool advancePage)
     const int tileWidth = qMax(1, availableRect.width() / columnCount);
     const int tileHeight = qMax(1, availableRect.height() / rowCount);
     const int pageStart = m_remoteMonitorPageIndex * capacity;
-    const int pageEnd = qMin(pageStart + capacity, windows.size());
+    const int pageEnd = qMin(pageStart + capacity, deviceIndexes.size());
 
-    for (int index = 0; index < windows.size(); ++index) {
-        RemoteDesktopWindow* remoteWindow = windows.at(index).data();
-        if (!remoteWindow) {
-            continue;
-        }
+    for (int index = 0; index < deviceIndexes.size(); ++index) {
+        RemoteDesktopWindow* remoteWindow = m_remoteMonitorWindows.value(
+            remoteMonitorDeviceKey(deviceIndexes.at(index))).data();
+        if (!remoteWindow || remoteWindow->isClosingConnection()) continue;
         remoteWindow->setRememberGeometryEnabled(false);
         if (index < pageStart || index >= pageEnd) {
-            remoteWindow->hide(); // wjy: 非当前页窗口保持连接但隐藏，由质量策略自动降到360/1保活。
+            remoteWindow->hide(); // wjy: 非当前页只读Viewer保持视频会话但隐藏，并由既有质量策略自动降到360/1保活。
             continue;
         }
         const int slot = index - pageStart;
@@ -9984,7 +10108,7 @@ void DeviceGrid::refreshRemoteMonitorMode(bool advancePage)
         remoteWindow->showNormal();
         remoteWindow->setGeometry(target);
         remoteWindow->show();
-        remoteWindow->raise(); // wjy: 当前页只显示实际剩余窗口，未使用的宫格保持空白且不会创建占位连接。
+        remoteWindow->raise(); // wjy: 当前页只显示实际在线且授权成功的设备，未使用或尚未授权的宫格保持空白。
     }
     requestRemoteQualityEvaluation();
     update(titlebarBandwidthUpdateRect());
@@ -9992,12 +10116,12 @@ void DeviceGrid::refreshRemoteMonitorMode(bool advancePage)
 
 void DeviceGrid::applyRemoteMonitorQualityPreset()
 {
-    const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteWindows();
+    const QVector<QPointer<RemoteDesktopWindow>> windows = openedRemoteMonitorWindows();
     for (const QPointer<RemoteDesktopWindow>& window : windows) {
         if (window) {
             window->setRemoteMonitorQualityPreset(
-                m_remoteMonitorModeEnabled,
-                m_remoteMonitorConfiguration.quality); // wjy: 设置修改一次广播到全部窗口，相同档位由窗口层直接去重。
+                true,
+                m_remoteMonitorConfiguration.quality); // wjy: 设置修改只广播到独立监控Viewer，普通远控的自动或手选档位完全不受影响。
         }
     }
     requestRemoteQualityEvaluation();
@@ -10672,7 +10796,9 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
     painter.drawPixmap(titleWordmarkRect, uupix(QStringLiteral("titlebar/title_wordmark.png"))); // wjy: 实际绘制标题名时复用统一矩形，保证左上标题与右侧按钮同高。
     // =====wjy====
     // wjy: 版本号、带宽、会话数、监控按钮和本机身份由同一布局快照计算，标题栏缩放时不会互相覆盖。
-    const int controlledSessionCount = totalRemoteControlSessionCount();
+    const int controlledSessionCount = m_remoteMonitorModeEnabled
+        ? remoteMonitorDeviceCount()
+        : totalRemoteControlSessionCount(); // wjy: 监控开启时数字表示全部在线轮询设备，关闭后恢复显示真实远控控制会话数。
     const TitlebarStatusLayout statusLayout = titlebarStatusLayout(
         m_updateAvailable,
         m_titlebarBandwidthSample,
@@ -11943,7 +12069,7 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
     const QRect monitorModeTitlebarRect = titlebarStatusLayout(
         m_updateAvailable,
         m_titlebarBandwidthSample,
-        totalRemoteControlSessionCount()).monitorModeButtonRect; // wjy: 拖窗和按钮点击复用绘制时的动态监控按钮矩形。
+        m_remoteMonitorModeEnabled ? remoteMonitorDeviceCount() : totalRemoteControlSessionCount()).monitorModeButtonRect; // wjy: 命中布局与绘制共用监控目标数或普通远控人数，数字位数变化不会错位。
     if (event->button() == Qt::LeftButton
         && event->pos().y() >= 0
         && event->pos().y() < kTitleBarHeight //窗口拖动
@@ -12264,7 +12390,7 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
     const QRect monitorModeTitlebarRect = titlebarStatusLayout(
         m_updateAvailable,
         m_titlebarBandwidthSample,
-        totalRemoteControlSessionCount()).monitorModeButtonRect;
+        m_remoteMonitorModeEnabled ? remoteMonitorDeviceCount() : totalRemoteControlSessionCount()).monitorModeButtonRect; // wjy: 悬停区域和标题栏当前数字口径保持一致。
     const bool titlebarButtonHovered = !m_detailPanelCollapsed
         && ((m_updateAvailable && titlebarUpdateRect().contains(event->pos()))
             || monitorModeTitlebarRect.contains(event->pos())
@@ -12871,7 +12997,7 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
         const QRect monitorModeTitlebarRect = titlebarStatusLayout(
             m_updateAvailable,
             m_titlebarBandwidthSample,
-            totalRemoteControlSessionCount()).monitorModeButtonRect;
+            m_remoteMonitorModeEnabled ? remoteMonitorDeviceCount() : totalRemoteControlSessionCount()).monitorModeButtonRect; // wjy: 点击热区使用监控设备总数重新计算，避免两位数扩展后按钮命中偏移。
         if (!m_detailPanelCollapsed && monitorModeTitlebarRect.contains(event->pos())) {
             toggleRemoteMonitorMode(); // wjy: 标题栏会话数字右侧按钮直接切换分页监控，不进入设置页或弹出菜单。
             event->accept();
