@@ -23,6 +23,7 @@
 #include <QRect>
 #include <QSet>
 #include <QString>
+#include <QStringList>
 #include <QVector>
 
 #include <functional>
@@ -199,10 +200,10 @@ private:
     void toggleRemoteWindowTiling();
     void toggleRemoteMonitorMode(); // wjy: 主窗口标题栏按钮开启独立设备轮询或关闭全部监控窗口，普通远控窗口不参与切换。
     void setRemoteMonitorModeEnabled(bool enabled); // wjy: 统一管理监控设备扫描、分页定时器和独立只读Viewer生命周期。
-    void refreshRemoteMonitorMode(bool advancePage); // wjy: 从符合Busy、名称和排除白名单规则的设备中选出当前页，并只切换固定槽位Viewer视频源。
+    void refreshRemoteMonitorMode(bool advancePage); // wjy: 从黑名单优先、白名单强制纳入后的设备集合中选出当前页，并只切换固定槽位Viewer视频源。
     void applyRemoteMonitorQualityPreset(); // wjy: 将设置页监控画质只同步到独立监控窗口，普通远控保留自身自动或手选档。
     int titlebarRemoteSessionCount() const; // wjy: 标题栏显示普通远控会话数加当前页监控Viewer数，宫格容量直接限制监控增量。
-    QVector<int> remoteMonitorDeviceIndexes() const; // wjy: 仅返回Busy且名称非英文开头、未进入排除白名单的有效远端设备，并按稳定自然名称轮询。
+    QVector<int> remoteMonitorDeviceIndexes() const; // wjy: 返回黑名单优先排除、白名单绕过普通筛选后的有效远端设备，并按稳定自然名称轮询。
     QString remoteMonitorDeviceKey(int deviceIndex) const; // wjy: 优先使用设备稳定ID，兼容旧记录时回退规范化IP作为固定槽位的当前来源键。
     void ensureRemoteMonitorWindowSlots(int slotCount); // wjy: 仅在开启监控或宫格容量变化时增减专用窗口，普通轮询不会创建新窗口。
     QVector<QPointer<RemoteDesktopWindow>> openedRemoteMonitorWindows() const; // wjy: 清理空指针后返回当前独立监控窗口快照。
@@ -254,6 +255,7 @@ private:
     void startDesktopWallpaperRotation(bool userInitiated); // wjy: 先异步探测 SMB，连接成功才进入真实壁纸任务。
     void performDesktopWallpaperRotation(bool userInitiated); // wjy: 已通过连接门禁后在后台选择并应用下一张共享图片。
     void saveRemoteQualitySettingsFromControls(); // wjy: 收集远控画质页字段、统一归一化持久化并立即通知跟随全局的窗口。
+    void saveRemoteMonitorFilterSettings(); // wjy: 将监控黑白名单编辑框按行解析、立即持久化并刷新当前监控页。
     void registerRemoteQualityWindow(RemoteDesktopWindow* window, bool monitorWindow = false); // wjy: 普通窗口恢复设备手选档；监控窗口只使用统一监控档位并纳入同一质量协调器。
     void requestRemoteQualityEvaluation(); // wjy: 合并同一事件循环内多次窗口变化，最多排队一个全局质量计算任务。
     void evaluateRemoteQuality(); // wjy: 每秒汇总窗口并在状态事件时即时重算，手选/监控/自动按优先级恢复，完全遮挡临时360/1。
@@ -373,6 +375,10 @@ private:
     QComboBox* m_remoteMonitorGridCombo = nullptr; // wjy: 设置页提供4/9/12/16/20/25六种单页容量。
     QComboBox* m_remoteMonitorQualityCombo = nullptr; // wjy: 设置页选择独立监控窗口的统一画质，不读取普通远控按设备保存的手选档。
     QLineEdit* m_remoteMonitorIntervalEdit = nullptr; // wjy: 轮询秒数默认30，失焦或回车后持久化并重启计时。
+    QTextEdit* m_remoteMonitorBlacklistEdit = nullptr; // wjy: 设置页每行编辑一个完整设备显示名，命中后无论状态都禁止监控。
+    QTextEdit* m_remoteMonitorWhitelistEdit = nullptr; // wjy: 设置页每行编辑一个完整设备显示名，命中后绕过普通筛选强制监控。
+    QStringList m_remoteMonitorBlacklist; // wjy: 当前运行中的监控黑名单快照，黑名单优先于白名单。
+    QStringList m_remoteMonitorWhitelist; // wjy: 当前运行中的监控白名单快照，白名单优先绕过Busy和英文名条件。
     // ===end====
     QSet<int> m_registeredGlobalShortcutIds;
     quintptr m_globalShortcutWindowHandle = 0;

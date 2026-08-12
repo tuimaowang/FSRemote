@@ -1069,6 +1069,39 @@ private:
     int m_shortcutIndex = -1;
     QString m_committedText;
 };
+
+class RemoteMonitorNameListEdit final : public QTextEdit {
+public:
+    explicit RemoteMonitorNameListEdit(QWidget* parent = nullptr)
+        : QTextEdit(parent)
+    {
+        setAcceptRichText(false); // wjy: 名单只接收纯文本，粘贴网页或富文本时不会把格式信息写入设置。
+        setLineWrapMode(QTextEdit::NoWrap); // wjy: 每行严格对应一个完整设备名，长名称通过横向滚动查看而不是视觉换成两行。
+    }
+
+    std::function<void()> commitCallback;
+
+protected:
+    void focusOutEvent(QFocusEvent* event) override
+    {
+        if (commitCallback) {
+            commitCallback(); // wjy: 点击名单框外部或切换页签时统一归一化、落盘并刷新运行中的监控窗口。
+        }
+        QTextEdit::focusOutEvent(event);
+    }
+
+    void keyPressEvent(QKeyEvent* event) override
+    {
+        if (event
+            && (event->modifiers() & Qt::ControlModifier)
+            && (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter)) {
+            clearFocus(); // wjy: Ctrl+Enter提供显式保存入口，普通Enter仍用于新增下一行设备名。
+            event->accept();
+            return;
+        }
+        QTextEdit::keyPressEvent(event);
+    }
+};
 // ===end====
 
 QRect minimizeRect()
@@ -1539,10 +1572,6 @@ QString screenshotGroupName(const DeviceEntry& device)
 // ===end====
 
 // =====wjy====
-const QStringList kRemoteMonitorExclusionWhitelist = {
-    // QStringLiteral("这里填写不参与监控轮询的完整设备名"),
-}; // wjy: 后续直接在数组中追加设备名；匹配忽略英文大小写，但必须与界面显示的完整名称一致。
-
 bool remoteMonitorNameStartsWithEnglishLetter(const QString& deviceName)
 {
     const QString normalizedName = deviceName.trimmed(); // wjy: 使用最终显示名并去掉首尾空格，避免空格掩盖英文首字母。
@@ -1554,11 +1583,11 @@ bool remoteMonitorNameStartsWithEnglishLetter(const QString& deviceName)
         || (firstCharacter >= QLatin1Char('a') && firstCharacter <= QLatin1Char('z')); // wjy: 只排除ASCII英文开头，中文、数字和其它字符开头仍可按Busy状态参与轮询。
 }
 
-bool remoteMonitorNameIsWhitelistedForExclusion(const QString& deviceName)
+bool remoteMonitorNameListContains(const QStringList& deviceNames, const QString& deviceName)
 {
-    return kRemoteMonitorExclusionWhitelist.contains(
+    return deviceNames.contains(
         deviceName.trimmed(),
-        Qt::CaseInsensitive); // wjy: 白名单语义按用户要求为“不参与轮询”，完整名称匹配可避免相似设备被误排除。
+        Qt::CaseInsensitive); // wjy: 黑白名单都按完整显示名忽略大小写匹配，避免相似设备被误纳入或误排除。
 }
 // ===end====
 
@@ -2211,16 +2240,20 @@ int maxSettingsScrollOffset(bool localInfoExpanded, bool addDeviceExpanded)
 
 // =====wjy====
 int keyboardShortcutMaxScrollOffset(); // wjy: 键盘页布局快照在快捷键几何函数定义前使用前置声明，避免回退到常规页滚动上限。
+int remoteMonitorSettingsMaxScrollOffset(); // wjy: 监控页布局快照在名单编辑框几何函数定义前使用前置声明。
 
 ui::SettingsLayoutSnapshot settingsLayoutSnapshot(
     bool localInfoExpanded,
     bool addDeviceExpanded,
     int requestedScrollOffset,
-    bool keyboardSelected = false)
+    bool keyboardSelected = false,
+    bool remoteMonitorSelected = false)
 {
     const int maxScrollOffset = keyboardSelected
         ? keyboardShortcutMaxScrollOffset()
-        : maxSettingsScrollOffset(localInfoExpanded, addDeviceExpanded);
+        : (remoteMonitorSelected
+                ? remoteMonitorSettingsMaxScrollOffset()
+                : maxSettingsScrollOffset(localInfoExpanded, addDeviceExpanded)); // wjy: 三类可滚动设置页分别按自身实际内容高度计算上限。
     return ui::SettingsLayoutSnapshot(
         settingsScrollViewportRect(),
         maxScrollOffset,
@@ -3461,6 +3494,32 @@ QRect settingsRemoteMonitorControlRect(int index)
         index == 2 ? 112 : 170,
         34); // wjy: 宫格、画质和轮询秒数按三行右对齐，轮询输入框缩短后为右侧“秒”保留空间。
 }
+
+QRect settingsRemoteMonitorNameListRect(int index)
+{
+    const QRect card = settingsScrollViewportRect();
+    const int gap = 16;
+    const int columnWidth = qMax(144, (card.width() - 56 - gap) / 2);
+    return QRect(
+        card.x() + 28 + index * (columnWidth + gap),
+        card.y() + 344,
+        columnWidth,
+        132); // wjy: 黑名单和白名单并排放在监控页下半区，保留足够高度供用户逐行粘贴多个设备名。
+}
+
+QRect settingsRemoteMonitorNameListLabelRect(int index)
+{
+    const QRect editor = settingsRemoteMonitorNameListRect(index);
+    return QRect(editor.x(), editor.y() - 26, editor.width(), 22); // wjy: 标签紧贴对应编辑框上方，和两个名单列保持一一对应。
+}
+
+int remoteMonitorSettingsMaxScrollOffset()
+{
+    const QRect viewport = settingsScrollViewportRect();
+    return qMax(
+        0,
+        settingsRemoteMonitorNameListRect(0).bottom() + 12 - viewport.bottom()); // wjy: 监控页滚动到最底时为名单编辑框保留12像素底部空白。
+}
 // ===end====
 
 // =====wjy====
@@ -3592,7 +3651,8 @@ void drawSettingsPage(
         localInfoExpanded,
         addDeviceExpanded,
         settingsScrollOffset,
-        keyboardSelected); // wjy: 键盘页使用十行快捷键自己的滚动上限，绘制、滚动条和真实输入框保持同一快照。
+        keyboardSelected,
+        remoteMonitorSelected); // wjy: 键盘页和监控页分别使用自己的滚动上限，绘制、滚动条和真实输入框保持同一快照。
     QFont tabFont(textFont);
     tabFont.setPixelSize(14);
     tabFont.setBold(true);
@@ -3615,6 +3675,8 @@ void drawSettingsPage(
         painter.setPen(QPen(QColor(QStringLiteral("#DDE3EA")), 1));
         painter.setBrush(QColor(QStringLiteral("#FFFFFF")));
         painter.drawRoundedRect(QRectF(monitorCard), 4, 4);
+        painter.setClipRect(monitorCard);
+        painter.translate(0, -layout.scrollOffset()); // wjy: 监控页全部文字和标签跟随真实输入控件使用同一滚动偏移。
 
         QFont title(textFont);
         title.setPixelSize(14);
@@ -3633,7 +3695,7 @@ void drawSettingsPage(
         painter.drawText(
             QRectF(monitorCard.x() + 28, monitorCard.y() + 38, monitorCard.width() - 56, 20),
             Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("自动轮询全部在线远端设备；不足一页只显示剩余设备，关闭后关闭全部监控窗口。")); // wjy: 设置页明确监控对象来自设备目录，不再暗示依赖本机普通远控窗口或恢复旧布局。
+            QString::fromUtf8("默认轮询Busy且名称不以英文字母开头的远端设备；名单规则可覆盖默认筛选。")); // wjy: 顶部说明与真实默认筛选保持一致，不再误导为全部在线设备都会进入监控。
 
         QFont labelFont(textFont);
         labelFont.setPixelSize(12);
@@ -3663,10 +3725,36 @@ void drawSettingsPage(
         painter.setFont(noteFont);
         painter.setPen(QColor(QStringLiteral("#687384")));
         painter.drawText(
-            QRectF(monitorCard.x() + 28, monitorCard.y() + 290, monitorCard.width() - 56, 44),
+            QRectF(monitorCard.x() + 28, monitorCard.y() + 282, monitorCard.width() - 56, 48),
             Qt::AlignTop | Qt::AlignLeft | Qt::TextWordWrap,
-            QString::fromUtf8("清晰度修改会立即作用于全部监控窗口；监控窗口不使用设备历史手选画质。")); // wjy: 独立只读监控只接受设置页统一档位，普通远控的历史手选记录互不影响。
+            QString::fromUtf8("黑名单优先：命中后永不监控；白名单强制纳入：绕过Busy和名称筛选。未命中名单时，仅轮询Busy且设备名不以英文字母开头的设备。")); // wjy: 设置页直接说明两类名单的优先级和与默认筛选的关系，避免把新白名单误解为旧排除名单。
+        QFont listLabelFont(textFont);
+        listLabelFont.setPixelSize(12);
+        listLabelFont.setBold(true);
+        painter.setFont(listLabelFont);
+        painter.setPen(QColor(QStringLiteral("#111827")));
+        painter.drawText(
+            QRectF(settingsRemoteMonitorNameListLabelRect(0)),
+            Qt::AlignVCenter | Qt::AlignLeft,
+            QString::fromUtf8("黑名单（优先排除）")); // wjy: 黑名单标题明确表示它在白名单之前判定。
+        painter.drawText(
+            QRectF(settingsRemoteMonitorNameListLabelRect(1)),
+            Qt::AlignVCenter | Qt::AlignLeft,
+            QString::fromUtf8("白名单（强制监控）")); // wjy: 新白名单语义与之前固定排除数组相反，标题直接标注强制纳入。
         painter.restore();
+        const int monitorMaxScrollOffset = remoteMonitorSettingsMaxScrollOffset();
+        if (monitorMaxScrollOffset > 0) {
+            painter.save();
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(QColor(QStringLiteral("#E5EAF1")));
+            painter.drawRoundedRect(QRectF(settingsVerticalScrollbarTrackRect()), 2.5, 2.5); // wjy: 名单区域超出视口时显示设置页统一滚动轨道。
+            painter.setBrush(QColor(QStringLiteral("#AAB3C0")));
+            painter.drawRoundedRect(
+                QRectF(settingsVerticalScrollbarThumbRect(layout.scrollOffset(), monitorMaxScrollOffset)),
+                2.5,
+                2.5); // wjy: 监控页滑块位置与名单编辑框的滚动偏移保持一致。
+            painter.restore();
+        }
         return;
     }
     // ===end====
@@ -6895,6 +6983,26 @@ void DeviceGrid::setupSettingsControls()
         "QLineEdit:focus{border:1px solid #3A7BFC;}"));
     m_remoteMonitorIntervalEdit->setVisible(false);
 
+    m_remoteMonitorBlacklist = platform::AppSettings::remoteMonitorBlacklist(); // wjy: 构造设置页时加载持久化黑名单，启动监控前即可参与筛选。
+    m_remoteMonitorWhitelist = platform::AppSettings::remoteMonitorWhitelist(); // wjy: 构造设置页时加载持久化白名单，程序重启后仍保持强制监控规则。
+    const QString monitorNameListStyle = QStringLiteral(
+        "QTextEdit{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;padding:6px;"
+        "font-family:'Microsoft YaHei UI';font-size:12px;color:#040B18;}"
+        "QTextEdit:focus{border:1px solid #3A7BFC;}");
+    auto createMonitorNameListEdit = [this, &monitorNameListStyle](const QStringList& names) {
+        auto* edit = new RemoteMonitorNameListEdit(this);
+        edit->setPlainText(names.join(QLatin1Char('\n'))); // wjy: 持久化QStringList恢复为每行一个完整设备名的编辑格式。
+        edit->setPlaceholderText(QString::fromUtf8("每行一个完整设备名"));
+        edit->setStyleSheet(monitorNameListStyle);
+        edit->setVisible(false);
+        edit->commitCallback = [this] {
+            saveRemoteMonitorFilterSettings(); // wjy: 两个编辑框共用一个保存入口，保证黑白名单优先级在同一份快照中生效。
+        };
+        return edit;
+    };
+    m_remoteMonitorBlacklistEdit = createMonitorNameListEdit(m_remoteMonitorBlacklist);
+    m_remoteMonitorWhitelistEdit = createMonitorNameListEdit(m_remoteMonitorWhitelist);
+
     connect(m_remoteMonitorGridCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
         if (index < 0 || !m_remoteMonitorGridCombo) {
             return;
@@ -7151,7 +7259,8 @@ void DeviceGrid::updateAddDeviceControls()
         m_settingsLocalInfoExpanded,
         m_settingsAddDeviceExpanded,
         m_settingsScrollOffset,
-        m_settingsTab == SettingsTab::Keyboard); // wjy: 即使键盘页暂时隐藏新增设备控件，也不能把快捷键页偏移重新夹回常规页范围。
+        m_settingsTab == SettingsTab::Keyboard,
+        m_settingsTab == SettingsTab::RemoteMonitor); // wjy: 隐藏的常规页控件也必须尊重当前页滚动上限，不能把键盘页或监控页偏移夹回常规范围。
     m_settingsScrollOffset = layout.scrollOffset();
     const QRect ipRect = layout.scrolled(settingsAddDeviceIpEditRect(m_settingsLocalInfoExpanded));
     const QRect nameRect = layout.scrolled(settingsAddDeviceNameEditRect(m_settingsLocalInfoExpanded));
@@ -7227,7 +7336,8 @@ void DeviceGrid::updateLocalInfoControls()
         m_settingsLocalInfoExpanded,
         m_settingsAddDeviceExpanded,
         m_settingsScrollOffset,
-        m_settingsTab == SettingsTab::Keyboard); // wjy: 本机信息控件隐藏时仍共享当前页滚动上限，避免刷新把键盘页位置改回常规页。
+        m_settingsTab == SettingsTab::Keyboard,
+        m_settingsTab == SettingsTab::RemoteMonitor); // wjy: 本机信息控件隐藏时仍共享当前页滚动上限，避免刷新改写键盘页或监控页位置。
     m_settingsScrollOffset = layout.scrollOffset();
     const bool visible = !m_detailPanelCollapsed
         && m_settingsSelected
@@ -7381,7 +7491,8 @@ void DeviceGrid::updateSettingsControls()
         m_settingsLocalInfoExpanded,
         m_settingsAddDeviceExpanded,
         m_settingsScrollOffset,
-        m_settingsTab == SettingsTab::Keyboard); // wjy: 所有真实设置控件在同一快照下计算滚动后几何和视口可见性。
+        m_settingsTab == SettingsTab::Keyboard,
+        m_settingsTab == SettingsTab::RemoteMonitor); // wjy: 所有真实设置控件在当前页快照下计算滚动后几何和视口可见性。
     m_settingsScrollOffset = layout.scrollOffset();
     if (m_periodicDeviceDiscoveryIntervalEdit) {
         const QRect discoveryIntervalRect = layout.scrolled(settingsPeriodicDeviceDiscoveryIntervalInputRect());
@@ -7463,32 +7574,86 @@ void DeviceGrid::updateSettingsControls()
 
     const bool monitorVisible = m_settingsSelected && m_settingsTab == SettingsTab::RemoteMonitor;
     if (m_remoteMonitorGridCombo) {
+        const QRect contentRect = settingsRemoteMonitorControlRect(0);
         applySettingsControlGeometry(
             m_remoteMonitorGridCombo,
-            settingsRemoteMonitorControlRect(0),
-            monitorVisible,
+            layout.scrolled(contentRect),
+            monitorVisible && layout.fullyVisible(contentRect),
             monitorVisible,
             true); // wjy: 宫格下拉框只在独立监控页显示，选择后立即重排运行中的监控桌面。
     }
     if (m_remoteMonitorQualityCombo) {
+        const QRect contentRect = settingsRemoteMonitorControlRect(1);
         applySettingsControlGeometry(
             m_remoteMonitorQualityCombo,
-            settingsRemoteMonitorControlRect(1),
-            monitorVisible,
+            layout.scrolled(contentRect),
+            monitorVisible && layout.fullyVisible(contentRect),
             monitorVisible,
             true); // wjy: 画质下拉框不依赖监控是否开启，用户可先配置再按标题栏按钮启动。
     }
     if (m_remoteMonitorIntervalEdit) {
+        const QRect contentRect = settingsRemoteMonitorControlRect(2);
         applySettingsControlGeometry(
             m_remoteMonitorIntervalEdit,
-            settingsRemoteMonitorControlRect(2),
-            monitorVisible,
+            layout.scrolled(contentRect),
+            monitorVisible && layout.fullyVisible(contentRect),
             monitorVisible,
             true); // wjy: 轮询秒数输入框与手绘“秒”单位保持同一行。
+    }
+    if (m_remoteMonitorBlacklistEdit) {
+        const QRect contentRect = settingsRemoteMonitorNameListRect(0);
+        applySettingsControlGeometry(
+            m_remoteMonitorBlacklistEdit,
+            layout.scrolled(contentRect),
+            monitorVisible && layout.fullyVisible(contentRect),
+            monitorVisible,
+            true); // wjy: 黑名单编辑框随监控页滚动，完整进入视口后才允许编辑。
+    }
+    if (m_remoteMonitorWhitelistEdit) {
+        const QRect contentRect = settingsRemoteMonitorNameListRect(1);
+        applySettingsControlGeometry(
+            m_remoteMonitorWhitelistEdit,
+            layout.scrolled(contentRect),
+            monitorVisible && layout.fullyVisible(contentRect),
+            monitorVisible,
+            true); // wjy: 白名单编辑框和黑名单共用同一列布局及可见性规则。
     }
     // ===end====
 
 // ===end====
+}
+
+void DeviceGrid::saveRemoteMonitorFilterSettings()
+{
+    if (!m_remoteMonitorBlacklistEdit || !m_remoteMonitorWhitelistEdit) {
+        return;
+    }
+
+    const auto linesFromEdit = [](const QTextEdit* edit) {
+        return edit->toPlainText().split(
+            QRegularExpression(QStringLiteral("[\\r\\n]+")),
+            Qt::SkipEmptyParts); // wjy: Windows和Unix换行都按独立设备名解析，空行交给AppSettings统一清理。
+    };
+    platform::AppSettings::setRemoteMonitorBlacklist(linesFromEdit(m_remoteMonitorBlacklistEdit));
+    platform::AppSettings::setRemoteMonitorWhitelist(linesFromEdit(m_remoteMonitorWhitelistEdit));
+    m_remoteMonitorBlacklist = platform::AppSettings::remoteMonitorBlacklist(); // wjy: 保存后回读归一化结果，运行时筛选与磁盘配置保持完全一致。
+    m_remoteMonitorWhitelist = platform::AppSettings::remoteMonitorWhitelist();
+
+    const auto syncNormalizedText = [](QTextEdit* edit, const QStringList& names) {
+        const QString normalizedText = names.join(QLatin1Char('\n'));
+        if (edit->toPlainText() != normalizedText) {
+            const QSignalBlocker blocker(edit);
+            edit->setPlainText(normalizedText); // wjy: 失焦后去掉空行和大小写重复项，让界面直接展示最终生效名单。
+        }
+    };
+    syncNormalizedText(m_remoteMonitorBlacklistEdit, m_remoteMonitorBlacklist);
+    syncNormalizedText(m_remoteMonitorWhitelistEdit, m_remoteMonitorWhitelist);
+
+    m_remoteMonitorPageIndex = 0; // wjy: 名单变化后从第一批设备重新计算，避免旧页码跳过新纳入设备。
+    if (m_remoteMonitorModeEnabled) {
+        refreshRemoteMonitorMode(false); // wjy: 运行中修改名单立即关闭被排除来源并补入新命中的白名单设备。
+    }
+    update();
 }
 
 // =====wjy====
@@ -10163,14 +10328,15 @@ QVector<int> DeviceGrid::remoteMonitorDeviceIndexes() const
         if (ip.isEmpty() || deviceRecordMatchesLocal(device)) {
             continue; // wjy: 没有有效IP或匹配本机的记录无法建立远端监控Viewer，继续保持原有排除规则。
         }
-        if (presence != platform::DevicePresenceState::Busy) {
-            continue; // wjy: 监控模式现在只查看已经存在普通远控会话的Busy设备，普通Online设备完全不进入轮询页。
+        if (remoteMonitorNameListContains(m_remoteMonitorBlacklist, displayName)) {
+            continue; // wjy: 黑名单拥有最高优先级，即使同名设备也在白名单或当前为Busy都不创建监控Viewer。
         }
-        if (remoteMonitorNameStartsWithEnglishLetter(displayName)) {
-            continue; // wjy: 最终显示设备名以A-Z或a-z开头时直接排除，不受后续排序和宫格容量影响。
+        const bool whitelisted = remoteMonitorNameListContains(m_remoteMonitorWhitelist, displayName);
+        if (!whitelisted && presence != platform::DevicePresenceState::Busy) {
+            continue; // wjy: 未命中白名单时保留原Busy门槛，普通Online、Offline和Unknown设备不进入轮询。
         }
-        if (remoteMonitorNameIsWhitelistedForExclusion(displayName)) {
-            continue; // wjy: 用户维护的排除白名单拥有最后过滤权，名单中的Busy设备也不会创建或占用监控槽位。
+        if (!whitelisted && remoteMonitorNameStartsWithEnglishLetter(displayName)) {
+            continue; // wjy: 未命中白名单时继续排除英文字母开头名称，白名单设备可显式绕过该规则。
         }
         // ===end====
         indexes.append(deviceIndex);
@@ -11464,9 +11630,12 @@ void DeviceGrid::paintEvent(QPaintEvent* event)
         const bool settingsPage = m_settingsSelected && !m_remoteAssistSelected && !m_localInfoSelected; // wjy: 设置页也参照设备详情页，使用同一条底部绘制边界。
         painter.setClipRect((deviceDetailPage || settingsPage) ? deviceDetailContentClipRect() : contentClipRect()); // wjy: 详情栏展开时才创建右侧裁剪区域，紧凑态完全跳过详情绘制。
         if (m_settingsSelected) {
-            const int settingsMaxScrollOffset = m_settingsTab == SettingsTab::Keyboard
-                ? keyboardShortcutMaxScrollOffset()
-                : maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+            const int settingsMaxScrollOffset = settingsLayoutSnapshot(
+                m_settingsLocalInfoExpanded,
+                m_settingsAddDeviceExpanded,
+                m_settingsScrollOffset,
+                m_settingsTab == SettingsTab::Keyboard,
+                m_settingsTab == SettingsTab::RemoteMonitor).maxScrollOffset(); // wjy: 绘制前按当前页独立内容高度夹紧偏移，监控名单不会被常规页上限截断。
             m_settingsScrollOffset = qBound(0, m_settingsScrollOffset, settingsMaxScrollOffset);
         drawSettingsPage(
             painter,
@@ -12075,18 +12244,24 @@ void DeviceGrid::animateDeviceListScrollTo(int targetOffset)
 
 void DeviceGrid::animateSettingsScrollTo(int targetOffset)
 {
-    const int maxOffset = m_settingsTab == SettingsTab::Keyboard
-        ? keyboardShortcutMaxScrollOffset()
-        : maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+    const int maxOffset = settingsLayoutSnapshot(
+        m_settingsLocalInfoExpanded,
+        m_settingsAddDeviceExpanded,
+        m_settingsScrollOffset,
+        m_settingsTab == SettingsTab::Keyboard,
+        m_settingsTab == SettingsTab::RemoteMonitor).maxScrollOffset();
     const int boundedTarget = qBound(0, targetOffset, maxOffset); // wjy: 设置卡片展开状态决定当前滚动上限，动画目标必须使用本帧真实范围。
     if (!m_settingsScrollbarAnimation) {
         m_settingsScrollbarAnimation = new QVariantAnimation(this);
         m_settingsScrollbarAnimation->setDuration(140); // wjy: 与设备区保持相同速度，两个滚动条的点击手感一致。
         m_settingsScrollbarAnimation->setEasingCurve(QEasingCurve::OutCubic);
         connect(m_settingsScrollbarAnimation, &QVariantAnimation::valueChanged, this, [this](const QVariant& value) {
-            const int currentMax = m_settingsTab == SettingsTab::Keyboard
-                ? keyboardShortcutMaxScrollOffset()
-                : maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+            const int currentMax = settingsLayoutSnapshot(
+                m_settingsLocalInfoExpanded,
+                m_settingsAddDeviceExpanded,
+                m_settingsScrollOffset,
+                m_settingsTab == SettingsTab::Keyboard,
+                m_settingsTab == SettingsTab::RemoteMonitor).maxScrollOffset(); // wjy: 动画期间页签或窗口尺寸变化时重新取得当前页真实上限。
             m_settingsScrollOffset = qBound(0, value.toInt(), currentMax); // wjy: 动画每帧同步设置页偏移，避免折叠卡片后保留无效位置。
             updateSettingsControls();
             updateAddDeviceControls();
@@ -12154,10 +12329,15 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
     if (event->button() == Qt::LeftButton
         && !m_detailPanelCollapsed
         && m_settingsSelected
-        && (m_settingsTab == SettingsTab::General || m_settingsTab == SettingsTab::Keyboard)) {
-        const int maxScrollOffset = m_settingsTab == SettingsTab::Keyboard
-            ? keyboardShortcutMaxScrollOffset()
-            : maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+        && (m_settingsTab == SettingsTab::General
+            || m_settingsTab == SettingsTab::Keyboard
+            || m_settingsTab == SettingsTab::RemoteMonitor)) {
+        const int maxScrollOffset = settingsLayoutSnapshot(
+            m_settingsLocalInfoExpanded,
+            m_settingsAddDeviceExpanded,
+            m_settingsScrollOffset,
+            m_settingsTab == SettingsTab::Keyboard,
+            m_settingsTab == SettingsTab::RemoteMonitor).maxScrollOffset();
         const QRect track = settingsVerticalScrollbarTrackRect();
         const QRect thumb = settingsVerticalScrollbarThumbRect(m_settingsScrollOffset, maxScrollOffset);
         const QRect trackHitRect = track.adjusted(-5, -2, 5, 2); // wjy: 设置滚动条视觉较窄，扩大横向和纵向命中区后更容易拖动且不改变绘制宽度。
@@ -12216,6 +12396,18 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         && !m_remoteMonitorIntervalEdit->geometry().contains(event->pos())) {
         m_remoteMonitorIntervalEdit->clearFocus();
         setFocus(Qt::MouseFocusReason); // wjy: 点击监控轮询输入框外部时立即保存秒数并重启当前计时周期。
+    }
+    if (m_remoteMonitorBlacklistEdit
+        && m_remoteMonitorBlacklistEdit->hasFocus()
+        && !m_remoteMonitorBlacklistEdit->geometry().contains(event->pos())) {
+        m_remoteMonitorBlacklistEdit->clearFocus();
+        setFocus(Qt::MouseFocusReason); // wjy: 点击黑名单框外部立即提交完整黑白名单快照并刷新监控页。
+    }
+    if (m_remoteMonitorWhitelistEdit
+        && m_remoteMonitorWhitelistEdit->hasFocus()
+        && !m_remoteMonitorWhitelistEdit->geometry().contains(event->pos())) {
+        m_remoteMonitorWhitelistEdit->clearFocus();
+        setFocus(Qt::MouseFocusReason); // wjy: 点击白名单框外部立即提交，避免切换设置页后文本看似已填但未生效。
     }
     if (m_batchSubnetEdit
         && m_batchSubnetEdit->hasFocus()
@@ -12528,9 +12720,12 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
 
     // =====wjy====
     if (m_draggingSettingsScrollbar) {
-        const int maxScrollOffset = m_settingsTab == SettingsTab::Keyboard
-            ? keyboardShortcutMaxScrollOffset()
-            : maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded); // wjy: 卡片展开或窗口尺寸变化后始终使用当前页最新滚动范围。
+        const int maxScrollOffset = settingsLayoutSnapshot(
+            m_settingsLocalInfoExpanded,
+            m_settingsAddDeviceExpanded,
+            m_settingsScrollOffset,
+            m_settingsTab == SettingsTab::Keyboard,
+            m_settingsTab == SettingsTab::RemoteMonitor).maxScrollOffset(); // wjy: 卡片展开、页签或窗口尺寸变化后始终使用当前页最新滚动范围。
         if (!(event->buttons() & Qt::LeftButton) || maxScrollOffset <= 0) {
             m_draggingSettingsScrollbar = false;
             m_settingsScrollbarGrabOffsetY = 0;
@@ -12687,12 +12882,17 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
     const bool deviceListScrollbarHovered = m_deviceGroupExpanded
         && deviceListMaxScrollOffset > 0
         && deviceListScrollbarTrackRect().adjusted(-4, -2, 1, 2).intersected(deviceListViewportRect(true)).contains(event->pos()); // wjy: 整条设备轨道都显示可抓取手型，滑块和空白位置使用相同点击语义。
-    const int settingsMaxScrollOffset = m_settingsTab == SettingsTab::Keyboard
-        ? keyboardShortcutMaxScrollOffset()
-        : maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+    const int settingsMaxScrollOffset = settingsLayoutSnapshot(
+        m_settingsLocalInfoExpanded,
+        m_settingsAddDeviceExpanded,
+        m_settingsScrollOffset,
+        m_settingsTab == SettingsTab::Keyboard,
+        m_settingsTab == SettingsTab::RemoteMonitor).maxScrollOffset();
     const bool settingsScrollbarHovered = !m_detailPanelCollapsed
         && m_settingsSelected
-        && (m_settingsTab == SettingsTab::General || m_settingsTab == SettingsTab::Keyboard)
+        && (m_settingsTab == SettingsTab::General
+            || m_settingsTab == SettingsTab::Keyboard
+            || m_settingsTab == SettingsTab::RemoteMonitor)
         && settingsMaxScrollOffset > 0
         && settingsVerticalScrollbarTrackRect().adjusted(-5, -2, 5, 2).contains(event->pos()); // wjy: 常规页和键盘页整条滚动轨道均可拖拽或点击跳转，悬停时提前给出手型反馈。
     // ===end====
@@ -12711,7 +12911,8 @@ void DeviceGrid::mouseMoveEvent(QMouseEvent* event)
         m_settingsLocalInfoExpanded,
         m_settingsAddDeviceExpanded,
         m_settingsScrollOffset,
-        m_settingsTab == SettingsTab::Keyboard); // wjy: 命中测试与绘制、子控件几何共用同一设置页快照。
+        m_settingsTab == SettingsTab::Keyboard,
+        m_settingsTab == SettingsTab::RemoteMonitor); // wjy: 命中测试与绘制、子控件几何共用同一设置页快照。
     const bool settingsSwitchHovered = !m_detailPanelCollapsed
         && m_settingsSelected
         && m_settingsTab == SettingsTab::General
@@ -12863,12 +13064,17 @@ void DeviceGrid::wheelEvent(QWheelEvent* event)
         return;
     }
 
-    const int maxSettingsOffset = m_settingsTab == SettingsTab::Keyboard
-        ? keyboardShortcutMaxScrollOffset()
-        : maxSettingsScrollOffset(m_settingsLocalInfoExpanded, m_settingsAddDeviceExpanded);
+    const int maxSettingsOffset = settingsLayoutSnapshot(
+        m_settingsLocalInfoExpanded,
+        m_settingsAddDeviceExpanded,
+        m_settingsScrollOffset,
+        m_settingsTab == SettingsTab::Keyboard,
+        m_settingsTab == SettingsTab::RemoteMonitor).maxScrollOffset();
     if (!m_detailPanelCollapsed
         && m_settingsSelected
-        && (m_settingsTab == SettingsTab::General || m_settingsTab == SettingsTab::Keyboard)
+        && (m_settingsTab == SettingsTab::General
+            || m_settingsTab == SettingsTab::Keyboard
+            || m_settingsTab == SettingsTab::RemoteMonitor)
         && maxSettingsOffset > 0
         && settingsScrollViewportRect().contains(event->position().toPoint())) {
         const int wheelDelta = !event->pixelDelta().isNull()
@@ -13556,7 +13762,8 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
                 m_settingsLocalInfoExpanded,
                 m_settingsAddDeviceExpanded,
                 m_settingsScrollOffset,
-                m_settingsTab == SettingsTab::Keyboard); // wjy: 设置页点击命中与手绘/子控件布局共享同一滚动快照。
+                m_settingsTab == SettingsTab::Keyboard,
+                m_settingsTab == SettingsTab::RemoteMonitor); // wjy: 设置页点击命中与手绘/子控件布局共享同一滚动快照。
             if (settingsGeneralTabRect().contains(event->pos())
                 || settingsKeyboardTabRect().contains(event->pos())
                 || settingsRemoteControlTabRect().contains(event->pos())

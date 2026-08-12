@@ -15791,3 +15791,90 @@ if (!source_ip_.empty()) {
 - 已执行 `git diff --check`，未发现空白错误。
 - 已静态确认旧 Viewer 入口仍保留，新入口为可选解析，不会因旧 DLL 缺失直接改变加载结果。
 - 按用户此前要求未执行构建、链接或运行测试。
+
+## 2026-08-12 09:39 - 开放监控模式黑白名单设置
+
+### Changed Location
+- `src/system/AppSettings.h:49-52`：声明监控黑名单和白名单的读取、持久化接口。
+- `src/system/AppSettings.cpp:58-70,347-370`：归一化名单并保存到独立的 `QSettings` 键。
+- `src/ui/DeviceGrid.h:202-205,257,377-380`：更新监控筛选职责并保存名单控件和运行时快照。
+- `src/ui/DeviceGrid.cpp:1074-1105,1588-1593,2244-2263,3500-3524,3673-3760,6988-7006,7488-7659,10320-10344,12249-12413,12725-13088,13763-13780`：新增名单编辑、监控页滚动、失焦保存、实时刷新和最终筛选优先级。
+
+### Reason
+旧逻辑只能在源码数组中填写“不参与监控”的设备名，用户无法在运行界面维护，而且旧白名单实际代表排除项，语义容易混淆。本次把功能开放到“设置 -> 监控模式”，明确黑名单永不监控、白名单强制纳入，黑名单同时命中时优先；空 IP 和本机记录仍排除，因为无法建立有效的远端监控 Viewer。
+
+### Original Code
+```cpp
+// src/ui/DeviceGrid.cpp:1542-1562（修改前）
+const QStringList kRemoteMonitorExclusionWhitelist = {
+    // QStringLiteral("这里填写不参与监控轮询的完整设备名"),
+};
+
+bool remoteMonitorNameIsWhitelistedForExclusion(const QString& deviceName)
+{
+    return kRemoteMonitorExclusionWhitelist.contains(
+        deviceName.trimmed(),
+        Qt::CaseInsensitive);
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:10194-10205（修改前）
+if (ip.isEmpty() || deviceRecordMatchesLocal(device)) continue;
+if (presence != platform::DevicePresenceState::Busy) continue;
+if (remoteMonitorNameStartsWithEnglishLetter(displayName)) continue;
+if (remoteMonitorNameIsWhitelistedForExclusion(displayName)) continue;
+```
+
+```cpp
+// src/system/AppSettings.h（修改前）
+// 新增功能，原位置没有监控黑白名单持久化接口。
+```
+
+### Modified Code
+```cpp
+// src/system/AppSettings.h:49-52（修改后）
+static QStringList remoteMonitorBlacklist();
+static void setRemoteMonitorBlacklist(const QStringList& deviceNames);
+static QStringList remoteMonitorWhitelist();
+static void setRemoteMonitorWhitelist(const QStringList& deviceNames);
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:7628-7659（修改后）
+void DeviceGrid::saveRemoteMonitorFilterSettings()
+{
+    platform::AppSettings::setRemoteMonitorBlacklist(linesFromEdit(m_remoteMonitorBlacklistEdit));
+    platform::AppSettings::setRemoteMonitorWhitelist(linesFromEdit(m_remoteMonitorWhitelistEdit));
+    m_remoteMonitorBlacklist = platform::AppSettings::remoteMonitorBlacklist();
+    m_remoteMonitorWhitelist = platform::AppSettings::remoteMonitorWhitelist();
+    m_remoteMonitorPageIndex = 0;
+    if (m_remoteMonitorModeEnabled) {
+        refreshRemoteMonitorMode(false);
+    }
+}
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:10329-10344（修改后）
+if (ip.isEmpty() || deviceRecordMatchesLocal(device)) continue;
+if (remoteMonitorNameListContains(m_remoteMonitorBlacklist, displayName)) continue;
+const bool whitelisted = remoteMonitorNameListContains(m_remoteMonitorWhitelist, displayName);
+if (!whitelisted && presence != platform::DevicePresenceState::Busy) continue;
+if (!whitelisted && remoteMonitorNameStartsWithEnglishLetter(displayName)) continue;
+```
+
+### Steps
+1. 删除旧固定排除数组和反向白名单辅助函数，统一改为完整设备显示名、忽略大小写匹配。
+2. 在 `AppSettings` 中新增 `remoteMonitor/blacklist` 与 `remoteMonitor/whitelist`，保存前去空行、去首尾空格并忽略大小写去重。
+3. 在监控设置页新增并排的黑名单、白名单多行编辑框，每行一个设备名，失焦或 `Ctrl+Enter` 后保存。
+4. 给监控设置页增加独立滚动上限，并让绘制、真实控件、滚轮、轨道点击和滑块拖动共用同一布局快照。
+5. 按“空 IP/本机排除 -> 黑名单排除 -> 白名单强制纳入 -> 默认 Busy 和英文开头筛选”的顺序重写监控设备选择。
+6. 名单保存后重置到第一页；监控模式正在运行时立即刷新当前 Viewer 来源。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已静态搜索确认源码中的 `kRemoteMonitorExclusionWhitelist`、`remoteMonitorNameIsWhitelistedForExclusion` 和旧“排除白名单”文案均已清理；历史变更记录保留原始代码用于追溯。
+- 已静态确认 `AppSettings` 声明与实现、`DeviceGrid` 保存入口和控件成员完整对应。
+- 已静态确认监控页滚动快照覆盖绘制、真实控件、滚轮、轨道点击、滑块拖动和悬停命中。
+- 按用户要求未执行构建、链接或运行测试。

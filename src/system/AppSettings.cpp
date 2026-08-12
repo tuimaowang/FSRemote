@@ -54,6 +54,22 @@ void setShortcutToSettings(const QString& key, const QKeySequence& shortcut, con
 }
 // ===end====
 
+// =====wjy====
+QStringList normalizedRemoteMonitorNameList(const QStringList& deviceNames)
+{
+    QStringList normalized;
+    for (const QString& deviceName : deviceNames) {
+        const QString trimmedName = deviceName.trimmed(); // wjy: 名单以设备显示名为匹配键，去掉用户输入行首尾空格避免视觉相同却匹配失败。
+        if (trimmedName.isEmpty()
+            || normalized.contains(trimmedName, Qt::CaseInsensitive)) {
+            continue; // wjy: 空行和大小写重复项不进入持久化列表，避免刷新筛选时重复计算。
+        }
+        normalized.append(trimmedName);
+    }
+    return normalized;
+}
+// ===end====
+
 QRect geometryFromJsonObject(const QJsonObject& object)
 {
     const int width = object.value(QStringLiteral("width")).toInt();
@@ -326,6 +342,32 @@ void AppSettings::setRemoteMonitorConfiguration(
     appSettings.setValue(QStringLiteral("remoteMonitor/grid"), static_cast<int>(normalized.grid)); // wjy: 三项配置在同一入口写入，设置页和运行中监控状态始终读取同一份值。
     appSettings.setValue(QStringLiteral("remoteMonitor/quality"), static_cast<int>(normalized.quality));
     appSettings.setValue(QStringLiteral("remoteMonitor/rotationIntervalSeconds"), normalized.rotationIntervalSeconds);
+}
+
+QStringList AppSettings::remoteMonitorBlacklist()
+{
+    return normalizedRemoteMonitorNameList(
+        settings().value(QStringLiteral("remoteMonitor/blacklist")).toStringList()); // wjy: 读取后再次归一化，兼容旧版本手工写入的空行和重复名称。
+}
+
+void AppSettings::setRemoteMonitorBlacklist(const QStringList& deviceNames)
+{
+    settings().setValue(
+        QStringLiteral("remoteMonitor/blacklist"),
+        normalizedRemoteMonitorNameList(deviceNames)); // wjy: 黑名单单独保存，和宫格/画质/轮询配置互不覆盖。
+}
+
+QStringList AppSettings::remoteMonitorWhitelist()
+{
+    return normalizedRemoteMonitorNameList(
+        settings().value(QStringLiteral("remoteMonitor/whitelist")).toStringList()); // wjy: 白名单使用独立QSettings键，语义与旧排除名单完全相反。
+}
+
+void AppSettings::setRemoteMonitorWhitelist(const QStringList& deviceNames)
+{
+    settings().setValue(
+        QStringLiteral("remoteMonitor/whitelist"),
+        normalizedRemoteMonitorNameList(deviceNames)); // wjy: 白名单修改立即落盘，程序重启后仍强制纳入匹配设备。
 }
 // ===end====
 
