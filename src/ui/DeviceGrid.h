@@ -255,7 +255,8 @@ private:
     void startDesktopWallpaperRotation(bool userInitiated); // wjy: 先异步探测 SMB，连接成功才进入真实壁纸任务。
     void performDesktopWallpaperRotation(bool userInitiated); // wjy: 已通过连接门禁后在后台选择并应用下一张共享图片。
     void saveRemoteQualitySettingsFromControls(); // wjy: 收集远控画质页字段、统一归一化持久化并立即通知跟随全局的窗口。
-    void saveRemoteMonitorFilterSettings(); // wjy: 将监控黑白名单编辑框按行解析、立即持久化并刷新当前监控页。
+    void refreshRemoteMonitorFilterList(bool preserveDraft); // wjy: 合并设备目录、持久化名单和未应用草稿，刷新黑白名单勾选表格。
+    void saveRemoteMonitorFilterSettings(); // wjy: 点击应用后收集勾选项、持久化黑白名单并刷新当前监控页。
     void registerRemoteQualityWindow(RemoteDesktopWindow* window, bool monitorWindow = false); // wjy: 普通窗口恢复设备手选档；监控窗口只使用统一监控档位并纳入同一质量协调器。
     void requestRemoteQualityEvaluation(); // wjy: 合并同一事件循环内多次窗口变化，最多排队一个全局质量计算任务。
     void evaluateRemoteQuality(); // wjy: 每秒汇总窗口并在状态事件时即时重算，手选/监控/自动按优先级恢复，完全遮挡临时360/1。
@@ -375,10 +376,11 @@ private:
     QComboBox* m_remoteMonitorGridCombo = nullptr; // wjy: 设置页提供4/9/12/16/20/25六种单页容量。
     QComboBox* m_remoteMonitorQualityCombo = nullptr; // wjy: 设置页选择独立监控窗口的统一画质，不读取普通远控按设备保存的手选档。
     QLineEdit* m_remoteMonitorIntervalEdit = nullptr; // wjy: 轮询秒数默认30，失焦或回车后持久化并重启计时。
-    QTextEdit* m_remoteMonitorBlacklistEdit = nullptr; // wjy: 设置页每行编辑一个完整设备显示名，命中后无论状态都禁止监控。
-    QTextEdit* m_remoteMonitorWhitelistEdit = nullptr; // wjy: 设置页每行编辑一个完整设备显示名，命中后绕过普通筛选强制监控。
+    QTreeWidget* m_remoteMonitorFilterTree = nullptr; // wjy: 设置页按设备逐行展示黑白名单互斥复选框，避免手工输入错误名称。
+    QPushButton* m_remoteMonitorApplyButton = nullptr; // wjy: 用户点击应用后才让勾选草稿写入设置并影响运行中的监控。
     QStringList m_remoteMonitorBlacklist; // wjy: 当前运行中的监控黑名单快照，黑名单优先于白名单。
     QStringList m_remoteMonitorWhitelist; // wjy: 当前运行中的监控白名单快照，白名单优先绕过Busy和英文名条件。
+    bool m_remoteMonitorFilterDraftDirty = false; // wjy: 区分尚未应用的界面勾选和已经生效的运行时名单。
     // ===end====
     QSet<int> m_registeredGlobalShortcutIds;
     quintptr m_globalShortcutWindowHandle = 0;

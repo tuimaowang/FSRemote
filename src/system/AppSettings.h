@@ -47,9 +47,9 @@ public:
     static stream::RemoteMonitorConfiguration remoteMonitorConfiguration(); // wjy: 读取监控模式宫格、默认画质和轮询秒数，异常值统一回退产品默认。
     static void setRemoteMonitorConfiguration(const stream::RemoteMonitorConfiguration& configuration); // wjy: 设置页每次修改立即持久化完整监控配置。
     static QStringList remoteMonitorBlacklist(); // wjy: 读取监控黑名单，名单中的设备无论Busy或白名单状态都不进入监控。
-    static void setRemoteMonitorBlacklist(const QStringList& deviceNames); // wjy: 持久化按行编辑的监控黑名单并去除空项和重复项。
+    static void setRemoteMonitorBlacklist(const QStringList& deviceNames); // wjy: 持久化设备列表中勾选的监控黑名单并去除空项和重复项。
     static QStringList remoteMonitorWhitelist(); // wjy: 读取监控白名单，名单中的设备绕过Busy和英文名筛选强制进入监控。
-    static void setRemoteMonitorWhitelist(const QStringList& deviceNames); // wjy: 持久化按行编辑的监控白名单，和黑名单同时命中时由黑名单优先。
+    static void setRemoteMonitorWhitelist(const QStringList& deviceNames); // wjy: 持久化设备列表中勾选的监控白名单，和黑名单同时命中时由黑名单优先。
     // ===end====
     static QKeySequence remoteShortcutFullscreen();
     static void setRemoteShortcutFullscreen(const QKeySequence& shortcut);

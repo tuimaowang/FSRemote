@@ -36,6 +36,7 @@
 #include <QApplication>
 #include <QByteArray>
 #include <QClipboard>
+#include <QCollator>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QCryptographicHash>
@@ -73,6 +74,7 @@
 #include <QPushButton>
 #include <QToolTip>
 #include <QGuiApplication>
+#include <QHeaderView>
 #include <QRegularExpression>
 #include <QResizeEvent>
 #include <QSaveFile>
@@ -1070,38 +1072,6 @@ private:
     QString m_committedText;
 };
 
-class RemoteMonitorNameListEdit final : public QTextEdit {
-public:
-    explicit RemoteMonitorNameListEdit(QWidget* parent = nullptr)
-        : QTextEdit(parent)
-    {
-        setAcceptRichText(false); // wjy: 名单只接收纯文本，粘贴网页或富文本时不会把格式信息写入设置。
-        setLineWrapMode(QTextEdit::NoWrap); // wjy: 每行严格对应一个完整设备名，长名称通过横向滚动查看而不是视觉换成两行。
-    }
-
-    std::function<void()> commitCallback;
-
-protected:
-    void focusOutEvent(QFocusEvent* event) override
-    {
-        if (commitCallback) {
-            commitCallback(); // wjy: 点击名单框外部或切换页签时统一归一化、落盘并刷新运行中的监控窗口。
-        }
-        QTextEdit::focusOutEvent(event);
-    }
-
-    void keyPressEvent(QKeyEvent* event) override
-    {
-        if (event
-            && (event->modifiers() & Qt::ControlModifier)
-            && (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter)) {
-            clearFocus(); // wjy: Ctrl+Enter提供显式保存入口，普通Enter仍用于新增下一行设备名。
-            event->accept();
-            return;
-        }
-        QTextEdit::keyPressEvent(event);
-    }
-};
 // ===end====
 
 QRect minimizeRect()
@@ -2240,7 +2210,7 @@ int maxSettingsScrollOffset(bool localInfoExpanded, bool addDeviceExpanded)
 
 // =====wjy====
 int keyboardShortcutMaxScrollOffset(); // wjy: 键盘页布局快照在快捷键几何函数定义前使用前置声明，避免回退到常规页滚动上限。
-int remoteMonitorSettingsMaxScrollOffset(); // wjy: 监控页布局快照在名单编辑框几何函数定义前使用前置声明。
+int remoteMonitorSettingsMaxScrollOffset(); // wjy: 监控页布局快照在设备勾选表格几何函数定义前使用前置声明。
 
 ui::SettingsLayoutSnapshot settingsLayoutSnapshot(
     bool localInfoExpanded,
@@ -3495,22 +3465,20 @@ QRect settingsRemoteMonitorControlRect(int index)
         34); // wjy: 宫格、画质和轮询秒数按三行右对齐，轮询输入框缩短后为右侧“秒”保留空间。
 }
 
-QRect settingsRemoteMonitorNameListRect(int index)
+QRect settingsRemoteMonitorFilterListRect()
 {
     const QRect card = settingsScrollViewportRect();
-    const int gap = 16;
-    const int columnWidth = qMax(144, (card.width() - 56 - gap) / 2);
     return QRect(
-        card.x() + 28 + index * (columnWidth + gap),
-        card.y() + 344,
-        columnWidth,
-        132); // wjy: 黑名单和白名单并排放在监控页下半区，保留足够高度供用户逐行粘贴多个设备名。
+        card.x() + 28,
+        card.y() + 330,
+        card.width() - 56,
+        146); // wjy: 表格内部自行滚动；高度收紧后最低窗口也能同时完整显示表格和应用按钮。
 }
 
-QRect settingsRemoteMonitorNameListLabelRect(int index)
+QRect settingsRemoteMonitorApplyButtonRect()
 {
-    const QRect editor = settingsRemoteMonitorNameListRect(index);
-    return QRect(editor.x(), editor.y() - 26, editor.width(), 22); // wjy: 标签紧贴对应编辑框上方，和两个名单列保持一一对应。
+    const QRect listRect = settingsRemoteMonitorFilterListRect();
+    return QRect(listRect.right() - 104, listRect.bottom() + 8, 104, 34); // wjy: 应用按钮位于名单表格右下方，最低窗口滚到底时仍和完整表格同时可见。
 }
 
 int remoteMonitorSettingsMaxScrollOffset()
@@ -3518,7 +3486,7 @@ int remoteMonitorSettingsMaxScrollOffset()
     const QRect viewport = settingsScrollViewportRect();
     return qMax(
         0,
-        settingsRemoteMonitorNameListRect(0).bottom() + 12 - viewport.bottom()); // wjy: 监控页滚动到最底时为名单编辑框保留12像素底部空白。
+        settingsRemoteMonitorApplyButtonRect().bottom() + 12 - viewport.bottom()); // wjy: 监控页滚动到最底时仍完整显示应用按钮和底部留白。
 }
 // ===end====
 
@@ -3727,20 +3695,7 @@ void drawSettingsPage(
         painter.drawText(
             QRectF(monitorCard.x() + 28, monitorCard.y() + 282, monitorCard.width() - 56, 48),
             Qt::AlignTop | Qt::AlignLeft | Qt::TextWordWrap,
-            QString::fromUtf8("黑名单优先：命中后永不监控；白名单强制纳入：绕过Busy和名称筛选。未命中名单时，仅轮询Busy且设备名不以英文字母开头的设备。")); // wjy: 设置页直接说明两类名单的优先级和与默认筛选的关系，避免把新白名单误解为旧排除名单。
-        QFont listLabelFont(textFont);
-        listLabelFont.setPixelSize(12);
-        listLabelFont.setBold(true);
-        painter.setFont(listLabelFont);
-        painter.setPen(QColor(QStringLiteral("#111827")));
-        painter.drawText(
-            QRectF(settingsRemoteMonitorNameListLabelRect(0)),
-            Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("黑名单（优先排除）")); // wjy: 黑名单标题明确表示它在白名单之前判定。
-        painter.drawText(
-            QRectF(settingsRemoteMonitorNameListLabelRect(1)),
-            Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("白名单（强制监控）")); // wjy: 新白名单语义与之前固定排除数组相反，标题直接标注强制纳入。
+            QString::fromUtf8("在设备列表中勾选黑名单或白名单，再点击应用；同一设备只能选择一项。黑名单优先，白名单绕过Busy和名称筛选。")); // wjy: 设置页说明新的互斥勾选和应用流程，避免用户误认为勾选后已经立即生效。
         painter.restore();
         const int monitorMaxScrollOffset = remoteMonitorSettingsMaxScrollOffset();
         if (monitorMaxScrollOffset > 0) {
@@ -3752,7 +3707,7 @@ void drawSettingsPage(
             painter.drawRoundedRect(
                 QRectF(settingsVerticalScrollbarThumbRect(layout.scrollOffset(), monitorMaxScrollOffset)),
                 2.5,
-                2.5); // wjy: 监控页滑块位置与名单编辑框的滚动偏移保持一致。
+                2.5); // wjy: 监控页滑块位置与设备勾选表格和应用按钮的滚动偏移保持一致。
             painter.restore();
         }
         return;
@@ -6985,23 +6940,76 @@ void DeviceGrid::setupSettingsControls()
 
     m_remoteMonitorBlacklist = platform::AppSettings::remoteMonitorBlacklist(); // wjy: 构造设置页时加载持久化黑名单，启动监控前即可参与筛选。
     m_remoteMonitorWhitelist = platform::AppSettings::remoteMonitorWhitelist(); // wjy: 构造设置页时加载持久化白名单，程序重启后仍保持强制监控规则。
-    const QString monitorNameListStyle = QStringLiteral(
-        "QTextEdit{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;padding:6px;"
-        "font-family:'Microsoft YaHei UI';font-size:12px;color:#040B18;}"
-        "QTextEdit:focus{border:1px solid #3A7BFC;}");
-    auto createMonitorNameListEdit = [this, &monitorNameListStyle](const QStringList& names) {
-        auto* edit = new RemoteMonitorNameListEdit(this);
-        edit->setPlainText(names.join(QLatin1Char('\n'))); // wjy: 持久化QStringList恢复为每行一个完整设备名的编辑格式。
-        edit->setPlaceholderText(QString::fromUtf8("每行一个完整设备名"));
-        edit->setStyleSheet(monitorNameListStyle);
-        edit->setVisible(false);
-        edit->commitCallback = [this] {
-            saveRemoteMonitorFilterSettings(); // wjy: 两个编辑框共用一个保存入口，保证黑白名单优先级在同一份快照中生效。
-        };
-        return edit;
-    };
-    m_remoteMonitorBlacklistEdit = createMonitorNameListEdit(m_remoteMonitorBlacklist);
-    m_remoteMonitorWhitelistEdit = createMonitorNameListEdit(m_remoteMonitorWhitelist);
+    m_remoteMonitorFilterTree = new QTreeWidget(this);
+    m_remoteMonitorFilterTree->setColumnCount(3);
+    m_remoteMonitorFilterTree->setHeaderLabels({
+        QString::fromUtf8("设备"),
+        QString::fromUtf8("黑名单"),
+        QString::fromUtf8("白名单"),
+    });
+    m_remoteMonitorFilterTree->setRootIsDecorated(false);
+    m_remoteMonitorFilterTree->setItemsExpandable(false);
+    m_remoteMonitorFilterTree->setUniformRowHeights(true);
+    m_remoteMonitorFilterTree->setAlternatingRowColors(true);
+    m_remoteMonitorFilterTree->setSelectionMode(QAbstractItemView::NoSelection); // wjy: 表格只通过两列复选框编辑，不保留容易混淆的整行选择状态。
+    m_remoteMonitorFilterTree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+    m_remoteMonitorFilterTree->header()->setSectionResizeMode(1, QHeaderView::Fixed);
+    m_remoteMonitorFilterTree->header()->setSectionResizeMode(2, QHeaderView::Fixed);
+    m_remoteMonitorFilterTree->setColumnWidth(1, 78);
+    m_remoteMonitorFilterTree->setColumnWidth(2, 78);
+    m_remoteMonitorFilterTree->headerItem()->setTextAlignment(1, Qt::AlignCenter);
+    m_remoteMonitorFilterTree->headerItem()->setTextAlignment(2, Qt::AlignCenter); // wjy: 两个名单表头和下方复选框居中对齐，扫视时能直接对应列语义。
+    m_remoteMonitorFilterTree->setStyleSheet(QStringLiteral(
+        "QTreeWidget{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;"
+        "font-family:'Microsoft YaHei UI';font-size:12px;color:#040B18;alternate-background-color:#F8FAFC;}"
+        "QTreeWidget::item{height:28px;border:0;}"
+        "QHeaderView::section{background:#F3F6FA;border:0;border-bottom:1px solid #DDE3EA;"
+        "padding:0 8px;font-family:'Microsoft YaHei UI';font-size:12px;color:#334155;}"));
+    m_remoteMonitorFilterTree->setVisible(false);
+
+    m_remoteMonitorApplyButton = new QPushButton(QString::fromUtf8("应用"), this);
+    m_remoteMonitorApplyButton->setCursor(Qt::PointingHandCursor);
+    m_remoteMonitorApplyButton->setStyleSheet(QStringLiteral(
+        "QPushButton{border:0;border-radius:4px;background:#3A7BFC;"
+        "font-family:'Microsoft YaHei UI';font-size:13px;color:#FFFFFF;}"
+        "QPushButton:hover{background:#2F6FEF;}"
+        "QPushButton:disabled{background:#C9D0DA;color:#FFFFFF;}"));
+    m_remoteMonitorApplyButton->setEnabled(false);
+    m_remoteMonitorApplyButton->setVisible(false);
+
+    connect(m_remoteMonitorFilterTree, &QTreeWidget::itemChanged, this,
+        [this](QTreeWidgetItem* item, int column) {
+            if (!item || (column != 1 && column != 2)) {
+                return;
+            }
+            if (item->checkState(column) == Qt::Checked) {
+                const QSignalBlocker blocker(m_remoteMonitorFilterTree);
+                item->setCheckState(column == 1 ? 2 : 1, Qt::Unchecked); // wjy: 同一设备不能同时属于黑白名单，最近一次勾选自动取消另一列。
+            }
+            bool draftDirty = false;
+            for (int row = 0; row < m_remoteMonitorFilterTree->topLevelItemCount(); ++row) {
+                const QTreeWidgetItem* rowItem = m_remoteMonitorFilterTree->topLevelItem(row);
+                if (!rowItem) {
+                    continue;
+                }
+                const QString deviceName = rowItem->text(0).trimmed();
+                const bool savedBlacklisted = m_remoteMonitorBlacklist.contains(deviceName, Qt::CaseInsensitive);
+                const bool savedWhitelisted = !savedBlacklisted
+                    && m_remoteMonitorWhitelist.contains(deviceName, Qt::CaseInsensitive);
+                if ((rowItem->checkState(1) == Qt::Checked) != savedBlacklisted
+                    || (rowItem->checkState(2) == Qt::Checked) != savedWhitelisted) {
+                    draftDirty = true;
+                    break; // wjy: 任意一行与已保存配置不同才允许应用；全部恢复原状后按钮自动重新禁用。
+                }
+            }
+            m_remoteMonitorFilterDraftDirty = draftDirty; // wjy: 勾选只修改界面草稿，必须点击应用才写入QSettings和运行时筛选。
+            if (m_remoteMonitorApplyButton) {
+                m_remoteMonitorApplyButton->setEnabled(draftDirty);
+            }
+        });
+    connect(m_remoteMonitorApplyButton, &QPushButton::clicked,
+        this, &DeviceGrid::saveRemoteMonitorFilterSettings);
+    refreshRemoteMonitorFilterList(false); // wjy: 首次创建表格时合并当前设备目录和已保存但暂时不在目录中的名单项。
 
     connect(m_remoteMonitorGridCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
         if (index < 0 || !m_remoteMonitorGridCombo) {
@@ -7600,54 +7608,63 @@ void DeviceGrid::updateSettingsControls()
             monitorVisible,
             true); // wjy: 轮询秒数输入框与手绘“秒”单位保持同一行。
     }
-    if (m_remoteMonitorBlacklistEdit) {
-        const QRect contentRect = settingsRemoteMonitorNameListRect(0);
+    refreshRemoteMonitorFilterList(true); // wjy: 设备目录变化时补充新行，同时保留尚未点击应用的勾选草稿。
+    if (m_remoteMonitorFilterTree) {
+        const QRect contentRect = settingsRemoteMonitorFilterListRect();
         applySettingsControlGeometry(
-            m_remoteMonitorBlacklistEdit,
+            m_remoteMonitorFilterTree,
             layout.scrolled(contentRect),
             monitorVisible && layout.fullyVisible(contentRect),
             monitorVisible,
-            true); // wjy: 黑名单编辑框随监控页滚动，完整进入视口后才允许编辑。
+            true); // wjy: 设备勾选表格随监控页滚动，完整进入视口后才允许修改草稿。
     }
-    if (m_remoteMonitorWhitelistEdit) {
-        const QRect contentRect = settingsRemoteMonitorNameListRect(1);
+    if (m_remoteMonitorApplyButton) {
+        const QRect contentRect = settingsRemoteMonitorApplyButtonRect();
         applySettingsControlGeometry(
-            m_remoteMonitorWhitelistEdit,
+            m_remoteMonitorApplyButton,
             layout.scrolled(contentRect),
             monitorVisible && layout.fullyVisible(contentRect),
-            monitorVisible,
-            true); // wjy: 白名单编辑框和黑名单共用同一列布局及可见性规则。
+            monitorVisible && m_remoteMonitorFilterDraftDirty,
+            true); // wjy: 应用按钮只在名单页显示，草稿未变化时禁用，避免无意义重复写入和刷新Viewer。
     }
     // ===end====
 
 // ===end====
 }
 
+// =====wjy====
 void DeviceGrid::saveRemoteMonitorFilterSettings()
 {
-    if (!m_remoteMonitorBlacklistEdit || !m_remoteMonitorWhitelistEdit) {
+    if (!m_remoteMonitorFilterTree) {
         return;
     }
 
-    const auto linesFromEdit = [](const QTextEdit* edit) {
-        return edit->toPlainText().split(
-            QRegularExpression(QStringLiteral("[\\r\\n]+")),
-            Qt::SkipEmptyParts); // wjy: Windows和Unix换行都按独立设备名解析，空行交给AppSettings统一清理。
-    };
-    platform::AppSettings::setRemoteMonitorBlacklist(linesFromEdit(m_remoteMonitorBlacklistEdit));
-    platform::AppSettings::setRemoteMonitorWhitelist(linesFromEdit(m_remoteMonitorWhitelistEdit));
+    QStringList blacklist;
+    QStringList whitelist;
+    for (int row = 0; row < m_remoteMonitorFilterTree->topLevelItemCount(); ++row) {
+        const QTreeWidgetItem* item = m_remoteMonitorFilterTree->topLevelItem(row);
+        if (!item) {
+            continue;
+        }
+        const QString deviceName = item->text(0).trimmed();
+        if (deviceName.isEmpty()) {
+            continue;
+        }
+        if (item->checkState(1) == Qt::Checked) {
+            blacklist.append(deviceName); // wjy: 应用时才收集黑名单勾选项，表格中的临时操作不会提前改变监控。
+        } else if (item->checkState(2) == Qt::Checked) {
+            whitelist.append(deviceName); // wjy: 互斥列使用else-if兜底，即使外部异常写入双选也仍保持黑名单优先。
+        }
+    }
+    platform::AppSettings::setRemoteMonitorBlacklist(blacklist);
+    platform::AppSettings::setRemoteMonitorWhitelist(whitelist);
     m_remoteMonitorBlacklist = platform::AppSettings::remoteMonitorBlacklist(); // wjy: 保存后回读归一化结果，运行时筛选与磁盘配置保持完全一致。
     m_remoteMonitorWhitelist = platform::AppSettings::remoteMonitorWhitelist();
-
-    const auto syncNormalizedText = [](QTextEdit* edit, const QStringList& names) {
-        const QString normalizedText = names.join(QLatin1Char('\n'));
-        if (edit->toPlainText() != normalizedText) {
-            const QSignalBlocker blocker(edit);
-            edit->setPlainText(normalizedText); // wjy: 失焦后去掉空行和大小写重复项，让界面直接展示最终生效名单。
-        }
-    };
-    syncNormalizedText(m_remoteMonitorBlacklistEdit, m_remoteMonitorBlacklist);
-    syncNormalizedText(m_remoteMonitorWhitelistEdit, m_remoteMonitorWhitelist);
+    m_remoteMonitorFilterDraftDirty = false;
+    refreshRemoteMonitorFilterList(false); // wjy: 应用后按持久化结果重建勾选状态，并清理目录和名单中的大小写重复项。
+    if (m_remoteMonitorApplyButton) {
+        m_remoteMonitorApplyButton->setEnabled(false);
+    }
 
     m_remoteMonitorPageIndex = 0; // wjy: 名单变化后从第一批设备重新计算，避免旧页码跳过新纳入设备。
     if (m_remoteMonitorModeEnabled) {
@@ -7655,6 +7672,87 @@ void DeviceGrid::saveRemoteMonitorFilterSettings()
     }
     update();
 }
+
+void DeviceGrid::refreshRemoteMonitorFilterList(bool preserveDraft)
+{
+    if (!m_remoteMonitorFilterTree) {
+        return;
+    }
+
+    QStringList draftBlacklist;
+    QStringList draftWhitelist;
+    if (preserveDraft) {
+        for (int row = 0; row < m_remoteMonitorFilterTree->topLevelItemCount(); ++row) {
+            const QTreeWidgetItem* item = m_remoteMonitorFilterTree->topLevelItem(row);
+            if (!item) {
+                continue;
+            }
+            const QString deviceName = item->text(0).trimmed();
+            if (item->checkState(1) == Qt::Checked) {
+                draftBlacklist.append(deviceName); // wjy: 设备目录刷新前保存未应用黑名单勾选，重建行后继续保留用户草稿。
+            } else if (item->checkState(2) == Qt::Checked) {
+                draftWhitelist.append(deviceName); // wjy: 未应用白名单勾选同样不因实时状态刷新或窗口缩放丢失。
+            }
+        }
+    }
+
+    QStringList names;
+    const auto appendUniqueName = [&names](const QString& rawName) {
+        const QString deviceName = rawName.trimmed();
+        if (!deviceName.isEmpty() && !names.contains(deviceName, Qt::CaseInsensitive)) {
+            names.append(deviceName); // wjy: 设备目录和历史名单按完整显示名忽略大小写合并，避免同一设备出现重复行。
+        }
+    };
+    for (const DeviceEntry& device : g_devices) {
+        if (!device.ip.trimmed().isEmpty() && !deviceRecordMatchesLocal(device)) {
+            appendUniqueName(deviceDisplayName(device)); // wjy: 当前目录只列出可建立远端Viewer的设备，空IP和本机记录不提供无效名单选项。
+        }
+    }
+    for (const QString& deviceName : m_remoteMonitorBlacklist) appendUniqueName(deviceName);
+    for (const QString& deviceName : m_remoteMonitorWhitelist) appendUniqueName(deviceName);
+    for (const QString& deviceName : draftBlacklist) appendUniqueName(deviceName);
+    for (const QString& deviceName : draftWhitelist) appendUniqueName(deviceName); // wjy: 已删除或暂时不同步的设备只要仍在配置或草稿中就保留一行，用户可以取消勾选。
+
+    QCollator naturalCollator;
+    naturalCollator.setCaseSensitivity(Qt::CaseInsensitive);
+    naturalCollator.setNumericMode(true);
+    std::sort(names.begin(), names.end(), [&naturalCollator](const QString& left, const QString& right) {
+        return naturalCollator.compare(left, right) < 0; // wjy: 名单表格使用自然数字排序，设备4显示在设备15之前。
+    });
+
+    QStringList currentNames;
+    currentNames.reserve(m_remoteMonitorFilterTree->topLevelItemCount());
+    for (int row = 0; row < m_remoteMonitorFilterTree->topLevelItemCount(); ++row) {
+        if (const QTreeWidgetItem* item = m_remoteMonitorFilterTree->topLevelItem(row)) {
+            currentNames.append(item->text(0).trimmed());
+        }
+    }
+    if (preserveDraft && currentNames == names) {
+        return; // wjy: 名称集合未变化时不重建表格，避免updateSettingsControls频繁打断复选框操作和内部滚动位置。
+    }
+
+    const QStringList& effectiveBlacklist = preserveDraft ? draftBlacklist : m_remoteMonitorBlacklist;
+    const QStringList& effectiveWhitelist = preserveDraft ? draftWhitelist : m_remoteMonitorWhitelist;
+    const QSignalBlocker blocker(m_remoteMonitorFilterTree);
+    m_remoteMonitorFilterTree->clear();
+    for (const QString& deviceName : names) {
+        auto* item = new QTreeWidgetItem(m_remoteMonitorFilterTree);
+        item->setText(0, deviceName);
+        Qt::ItemFlags itemFlags = item->flags();
+        itemFlags.setFlag(Qt::ItemIsUserCheckable, true);
+        itemFlags.setFlag(Qt::ItemIsEnabled, true);
+        itemFlags.setFlag(Qt::ItemIsEditable, false);
+        item->setFlags(itemFlags); // wjy: 分步修改Qt标志避免MSVC重载歧义；设备名只读，用户只能操作黑白名单复选框。
+        const bool blacklisted = effectiveBlacklist.contains(deviceName, Qt::CaseInsensitive);
+        const bool whitelisted = !blacklisted
+            && effectiveWhitelist.contains(deviceName, Qt::CaseInsensitive); // wjy: 读取异常双重配置时仍按黑名单优先显示唯一勾选。
+        item->setCheckState(1, blacklisted ? Qt::Checked : Qt::Unchecked);
+        item->setCheckState(2, whitelisted ? Qt::Checked : Qt::Unchecked);
+        item->setTextAlignment(1, Qt::AlignCenter);
+        item->setTextAlignment(2, Qt::AlignCenter);
+    }
+}
+// ===end====
 
 // =====wjy====
 void DeviceGrid::saveRemoteQualitySettingsFromControls()
@@ -12396,18 +12494,6 @@ void DeviceGrid::mousePressEvent(QMouseEvent* event)
         && !m_remoteMonitorIntervalEdit->geometry().contains(event->pos())) {
         m_remoteMonitorIntervalEdit->clearFocus();
         setFocus(Qt::MouseFocusReason); // wjy: 点击监控轮询输入框外部时立即保存秒数并重启当前计时周期。
-    }
-    if (m_remoteMonitorBlacklistEdit
-        && m_remoteMonitorBlacklistEdit->hasFocus()
-        && !m_remoteMonitorBlacklistEdit->geometry().contains(event->pos())) {
-        m_remoteMonitorBlacklistEdit->clearFocus();
-        setFocus(Qt::MouseFocusReason); // wjy: 点击黑名单框外部立即提交完整黑白名单快照并刷新监控页。
-    }
-    if (m_remoteMonitorWhitelistEdit
-        && m_remoteMonitorWhitelistEdit->hasFocus()
-        && !m_remoteMonitorWhitelistEdit->geometry().contains(event->pos())) {
-        m_remoteMonitorWhitelistEdit->clearFocus();
-        setFocus(Qt::MouseFocusReason); // wjy: 点击白名单框外部立即提交，避免切换设置页后文本看似已填但未生效。
     }
     if (m_batchSubnetEdit
         && m_batchSubnetEdit->hasFocus()

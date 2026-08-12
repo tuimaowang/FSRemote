@@ -15878,3 +15878,89 @@ if (!whitelisted && remoteMonitorNameStartsWithEnglishLetter(displayName)) conti
 - 已静态确认 `AppSettings` 声明与实现、`DeviceGrid` 保存入口和控件成员完整对应。
 - 已静态确认监控页滚动快照覆盖绘制、真实控件、滚轮、轨道点击、滑块拖动和悬停命中。
 - 按用户要求未执行构建、链接或运行测试。
+
+## 2026-08-12 09:57 - 将监控名单改为设备勾选列表
+
+### Changed Location
+- `src/system/AppSettings.h:50,52`：将持久化接口注释改为设备列表勾选语义，存储格式保持不变。
+- `src/ui/DeviceGrid.h:258-259,379-383`：用设备表格、应用按钮和草稿状态替换两个多行编辑框。
+- `src/ui/DeviceGrid.cpp:39,77,3468-3489,3695-3711,6943-7012,7611-7751,12493`：新增设备勾选列表、黑白名单互斥规则、显式应用和草稿保留逻辑，并删除失焦自动保存。
+
+### Reason
+自由输入设备名容易出现拼写、空格或名称不一致，且失焦立即生效不够明确。改为从当前设备目录中直接勾选，可以保证名称来源可靠；只有点击“应用”才写入配置和刷新监控，避免误操作。已保存但暂时不在设备目录中的历史名称仍保留在表格中，用户可以取消旧配置。
+
+### Original Code
+```cpp
+// src/ui/DeviceGrid.cpp:1073-1105（修改前）
+class RemoteMonitorNameListEdit final : public QTextEdit {
+public:
+    std::function<void()> commitCallback;
+protected:
+    void focusOutEvent(QFocusEvent* event) override
+    {
+        if (commitCallback) commitCallback();
+        QTextEdit::focusOutEvent(event);
+    }
+};
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:6988-7006（修改前）
+auto createMonitorNameListEdit = [this, &monitorNameListStyle](const QStringList& names) {
+    auto* edit = new RemoteMonitorNameListEdit(this);
+    edit->setPlainText(names.join(QLatin1Char('\n')));
+    edit->commitCallback = [this] { saveRemoteMonitorFilterSettings(); };
+    return edit;
+};
+m_remoteMonitorBlacklistEdit = createMonitorNameListEdit(m_remoteMonitorBlacklist);
+m_remoteMonitorWhitelistEdit = createMonitorNameListEdit(m_remoteMonitorWhitelist);
+```
+
+### Modified Code
+```cpp
+// src/ui/DeviceGrid.cpp:6944-7027（修改后）
+m_remoteMonitorFilterTree = new QTreeWidget(this);
+m_remoteMonitorFilterTree->setColumnCount(3);
+m_remoteMonitorFilterTree->setHeaderLabels({"设备", "黑名单", "白名单"});
+
+connect(m_remoteMonitorFilterTree, &QTreeWidget::itemChanged, this,
+    [this](QTreeWidgetItem* item, int column) {
+        if (item->checkState(column) == Qt::Checked) {
+            item->setCheckState(column == 1 ? 2 : 1, Qt::Unchecked);
+        }
+        m_remoteMonitorFilterDraftDirty = draftDirty;
+    });
+connect(m_remoteMonitorApplyButton, &QPushButton::clicked,
+    this, &DeviceGrid::saveRemoteMonitorFilterSettings);
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:7636-7674（修改后）
+void DeviceGrid::saveRemoteMonitorFilterSettings()
+{
+    for (int row = 0; row < m_remoteMonitorFilterTree->topLevelItemCount(); ++row) {
+        const QTreeWidgetItem* item = m_remoteMonitorFilterTree->topLevelItem(row);
+        if (item->checkState(1) == Qt::Checked) blacklist.append(item->text(0));
+        else if (item->checkState(2) == Qt::Checked) whitelist.append(item->text(0));
+    }
+    platform::AppSettings::setRemoteMonitorBlacklist(blacklist);
+    platform::AppSettings::setRemoteMonitorWhitelist(whitelist);
+    refreshRemoteMonitorMode(false);
+}
+```
+
+### Steps
+1. 删除 `RemoteMonitorNameListEdit` 和两个 `QTextEdit` 成员，不再接受任意设备名文本。
+2. 新增三列表格“设备 / 黑名单 / 白名单”，设备名只读，两个名单列使用复选框。
+3. 同一设备的黑白名单勾选互斥，最近一次勾选自动取消另一列。
+4. 新增“应用”按钮；勾选只形成草稿，与已保存状态不同才启用按钮，恢复原状后自动禁用。
+5. 点击应用后才收集勾选项、持久化并刷新运行中的监控窗口。
+6. 表格合并当前有效远端设备和历史名单项，忽略大小写去重并自然排序；设备目录变化时保留未应用草稿。
+7. 调整监控页滚动上限，确保设备表格和应用按钮在小窗口中都可访问。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已静态确认源码中不存在 `RemoteMonitorNameListEdit`、`m_remoteMonitorBlacklistEdit`、`m_remoteMonitorWhitelistEdit` 和旧名单编辑框几何函数。
+- 已静态确认黑白名单列互斥、应用按钮脏状态计算、草稿保留及历史名单保留逻辑完整。
+- 已静态确认 `AppSettings` 的 `remoteMonitor/blacklist`、`remoteMonitor/whitelist` 存储键不变，已有配置可以直接恢复到勾选列表。
+- 按用户此前要求未执行构建、链接或运行测试。
