@@ -15792,6 +15792,90 @@ if (!source_ip_.empty()) {
 - 已静态确认旧 Viewer 入口仍保留，新入口为可选解析，不会因旧 DLL 缺失直接改变加载结果。
 - 按用户此前要求未执行构建、链接或运行测试。
 
+## 2026-08-12 10:24 - 修复监控名单表格对齐与滚动交互
+
+### Changed Location
+- `src/ui/DeviceGrid.cpp:87-89,1172-1257`：新增居中复选框委托，统一黑白名单列绘制、点击命中和单元格分隔线。
+- `src/ui/DeviceGrid.cpp:3547-3578,3736-3777`：将监控页改为固定布局并取消外层手绘滚动条。
+- `src/ui/DeviceGrid.cpp:7024-7046,7814-7847`：启用表格原生实时滚动条、加宽滑块，并在行数或控件尺寸变化后立即重算范围。
+
+### Reason
+原表格只设置了单元格文字对齐，Qt 默认复选框仍绘制在单元格左侧，导致复选框与“黑名单/白名单”表头不对齐。监控页同时存在外层手绘滑块和表格原生滑块，用户操作设备列表时外层滑块不会同步，而且手绘滑块缺少原生鼠标抓取，容易表现为失焦后才更新。列边界也不够明显，难以直观看出复选框所属列。
+
+### Original Code
+```cpp
+// src/ui/DeviceGrid.cpp:7744-7747（修改前）
+item->setCheckState(1, blacklisted ? Qt::Checked : Qt::Unchecked);
+item->setCheckState(2, whitelisted ? Qt::Checked : Qt::Unchecked);
+item->setTextAlignment(1, Qt::AlignCenter);
+item->setTextAlignment(2, Qt::AlignCenter);
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:3747-3758（修改前）
+const int monitorMaxScrollOffset = remoteMonitorSettingsMaxScrollOffset();
+if (monitorMaxScrollOffset > 0) {
+    painter.drawRoundedRect(QRectF(settingsVerticalScrollbarTrackRect()), 2.5, 2.5);
+    painter.drawRoundedRect(
+        QRectF(settingsVerticalScrollbarThumbRect(layout.scrollOffset(), monitorMaxScrollOffset)),
+        2.5,
+        2.5);
+}
+```
+
+### Modified Code
+```cpp
+// src/ui/DeviceGrid.cpp:1172-1257（修改后）
+class CenteredCheckBoxDelegate final : public QStyledItemDelegate {
+public:
+    void paint(QPainter* painter, const QStyleOptionViewItem& option,
+        const QModelIndex& index) const override
+    {
+        checkOption.rect.moveCenter(option.rect.center());
+        style->drawPrimitive(QStyle::PE_IndicatorCheckBox, &checkOption, painter, option.widget);
+        drawCellSeparators(painter, option.rect);
+    }
+};
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:3575-3578,7024-7026（修改后）
+int remoteMonitorSettingsMaxScrollOffset()
+{
+    return 0;
+}
+
+m_remoteMonitorFilterTree->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+m_remoteMonitorFilterTree->verticalScrollBar()->setTracking(true);
+```
+
+```cpp
+// src/ui/DeviceGrid.cpp:7835-7847（修改后）
+m_remoteMonitorFilterTree->doItemsLayout();
+QScrollBar* scrollBar = m_remoteMonitorFilterTree->verticalScrollBar();
+scrollBar->setValue(qBound(scrollBar->minimum(), previousScrollValue, scrollBar->maximum()));
+QTimer::singleShot(0, m_remoteMonitorFilterTree, [filterTree] {
+    filterTree->doItemsLayout();
+    filterTree->verticalScrollBar()->update();
+});
+```
+
+### Steps
+1. 新增 `CenteredCheckBoxDelegate`，按名单列单元格中心绘制复选框，并让整格左键点击切换勾选。
+2. 由委托在每个单元格内绘制稳定的深灰竖线和浅灰横线，表头同步使用更明显的边框和底色。
+3. 把宫格、清晰度和轮询秒数调整为顶部横向三列，设备表格占用剩余高度。
+4. 将监控页外层滚动上限固定为零，删除监控页手绘滑块，只保留设备表格原生滚动条。
+5. 原生滑块加宽到 14 像素、提高最小高度并开启实时跟踪，拖动过程中列表立即移动。
+6. 设备列表重建前保存滚动位置，重建后立即和下一事件循环各执行一次布局更新，使滑块范围和长度及时反映真实行数与表格高度。
+
+### Verification
+- 已执行 `git diff --check`，未发现空白错误。
+- 已静态确认黑白名单复选框由委托按对应列中心绘制，点击事件只处理名单列。
+- 已静态确认监控页外层滚动上限为零，页面不再绘制第二套滑块。
+- 已静态确认表格原生滑块开启 `setTracking(true)`，并在行数、表格尺寸变化后主动重算布局和刷新。
+- 已静态确认列竖线由委托直接绘制，表头竖线由样式表绘制，不依赖系统默认边框行为。
+- 按用户此前要求未执行构建、链接或运行测试。
+
 ## 2026-08-12 09:39 - 开放监控模式黑白名单设置
 
 ### Changed Location

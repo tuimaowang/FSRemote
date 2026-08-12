@@ -84,7 +84,9 @@
 #include <QShortcut>
 #include <QShowEvent>
 #include <QSignalBlocker>
+#include <QStyledItemDelegate>
 #include <QStringList>
+#include <QStyleOptionButton>
 #include <QTimer>
 #include <QToolButton>
 #include <QTextEdit>
@@ -1165,6 +1167,93 @@ struct DeviceListRow {
     Type type = Type::Device;
     int deviceIndex = -1; // wjy: 真实设备下标，只有设备行有效。
     int groupIndex = -1;  // wjy: 真实分组下标，分组行有效；分组内设备也记录所属分组。
+};
+
+class CenteredCheckBoxDelegate final : public QStyledItemDelegate {
+public:
+    explicit CenteredCheckBoxDelegate(QObject* parent = nullptr)
+        : QStyledItemDelegate(parent)
+    {
+    }
+
+    void paint(
+        QPainter* painter,
+        const QStyleOptionViewItem& option,
+        const QModelIndex& index) const override
+    {
+        if (index.column() == 0) {
+            QStyledItemDelegate::paint(painter, option, index); // wjy: 设备名称列保留Qt标准文字、省略和交替行背景绘制。
+            drawCellSeparators(painter, option.rect);
+            return;
+        }
+
+        QStyleOptionViewItem itemOption(option);
+        initStyleOption(&itemOption, index);
+        itemOption.features.setFlag(QStyleOptionViewItem::HasCheckIndicator, false);
+        itemOption.text.clear();
+        const QStyle* style = option.widget ? option.widget->style() : QApplication::style();
+        style->drawControl(QStyle::CE_ItemViewItem, &itemOption, painter, option.widget); // wjy: 先保留交替行背景、悬停和单元格边线，再单独绘制居中的复选框。
+
+        QStyleOptionButton checkOption;
+        checkOption.state = QStyle::State_Active | QStyle::State_Enabled;
+        if (index.data(Qt::CheckStateRole).toInt() == Qt::Checked) {
+            checkOption.state |= QStyle::State_On;
+        } else {
+            checkOption.state |= QStyle::State_Off;
+        }
+        const QSize indicatorSize(
+            style->pixelMetric(QStyle::PM_IndicatorWidth, &checkOption, option.widget),
+            style->pixelMetric(QStyle::PM_IndicatorHeight, &checkOption, option.widget));
+        checkOption.rect = QRect(QPoint(), indicatorSize);
+        checkOption.rect.moveCenter(option.rect.center()); // wjy: 勾选框严格以黑名单/白名单单元格中心定位，与居中的表头文字对齐。
+        style->drawPrimitive(QStyle::PE_IndicatorCheckBox, &checkOption, painter, option.widget);
+        drawCellSeparators(painter, option.rect); // wjy: 委托直接绘制列竖线，避免不同Windows/Qt样式忽略QSS单元格右边框。
+    }
+
+    bool editorEvent(
+        QEvent* event,
+        QAbstractItemModel* model,
+        const QStyleOptionViewItem& option,
+        const QModelIndex& index) override
+    {
+        if (!event || !model || !(index.flags() & Qt::ItemIsUserCheckable)
+            || !(index.flags() & Qt::ItemIsEnabled) || index.column() == 0) {
+            return QStyledItemDelegate::editorEvent(event, model, option, index);
+        }
+        if (event->type() == QEvent::MouseButtonPress
+            || event->type() == QEvent::MouseButtonDblClick) {
+            const auto* mouseEvent = static_cast<QMouseEvent*>(event);
+            return mouseEvent->button() == Qt::LeftButton && option.rect.contains(mouseEvent->position().toPoint()); // wjy: 按下阶段先由委托接管，防止表格默认左侧指示器命中和居中视觉区域不一致。
+        }
+        if (event->type() != QEvent::MouseButtonRelease) {
+            return false;
+        }
+        const auto* mouseEvent = static_cast<QMouseEvent*>(event);
+        if (mouseEvent->button() != Qt::LeftButton
+            || !option.rect.contains(mouseEvent->position().toPoint())) {
+            return false;
+        }
+        const Qt::CheckState currentState = static_cast<Qt::CheckState>(
+            index.data(Qt::CheckStateRole).toInt());
+        return model->setData(
+            index,
+            currentState == Qt::Checked ? Qt::Unchecked : Qt::Checked,
+            Qt::CheckStateRole); // wjy: 点击整列单元格即可切换居中复选框，不再要求命中Qt默认左侧小区域。
+    }
+
+private:
+    static void drawCellSeparators(QPainter* painter, const QRect& rect)
+    {
+        if (!painter) {
+            return;
+        }
+        painter->save();
+        painter->setPen(QPen(QColor(QStringLiteral("#94A3B8")), 1));
+        painter->drawLine(QPointF(rect.right() - 0.5, rect.top()), QPointF(rect.right() - 0.5, rect.bottom())); // wjy: 竖线收在单元格裁剪范围内，设备、黑名单、白名单边界在所有Qt样式下都清晰可见。
+        painter->setPen(QPen(QColor(QStringLiteral("#D7DEE8")), 1));
+        painter->drawLine(QPointF(rect.left(), rect.bottom() - 0.5), QPointF(rect.right(), rect.bottom() - 0.5));
+        painter->restore();
+    }
 };
 // ===end====
 
@@ -3458,11 +3547,13 @@ QRect settingsRemoteQualityControlRect(int index)
 QRect settingsRemoteMonitorControlRect(int index)
 {
     const QRect card = settingsScrollViewportRect();
+    const int gap = 12;
+    const int columnWidth = qMax(88, (card.width() - 56 - gap * 2) / 3);
     return QRect(
-        card.right() - 198,
-        card.y() + 76 + index * 64,
-        index == 2 ? 112 : 170,
-        34); // wjy: 宫格、画质和轮询秒数按三行右对齐，轮询输入框缩短后为右侧“秒”保留空间。
+        card.x() + 28 + index * (columnWidth + gap),
+        card.y() + 92,
+        columnWidth,
+        32); // wjy: 三项监控配置横向并排，释放纵向空间后监控页不再依赖外层手绘滚动条。
 }
 
 QRect settingsRemoteMonitorFilterListRect()
@@ -3470,23 +3561,20 @@ QRect settingsRemoteMonitorFilterListRect()
     const QRect card = settingsScrollViewportRect();
     return QRect(
         card.x() + 28,
-        card.y() + 330,
+        card.y() + 194,
         card.width() - 56,
-        146); // wjy: 表格内部自行滚动；高度收紧后最低窗口也能同时完整显示表格和应用按钮。
+        qMax(116, card.height() - 246)); // wjy: 设备表格占用剩余高度并使用自身原生滚动条，设备数量变化时滑块立即按真实行数更新。
 }
 
 QRect settingsRemoteMonitorApplyButtonRect()
 {
     const QRect listRect = settingsRemoteMonitorFilterListRect();
-    return QRect(listRect.right() - 104, listRect.bottom() + 8, 104, 34); // wjy: 应用按钮位于名单表格右下方，最低窗口滚到底时仍和完整表格同时可见。
+    return QRect(listRect.right() - 104, listRect.bottom() + 8, 104, 34); // wjy: 应用按钮固定在设备表格下方，不需要滚动页面才能操作。
 }
 
 int remoteMonitorSettingsMaxScrollOffset()
 {
-    const QRect viewport = settingsScrollViewportRect();
-    return qMax(
-        0,
-        settingsRemoteMonitorApplyButtonRect().bottom() + 12 - viewport.bottom()); // wjy: 监控页滚动到最底时仍完整显示应用按钮和底部留白。
+    return 0; // wjy: 监控页改成固定布局，只保留设备表格的原生滚动条，消除右侧双滑块及焦点不同步问题。
 }
 // ===end====
 
@@ -3672,44 +3760,25 @@ void drawSettingsPage(
         const QStringList labels = {
             QString::fromUtf8("单页宫格"),
             QString::fromUtf8("监控清晰度"),
-            QString::fromUtf8("轮询时间"),
+            QString::fromUtf8("轮询时间（秒）"),
         };
         for (int index = 0; index < labels.size(); ++index) {
             const QRect controlRect = settingsRemoteMonitorControlRect(index);
             painter.drawText(
-                QRectF(monitorCard.x() + 28, controlRect.y(), 130, controlRect.height()),
+                QRectF(controlRect.x(), controlRect.y() - 24, controlRect.width(), 20),
                 Qt::AlignVCenter | Qt::AlignLeft,
-                labels.at(index)); // wjy: 三项真实控件的标签由同一布局函数定位，缩放窗口时不会错行。
+                labels.at(index)); // wjy: 三个标签分别位于对应横向控件正上方，不会互相覆盖或挤占下拉框宽度。
         }
-        const QRect intervalRect = settingsRemoteMonitorControlRect(2);
-        painter.setPen(QColor(QStringLiteral("#687384")));
-        painter.drawText(
-            QRectF(intervalRect.right() + 10, intervalRect.y(), 34, intervalRect.height()),
-            Qt::AlignVCenter | Qt::AlignLeft,
-            QString::fromUtf8("秒"));
 
         QFont noteFont(textFont);
         noteFont.setPixelSize(11);
         painter.setFont(noteFont);
         painter.setPen(QColor(QStringLiteral("#687384")));
         painter.drawText(
-            QRectF(monitorCard.x() + 28, monitorCard.y() + 282, monitorCard.width() - 56, 48),
+            QRectF(monitorCard.x() + 28, monitorCard.y() + 142, monitorCard.width() - 56, 38),
             Qt::AlignTop | Qt::AlignLeft | Qt::TextWordWrap,
             QString::fromUtf8("在设备列表中勾选黑名单或白名单，再点击应用；同一设备只能选择一项。黑名单优先，白名单绕过Busy和名称筛选。")); // wjy: 设置页说明新的互斥勾选和应用流程，避免用户误认为勾选后已经立即生效。
         painter.restore();
-        const int monitorMaxScrollOffset = remoteMonitorSettingsMaxScrollOffset();
-        if (monitorMaxScrollOffset > 0) {
-            painter.save();
-            painter.setPen(Qt::NoPen);
-            painter.setBrush(QColor(QStringLiteral("#E5EAF1")));
-            painter.drawRoundedRect(QRectF(settingsVerticalScrollbarTrackRect()), 2.5, 2.5); // wjy: 名单区域超出视口时显示设置页统一滚动轨道。
-            painter.setBrush(QColor(QStringLiteral("#AAB3C0")));
-            painter.drawRoundedRect(
-                QRectF(settingsVerticalScrollbarThumbRect(layout.scrollOffset(), monitorMaxScrollOffset)),
-                2.5,
-                2.5); // wjy: 监控页滑块位置与设备勾选表格和应用按钮的滚动偏移保持一致。
-            painter.restore();
-        }
         return;
     }
     // ===end====
@@ -6952,6 +7021,9 @@ void DeviceGrid::setupSettingsControls()
     m_remoteMonitorFilterTree->setUniformRowHeights(true);
     m_remoteMonitorFilterTree->setAlternatingRowColors(true);
     m_remoteMonitorFilterTree->setSelectionMode(QAbstractItemView::NoSelection); // wjy: 表格只通过两列复选框编辑，不保留容易混淆的整行选择状态。
+    m_remoteMonitorFilterTree->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    m_remoteMonitorFilterTree->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded); // wjy: 仅保留表格原生竖向滑块，设备行数超过可见区域时立即出现并支持直接拖拽。
+    m_remoteMonitorFilterTree->verticalScrollBar()->setTracking(true); // wjy: 拖动滑块时逐像素实时更新列表，不等鼠标松开或焦点变化后才跳到最终位置。
     m_remoteMonitorFilterTree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_remoteMonitorFilterTree->header()->setSectionResizeMode(1, QHeaderView::Fixed);
     m_remoteMonitorFilterTree->header()->setSectionResizeMode(2, QHeaderView::Fixed);
@@ -6959,12 +7031,20 @@ void DeviceGrid::setupSettingsControls()
     m_remoteMonitorFilterTree->setColumnWidth(2, 78);
     m_remoteMonitorFilterTree->headerItem()->setTextAlignment(1, Qt::AlignCenter);
     m_remoteMonitorFilterTree->headerItem()->setTextAlignment(2, Qt::AlignCenter); // wjy: 两个名单表头和下方复选框居中对齐，扫视时能直接对应列语义。
+    auto* centeredCheckDelegate = new CenteredCheckBoxDelegate(m_remoteMonitorFilterTree);
+    m_remoteMonitorFilterTree->setItemDelegate(centeredCheckDelegate); // wjy: 同一委托负责设备列竖线以及两个名单列的居中复选框，三列边界使用统一绘制口径。
     m_remoteMonitorFilterTree->setStyleSheet(QStringLiteral(
         "QTreeWidget{background:#FFFFFF;border:1px solid #DDE3EA;border-radius:4px;"
         "font-family:'Microsoft YaHei UI';font-size:12px;color:#040B18;alternate-background-color:#F8FAFC;}"
         "QTreeWidget::item{height:28px;border:0;}"
-        "QHeaderView::section{background:#F3F6FA;border:0;border-bottom:1px solid #DDE3EA;"
-        "padding:0 8px;font-family:'Microsoft YaHei UI';font-size:12px;color:#334155;}"));
+        "QHeaderView::section{background:#E9EEF5;border:0;border-right:1px solid #94A3B8;"
+        "border-bottom:1px solid #94A3B8;padding:0 8px;font-family:'Microsoft YaHei UI';"
+        "font-size:12px;font-weight:600;color:#334155;}"
+        "QScrollBar:vertical{background:#EEF2F6;width:14px;margin:0;border-left:1px solid #D5DCE5;}"
+        "QScrollBar::handle:vertical{background:#94A3B8;min-height:36px;border-radius:4px;margin:2px;}"
+        "QScrollBar::handle:vertical:hover{background:#64748B;}"
+        "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+        "QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}")); // wjy: 加深表头和列竖线，并让唯一保留的原生滑块更显眼、可直接抓取。
     m_remoteMonitorFilterTree->setVisible(false);
 
     m_remoteMonitorApplyButton = new QPushButton(QString::fromUtf8("应用"), this);
@@ -7733,6 +7813,7 @@ void DeviceGrid::refreshRemoteMonitorFilterList(bool preserveDraft)
 
     const QStringList& effectiveBlacklist = preserveDraft ? draftBlacklist : m_remoteMonitorBlacklist;
     const QStringList& effectiveWhitelist = preserveDraft ? draftWhitelist : m_remoteMonitorWhitelist;
+    const int previousScrollValue = m_remoteMonitorFilterTree->verticalScrollBar()->value(); // wjy: 清空表格前保存当前位置，设备目录更新后尽量停留在用户正在查看的区域。
     const QSignalBlocker blocker(m_remoteMonitorFilterTree);
     m_remoteMonitorFilterTree->clear();
     for (const QString& deviceName : names) {
@@ -7751,6 +7832,19 @@ void DeviceGrid::refreshRemoteMonitorFilterList(bool preserveDraft)
         item->setTextAlignment(1, Qt::AlignCenter);
         item->setTextAlignment(2, Qt::AlignCenter);
     }
+    m_remoteMonitorFilterTree->doItemsLayout(); // wjy: 增删设备行后立即重算原生滑块的maximum和pageStep，不等待失焦或下一次事件循环。
+    QScrollBar* scrollBar = m_remoteMonitorFilterTree->verticalScrollBar();
+    scrollBar->setSingleStep(28);
+    scrollBar->setValue(qBound(scrollBar->minimum(), previousScrollValue, scrollBar->maximum()));
+    scrollBar->update(); // wjy: 设备数量和当前位置变化后同步重绘滑块，拖拽反馈不再滞后一帧。
+    QPointer<QTreeWidget> filterTree = m_remoteMonitorFilterTree;
+    QTimer::singleShot(0, m_remoteMonitorFilterTree, [filterTree] {
+        if (!filterTree) {
+            return;
+        }
+        filterTree->doItemsLayout();
+        filterTree->verticalScrollBar()->update(); // wjy: 控件几何在当前事件结束后稳定，再补算一次pageStep和滑块长度，首次显示也立即反映真实可见行数。
+    });
 }
 // ===end====
 
