@@ -2933,6 +2933,7 @@ class ViewerInstance final : public StreamInstance {
 public:
     ViewerInstance(
         std::string hostIp,
+        std::string sourceIp,
         uint16_t port,
         FsRemoteFrameCallback frameCallback,
         FsRemoteTextureFrameCallback textureCallback,
@@ -2940,6 +2941,7 @@ public:
         void* user,
         FsRemoteViewerRole viewerRole)
         : host_ip_(std::move(hostIp))
+        , source_ip_(std::move(sourceIp)) // wjy: 源地址在创建时复制，Viewer 工作线程无需读取 Qt 临时 QByteArray。
         , port_(port)
         , frame_callback_(frameCallback)
         , texture_callback_(textureCallback)
@@ -3230,6 +3232,25 @@ private:
 
         socket_ = static_cast<uintptr_t>(socket);
 
+        if (!source_ip_.empty()) {
+            sockaddr_in source = {};
+            source.sin_family = AF_INET;
+            if (::inet_pton(AF_INET, source_ip_.c_str(), &source.sin_addr) != 1
+                || ::bind(socket, reinterpret_cast<sockaddr*>(&source), sizeof(source)) == SOCKET_ERROR) {
+                const int bindError = ::WSAGetLastError();
+                append_viewer_log("viewer bind failed source=" + source_ip_
+                    + " target=" + host_ip_
+                    + " error=" + std::to_string(bindError)); // wjy: 绑定失败直接终止信令连接，日志可区分源地址错误和目标端拒绝。
+                const uintptr_t current = socket_.exchange(0);
+                if (current) {
+                    closesocket(static_cast<SOCKET>(current));
+                }
+                if (running_ && error) *error = "bind failed";
+                return 0;
+            }
+            append_viewer_log("viewer bound source=" + source_ip_ + " target=" + host_ip_); // wjy: 现场可确认 CLTEST 49100 已使用 192.168.1.154 而不是 198.18.0.1。
+        }
+
         sockaddr_in addr = {};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(port_);
@@ -3470,6 +3491,7 @@ private:
     }
 
     std::string host_ip_;
+    std::string source_ip_; // wjy: 可选的物理局域网源 IPv4；为空时保持旧 DLL 的系统路由行为。
     uint16_t port_ = 49100;
     FsRemoteFrameCallback frame_callback_ = nullptr;
     FsRemoteTextureFrameCallback texture_callback_ = nullptr;
@@ -3574,7 +3596,7 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer(
     }
 
     try {
-        return new ViewerInstance(host_ip, port, callback, nullptr, nullptr, user, FSREMOTE_VIEWER_ROLE_CONTROL);
+        return new ViewerInstance(host_ip, std::string(), port, callback, nullptr, nullptr, user, FSREMOTE_VIEWER_ROLE_CONTROL);
     } catch (const std::exception& ex) {
         set_error(ex.what());
         return nullptr;
@@ -3600,7 +3622,7 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_stat
     }
 
     try {
-        return new ViewerInstance(host_ip, port, frame_callback, nullptr, status_callback, user, FSREMOTE_VIEWER_ROLE_CONTROL);
+        return new ViewerInstance(host_ip, std::string(), port, frame_callback, nullptr, status_callback, user, FSREMOTE_VIEWER_ROLE_CONTROL);
     } catch (const std::exception& ex) {
         set_error(ex.what());
         report_status(status_callback, user, 90, ex.what());
@@ -3626,7 +3648,7 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_text
     }
 
     try {
-        return new ViewerInstance(host_ip, port, frame_callback, texture_callback, status_callback, user, FSREMOTE_VIEWER_ROLE_CONTROL);
+        return new ViewerInstance(host_ip, std::string(), port, frame_callback, texture_callback, status_callback, user, FSREMOTE_VIEWER_ROLE_CONTROL);
     } catch (const std::exception& ex) {
         set_error(ex.what());
         report_status(status_callback, user, 90, ex.what());
@@ -3656,7 +3678,48 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_text
     }
 
     try {
-        return new ViewerInstance(host_ip, port, frame_callback, texture_callback, status_callback, user, role); // wjy: 角色随实例按值复制，认证线程不读取调用方临时内存。
+        return new ViewerInstance(host_ip, std::string(), port, frame_callback, texture_callback, status_callback, user, role); // wjy: 旧入口不携带源地址，保持旧 DLL 调用方的系统路由行为。
+    } catch (const std::exception& ex) {
+        set_error(ex.what());
+        report_status(status_callback, user, FSREMOTE_STATUS_ERROR, ex.what());
+        return nullptr;
+    }
+}
+// ===end====
+
+// =====wjy====
+FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_texture_role_source(
+    const char* host_ip,
+    const char* source_ip,
+    uint16_t port,
+    FsRemoteFrameCallback frame_callback,
+    FsRemoteTextureFrameCallback texture_callback,
+    FsRemoteStatusCallback status_callback,
+    void* user,
+    FsRemoteViewerRole role)
+{
+    install_crash_logger();
+    append_viewer_log(std::string("api start_viewer_with_texture_role_source ip=") + (host_ip ? host_ip : "<null>")
+        + " source=" + (source_ip ? source_ip : "<none>")
+        + " port=" + std::to_string(port)
+        + " role=" + std::to_string(static_cast<int>(role))); // wjy: 日志同时记录目标和物理源地址，方便确认 CLTEST 是否避开 Meta/TUN。
+    if (!host_ip || !*host_ip || !frame_callback
+        || (role != FSREMOTE_VIEWER_ROLE_CONTROL && role != FSREMOTE_VIEWER_ROLE_MONITOR)) {
+        set_error("invalid source-aware viewer arguments");
+        report_status(status_callback, user, FSREMOTE_STATUS_ERROR, "Invalid source-aware viewer arguments");
+        return nullptr;
+    }
+
+    try {
+        return new ViewerInstance(
+            host_ip,
+            source_ip && *source_ip ? std::string(source_ip) : std::string(),
+            port,
+            frame_callback,
+            texture_callback,
+            status_callback,
+            user,
+            role); // wjy: DLL 在进入 Viewer 工作线程前复制源地址，connect() 前即可稳定绑定。
     } catch (const std::exception& ex) {
         set_error(ex.what());
         report_status(status_callback, user, FSREMOTE_STATUS_ERROR, ex.what());

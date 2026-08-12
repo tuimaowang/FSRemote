@@ -200,6 +200,15 @@ FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_text
     FsRemoteStatusCallback status_callback,
     void* user,
     enum FsRemoteViewerRole role); // wjy: 连接创建前固定普通控制或只读监控角色，认证完成后不能切换权限。
+FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_texture_role_source(
+    const char* host_ip,
+    const char* source_ip,
+    uint16_t port,
+    FsRemoteFrameCallback frame_callback,
+    FsRemoteTextureFrameCallback texture_callback,
+    FsRemoteStatusCallback status_callback,
+    void* user,
+    enum FsRemoteViewerRole role); // wjy: 由 Qt 层传入已选定的物理源 IPv4，避免原生 Viewer 被 Meta/TUN 默认路由截走。
 // ===end====
 void FSREMOTE_STREAM_CALL fsremote_stream_stop(FsRemoteStreamHandle handle);
 int FSREMOTE_STREAM_CALL fsremote_stream_send_input(FsRemoteStreamHandle handle, const char* message);

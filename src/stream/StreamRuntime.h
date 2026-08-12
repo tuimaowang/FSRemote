@@ -109,6 +109,15 @@ private:
         FsRemoteStatusCallback,
         void*,
         FsRemoteViewerRole); // wjy: 角色参数由DLL同步复制，Viewer工作线程不读取Qt窗口临时状态。
+    using StartViewerWithTextureRoleSourceFn = FsRemoteStreamHandle(FSREMOTE_STREAM_CALL*)(
+        const char*,
+        const char*,
+        uint16_t,
+        FsRemoteFrameCallback,
+        FsRemoteTextureFrameCallback,
+        FsRemoteStatusCallback,
+        void*,
+        FsRemoteViewerRole); // wjy: 新入口额外接收 Qt 已选定的物理源地址，旧 DLL 仍可回退到原始角色入口。
     // ===end====
     using StopFn = void(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle);
     using SendInputFn = int(FSREMOTE_STREAM_CALL*)(FsRemoteStreamHandle, const char*);
@@ -133,6 +142,7 @@ private:
     StartViewerWithStatusFn m_startViewerWithStatus = nullptr;
     StartViewerWithTextureFn m_startViewerWithTexture = nullptr;
     StartViewerWithTextureRoleFn m_startViewerWithTextureRole = nullptr; // wjy: 缺失时普通远控可回退，监控不得降级为占名额的控制会话。
+    StartViewerWithTextureRoleSourceFn m_startViewerWithTextureRoleSource = nullptr; // wjy: 可选源地址入口只在新 DLL 存在时启用，保持旧 DLL ABI 兼容。
     StopFn m_stop = nullptr;
     SendInputFn m_sendInput = nullptr;
     SetViewerQualityFn m_setViewerQuality = nullptr;

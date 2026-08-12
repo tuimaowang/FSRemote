@@ -15663,3 +15663,131 @@ socket.connectToHost(hostIp.trimmed(), port);
 - 已使用 `rg` 确认 49101 查询也已传入目标 IP，旧的 `configureLanStatusSocket(socket)` 调用为 0。
 - 已静态核对并发刷新路径最多启动八个 worker；物理网卡快照由互斥锁保护并在三秒内复用，单轮刷新不会按设备数重复枚举网卡。
 - 按用户要求未执行构建、链接或运行测试；新增策略测试已写入源码但未编译运行。
+
+## 2026-08-12 08:50 - 修复 Viewer 准入回复被虚拟路由截断
+
+### Changed Location
+- `include/FsRemoteStreamApi.h:203-211`：新增携带物理源 IPv4 的 Viewer 角色入口。
+- `src/stream/StreamRuntime.h:112-120,144-145`：增加可选 DLL 函数指针，保持旧 DLL ABI 回退能力。
+- `src/stream/StreamRuntime.cpp:3,97-98,200-212`：复用 `DeviceInfoService::physicalLanIpv4ForTarget()`，把物理源地址传入新 Viewer 入口。
+- `third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:2934-2950`：Viewer 实例复制源地址。
+- `third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:3220-3252`：原生 Winsock `connect()` 前绑定源 IPv4，并记录绑定结果。
+- `third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:3691-3729`：新增源地址感知的 Viewer C ABI 实现，旧入口继续保留。
+
+### Reason
+读取现场日志后确认，上一轮 49102 修复已经生效：CLTEST 日志在 `08:41:50.687` 和 `08:41:50.932` 记录了 `bound source=192.168.1.154 target=192.168.3.4`。本次失败发生在后续的 49100 Viewer 信令阶段：
+
+```text
+CLTEST 08:41:50.932 viewer tcp connected socket=3352
+CLTEST 08:41:50.991 viewer admission failed error=failed to receive session message
+A10    host admission accepted session=... client=...
+A10    host ICE ended session=... state=6
+```
+
+这说明 CLTEST 已经连接 A10 并发送准入请求，A10 也接受了请求，但 A10 返回的准入消息没有回到 CLTEST。原因是 49100 使用第三方 DLL 内部的原生 Winsock，之前只修复了 Qt 的 49101/49102 socket；CLTEST 的 49100 Viewer 仍然可能使用 `Meta` 的 `198.18.0.1` 默认路由。A10 看到准入成功后，因 Viewer 收不到回复而结束会话，正好对应 `state=6`。
+
+### Original Code
+```cpp
+// include/FsRemoteStreamApi.h:195-202（修改前）
+FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_texture_role(
+    const char* host_ip,
+    uint16_t port,
+    FsRemoteFrameCallback frame_callback,
+    FsRemoteTextureFrameCallback texture_callback,
+    FsRemoteStatusCallback status_callback,
+    void* user,
+    enum FsRemoteViewerRole role);
+```
+
+```cpp
+// src/stream/StreamRuntime.cpp:197-207（修改前）
+const QByteArray ip = hostIp.toUtf8();
+if (m_startViewerWithTextureRole) {
+    return m_startViewerWithTextureRole(
+        ip.constData(),
+        port,
+        frameCallback,
+        textureCallback,
+        statusCallback,
+        user,
+        monitorReadOnly ? FSREMOTE_VIEWER_ROLE_MONITOR : FSREMOTE_VIEWER_ROLE_CONTROL);
+}
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:2934-2948,3233-3237（修改前）
+ViewerInstance(std::string hostIp, uint16_t port, ...)
+    : host_ip_(std::move(hostIp))
+{
+    // ...
+}
+
+sockaddr_in addr = {};
+addr.sin_family = AF_INET;
+addr.sin_port = htons(port_);
+::inet_pton(AF_INET, host_ip_.c_str(), &addr.sin_addr);
+::connect(socket, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+```
+
+### Modified Code
+```cpp
+// include/FsRemoteStreamApi.h:203-211（修改后）
+FsRemoteStreamHandle FSREMOTE_STREAM_CALL fsremote_stream_start_viewer_with_texture_role_source(
+    const char* host_ip,
+    const char* source_ip,
+    uint16_t port,
+    FsRemoteFrameCallback frame_callback,
+    FsRemoteTextureFrameCallback texture_callback,
+    FsRemoteStatusCallback status_callback,
+    void* user,
+    enum FsRemoteViewerRole role);
+```
+
+```cpp
+// src/stream/StreamRuntime.cpp:199-217（修改后）
+const QByteArray sourceIp = platform::DeviceInfoService::physicalLanIpv4ForTarget(hostIp).toUtf8();
+if (m_startViewerWithTextureRoleSource) {
+    return m_startViewerWithTextureRoleSource(
+        ip.constData(),
+        sourceIp.isEmpty() ? nullptr : sourceIp.constData(),
+        port,
+        frameCallback,
+        textureCallback,
+        statusCallback,
+        user,
+        monitorReadOnly ? FSREMOTE_VIEWER_ROLE_MONITOR : FSREMOTE_VIEWER_ROLE_CONTROL);
+}
+```
+
+```cpp
+// third_party/uu_stream_webrtc/src/fsremote_stream_api.cpp:2934-2945,3235-3252（修改后）
+ViewerInstance(std::string hostIp, std::string sourceIp, uint16_t port, ...)
+    : host_ip_(std::move(hostIp))
+    , source_ip_(std::move(sourceIp))
+{
+    // ...
+}
+
+if (!source_ip_.empty()) {
+    sockaddr_in source = {};
+    source.sin_family = AF_INET;
+    ::inet_pton(AF_INET, source_ip_.c_str(), &source.sin_addr);
+    ::bind(socket, reinterpret_cast<sockaddr*>(&source), sizeof(source));
+    append_viewer_log("viewer bound source=" + source_ip_ + " target=" + host_ip_);
+}
+```
+
+### Steps
+1. 从 CLTEST 和 A10 的现场日志确认 49102 授权已经成功，排除公钥和准入身份问题。
+2. 在 Qt `StreamRuntime` 中复用已有的物理网卡选择策略，避免 Viewer 自己维护第二套网卡枚举逻辑。
+3. 增加可选 `fsremote_stream_start_viewer_with_texture_role_source` 导出，旧 DLL 缺少该符号时继续使用原角色入口。
+4. 让 Viewer 实例复制源 IPv4，在原生 Winsock `connect()` 前调用 `bind()`。
+5. 新增 `viewer bound source=... target=...` 和 `viewer bind failed ...` 日志，便于验证 CLTEST 是否从 `192.168.1.154` 建立 49100。
+
+### Verification
+- 已通过项目 SSH 交互终端读取 CLTEST：确认 `viewer tcp connected` 后立即出现 `failed to receive session message`。
+- 已通过项目 SSH 交互终端读取 A10：确认 `host admission accepted` 后出现 `host ICE ended ... state=6`。
+- 已静态确认 49102 日志已经使用 `source=192.168.1.154 target=192.168.3.4`。
+- 已执行 `git diff --check`，未发现空白错误。
+- 已静态确认旧 Viewer 入口仍保留，新入口为可选解析，不会因旧 DLL 缺失直接改变加载结果。
+- 按用户此前要求未执行构建、链接或运行测试。
