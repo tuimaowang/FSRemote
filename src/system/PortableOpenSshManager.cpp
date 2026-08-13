@@ -1,6 +1,8 @@
 #include "system/PortableOpenSshManager.h"
+#include "system/WjyDiagnosticLog.h" // 记录主机密钥 ACL 自动恢复阶段，不写入任何私钥内容。
 
 #include <QCoreApplication>
+#include <QDateTime> // 为替代主机密钥生成毫秒时间前缀，便于后续启动选择最新文件。
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
@@ -36,6 +38,16 @@ QString currentProcessAccount()
 #endif
 }
 // ===end====
+
+// 判断外部权限工具是否明确报告拒绝访问；仅这种错误允许轮换不被客户端固定信任的 SSH 主机密钥。
+bool isAccessDeniedPermissionError(const QString& errorText)
+{
+    const QString normalizedError = errorText.trimmed().toCaseFolded(); // 统一大小写和首尾空白，兼容英文系统工具输出格式差异。
+    return normalizedError.contains(QStringLiteral("拒绝访问")) // 中文 Windows 的 icacls 使用该固定错误文本。
+        || normalizedError.contains(QStringLiteral("访问被拒绝")) // 兼容部分系统组件使用的另一种中文拒绝访问表述。
+        || normalizedError.contains(QStringLiteral("access is denied")) // 英文 Windows 常见的完整拒绝访问文本。
+        || normalizedError.contains(QStringLiteral("access denied")); // 兼容省略“is”的工具或包装层错误文本。
+}
 
 QString quoteForCmd(const QString& value)
 {
@@ -750,6 +762,7 @@ QString PortableOpenSshManager::clientPublicKey(QString* errorMessage)
 // ===end====
 }
 
+// 登记远端客户端公钥并确保目标端 49103 sshd 正在运行；启动阶段因旧主机密钥 ACL 失败时可在本次授权内完成恢复。
 bool PortableOpenSshManager::authorizeClientPublicKey(const QString& publicKey, QString* errorMessage)
 {
 // =====wjy====
@@ -757,13 +770,15 @@ bool PortableOpenSshManager::authorizeClientPublicKey(const QString& publicKey, 
     if (!ensurePrepared(errorMessage)) {
         return false; // wjy: 写 authorized_keys 前确保 data/openssh 目录和基础配置已经创建完成。
     }
-
     const QByteArray normalizedKey = normalizedPublicKeyLine(publicKey.toUtf8());
     if (normalizedKey.isEmpty()) {
         if (errorMessage) {
             *errorMessage = QStringLiteral("remote client public key is empty");
         }
         return false; // wjy: 空公钥没有授权意义，直接拒绝写入目标机 authorized_keys。
+    }
+    if (!startServer(errorMessage)) { // wjy: 公钥有效后再确保 49103 已恢复监听，空或畸形请求不能触发服务启动操作。
+        return false; // wjy: sshd 仍无法启动时不返回授权成功，避免控制端紧接着打开一个必然失败的终端。
     }
 
     QFile authorizedKeysFile(authorizedKeysPath());
@@ -966,6 +981,7 @@ bool PortableOpenSshManager::ensureLayout(QString* errorMessage) const
     return true;
 }
 
+// 准备本机 OpenSSH 密钥；仅当旧主机私钥 ACL 明确拒绝访问时轮换主机密钥，客户端身份密钥保持不变。
 bool PortableOpenSshManager::ensureKeys(QString* errorMessage)
 {
     if (!QFileInfo::exists(hostKeyPath())) {
@@ -973,8 +989,21 @@ bool PortableOpenSshManager::ensureKeys(QString* errorMessage)
             return false;
         }
     }
-    if (!ensurePrivateKeyPermissions(hostKeyPath(), errorMessage)) {
-        return false;
+    QString hostKeyPermissionError; // 单独保存主机密钥 ACL 错误，避免自动恢复过程覆盖最有价值的原始原因。
+    if (!ensurePrivateKeyPermissions(hostKeyPath(), &hostKeyPermissionError)) { // 先尝试保留现有主机密钥并把权限收紧到当前账户。
+        if (!isAccessDeniedPermissionError(hostKeyPermissionError)) { // 超时、工具缺失等非权限错误不能通过删除密钥掩盖。
+            if (errorMessage) {
+                *errorMessage = hostKeyPermissionError; // 向调用方返回原始工具错误，便于继续定位环境问题。
+            }
+            return false; // 非拒绝访问错误保持原行为，不修改任何现有密钥文件。
+        }
+        writeWjyDiagnosticLog(QStringLiteral("[wjy-ssh] host key ACL denied path=%1; recovery begin")
+            .arg(QDir::toNativeSeparators(hostKeyPath()))); // 只记录固定文件路径和恢复阶段，避免把系统工具输出中的账户信息长期写盘。
+        if (!createReplacementHostKeyAfterAccessDenied(hostKeyPermissionError, errorMessage)) { // 旧 SID 阻止修改 ACL 时改用当前账户创建独立替代主机密钥。
+            return false; // 生成、权限收紧或替代文件确认任一步失败都停止 OpenSSH 准备。
+        }
+        writeWjyDiagnosticLog(QStringLiteral("[wjy-ssh] host key ACL recovery complete path=%1")
+            .arg(QDir::toNativeSeparators(hostKeyPath()))); // 成功日志确认新主机密钥已经生成并完成 ACL 收紧。
     }
 
     const bool hasBundledSharedKey =
@@ -1124,6 +1153,71 @@ bool PortableOpenSshManager::ensurePrivateKeyPermissions(const QString& keyPath,
     return true;
 #endif
 // ===end====
+}
+
+// 创建独立 SSH 主机替代密钥并保留 ACL 锁死的旧文件；客户端使用 NUL known_hosts，因此主机密钥轮换不会破坏远控授权关系。
+bool PortableOpenSshManager::createReplacementHostKeyAfterAccessDenied(
+    const QString& permissionError, // 保留首次 icacls 拒绝访问文本，恢复失败时与后续原因一起返回。
+    QString* errorMessage) const // 输出完整恢复结果；成功时清空，失败时提供可直接显示的中文说明。
+{
+#if !defined(_WIN32)
+    Q_UNUSED(permissionError); // 非 Windows 不使用 icacls，也不会进入该恢复路径。
+    Q_UNUSED(errorMessage); // 非 Windows 调用方无需接收 Windows ACL 恢复错误。
+    return false; // 防御性拒绝非 Windows 调用，避免意外轮换主机身份。
+#else
+    QString replacementId = QUuid::createUuid().toString(QUuid::WithoutBraces); // UUID 避免同一毫秒内并发或快速重试生成同名文件。
+    replacementId.remove(QLatin1Char('-')); // 文件名只保留十六进制字符，便于 sshd_config 无转义引用。
+    const QString replacementFileName = QStringLiteral("ssh_host_ed25519_key_recovery_%1_%2.key")
+        .arg(QDateTime::currentMSecsSinceEpoch()) // 时间前缀使 hostKeyPath 可以按文件名稳定选择最新恢复密钥。
+        .arg(replacementId); // UUID 后缀保证每次恢复都写入全新路径，不需要删除旧 ACL 文件。
+    const QString privateKeyPath = QDir(dataDir()).filePath(replacementFileName); // 替代私钥仍位于受控 data\openssh 目录，更新和日志清理不会误删。
+    const QString publicKeyPath = privateKeyPath + QStringLiteral(".pub"); // 记录配对公钥路径，失败清理时保持密钥对一致。
+    QString generationError; // 独立保存生成、新 ACL 或文件确认错误，避免丢失恢复阶段信息。
+    const QStringList generationArguments { // 使用与首次安装完全相同的 Ed25519 主机密钥参数。
+        QStringLiteral("-q"), // 关闭正常成功输出，错误信息仍由 runTool 收集。
+        QStringLiteral("-t"), QStringLiteral("ed25519"), // 保持现有 sshd 配置使用的 Ed25519 算法。
+        QStringLiteral("-N"), QString(), // 主机服务必须无人值守启动，因此私钥不设置口令。
+        QStringLiteral("-f"), privateKeyPath, // 在独立恢复路径生成，随后由 ensureConfig 把 sshd_config 切换到该文件。
+    };
+    if (!runTool(sshKeygenExePath(), generationArguments, 15000, &generationError)) { // 重新生成限制为十五秒，与首次密钥创建超时一致。
+        writeWjyDiagnosticLog(QStringLiteral("[wjy-ssh] replacement host key generation failed path=%1 error=%2")
+            .arg(QDir::toNativeSeparators(privateKeyPath), generationError)); // 记录恢复文件路径和工具错误，便于目标端日志直接定位生成失败阶段。
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("%1；创建替代 OpenSSH 主机密钥失败：%2")
+                .arg(permissionError, generationError); // 返回原始 ACL 错误和替代文件生成错误，旧密钥保持不变。
+        }
+        return false; // 没有完整替代密钥对时禁止继续启动 sshd。
+    }
+
+    if (!ensurePrivateKeyPermissions(privateKeyPath, &generationError)) { // 新文件生成后仍按当前进程账户、SYSTEM 和 Administrators 收紧 ACL。
+        writeWjyDiagnosticLog(QStringLiteral("[wjy-ssh] replacement host key ACL failed path=%1 error=%2")
+            .arg(QDir::toNativeSeparators(privateKeyPath), generationError)); // 新文件仍无法收紧 ACL 时记录具体阶段，不记录任何密钥内容。
+        QFile::remove(privateKeyPath); // 删除未完成权限收紧的私钥，避免留下 OpenSSH 会拒绝或权限过宽的文件。
+        QFile::remove(publicKeyPath); // 同步删除对应公钥，下一次重试必须重新生成完整密钥对。
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("%1；新主机密钥权限设置失败：%2")
+                .arg(permissionError, generationError); // 把两阶段错误一起反馈给远控公钥登记界面。
+        }
+        return false; // 新密钥 ACL 未达到要求时不声明恢复成功。
+    }
+
+    if (!QFileInfo::exists(privateKeyPath) || !QFileInfo::exists(publicKeyPath)) { // ssh-keygen 必须同时产生私钥与公钥，缺一不可作为稳定恢复结果。
+        writeWjyDiagnosticLog(QStringLiteral("[wjy-ssh] replacement host key pair incomplete path=%1")
+            .arg(QDir::toNativeSeparators(privateKeyPath))); // 完整性失败时记录预期私钥路径，便于检查杀毒软件或磁盘异常。
+        QFile::remove(privateKeyPath); // 清理不完整私钥，避免 hostKeyPath 在下一次启动误选残缺文件。
+        QFile::remove(publicKeyPath); // 同步清理可能存在的单独公钥，保持恢复文件集合一致。
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("%1；替代 OpenSSH 主机密钥生成不完整。")
+                .arg(permissionError); // 保留最初 ACL 错误，并明确指出恢复文件完整性检查失败。
+        }
+        return false; // 不完整密钥对不能写入 sshd_config。
+    }
+
+    if (errorMessage) {
+        errorMessage->clear(); // 恢复完成后清除首次拒绝访问文本，后续公钥登记继续执行。
+    }
+    return true; // 替代主机密钥已由当前账户创建并收紧权限，hostKeyPath 会立即选中它。
+#endif
 }
 
 bool PortableOpenSshManager::cleanupResidualServerProcesses(QString* errorMessage) const
@@ -1319,9 +1413,21 @@ QString PortableOpenSshManager::clientKeyPath() const
     return dataDir() + QStringLiteral("/client_ed25519");
 }
 
+// 从恢复文件中选择文件名时间前缀最大的完整密钥对；没有恢复文件时返回历史固定主机密钥路径。
 QString PortableOpenSshManager::hostKeyPath() const
 {
-    return dataDir() + QStringLiteral("/ssh_host_ed25519_key");
+    const QDir directory(dataDir()); // 所有候选主机密钥都限制在当前程序的 data\openssh 目录内。
+    const QStringList recoveryPrivateKeys = directory.entryList(
+        {QStringLiteral("ssh_host_ed25519_key_recovery_*.key")}, // `.key.pub` 不以 `.key` 结尾，因此不会被误当作私钥候选。
+        QDir::Files | QDir::NoSymLinks, // 拒绝目录和符号链接，避免配置引用到受控目录外部。
+        QDir::Name | QDir::Reversed); // 时间戳位于文件名固定前缀后，倒序首项就是最新恢复文件。
+    for (const QString& privateKeyName : recoveryPrivateKeys) { // 跳过异常中断留下的无配对公钥文件，继续寻找更早的完整恢复结果。
+        const QString privateKeyPath = directory.filePath(privateKeyName); // 将受控文件名解析为当前 data\openssh 下的绝对路径。
+        if (QFileInfo::exists(privateKeyPath + QStringLiteral(".pub"))) { // 仅完整私钥与公钥对可以成为 sshd 当前主机身份。
+            return privateKeyPath; // 返回最新完整替代密钥，ensureConfig 会同步更新 HostKey 路径。
+        }
+    }
+    return directory.filePath(QStringLiteral("ssh_host_ed25519_key")); // 首次安装或从未恢复时保持历史固定路径和兼容行为。
 }
 
 QString PortableOpenSshManager::authorizedKeysPath() const

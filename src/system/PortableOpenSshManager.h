@@ -38,9 +38,12 @@ private:
 
     bool ensurePrepared(QString* errorMessage);
     bool ensureLayout(QString* errorMessage) const;
+    // 准备主机密钥和客户端密钥；主机私钥属于旧账户且拒绝修改 ACL 时会安全轮换主机密钥。
     bool ensureKeys(QString* errorMessage);
     bool ensureConfig(QString* errorMessage);
     bool ensurePrivateKeyPermissions(const QString& keyPath, QString* errorMessage) const;
+    // 为无法接管 ACL 的旧主机密钥创建独立替代密钥；旧文件保持不动，失败时返回完整诊断信息。
+    bool createReplacementHostKeyAfterAccessDenied(const QString& permissionError, QString* errorMessage) const;
     bool cleanupResidualServerProcesses(QString* errorMessage) const;
     // =====wjy====
     bool ensureServerProcessJob(QString* errorMessage); // wjy: Windows 启动 sshd 前创建“句柄关闭即杀进程”的独立 Job，主程序被强制结束也不会遗留服务进程占用版本目录。
@@ -63,6 +66,7 @@ private:
     QString effectiveClientKeyPath() const;
     QString effectiveClientPublicKeyPath() const;
     QString clientKeyPath() const;
+    // 返回最新可用的替代主机密钥；不存在替代文件时继续使用历史固定路径。
     QString hostKeyPath() const;
     QString authorizedKeysPath() const;
     QString sshdPidPath() const;

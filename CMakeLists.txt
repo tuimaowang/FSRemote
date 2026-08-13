@@ -810,8 +810,12 @@ if(FSREMOTE_BUILD_TESTS AND FSREMOTE_BUILD_SESSION_IDENTITY_TESTS) # wjy: OpenSS
     enable_testing()
     add_executable(fsremote_session_identity_tests EXCLUDE_FROM_ALL # wjy: 仅显式构建该目标时生成隔离测试目录和 OpenSSH 工具副本。
         tests/session_identity_tests.cpp
-        src/system/PortableOpenSshManager.cpp
-        src/system/PortableOpenSshManager.h
+        src/system/PortableOpenSshManager.cpp # wjy: 测试直接编译生产身份管理器，覆盖真实主机密钥 ACL 恢复路径。
+        src/system/PortableOpenSshManager.h # wjy: 暴露与正式程序一致的身份管理接口和私有恢复声明。
+        src/system/RuntimeLogManager.cpp # wjy: 诊断日志需要正式程序相同的 data 目录解析实现，测试链接不能留下未解析符号。
+        src/system/RuntimeLogManager.h # wjy: 为诊断日志提供统一运行日志目录声明。
+        src/system/WjyDiagnosticLog.cpp # wjy: 主机密钥 ACL 自动恢复会写低频阶段日志，独立测试目标必须链接该实现。
+        src/system/WjyDiagnosticLog.h # wjy: 保持测试目标源码列表完整展示诊断日志接口。
     ) # wjy: 测试直接编译生产 OpenSSH 管理器，避免用假签名实现掩盖命令行或临时文件错误。
     target_include_directories(fsremote_session_identity_tests PRIVATE src)
     target_link_libraries(fsremote_session_identity_tests PRIVATE Qt6::Core advapi32) # wjy: 身份测试和生产代码都通过 Windows 进程账户 API 计算私钥 ACL 所有者。
