@@ -1243,10 +1243,13 @@ bool DeviceRealtimeStateService::decodeSnapshot(
     // ===end====
 }
 
+// 根据客户端公钥计算稳定设备 ID；实时在线服务只读取公开材料，不检查或修改客户端私钥 ACL。
 QString DeviceRealtimeStateService::localDeviceId() const
 {
-    QString errorMessage;
-    const QString publicKey = PortableOpenSshManager::instance().clientPublicKey(&errorMessage).trimmed();
+    QString errorMessage; // wjy: 保存公钥缺失或读取失败原因，启动日志可区分身份文件问题与 UDP 绑定问题。
+    const QString publicKey = PortableOpenSshManager::instance()
+        .clientPublicKeyForDeviceIdentity(&errorMessage)
+        .trimmed(); // wjy: 在线身份不需要私钥，避免旧账户 ACL 让设备在在线与离线状态之间反复切换。
     if (publicKey.isEmpty()) {
         writeWjyDiagnosticLog(QStringLiteral("[wjy-realtime] public key unavailable: %1").arg(errorMessage));
         return {};

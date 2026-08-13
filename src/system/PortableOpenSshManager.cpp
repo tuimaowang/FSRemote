@@ -284,6 +284,7 @@ void PortableOpenSshManager::stopClientProcesses()
 }
 // ===end====
 
+// 启动目标端 sshd 服务；仅依赖服务端主机密钥和配置，客户端身份私钥异常不影响接收远控。
 bool PortableOpenSshManager::startServer(QString* errorMessage)
 {
     if (!ensurePrepared(errorMessage)) {
@@ -370,6 +371,7 @@ void PortableOpenSshManager::stopServer()
     cleanupResidualServerProcesses(nullptr); // wjy: 扫描只终止路径完全等于本版本 openssh/sshd.exe 的进程，不影响系统或其它目录中的 OpenSSH 服务。
 }
 
+// 打开交互式远程终端；启动前只准备主动认证使用的客户端身份，不要求本机 sshd 已可用。
 bool PortableOpenSshManager::openTerminal(const QString& hostIp, const QString& loginUser, QString* errorMessage)
 {
     std::lock_guard identityLock(m_identityMutex); // wjy: 后台批量终端串行保护 OpenSSH 准备、客户端 Job 创建和进程绑定，避免多线程重复创建或关闭句柄。
@@ -387,8 +389,8 @@ bool PortableOpenSshManager::openTerminal(const QString& hostIp, const QString& 
         }
         return false;
     }
-    if (!ensurePrepared(errorMessage)) {
-        return false;
+    if (!ensureClientIdentityPrepared(errorMessage)) { // wjy: 只有本机主动发起 SSH 时才收紧客户端私钥 ACL，目标端接收公钥不走该路径。
+        return false; // wjy: 私钥不可用时在创建终端窗口前返回明确错误，避免 ssh.exe 再次报告模糊认证失败。
     }
 
     const QStringList arguments = sshArguments(
@@ -481,6 +483,7 @@ bool PortableOpenSshManager::openTerminal(const QString& hostIp, const QString& 
 #endif
 }
 
+// 执行远端命令；发起 SSH 前只严格准备客户端身份，本机服务端主机密钥故障不阻止主动控制。
 bool PortableOpenSshManager::runRemoteCommands(const QString& hostIp, const QString& loginUser, const QStringList& commands, QString* outputText, QString* errorMessage, int timeoutMs, std::function<void(const QString&)> outputCallback, std::function<bool()> shouldCancel)
 {
 // =====wjy====
@@ -498,8 +501,8 @@ bool PortableOpenSshManager::runRemoteCommands(const QString& hostIp, const QStr
         }
         return false; // wjy: 没有命令时不启动 SSH，避免打开一个空的远程 cmd 会话。
     }
-    if (!ensurePrepared(errorMessage)) {
-        return false;
+    if (!ensureClientIdentityPrepared(errorMessage)) { // wjy: 批量命令同样需要可用客户端私钥，不能只因公钥可读就继续启动 ssh.exe。
+        return false; // wjy: ACL 或密钥完整性失败时保留准备阶段的准确错误信息。
     }
 
     QStringList arguments = sshArguments(
@@ -738,27 +741,27 @@ bool PortableOpenSshManager::runRemotePowerShellScript(
 // ===end====
 }
 
+// 返回主动远控使用的客户端公钥；返回前严格确认配对私钥可以被当前进程安全使用。
 QString PortableOpenSshManager::clientPublicKey(QString* errorMessage)
 {
 // =====wjy====
     std::lock_guard identityLock(m_identityMutex); // wjy: 读取公钥前和其它签名/验签操作串行，避免首次准备目录和密钥时发生竞态。
-    if (!ensurePrepared(errorMessage)) {
-        return {}; // wjy: 取公钥前先完成 OpenSSH 布局、密钥和权限准备，保证后续发给目标设备的 key 是当前可用的。
+    if (!ensureClientIdentityPrepared(errorMessage)) { // wjy: 发给目标设备前确认对应私钥 ACL 可用，保证公钥登记后能够完成挑战签名和 SSH 认证。
+        return {}; // wjy: 客户端私钥无法使用时保留原始 ACL 错误，不发送一把本机无法持有的身份公钥。
     }
+    return readEffectiveClientPublicKey(errorMessage); // wjy: 严格准备成功后读取同一有效密钥对的公钥行。
+// ===end====
+}
 
-    QFile publicKeyFile(effectiveClientPublicKeyPath());
-    if (!publicKeyFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        if (errorMessage) {
-            *errorMessage = QStringLiteral("failed to read client public key");
-        }
-        return {}; // wjy: 公钥读不到时不能继续授权目标设备，否则 SSH 仍然会认证失败。
+// 为实时在线状态返回稳定设备身份公钥；已有公钥可读时绝不修改配对私钥 ACL。
+QString PortableOpenSshManager::clientPublicKeyForDeviceIdentity(QString* errorMessage)
+{
+// =====wjy====
+    std::lock_guard identityLock(m_identityMutex); // wjy: 在线服务与主动远控可能同时首次生成客户端密钥，串行保证只产生一套稳定身份。
+    if (!ensureClientPublicIdentityAvailable(errorMessage)) { // wjy: 轻量准备只在密钥完全缺失时生成新密钥，不对已有私钥执行 icacls。
+        return {}; // wjy: 公钥确实不存在或不可读时才放弃实时设备身份。
     }
-
-    const QString publicKey = QString::fromUtf8(publicKeyFile.readAll()).trimmed();
-    if (publicKey.isEmpty() && errorMessage) {
-        *errorMessage = QStringLiteral("client public key is empty");
-    }
-    return publicKey; // wjy: 返回单行公钥，调用方通过命令通道写入目标机 authorized_keys。
+    return readEffectiveClientPublicKey(errorMessage); // wjy: 设备 ID 仅需要公开材料，私钥 ACL 异常不应让整台设备离线。
 // ===end====
 }
 
@@ -816,6 +819,7 @@ bool PortableOpenSshManager::authorizeClientPublicKey(const QString& publicKey, 
 }
 
 // =====wjy====
+// 使用本机客户端私钥签署远控会话挑战；签名前严格准备私钥权限，避免把 ACL 故障误判成网络失败。
 QByteArray PortableOpenSshManager::signSessionChallenge(const QByteArray& challenge, QString* errorMessage)
 {
     std::lock_guard identityLock(m_identityMutex);
@@ -823,7 +827,7 @@ QByteArray PortableOpenSshManager::signSessionChallenge(const QByteArray& challe
         if (errorMessage) *errorMessage = QStringLiteral("invalid session challenge size");
         return {}; // wjy: 只签名协议定义的小型上下文，拒绝空数据和异常超长输入。
     }
-    if (!ensurePrepared(errorMessage)) return {};
+    if (!ensureClientIdentityPrepared(errorMessage)) return {}; // wjy: 只有发起方签名需要客户端私钥，目标端验签不再被自己的私钥 ACL 阻断。
 
     QTemporaryDir temporaryDir(QDir(dataDir()).filePath(QStringLiteral("session-sign-XXXXXX")));
     if (!temporaryDir.isValid()) {
@@ -861,6 +865,7 @@ QByteArray PortableOpenSshManager::signSessionChallenge(const QByteArray& challe
     return signature; // wjy: 返回 OpenSSH armored SSH signature，协议层会百分号转义后发送。
 }
 
+// 检查远端会话公钥是否已登记；只准备服务端授权文件环境，不访问目标端自己的客户端私钥。
 bool PortableOpenSshManager::isSessionPublicKeyAuthorized(const QString& publicKey, QString* errorMessage)
 {
     std::lock_guard identityLock(m_identityMutex);
@@ -882,6 +887,7 @@ bool PortableOpenSshManager::isSessionPublicKeyAuthorized(const QString& publicK
     return authorized;
 }
 
+// 验证远端设备提交的会话签名；验签只使用对方公钥和 authorized_keys，不需要本机客户端私钥。
 bool PortableOpenSshManager::verifySessionChallenge(
     const QString& publicKey,
     const QByteArray& challenge,
@@ -938,10 +944,12 @@ uint16_t PortableOpenSshManager::serverPort() const
     return kPortableSshPort;
 }
 
+// 准备目标端 sshd 服务环境；客户端私钥属于主动控制身份，不再参与服务端启动和公钥登记。
 bool PortableOpenSshManager::ensurePrepared(QString* errorMessage)
 {
-    if (m_prepared) {
-        return true;
+    std::lock_guard identityLock(m_identityMutex); // wjy: 主线程启动 sshd 与后台身份操作可能并发，服务端准备内部自行串行保护状态和文件。
+    if (m_serverPrepared) { // wjy: sshd 主机密钥和配置已完成时直接复用，不重复执行 icacls 或改写配置。
+        return true; // wjy: 客户端身份即使尚未准备也不影响目标端继续接收远控连接。
     }
     if (!ensureLayout(errorMessage)) {
         return false;
@@ -952,14 +960,14 @@ bool PortableOpenSshManager::ensurePrepared(QString* errorMessage)
         }
         return false;
     }
-    if (!ensureKeys(errorMessage)) {
+    if (!ensureHostKey(errorMessage)) { // wjy: 服务端准备只处理 sshd 必需的主机私钥，不接触 client_ed25519。
         return false;
     }
     if (!ensureConfig(errorMessage)) {
         return false;
     }
-    m_prepared = true;
-    return true;
+    m_serverPrepared = true; // wjy: 仅缓存服务端准备成功，后续客户端私钥检查仍由独立状态控制。
+    return true; // wjy: 此时 49103 已具备启动条件，但不保证本机可以主动控制其它设备。
 }
 
 bool PortableOpenSshManager::ensureLayout(QString* errorMessage) const
@@ -981,8 +989,8 @@ bool PortableOpenSshManager::ensureLayout(QString* errorMessage) const
     return true;
 }
 
-// 准备本机 OpenSSH 密钥；仅当旧主机私钥 ACL 明确拒绝访问时轮换主机密钥，客户端身份密钥保持不变。
-bool PortableOpenSshManager::ensureKeys(QString* errorMessage)
+// 准备 sshd 主机密钥；仅当旧主机私钥 ACL 明确拒绝访问时轮换，完全不读取客户端身份密钥。
+bool PortableOpenSshManager::ensureHostKey(QString* errorMessage)
 {
     if (!QFileInfo::exists(hostKeyPath())) {
         if (!runTool(sshKeygenExePath(), {QStringLiteral("-q"), QStringLiteral("-t"), QStringLiteral("ed25519"), QStringLiteral("-N"), QString(), QStringLiteral("-f"), hostKeyPath()}, 15000, errorMessage)) {
@@ -1006,63 +1014,138 @@ bool PortableOpenSshManager::ensureKeys(QString* errorMessage)
             .arg(QDir::toNativeSeparators(hostKeyPath()))); // 成功日志确认新主机密钥已经生成并完成 ACL 收紧。
     }
 
+    return true; // wjy: 主机密钥可用后立即结束，目标端自己的 client_ed25519 不再阻断 sshd 和 49102 授权回复。
+}
+
+// 确保稳定客户端公钥存在且可读；已有公钥可用时不读取、不授权也不修改配对私钥。
+bool PortableOpenSshManager::ensureClientPublicIdentityAvailable(QString* errorMessage)
+{
+    std::lock_guard identityLock(m_identityMutex); // wjy: 实时在线与主动远控可能并发首次生成密钥，递归锁保证只创建一套身份。
     const bool hasBundledSharedKey =
         QFileInfo::exists(bundledClientKeyPath())
-        && QFileInfo::exists(bundledClientPublicKeyPath());
-    if (!hasBundledSharedKey && !QFileInfo::exists(clientKeyPath())) {
-        if (!runTool(sshKeygenExePath(), {QStringLiteral("-q"), QStringLiteral("-t"), QStringLiteral("ed25519"), QStringLiteral("-N"), QString(), QStringLiteral("-f"), clientKeyPath()}, 15000, errorMessage)) {
-            return false;
-        }
-    }
-// =====wjy====
-    if (!ensurePrivateKeyPermissions(effectiveClientKeyPath(), errorMessage)) {
-        return false;
-    } // wjy: 无论使用自动生成的 client_ed25519，还是随 OpenSSH 目录分发的 fsremote_client_ed25519，都要修 ACL，否则 ssh.exe 会因 bad permissions 忽略私钥。
-// ===end====
-
-    QFile publicKeyFile(effectiveClientPublicKeyPath());
-    if (!publicKeyFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        if (errorMessage) {
-            *errorMessage = QStringLiteral("failed to read client public key");
-        }
-        return false;
-    }
-    const QByteArray publicKey = publicKeyFile.readAll().trimmed();
-    publicKeyFile.close();
-    if (publicKey.isEmpty()) {
-        if (errorMessage) {
-            *errorMessage = QStringLiteral("client public key is empty");
-        }
-        return false;
+        && QFileInfo::exists(bundledClientPublicKeyPath()); // wjy: 成对存在的随包身份继续保持最高优先级，与历史有效密钥选择行为一致。
+    const bool hasLocalPublicKey = QFileInfo::exists(clientKeyPath() + QStringLiteral(".pub")); // wjy: data 中公钥可独立承担稳定设备 ID，不要求配对私钥当前可访问。
+    if (hasBundledSharedKey || hasLocalPublicKey) { // wjy: 已有公开身份时立即读取，在线状态不再依赖完整 OpenSSH 运行库或任何私钥操作。
+        return !readEffectiveClientPublicKey(errorMessage).isEmpty(); // wjy: 只验证实际公钥内容，私钥 ACL 异常不会让实时服务停止。
     }
 
-    QFile authorizedKeysFile(authorizedKeysPath());
-    QByteArray existing;
-    if (authorizedKeysFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        existing = authorizedKeysFile.readAll().trimmed();
-        authorizedKeysFile.close();
+    if (!ensureLayout(errorMessage)) { // wjy: 只有完全缺少公钥、确实需要生成新身份时才检查 ssh-keygen 等 OpenSSH 工具。
+        return false; // wjy: 运行库缺失时返回明确路径错误，不能生成临时随机设备身份。
     }
-// =====wjy====
-    if (authorizedKeysContain(existing, publicKey)) {
-        return true;
+    if (!QDir().mkpath(dataDir())) { // wjy: 本地客户端密钥缺失时必须在固定 data\openssh 目录创建稳定密钥对。
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("failed to create openssh data directory"); // wjy: 把目录创建故障返回给实时服务和主动远控调用方。
+        }
+        return false; // wjy: 固定身份目录不可用时不回退到临时目录，避免每次启动产生不同设备 ID。
     }
 
-    QSaveFile saveFile(authorizedKeysPath());
-    if (!saveFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
-        if (errorMessage) {
-            *errorMessage = QStringLiteral("failed to write authorized_keys");
+    if (!QFileInfo::exists(clientKeyPath())) { // wjy: 没有随包身份且本地公钥也不存在时，仅在私钥同样缺失的全新安装场景生成密钥对。
+        if (!runTool(sshKeygenExePath(), {
+                QStringLiteral("-q"), // wjy: 抑制正常生成输出，错误仍通过 runTool 返回。
+                QStringLiteral("-t"), QStringLiteral("ed25519"), // wjy: 延续现有 Ed25519 客户端身份格式和指纹算法输入。
+                QStringLiteral("-N"), QString(), // wjy: 自动远控认证必须无人值守使用，因此客户端私钥不设置口令。
+                QStringLiteral("-f"), clientKeyPath(), // wjy: 新身份固定写入 data\openssh，跨程序重启保持同一设备 ID。
+            }, 15000, errorMessage)) { // wjy: 首次生成沿用十五秒超时，避免磁盘或安全软件异常无限阻塞启动。
+            return false; // wjy: 密钥生成失败时保留工具原始错误，实时在线服务不发布不稳定身份。
         }
-        return false;
     }
-    saveFile.write(appendAuthorizedKeyLine(existing, publicKey)); // wjy: 只追加本机公钥，不覆盖其它 FSRemote 设备已经登记进来的远程公钥。
-    if (!saveFile.commit()) {
+
+    const QString publicKey = readEffectiveClientPublicKey(errorMessage); // wjy: 最终以实际生效路径验证公钥可读且内容非空。
+    return !publicKey.isEmpty(); // wjy: 轻量准备只承诺公开身份可用，不承诺配对私钥可以用于主动控制。
+}
+
+// 严格准备本机主动控制身份；收紧客户端私钥 ACL，并保留历史上将自身公钥加入 authorized_keys 的兼容行为。
+bool PortableOpenSshManager::ensureClientIdentityPrepared(QString* errorMessage)
+{
+    std::lock_guard identityLock(m_identityMutex); // wjy: 批量命令没有长期持锁，严格准备在内部短暂串行 ACL 和 authorized_keys 更新。
+    if (m_clientIdentityPrepared) { // wjy: 同一进程已完成私钥 ACL 和自身授权写入后不再重复执行外部工具。
+        return true; // wjy: 严格准备缓存独立于 sshd 服务端状态，避免两类身份再次互相阻断。
+    }
+    if (!ensureLayout(errorMessage)) { // wjy: 主动控制和挑战签名依赖 ssh.exe、ssh-keygen 等完整随包运行库，但不要求主机密钥成功。
+        return false; // wjy: 客户端工具缺失时返回具体文件路径，不再通过服务端准备间接失败。
+    }
+    if (!QDir().mkpath(dataDir())) { // wjy: 客户端密钥、临时签名文件和自身授权都固定使用 data\openssh 目录。
         if (errorMessage) {
-            *errorMessage = QStringLiteral("failed to commit authorized_keys");
+            *errorMessage = QStringLiteral("failed to create openssh data directory"); // wjy: 目录无法创建时向主动控制界面返回明确原因。
         }
-        return false;
+        return false; // wjy: 不回退到临时身份目录，避免设备 ID 和远端授权发生漂移。
     }
-    return true;
-// ===end====
+    if (!ensureClientPublicIdentityAvailable(errorMessage)) { // wjy: 先保证密钥对至少有可读公钥，并在完全缺失时创建稳定本地身份。
+        return false; // wjy: 公钥不可用时无法确认私钥对应身份，也不能向其它设备登记授权。
+    }
+
+    const QString privateKeyPath = effectiveClientKeyPath(); // wjy: 私钥检查必须和刚读取的有效公钥使用同一套随包或本地密钥对。
+    if (!QFileInfo::exists(privateKeyPath)) { // wjy: 只残留公钥时仍可维持在线设备 ID，但不能伪装为具备主动远控能力。
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("client private key is missing: %1")
+                .arg(QDir::toNativeSeparators(privateKeyPath)); // wjy: 返回缺失私钥的准确路径，便于区分 ACL 拒绝访问和文件不完整。
+        }
+        return false; // wjy: 没有配对私钥时禁止公钥登记、挑战签名和 ssh.exe 启动。
+    }
+    if (!ensurePrivateKeyPermissions(privateKeyPath, errorMessage)) { // wjy: 主动控制前仍执行严格 ACL 收紧，OpenSSH 不会接受权限过宽的私钥。
+        return false; // wjy: 客户端私钥属于旧账户时只阻止本机主动控制，不再影响本机在线或接收其它设备远控。
+    }
+
+    const QString publicKey = readEffectiveClientPublicKey(errorMessage); // wjy: ACL 完成后再次读取对应公钥，确保后续自身授权写入使用同一身份。
+    if (publicKey.isEmpty()) { // wjy: 公钥在准备期间被外部删除或变空时拒绝缓存成功状态。
+        return false; // wjy: 不完整密钥对不能用于挑战签名或 SSH 认证。
+    }
+
+    QFile authorizedKeysFile(authorizedKeysPath()); // wjy: 沿用历史行为，让本机身份也保留在自身授权集合中。
+    QByteArray existing; // wjy: 先读取现有远端授权，追加自身公钥时不能覆盖其它控制设备。
+    if (authorizedKeysFile.open(QIODevice::ReadOnly | QIODevice::Text)) { // wjy: 首次运行文件不存在时按空授权集合处理。
+        existing = authorizedKeysFile.readAll().trimmed(); // wjy: 规范化尾部空白，追加函数负责恢复单行换行格式。
+        authorizedKeysFile.close(); // wjy: 写入前关闭读句柄，避免 QSaveFile 提交时受旧句柄影响。
+    }
+    const QByteArray normalizedPublicKey = normalizedPublicKeyLine(publicKey.toUtf8()); // wjy: 自身授权匹配忽略注释差异，只比较 OpenSSH 算法和密钥主体。
+    if (!authorizedKeysContain(existing, normalizedPublicKey)) { // wjy: 已存在自身公钥时不改写文件，减少启动阶段磁盘和杀毒扫描开销。
+        QSaveFile saveFile(authorizedKeysPath()); // wjy: 使用原子替换追加自身授权，异常退出不会留下半行 authorized_keys。
+        if (!saveFile.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) { // wjy: 无法创建临时写入文件时保留原授权文件不动。
+            if (errorMessage) {
+                *errorMessage = QStringLiteral("failed to write authorized_keys"); // wjy: 主动控制准备向上返回准确的授权文件写入失败原因。
+            }
+            return false; // wjy: 自身授权未保持历史一致性时不缓存客户端身份准备成功。
+        }
+        saveFile.write(appendAuthorizedKeyLine(existing, normalizedPublicKey)); // wjy: 保留已有远控设备公钥，并仅追加当前本机身份。
+        if (!saveFile.commit()) { // wjy: 只有原子提交成功才允许后续会话使用该身份。
+            if (errorMessage) {
+                *errorMessage = QStringLiteral("failed to commit authorized_keys"); // wjy: 区分打开失败和最终替换失败，便于定位权限或安全软件拦截。
+            }
+            return false; // wjy: 提交失败时旧文件仍保持完整，下次主动操作可以重新尝试。
+        }
+    }
+
+    m_clientIdentityPrepared = true; // wjy: 私钥 ACL、公钥读取和自身授权全部成功后才缓存严格准备状态。
+    if (errorMessage) {
+        errorMessage->clear(); // wjy: 成功结果清除之前可能残留的轻量公钥检查信息。
+    }
+    return true; // wjy: 本机现在可以安全执行公钥登记、挑战签名和 SSH 客户端认证。
+}
+
+// 读取当前生效客户端公钥并校验非空；该函数不生成文件，也不访问配对私钥。
+QString PortableOpenSshManager::readEffectiveClientPublicKey(QString* errorMessage) const
+{
+    const QString publicKeyPath = effectiveClientPublicKeyPath(); // wjy: 与私钥选择规则一致，随包完整密钥对优先，否则使用 data\openssh 本地身份。
+    QFile publicKeyFile(publicKeyPath); // wjy: 公钥是设备 ID 和授权交换所需的公开材料，可以独立读取。
+    if (!publicKeyFile.open(QIODevice::ReadOnly | QIODevice::Text)) { // wjy: 读取失败可能来自文件缺失、ACL 或安全软件占用。
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("failed to read client public key: %1")
+                .arg(QDir::toNativeSeparators(publicKeyPath)); // wjy: 错误包含实际生效路径，便于直接检查部署目录或 data 目录。
+        }
+        return {}; // wjy: 不用随机值替代真实公钥，防止在线列表生成漂移设备身份。
+    }
+    const QString publicKey = QString::fromUtf8(publicKeyFile.readAll()).trimmed(); // wjy: OpenSSH 公钥按 UTF-8 单行文本读取并去掉首尾换行。
+    if (publicKey.isEmpty()) { // wjy: 空文件不能形成设备指纹，也不能登记到远端 authorized_keys。
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("client public key is empty: %1")
+                .arg(QDir::toNativeSeparators(publicKeyPath)); // wjy: 明确指出空公钥路径，避免和私钥 ACL 错误混淆。
+        }
+        return {}; // wjy: 空公钥保持失败，不发布临时在线身份。
+    }
+    if (errorMessage) {
+        errorMessage->clear(); // wjy: 成功读取时清除调用方上一次失败信息。
+    }
+    return publicKey; // wjy: 返回完整 OpenSSH 公钥行，指纹计算和目标授权可各自做规范化处理。
 }
 
 bool PortableOpenSshManager::ensureConfig(QString* errorMessage)

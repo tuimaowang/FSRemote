@@ -22,7 +22,8 @@ public:
     bool openTerminal(const QString& hostIp, const QString& loginUser, QString* errorMessage = nullptr);
     bool runRemoteCommands(const QString& hostIp, const QString& loginUser, const QStringList& commands, QString* outputText = nullptr, QString* errorMessage = nullptr, int timeoutMs = 120000, std::function<void(const QString&)> outputCallback = {}, std::function<bool()> shouldCancel = {});
     bool runRemotePowerShellScript(const QString& hostIp, const QString& loginUser, const QString& script, QString* outputText = nullptr, QString* errorMessage = nullptr, int timeoutMs = 120000, std::function<void(const QString&)> outputCallback = {}, std::function<bool()> shouldCancel = {}); // wjy: 将长 PowerShell 分块写入远端临时 ps1 后执行，避开 cmd 单行长度限制和 Base64 命令回显。
-    QString clientPublicKey(QString* errorMessage = nullptr);
+    QString clientPublicKey(QString* errorMessage = nullptr); // wjy: 主动远控前准备客户端私钥权限并返回对应公钥，失败时阻止进入必然失败的认证流程。
+    QString clientPublicKeyForDeviceIdentity(QString* errorMessage = nullptr); // wjy: 在线状态只读取稳定客户端公钥，不因本机私钥 ACL 异常停止实时设备广播。
     bool authorizeClientPublicKey(const QString& publicKey, QString* errorMessage = nullptr);
     // =====wjy====
     QByteArray signSessionChallenge(const QByteArray& challenge, QString* errorMessage = nullptr);
@@ -36,10 +37,16 @@ private:
     PortableOpenSshManager() = default;
     ~PortableOpenSshManager();
 
-    bool ensurePrepared(QString* errorMessage);
+    bool ensurePrepared(QString* errorMessage); // wjy: 仅准备目标端 sshd 所需布局、主机密钥和配置，不检查本机主动控制使用的客户端私钥。
     bool ensureLayout(QString* errorMessage) const;
-    // 准备主机密钥和客户端密钥；主机私钥属于旧账户且拒绝修改 ACL 时会安全轮换主机密钥。
-    bool ensureKeys(QString* errorMessage);
+    // 准备 sshd 主机密钥；旧主机私钥属于其它账户且拒绝修改 ACL 时会安全轮换到替代密钥。
+    bool ensureHostKey(QString* errorMessage);
+    // 确保客户端公钥文件存在且可读；该轻量路径不会修改客户端私钥 ACL。
+    bool ensureClientPublicIdentityAvailable(QString* errorMessage);
+    // 准备本机主动控制使用的客户端私钥权限，并把对应公钥保留在本机授权列表中。
+    bool ensureClientIdentityPrepared(QString* errorMessage);
+    // 读取当前生效客户端公钥；调用方必须先选择轻量或严格准备路径。
+    QString readEffectiveClientPublicKey(QString* errorMessage) const;
     bool ensureConfig(QString* errorMessage);
     bool ensurePrivateKeyPermissions(const QString& keyPath, QString* errorMessage) const;
     // 为无法接管 ACL 的旧主机密钥创建独立替代密钥；旧文件保持不动，失败时返回完整诊断信息。
@@ -75,7 +82,8 @@ private:
     QString currentLoginUser() const;
     QString shellPath() const;
 
-    bool m_prepared = false;
+    bool m_serverPrepared = false; // wjy: 单独缓存 sshd 服务端准备结果，客户端私钥异常不能污染目标端接收远控的能力。
+    bool m_clientIdentityPrepared = false; // wjy: 仅在本机主动控制或会话签名时标记客户端私钥 ACL 已完成严格检查。
     std::recursive_mutex m_identityMutex; // wjy: DLL 的主机和 Viewer 工作线程可能同时签名/验签，串行保护 OpenSSH 准备和临时工具调用。
     QProcess* m_sshdProcess = nullptr;
 #if defined(_WIN32)
