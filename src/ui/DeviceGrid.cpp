@@ -1743,7 +1743,6 @@ const auto& g_devices = g_deviceCatalog.devices(); // wjy: 绘制和命中测试
 const auto& g_deviceGroupNames = g_deviceCatalog.groupNames(); // wjy: 分组名称通过目录只读视图提供，写操作必须携带稳定 groupId 调用目录方法。
 const auto& g_deviceGroupExpandedStates = g_deviceCatalog.groupExpandedStates(); // wjy: 展开状态只读消费，切换操作统一交给目录校验分组身份。
 const auto& g_deviceGroupIds = g_deviceCatalog.groupIds(); // wjy: 稳定 groupId 与展示顺序仍保持同位，但匿名命名空间不再拥有可写容器。
-bool g_hideLocalDeviceFromList = false; // wjy: 本机隐藏是当前窗口进程的展示策略，不写入共享 DeviceCatalog 快照。
 platform::DeviceInfo g_localDeviceIdentityForList; // wjy: 保存设备名/IP/MAC 三种本机身份，供列表、搜索和批量新增使用同一判定。
 // ===end====
 
@@ -1792,24 +1791,42 @@ bool deviceRecordMatchesLocal(const DeviceEntry& device)
     return deviceIdentityMatchesLocal(device.name, device.ip, device.mac, g_localDeviceIdentityForList); // wjy: 目录记录和批量扫描结果共享同一身份判定规则。
 }
 
-bool batchAddResultMatchesLocal(const BatchAddResult& result, const platform::DeviceInfo& localInfo)
+// 判断设备是否已通过共享目录设置为全局隐藏；所有列表、搜索和批量操作必须使用同一字段。
+bool deviceHiddenGlobally(const DeviceEntry& device)
 {
-    return deviceIdentityMatchesLocal(result.name, result.ip, result.mac, localInfo); // wjy: 批量新增回调在写目录前过滤本机，不依赖列表当前是否已有对应记录。
+    return device.globallyHidden; // wjy: 设备实体保留在目录中用于同步和恢复显示，但任何客户端都不生成它的可见行。
 }
 
-bool deviceHiddenByLocalPreference(const DeviceEntry& device)
-{
-    return g_hideLocalDeviceFromList && deviceRecordMatchesLocal(device); // wjy: 开关关闭时所有记录照常显示，开启时只隐藏确认属于本机的设备。
-}
-
+// 按 IP、MAC、设备名的全目录优先级定位本机实体；避免前面的同名远端设备抢先命中。
 int localDeviceCatalogIndex()
 {
-    for (int index = 0; index < g_devices.size(); ++index) {
-        if (deviceRecordMatchesLocal(g_devices.at(index))) {
-            return index; // wjy: 关闭隐藏开关时优先复用目录中已有本机实体，避免重复添加相同设备。
+    const QString localIp = g_localDeviceIdentityForList.ip.trimmed(); // wjy: 完整网卡信息可用时 IPv4 是最高优先级身份。
+    if (!localIp.isEmpty()) { // wjy: 空 IP 不能参与比较，避免两个空字段被误判为同一设备。
+        for (int index = 0; index < g_devices.size(); ++index) { // wjy: 先遍历完整目录查找当前本机 IPv4，不受设备排列和可见性影响。
+            if (g_devices.at(index).ip.trimmed().compare(localIp, Qt::CaseInsensitive) == 0) { // wjy: IPv4 精确相等时直接确认本机稳定实体。
+                return index; // wjy: IP 命中优先于任何 MAC 或名称候选，避免同名设备抢先返回。
+            }
         }
     }
-    return -1;
+
+    const QString localMac = normalizedDeviceMac(g_localDeviceIdentityForList.mac); // wjy: DHCP 改址后通过规范化 MAC 继续关联原设备实体。
+    if (!localMac.isEmpty()) { // wjy: 只有本机确实提供 MAC 时才执行第二级匹配。
+        for (int index = 0; index < g_devices.size(); ++index) { // wjy: 全目录检查 MAC，隐藏实体也必须参与恢复和开关定位。
+            if (normalizedDeviceMac(g_devices.at(index).mac) == localMac) { // wjy: 忽略分隔符和大小写后完全一致才认定为同一物理设备。
+                return index; // wjy: MAC 命中优先于设备名，名称重复不会影响结果。
+            }
+        }
+    }
+
+    const QString localName = g_localDeviceIdentityForList.name.trimmed(); // wjy: 启动早期没有网卡信息时才使用 Windows 设备名作为最后兜底。
+    if (!localName.isEmpty()) { // wjy: 空名称不参与兜底匹配。
+        for (int index = 0; index < g_devices.size(); ++index) { // wjy: 最后遍历名称，使首帧仍可显示正确开关状态。
+            if (g_devices.at(index).name.trimmed().compare(localName, Qt::CaseInsensitive) == 0) { // wjy: 名称只在更稳定身份都不可用时生效。
+                return index; // wjy: 返回首个同名实体维持旧数据兼容，完整网卡信息到达后会重新精确校正。
+            }
+        }
+    }
+    return -1; // wjy: 目录没有本机实体时由用户点击路径按完整本机信息创建一条共享记录。
 }
 // ===end====
 
@@ -1857,11 +1874,12 @@ QString deviceStorePath()
 }
 
 // =====wjy====
-void saveDevices()
+// 原子保存当前设备目录并在同步服务运行时提交共享快照；返回 false 表示本地文件未成功落盘。
+bool saveDevices()
 {
     // =====wjy====
-    g_deviceCatalogRepository.setStorePath(deviceStorePath());
-    g_deviceCatalogRepository.saveLocal(); // wjy: 原子保存和“仅本地修改才提交同步”的判断统一由仓储处理，UI 不再维护同步生命周期标志。
+    g_deviceCatalogRepository.setStorePath(deviceStorePath()); // wjy: 每次保存前确认仓储使用当前程序 data 目录，兼容静态对象延迟初始化。
+    return g_deviceCatalogRepository.saveLocal(); // wjy: 原子保存和“仅本地修改才提交同步”的判断统一由仓储处理，调用方可据结果决定是否回滚内存修改。
     // ===end====
 }
 
@@ -1936,8 +1954,8 @@ QStringList deviceNames()
     QStringList names;
     names.reserve(g_devices.size());
     for (const DeviceEntry& device : g_devices) {
-        if (deviceHiddenByLocalPreference(device)) {
-            continue; // wjy: 所有基于设备名称数量的旧布局入口也必须排除隐藏本机。
+        if (deviceHiddenGlobally(device)) {
+            continue; // wjy: 所有基于设备名称数量的旧布局入口也必须排除共享目录中的全局隐藏设备。
         }
         names.append(deviceDisplayName(device));
     }
@@ -1994,8 +2012,8 @@ QVector<int> sortedDeviceIndexesForGroup(
         : QString();
 
     for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
-        if (deviceHiddenByLocalPreference(g_devices.at(deviceIndex))) {
-            continue; // wjy: 本机在进入分组、在线优先和自然排序之前就被过滤，不产生任何可见设备行。
+        if (deviceHiddenGlobally(g_devices.at(deviceIndex))) {
+            continue; // wjy: 全局隐藏设备在进入分组、在线优先和自然排序之前就被过滤，不产生任何客户端可见行。
         }
         if (groupIndex < 0) {
             if (deviceGroupIndexByName(g_devices.at(deviceIndex).group) < 0) {
@@ -2064,8 +2082,8 @@ QVector<DeviceListRow> visibleDeviceRows()
 int firstUnhiddenDeviceIndex()
 {
     for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
-        if (!deviceHiddenByLocalPreference(g_devices.at(deviceIndex))) {
-            return deviceIndex; // wjy: 初始选择、同步回退和关闭隐藏开关只跳过本机过滤，不改变折叠分组原有的详情选择行为。
+        if (!deviceHiddenGlobally(g_devices.at(deviceIndex))) {
+            return deviceIndex; // wjy: 初始选择和同步回退统一跳过所有全局隐藏设备，不改变折叠分组原有的详情选择行为。
         }
     }
     return -1;
@@ -3656,7 +3674,7 @@ void drawSettingsOptionIcon(QPainter& painter, const QRect& rect, int iconKind)
     } else if (iconKind == 11) {
         painter.drawEllipse(QRectF(c.x() - 8, c.y() - 5, 16, 10)); // wjy: 眼睛轮廓表达设备列表可见性设置。
         painter.drawEllipse(QRectF(c.x() - 2, c.y() - 2, 4, 4));
-        painter.drawLine(QPointF(c.x() - 9, c.y() + 8), QPointF(c.x() + 9, c.y() - 8)); // wjy: 斜线明确表示开启后隐藏本机设备。
+        painter.drawLine(QPointF(c.x() - 9, c.y() + 8), QPointF(c.x() + 9, c.y() - 8)); // wjy: 斜线明确表示开启后在所有客户端列表隐藏本机设备。
     } else {
         painter.drawRoundedRect(QRectF(c.x() - 9, c.y() - 7, 18, 14), 2, 2); // wjy: 壁纸测试项使用横向图片框图标，与本机信息文档图标区分。
         painter.drawEllipse(QRectF(c.x() + 3, c.y() - 4, 3, 3)); // wjy: 右上圆点表示图片中的太阳。
@@ -3975,7 +3993,7 @@ void drawSettingsPage(
     painter.drawText(QRectF(contentLeft() + 60, refreshCard.y() + 16, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("实时状态同步")); // wjy: 旧“列表自动刷新”改为只读实时广播说明，不再暗示周期 TCP 轮询。
     painter.drawText(QRectF(contentLeft() + 60, batchCard.y() + 24, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("批量新增设备"));
     painter.drawText(QRectF(contentLeft() + 60, periodicDiscoveryCard.y() + 16, 220, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("周期检查新增设备"));
-    painter.drawText(QRectF(contentLeft() + 60, hideLocalDeviceCard.y() + 16, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("隐藏本机设备")); // wjy: 标题明确该开关只控制当前电脑在设备界面的可见性。
+    painter.drawText(QRectF(contentLeft() + 60, hideLocalDeviceCard.y() + 16, 180, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("隐藏本机设备")); // wjy: 标题保留原有入口名称，具体影响范围由下方说明明确为全部客户端。
     painter.drawText(QRectF(contentLeft() + 60, wallpaperTestCard.y() + 16, 160, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("自动切换桌面壁纸")); // wjy: 标题明确表示开关控制的是持续自动轮换，并为右侧运行状态留出空间。
     painter.drawText(
         QRectF(contentLeft() + 60, rollbackCard.y() + 16, qMax(80, settingsRollbackVersionComboRect().left() - contentLeft() - 76), 20),
@@ -4015,7 +4033,7 @@ void drawSettingsPage(
     painter.drawText(QRectF(contentLeft() + 60, refreshCard.y() + 37, qMax(260, contentWidth() - 260), 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("状态变化立即同步，心跳仅用于识别异常退出和离线")); // wjy: 明确业务变化是事件驱动，1/5 秒心跳不是全设备轮询。
     painter.drawText(QRectF(contentLeft() + 60, batchCard.y() + 45, 220, 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("可输入多个网段，用空格、逗号或换行分隔"));
     painter.drawText(QRectF(contentLeft() + 60, periodicDiscoveryCard.y() + 37, qMax(260, contentWidth() - 340), 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("按批量新增网段自动发现并加入新设备"));
-    painter.drawText(QRectF(contentLeft() + 60, hideLocalDeviceCard.y() + 37, qMax(260, contentWidth() - 220), 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("开启后设备列表和批量新增不再显示当前电脑")); // wjy: 直接说明开启、批量发现和当前列表三者的关系。
+    painter.drawText(QRectF(contentLeft() + 60, hideLocalDeviceCard.y() + 37, qMax(260, contentWidth() - 220), 20), Qt::AlignVCenter | Qt::AlignLeft, QString::fromUtf8("开启后所有设备列表都不再显示当前电脑")); // wjy: 明确状态会经共享目录传播，而不是只影响本机界面。
     painter.drawText(
         QRectF(contentLeft() + 60, wallpaperTestCard.y() + 37, qMax(120, settingsWallpaperRotationIntervalInputRect().left() - contentLeft() - 76), 20),
         Qt::AlignVCenter | Qt::AlignLeft,
@@ -4228,9 +4246,7 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     // =====wjy====
     m_periodicDeviceDiscoveryEnabled = platform::AppSettings::periodicDeviceDiscoveryEnabled();
     m_periodicDeviceDiscoveryIntervalSeconds = platform::AppSettings::periodicDeviceDiscoveryIntervalSeconds(); // wjy: 恢复周期新增开关和秒数，新安装默认关闭且为 60 秒。
-    m_hideLocalDeviceEnabled = platform::AppSettings::hideLocalDeviceEnabled(); // wjy: 在加载设备目录前恢复本机过滤状态，避免启动首帧先显示再隐藏。
     const QString localWallpaperDeviceName = platform::DeviceInfoService::localDeviceName(); // wjy: 启动阶段只读取计算机名，不提前执行原本延迟的完整网卡枚举。
-    g_hideLocalDeviceFromList = m_hideLocalDeviceEnabled; // wjy: 可见行构建发生在构造函数后续阶段，先发布当前窗口的隐藏策略。
     g_localDeviceIdentityForList = platform::DeviceInfo{};
     g_localDeviceIdentityForList.name = localWallpaperDeviceName; // wjy: 启动早期先用轻量计算机名过滤，500ms 后再补齐本机 IP/MAC。
     const bool defaultWallpaperRotationEnabled = platform::DesktopWallpaperService::rotationEnabledByDefaultForDeviceName(localWallpaperDeviceName); // wjy: 数字开头设备在没有历史开关配置时默认启动自动壁纸。
@@ -4242,6 +4258,7 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] before loadDevices restore")); // wjy: 加载设备文件前打点，验证 devices.json 读写路径是否稳定。
     loadDevices(); // wjy: 恢复读取已保存设备和分组，避免每次启动都丢失设备列表。
     // =====wjy====
+    syncHideLocalDeviceSettingFromCatalog(); // wjy: 目录加载后立即恢复本机开关显示；列表本身直接按每条设备的全局隐藏字段过滤，不等待网卡枚举。
     updateRealtimeConfiguredDevices();
     if (m_realtimeStateService) {
         connect(m_realtimeStateService, &platform::DeviceRealtimeStateService::deviceStateChanged,
@@ -4567,9 +4584,9 @@ DeviceGrid::DeviceGrid(platform::DeviceRealtimeStateService* realtimeStateServic
     QTimer::singleShot(500, this, [this] { // wjy: 窗口创建后再读取本机 IP/MAC，隔离 DeviceInfoService::local 是否导致 Release 启动阶段堆损坏。
         writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] delayed before DeviceInfoService::local")); // wjy: 延迟读取本机信息前打点。
         refreshLocalDeviceInfo();
-        if (m_hideLocalDeviceEnabled) {
-            applyHideLocalDeviceSetting(false); // wjy: 只有隐藏开关已开启时才按完整 IP/MAC 再过滤，关闭状态不改动折叠分组中的当前选择。
-        }
+        syncHideLocalDeviceSettingFromCatalog(); // wjy: IP/MAC 可用后重新精确匹配本机记录，设备同名时不会错误显示其它设备的隐藏状态。
+        migrateLegacyHideLocalDeviceSetting(); // wjy: 旧版私有开关只在完整本机身份可用后迁移一次，并通过现有共享同步通知其它客户端。
+        applyHideLocalDeviceSetting(false); // wjy: 迁移或共享状态读取完成后统一校正选择、实时订阅和设置页视觉，不产生额外提交。
         updateLocalInfoControls();
         update();
         writeDeviceGridStartupLog(QStringLiteral("[wjy-grid] delayed after DeviceInfoService::local")); // wjy: 延迟读取本机信息完成。
@@ -4648,6 +4665,7 @@ void DeviceGrid::applySyncedDeviceSnapshot(const QJsonObject& snapshot)
     saveCurrentScriptUiState(); // wjy: 快照可能删除或移动当前设备，替换数组前先保存它自己的脚本 UI 状态。
 
     g_deviceCatalogRepository.applySynchronizedSnapshot(snapshot); // wjy: 仓储一次完成目录应用和本机落盘，并在内部阻止远端快照形成递归 pending。
+    syncHideLocalDeviceSettingFromCatalog(); // wjy: 共享快照可能改变本机记录或其它设备的全局隐藏字段，先刷新设置开关再恢复可见选择。
     updateRealtimeConfiguredDevices(); // wjy: 同步快照可能新增、删除或修改 IP，立即重建广播来源白名单。
 
     m_selectedDeviceIndexes.clear();
@@ -4672,7 +4690,7 @@ void DeviceGrid::applySyncedDeviceSnapshot(const QJsonObject& snapshot)
         }
     }
 
-    pruneHiddenDeviceSelections(); // wjy: 共享快照可能重新带回本机记录，本机隐藏偏好必须在每次同步后重新应用。
+    pruneHiddenDeviceSelections(); // wjy: 共享快照可能隐藏当前主设备或多选设备，每次应用后都必须移除所有全局隐藏目标。
 
     if (m_selectedDeviceIndex >= 0 && m_selectedDeviceIndex < g_devices.size()) {
         m_selectionAnchorDeviceIndex = m_selectedDeviceIndex;
@@ -4692,6 +4710,9 @@ void DeviceGrid::applySyncedDeviceSnapshot(const QJsonObject& snapshot)
     updateAddDeviceControls();
     updateLocalInfoControls();
     update();
+    if (m_remoteMonitorModeEnabled && payloadChanged) { // wjy: 全局隐藏变化属于共享载荷变化，监控模式必须立即移除或恢复对应 Viewer。
+        QTimer::singleShot(0, this, [this] { refreshRemoteMonitorMode(false); }); // wjy: 延后到本轮选择和控件状态提交完成后重算监控窗口，避免重入同步回调。
+    }
     Q_UNUSED(payloadChanged); // wjy: 设备集合变化后等待实时广播或用户手动刷新，不再自动发起全设备 TCP 轮询。
 }
 // ===end====
@@ -4704,8 +4725,8 @@ void DeviceGrid::updateRealtimeConfiguredDevices()
     }
     QSet<QString> configuredIps;
     for (const DeviceEntry& device : std::as_const(g_devices)) {
-        if (deviceHiddenByLocalPreference(device)) {
-            continue; // wjy: 隐藏本机时不接收它的实时状态，避免不可见记录继续积累会话和更新缓存。
+        if (deviceHiddenGlobally(device)) {
+            continue; // wjy: 全局隐藏设备不再进入任何客户端实时订阅白名单，避免不可见记录继续积累会话和更新缓存。
         }
         const QString ip = device.ip.trimmed();
         if (!ip.isEmpty()) {
@@ -7784,8 +7805,10 @@ void DeviceGrid::refreshRemoteMonitorFilterList(bool preserveDraft)
         }
     };
     for (const DeviceEntry& device : g_devices) {
-        if (!device.ip.trimmed().isEmpty() && !deviceRecordMatchesLocal(device)) {
-            appendUniqueName(deviceDisplayName(device)); // wjy: 当前目录只列出可建立远端Viewer的设备，空IP和本机记录不提供无效名单选项。
+        if (!device.ip.trimmed().isEmpty()
+            && !deviceRecordMatchesLocal(device)
+            && !deviceHiddenGlobally(device)) { // wjy: 监控配置表与实际 Viewer 候选保持一致，全局隐藏设备不能通过白名单重新进入监控模式。
+            appendUniqueName(deviceDisplayName(device)); // wjy: 当前目录只列出可建立远端 Viewer 的可见设备，空 IP、本机和全局隐藏记录都不提供名单选项。
         }
     }
     for (const QString& deviceName : m_remoteMonitorBlacklist) appendUniqueName(deviceName);
@@ -8016,47 +8039,89 @@ void DeviceGrid::applyPeriodicDeviceDiscoverySetting(bool scanImmediately)
 // ===end====
 
 // =====wjy====
-void DeviceGrid::applyHideLocalDeviceSetting(bool revealLocalDeviceIfMissing)
+// 从设备目录读取当前电脑对应实体的全局隐藏状态；找不到本机记录时按显示状态处理。
+void DeviceGrid::syncHideLocalDeviceSettingFromCatalog()
 {
-    g_hideLocalDeviceFromList = m_hideLocalDeviceEnabled; // wjy: 所有可见行入口在下一次计算时立即使用最新开关值。
-    if (g_localDeviceIdentityForList.name.trimmed().isEmpty()) {
-        g_localDeviceIdentityForList.name = platform::DeviceInfoService::localDeviceName(); // wjy: 500ms 本机信息尚未完成时仍可按计算机名即时隐藏。
+    if (g_localDeviceIdentityForList.name.trimmed().isEmpty()) { // wjy: 启动早期至少补齐电脑名，使开关可以在完整网卡枚举前匹配已有本机记录。
+        g_localDeviceIdentityForList.name = platform::DeviceInfoService::localDeviceName(); // wjy: 这里只读取轻量设备名，不把延迟网卡枚举重新提前到窗口构造阶段。
+    }
+    const int localDeviceIndex = localDeviceCatalogIndex(); // wjy: 本机实体通过 IP、MAC、设备名统一识别，不依赖它当前是否已经从列表隐藏。
+    m_hideLocalDeviceEnabled = localDeviceIndex >= 0
+        && g_devices.at(localDeviceIndex).globallyHidden; // wjy: 设置开关只反映本机记录；其它设备被全局隐藏不会改变当前电脑自己的开关。
+}
+
+// 将旧版本机私有隐藏开关迁移到共享设备记录；旧值为关闭时只完成迁移，不覆盖现有共享状态。
+void DeviceGrid::migrateLegacyHideLocalDeviceSetting()
+{
+    if (platform::AppSettings::hideLocalDeviceGlobalMigrationCompleted()) { // wjy: 已迁移安装后不再读取旧键，避免重启时覆盖其它客户端同步回来的状态。
+        return;
+    }
+    if (!platform::AppSettings::legacyHideLocalDeviceEnabled()) { // wjy: 旧值为关闭不代表用户要取消新的共享隐藏，因此不能把目录字段强制写成 false。
+        platform::AppSettings::completeHideLocalDeviceGlobalMigration(); // wjy: 没有待迁移的开启状态时直接清理旧键并记录完成。
+        return;
     }
 
-    bool localDeviceAdded = false;
-    if (!m_hideLocalDeviceEnabled && revealLocalDeviceIfMissing) {
-        if (m_localDeviceInfo.ip.trimmed().isEmpty()) {
-            refreshLocalDeviceInfo(); // wjy: 用户明确关闭隐藏时同步读取本机 IP/MAC，确保能够立即创建可显示记录。
+    m_hideLocalDeviceEnabled = true; // wjy: 旧版已经隐藏本机时保留用户意图，并在下方写入当前设备的共享实体。
+    applyHideLocalDeviceSetting(true); // wjy: 复用正式点击路径补齐本机记录、保存 devices.json 并提交共享目录同步。
+    if (m_hideLocalDeviceEnabled) { // wjy: 只有目录成功反映隐藏状态后才删除旧键，识别失败时下次启动仍可重试迁移。
+        platform::AppSettings::completeHideLocalDeviceGlobalMigration(); // wjy: 迁移成功后永久切换到共享字段作为唯一真实状态。
+    }
+}
+
+// 应用本机全局隐藏设置；用户操作时写入共享设备实体，快照刷新时只校正界面和订阅状态。
+void DeviceGrid::applyHideLocalDeviceSetting(bool persistSharedState)
+{
+    bool catalogChanged = false; // wjy: 只有新增本机实体或隐藏字段变化时才保存并触发共享提交。
+    if (persistSharedState) { // wjy: 只有本机用户点击或旧设置迁移有权修改共享设备记录，远端快照应用不能反向提交。
+        const QJsonObject previousCatalogSnapshot = g_deviceCatalogRepository.snapshot(true); // wjy: 保存修改前完整本地快照，原子落盘失败时恢复设备、分组和本机展开状态。
+        if (m_localDeviceInfo.ip.trimmed().isEmpty()) { // wjy: 用户可能在延迟网卡读取完成前点击，先同步读取完整身份以便创建或精确匹配本机实体。
+            refreshLocalDeviceInfo(); // wjy: 点击是明确的用户操作，允许在此处完成一次本机 IP、MAC 和广播地址读取。
         }
-        if (localDeviceCatalogIndex() < 0 && !m_localDeviceInfo.ip.trimmed().isEmpty()) {
-            DeviceEntry localDevice;
+        if (g_localDeviceIdentityForList.name.trimmed().isEmpty()) { // wjy: 极端网卡读取失败时仍保留电脑名匹配能力。
+            g_localDeviceIdentityForList.name = platform::DeviceInfoService::localDeviceName(); // wjy: 设备名作为 IP/MAC 都不可用时的最后识别依据。
+        }
+
+        int localDeviceIndex = localDeviceCatalogIndex(); // wjy: 先复用目录中已有本机实体，避免关闭或开启开关时重复添加同一 IP。
+        if (localDeviceIndex < 0 && !m_localDeviceInfo.ip.trimmed().isEmpty()) { // wjy: 本机尚未进入目录时必须先创建实体，否则没有可同步的隐藏状态承载位置。
+            DeviceEntry localDevice; // wjy: 新记录沿用现有设备目录字段，后续发现和手动新增都会按 IP 去重。
             localDevice.name = m_localDeviceInfo.name.trimmed().isEmpty()
                 ? m_localDeviceInfo.ip.trimmed()
-                : m_localDeviceInfo.name.trimmed(); // wjy: 本机名称不可用时沿用目录统一的 IP 展示兜底。
-            localDevice.ip = m_localDeviceInfo.ip.trimmed();
-            localDevice.mac = m_localDeviceInfo.mac.trimmed();
-            localDevice.broadcastIp = m_localDeviceInfo.broadcastIp.trimmed();
-            localDevice.remark = QString::fromUtf8("本机");
-            localDeviceAdded = g_deviceCatalog.addDevice(std::move(localDevice)); // wjy: 只有目录中确实没有本机实体时才补回，重复 IP 仍由 DeviceCatalog 拒绝。
-            if (localDeviceAdded) {
-                saveDevices(); // wjy: 用户关闭隐藏后补回的本机记录需要跨启动保留，下一次启动无需重新发现。
+                : m_localDeviceInfo.name.trimmed(); // wjy: 本机名称为空时使用 IPv4，保证目录记录仍有可读显示名。
+            localDevice.ip = m_localDeviceInfo.ip.trimmed(); // wjy: IPv4 是目录去重和实时状态关联的基础字段。
+            localDevice.mac = m_localDeviceInfo.mac.trimmed(); // wjy: 保存 MAC 以便本机 DHCP 地址变化后仍能识别同一设备实体。
+            localDevice.broadcastIp = m_localDeviceInfo.broadcastIp.trimmed(); // wjy: 保留远程开机所需广播地址，不因创建隐藏记录丢失设备能力。
+            localDevice.remark = QString::fromUtf8("本机"); // wjy: 自动创建记录明确标记来源，关闭隐藏后恢复显示时用户可以识别。
+            localDevice.globallyHidden = m_hideLocalDeviceEnabled; // wjy: 创建时直接携带目标状态，避免先产生一次可见共享快照再二次修改。
+            catalogChanged = g_deviceCatalog.addDevice(std::move(localDevice)); // wjy: 目录统一验证 IPv4 和重复实体，失败时不提交不完整记录。
+            localDeviceIndex = localDeviceCatalogIndex(); // wjy: 新增后重新按本机身份解析稳定实体，后续字段更新不使用猜测下标。
+        }
+        if (localDeviceIndex >= 0) { // wjy: 已有或新建成功的本机实体才允许写入全局隐藏字段。
+            catalogChanged = g_deviceCatalog.setDeviceGloballyHidden(
+                                 g_devices.at(localDeviceIndex).id,
+                                 m_hideLocalDeviceEnabled)
+                || catalogChanged; // wjy: 新建记录可能已经带目标值，状态未变化时仍保留新增产生的保存需求。
+        } else { // wjy: 无法识别本机时不能只改变本地开关，否则界面会显示一个实际没有同步的虚假状态。
+            m_hideLocalDeviceEnabled = false; // wjy: 回退到默认显示状态，等待本机身份可用后用户再次操作或迁移重试。
+        }
+        if (catalogChanged) { // wjy: 设备实体或共享字段确实变化后才原子保存，并由仓储生成待同步快照。
+            if (!saveDevices()) { // wjy: 本地 devices.json 未原子落盘时不能声称全局隐藏已经生效，也不能删除旧迁移设置。
+                g_deviceCatalog.applySnapshot(previousCatalogSnapshot, false); // wjy: 恢复修改前完整目录，新增本机记录和隐藏字段变化都不会只残留在内存中。
+                qWarning().noquote() << QStringLiteral("[hide-local-device] failed to persist shared visibility state"); // wjy: 保留失败诊断，便于定位 data 目录权限或磁盘异常。
             }
         }
+        syncHideLocalDeviceSettingFromCatalog(); // wjy: 以保存成功后的目录或失败回滚结果重置开关，界面不会显示虚假目标状态。
     }
 
-    pruneHiddenDeviceSelections(); // wjy: 开启时移除隐藏本机选择，关闭时把无主选择恢复到第一台未隐藏设备。
+    pruneHiddenDeviceSelections(); // wjy: 所有客户端都移除全局隐藏设备的主选择、多选、Shift 锚点和拖拽快照。
     if (firstUnhiddenDeviceIndex() < 0) {
         m_settingsSelected = true;
         m_remoteAssistSelected = false;
         m_localInfoSelected = false;
         m_currentDeviceName.clear();
-        m_previousDeviceName.clear(); // wjy: 本机是唯一设备且被隐藏时保持设置页可操作，不让详情页引用不可见设备。
+        m_previousDeviceName.clear(); // wjy: 所有设备都被隐藏时保持设置页可操作，不让详情页继续引用不可见设备。
     }
     m_deviceListScrollOffset = qBound(0, m_deviceListScrollOffset, maxDeviceListScrollOffset());
-    updateRealtimeConfiguredDevices(); // wjy: 隐藏本机后实时状态来源白名单同步排除它，关闭时立即恢复。
-    if (localDeviceAdded) {
-        m_deviceStatuses.remove(m_localDeviceInfo.ip.trimmed()); // wjy: 新补回本机等待后续实时快照，不继承历史缓存状态。
-    }
+    updateRealtimeConfiguredDevices(); // wjy: 全局隐藏设备从状态来源白名单移除，恢复显示后立即重新允许其快照进入。
     updateSettingsControls();
     updateAddDeviceControls();
     updateLocalInfoControls();
@@ -8114,12 +8179,8 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
         .arg(subnetText)
         .arg(scanIps.size());
 
-    platform::DeviceInfo localDeviceIdentity = m_localDeviceInfo;
-    if (localDeviceIdentity.name.trimmed().isEmpty()) {
-        localDeviceIdentity.name = platform::DeviceInfoService::localDeviceName(); // wjy: 扫描可能早于延迟网卡枚举，至少携带本机设备名供结果过滤。
-    }
     QPointer<DeviceGrid> self(this);
-    runBackgroundTask([self, scanIps, userInitiated, localDeviceIdentity] {
+    runBackgroundTask([self, scanIps, userInitiated] { // wjy: 扫描只采集目标状态，是否隐藏完全由 UI 线程中的共享设备实体决定。
         QVector<BatchAddResult> results;
         std::mutex resultMutex;
         std::atomic_int nextIndex = 0;
@@ -8174,7 +8235,7 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
             return; // wjy: 窗口关闭后不再回到 UI 线程追加设备。
         }
 
-        QMetaObject::invokeMethod(self, [self, results = std::move(results), userInitiated, localDeviceIdentity]() mutable {
+        QMetaObject::invokeMethod(self, [self, results = std::move(results), userInitiated]() mutable { // wjy: 回调不再携带本机私有过滤状态，所有客户端使用同一目录字段。
             if (!self) {
                 return; // wjy: queued 回调执行前窗口可能已经销毁。
             }
@@ -8191,16 +8252,23 @@ void DeviceGrid::startBatchAddDevices(bool userInitiated)
                 if (ip.isEmpty() || addedIps.contains(ip)) {
                     continue; // wjy: UI 线程最终追加前再次去重，防止扫描期间用户手动新增同一 IP。
                 }
-                if (grid->m_hideLocalDeviceEnabled
-                    && (batchAddResultMatchesLocal(result, localDeviceIdentity)
-                        || batchAddResultMatchesLocal(result, grid->m_localDeviceInfo))) {
-                    continue; // wjy: 开关开启期间批量或周期发现命中本机时直接跳过，不写入目录也不显示在列表中。
+                int existingIndex = deviceIndexForIp(ip); // wjy: 先按当前 IPv4 命中目录，正常在线设备继续沿用原更新路径。
+                if (existingIndex < 0 && !result.mac.trimmed().isEmpty()) { // wjy: DHCP 地址变化时再通过稳定 MAC 查找原设备，防止全局隐藏实体被重新新增为可见设备。
+                    const QString resultMac = normalizedDeviceMac(result.mac); // wjy: 扫描和目录可能使用不同分隔符，统一规范化后比较。
+                    for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) { // wjy: 目录规模有限，线性遍历可保持现有数据结构且不引入第二套索引。
+                        if (normalizedDeviceMac(g_devices.at(deviceIndex).mac) == resultMac) { // wjy: 只在非空精确 MAC 相等时认定为同一设备，避免设备名重复导致误合并。
+                            existingIndex = deviceIndex; // wjy: 后续通过稳定设备 ID 更新网络字段，并自然保留 globallyHidden 状态。
+                            break;
+                        }
+                    }
                 }
-
-                const int existingIndex = deviceIndexForIp(ip);
                 if (existingIndex >= 0) {
                     bool deviceUpdated = false;
                     DeviceEntry existingDevice = g_devices.at(existingIndex); // wjy: 先复制稳定实体，修改完成后再通过目录按 ID 提交，禁止直接写展示数组。
+                    if (existingDevice.ip.trimmed().compare(ip, Qt::CaseInsensitive) != 0) { // wjy: MAC 命中旧实体时把 DHCP 新地址写回同一个设备记录。
+                        existingDevice.ip = ip; // wjy: 更新 IP 后实时状态、远控和共享列表继续指向当前可达地址。
+                        deviceUpdated = true; // wjy: 标记目录需要按稳定 ID 提交替换并触发共享同步。
+                    }
                     if (existingDevice.mac.trimmed().isEmpty() && !result.mac.trimmed().isEmpty()) {
                         existingDevice.mac = result.mac.trimmed(); // wjy: 批量扫描命中旧设备时补齐 MAC，让后续远程开机不再因为旧记录为空而被拦截。
                         deviceUpdated = true;
@@ -8511,13 +8579,7 @@ void DeviceGrid::saveNewDevice()
         updateAddDeviceControls();
         return;
     }
-    if (m_hideLocalDeviceEnabled
-        && deviceIdentityMatchesLocal(name, ip, mac, g_localDeviceIdentityForList)) {
-        updateAddDeviceControls();
-        return; // wjy: 隐藏本机开启时手动新增同样不能把本机重新带回列表，关闭开关后由统一补回逻辑处理。
-    }
-
-    const bool addingFirstDevice = firstUnhiddenDeviceIndex() < 0; // wjy: 目录中只有隐藏本机时，手动添加远端仍属于第一台未隐藏设备。
+    const bool addingFirstDevice = firstUnhiddenDeviceIndex() < 0; // wjy: 目录中只有全局隐藏设备时，手动添加可见远端仍属于第一台可见设备。
     DeviceEntry newDevice;
     newDevice.name = name;
     newDevice.ip = ip;
@@ -8606,8 +8668,8 @@ int DeviceGrid::totalRemoteControlSessionCount() const
 {
     qint64 total = 0; // wjy: 使用宽整数累计多台设备的会话数，避免设备列表较大时中间求和溢出。
     for (const DeviceEntry& device : g_devices) {
-        if (deviceHiddenByLocalPreference(device)) {
-            continue; // wjy: 用户隐藏的本机不属于当前设备列表显示范围，不计入标题栏汇总。
+        if (deviceHiddenGlobally(device)) {
+            continue; // wjy: 所有客户端都从标题栏汇总中排除全局隐藏设备，数字口径与当前可见列表一致。
         }
         const QString ip = device.ip.trimmed();
         if (ip.isEmpty()) {
@@ -9143,8 +9205,8 @@ QVector<int> DeviceGrid::deviceIndexesForGroup(int groupIndex) const
     for (const int deviceIndex : catalogIndexes) {
         if (deviceIndex < 0
             || deviceIndex >= g_devices.size()
-            || deviceHiddenByLocalPreference(g_devices.at(deviceIndex))) {
-            continue; // wjy: 隐藏本机时，分组右键的脚本、电源、终端和远控动作都只作用于界面可见设备。
+            || deviceHiddenGlobally(g_devices.at(deviceIndex))) {
+            continue; // wjy: 分组右键的脚本、电源、终端和远控动作统一排除全局隐藏设备。
         }
         result.append(deviceIndex);
     }
@@ -10517,8 +10579,8 @@ QVector<int> DeviceGrid::remoteMonitorDeviceIndexes() const
         const platform::DevicePresenceState presence = devicePresenceForIndex(deviceIndex);
         const QString displayName = deviceDisplayName(device);
         // =====wjy====
-        if (ip.isEmpty() || deviceRecordMatchesLocal(device)) {
-            continue; // wjy: 没有有效IP或匹配本机的记录无法建立远端监控Viewer，继续保持原有排除规则。
+        if (ip.isEmpty() || deviceRecordMatchesLocal(device) || deviceHiddenGlobally(device)) { // wjy: 全局隐藏设备与本机、空 IP 一样不能进入任何客户端监控 Viewer 候选。
+            continue; // wjy: 过滤发生在黑白名单前，白名单也不能重新启用已经全局隐藏的设备。
         }
         if (remoteMonitorNameListContains(m_remoteMonitorBlacklist, displayName)) {
             continue; // wjy: 黑名单拥有最高优先级，即使同名设备也在白名单或当前为Busy都不创建监控Viewer。
@@ -12177,8 +12239,8 @@ void DeviceGrid::showDeviceSearchPanel()
     QVector<DeviceSearchItem> searchItems;
     searchItems.reserve(g_devices.size()); // wjy: 每次进入查找页都复制当前展示字段，面板过滤不持有目录引用也不修改设备数据。
     for (const DeviceEntry& device : g_devices) {
-        if (deviceHiddenByLocalPreference(device)) {
-            continue; // wjy: 隐藏本机后搜索面板也不能通过名称或 IP 找到并重新选择本机。
+        if (deviceHiddenGlobally(device)) {
+            continue; // wjy: 全局隐藏设备不会出现在任何客户端搜索结果中，无法通过名称或 IP 重新选择。
         }
         const int groupIndex = g_deviceCatalog.groupIndexForId(device.groupId);
         const QString groupName = groupIndex >= 0 && groupIndex < g_deviceGroupNames.size()
@@ -12292,13 +12354,13 @@ void DeviceGrid::startDeviceSwitchAnimation(int newIndex, const QString& newName
 // =====wjy====
 void DeviceGrid::pruneHiddenDeviceSelections()
 {
-    QSet<int> unhiddenDeviceIndexes; // wjy: 这里只排除本机隐藏策略，不把折叠分组误判成需要清除的选择。
-    int fallbackDeviceIndex = -1; // wjy: 当前主设备是本机时，用第一台未隐藏设备作为详情页兜底目标。
+    QSet<int> unhiddenDeviceIndexes; // wjy: 这里只排除共享目录中的全局隐藏设备，不把折叠分组误判成需要清除的选择。
+    int fallbackDeviceIndex = -1; // wjy: 当前主设备被全局隐藏时，用第一台未隐藏设备作为详情页兜底目标。
     int firstSelectedUnhiddenDeviceIndex = -1; // wjy: 如果多选里还有未隐藏设备，优先用它作为新的主设备。
 
     for (int deviceIndex = 0; deviceIndex < g_devices.size(); ++deviceIndex) {
-        if (deviceHiddenByLocalPreference(g_devices.at(deviceIndex))) {
-            continue; // wjy: 开关开启后，本机不能继续留在主选择、多选或拖拽快照中。
+        if (deviceHiddenGlobally(g_devices.at(deviceIndex))) {
+            continue; // wjy: 任意设备被全局隐藏后都不能继续留在主选择、多选或拖拽快照中。
         }
 
         unhiddenDeviceIndexes.insert(deviceIndex);
@@ -14101,9 +14163,8 @@ void DeviceGrid::mouseReleaseEvent(QMouseEvent* event)
             }
             // =====wjy====
             if (settingsLayout.containsPoint(settingsHideLocalDeviceSwitchRect(), event->pos())) {
-                m_hideLocalDeviceEnabled = !m_hideLocalDeviceEnabled;
-                platform::AppSettings::setHideLocalDeviceEnabled(m_hideLocalDeviceEnabled); // wjy: 先持久化用户选择，进程异常退出后下次启动仍使用相同可见性策略。
-                applyHideLocalDeviceSetting(!m_hideLocalDeviceEnabled); // wjy: 开启立即隐藏并修正选择；关闭时目录缺少本机则立即补回。
+                m_hideLocalDeviceEnabled = !m_hideLocalDeviceEnabled; // wjy: 用户只修改当前电脑对应设备实体的目标状态，不能从本机设置页隐藏其它设备。
+                applyHideLocalDeviceSetting(true); // wjy: 把目标状态保存到 devices.json 并提交共享同步，所有新版客户端随后采用相同过滤结果。
                 event->accept();
                 return;
             }

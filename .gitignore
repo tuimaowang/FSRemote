@@ -7,6 +7,7 @@
 /build_webrtc_host/
 /build_webrtc_slim/
 /build-video*/
+/build-release/
 /dist/
 
 # CMake generated files
@@ -33,6 +34,12 @@
 /rustdesk/
 /.codex/
 /FakerInputDriverKit/
+
+# 安全：OpenSSH 客户端身份必须由每台电脑首次运行时生成，禁止提交任何本机私钥或对应公钥。
+/third_party/openssh/OpenSSH-Win64/fsremote_client_ed25519
+/third_party/openssh/OpenSSH-Win64/fsremote_client_ed25519.pub
+/third_party/faker_input_bridge/dist/
+/third_party/faker_input_bridge/build/
 
 # IDE / editor
 /.vs/

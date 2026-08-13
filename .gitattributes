@@ -1,1 +1,9 @@
 resources/FakerInput_Ryodigi_Solutions_LLC.cer -text
+README.md text eol=lf
+third_party/packages/*.tar.gz filter=lfs diff=lfs merge=lfs -text
+third_party/faker_input_driver_kit/driver/*.msi filter=lfs diff=lfs merge=lfs -text
+third_party/nvenc_sdk/** -whitespace
+third_party/openssh/** -whitespace
+third_party/faker_input_bridge/** -whitespace
+openspec/** -whitespace
+docs/** -whitespace

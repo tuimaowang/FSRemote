@@ -15,7 +15,7 @@ set(UU_STREAM_FFMPEG_BIN_DIR "${FFMPEG_BIN_DIR}" CACHE INTERNAL "FFmpeg runtime 
 if(UU_STREAM_WEBRTC_BUILD_VIEWER)
     include("../cmake/imgui.cmake")
 endif()
-set(WEBRTC_ROOT "c:/Users/test/Documents/Fsremote/webRTC/webrtc-checkout" CACHE PATH "Path to a native WebRTC build/install root")
+set(WEBRTC_ROOT "" CACHE PATH "Path to a native WebRTC build/install root") # wjy: historical backup expects an injected SDK root.
 include("cmake/FindWebRTCNative.cmake")
 
 add_library(uu_stream_common STATIC

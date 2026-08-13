@@ -275,7 +275,9 @@ private:
     // =====wjy====
     void applyPeriodicDeviceDiscoverySetting(bool scanImmediately);
     void startBatchAddDevices(bool userInitiated = true); // wjy: 手动按钮和周期定时器复用同一网段扫描；周期触发时不跳转当前页面或选择新设备。
-    void applyHideLocalDeviceSetting(bool revealLocalDeviceIfMissing); // wjy: 同步本机过滤状态，关闭开关时按需立即补回本机记录。
+    void syncHideLocalDeviceSettingFromCatalog(); // wjy: 从共享设备实体读取本机全局隐藏状态，确保设置开关与所有客户端共同使用的记录一致。
+    void migrateLegacyHideLocalDeviceSetting(); // wjy: 将旧版仅本机生效的开关一次性迁移到共享设备记录，成功后不再读取旧键。
+    void applyHideLocalDeviceSetting(bool persistSharedState); // wjy: 用户点击时更新本机设备实体并提交共享同步；普通刷新只重新应用全局过滤结果。
     // ===end====
     // =====wjy====
     QString nextDefaultDeviceGroupName() const; // wjy: 为所有新建分组入口生成不重复的“默认分组N”名称。
@@ -467,7 +469,7 @@ private:
     bool m_wolDetectionInProgress = false;
     bool m_preventSleepEnabled = true;
     bool m_periodicDeviceDiscoveryEnabled = false; // wjy: 默认关闭，开启后按批量新增输入框中的网段周期扫描。
-    bool m_hideLocalDeviceEnabled = false; // wjy: 默认显示本机；开启后只在当前电脑界面隐藏，不向共享目录传播删除。
+    bool m_hideLocalDeviceEnabled = false; // wjy: 表示本机设备实体的全局隐藏状态；开启后所有同步客户端都从设备列表过滤本机。
     bool m_statusRefreshInProgress = false;
     bool m_wakeProbeInProgress = false;
     bool m_batchAddInProgress = false; // wjy: 标记批量新增扫描是否正在后台执行。

@@ -178,15 +178,24 @@ void AppSettings::setPeriodicDeviceDiscoveryIntervalSeconds(int seconds)
     appSettings.setValue(QStringLiteral("periodicDeviceDiscoveryIntervalSeconds"), seconds > 0 ? seconds : 60);
 }
 
-bool AppSettings::hideLocalDeviceEnabled()
+// 读取旧版仅作用于本机列表的隐藏开关；该值只允许迁移流程消费一次。
+bool AppSettings::legacyHideLocalDeviceEnabled()
 {
-    return settings().value(QStringLiteral("hideLocalDeviceEnabled"), false).toBool(); // wjy: 新安装继续显示本机，只有用户主动开启后才过滤本机设备。
+    return settings().value(QStringLiteral("hideLocalDeviceEnabled"), false).toBool(); // wjy: 没有旧配置时按未隐藏处理，不影响共享设备记录中的现有状态。
 }
 
-void AppSettings::setHideLocalDeviceEnabled(bool enabled)
+// 判断旧本机隐藏值是否已经迁移到共享设备实体，避免重启后再次覆盖其它设备同步回来的新状态。
+bool AppSettings::hideLocalDeviceGlobalMigrationCompleted()
 {
-    QSettings appSettings = settings();
-    appSettings.setValue(QStringLiteral("hideLocalDeviceEnabled"), enabled); // wjy: 开关只写当前用户 QSettings，不修改共享设备快照。
+    return settings().value(QStringLiteral("hideLocalDeviceGlobalMigrationCompleted"), false).toBool(); // wjy: 旧安装没有标记时执行一次迁移，新安装也会在首次启动完成标记。
+}
+
+// 完成旧开关迁移并清理本机私有键；迁移标记保留在当前用户设置中，不进入设备列表同步。
+void AppSettings::completeHideLocalDeviceGlobalMigration()
+{
+    QSettings appSettings = settings(); // wjy: 同一个 QSettings 实例连续删除旧值并写入完成标记，减少中间状态窗口。
+    appSettings.remove(QStringLiteral("hideLocalDeviceEnabled")); // wjy: 删除旧私有开关，后续代码不能再把它误当成当前真实状态。
+    appSettings.setValue(QStringLiteral("hideLocalDeviceGlobalMigrationCompleted"), true); // wjy: 记录迁移完成，之后所有启动只使用设备记录的 globallyHidden 字段。
 }
 // ===end====
 

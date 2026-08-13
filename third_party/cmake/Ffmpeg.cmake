@@ -1,20 +1,13 @@
 include(FetchContent)
 
-set(_ffmpeg_local_dir "C:/Users/kagurayl/projects/fsAgent/build/_deps/ffmpeg-src")
-
-if(EXISTS "${_ffmpeg_local_dir}/include/libavcodec/avcodec.h")
-    FetchContent_Declare(
-        ffmpeg
-        SOURCE_DIR "${_ffmpeg_local_dir}"
-    )
-else()
-    FetchContent_Declare(
-        ffmpeg
-        URL https://github.com/GyanD/codexffmpeg/releases/download/8.1/ffmpeg-8.1-full_build-shared.7z
-        URL_HASH SHA256=e57f02cea8b22b7ff81fb0b2ec9f6d7edb6144e84e3c0026cea0fe6dfb28e03d
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
-    )
+if(NOT FSREMOTE_FFMPEG_ROOT OR NOT EXISTS "${FSREMOTE_FFMPEG_ROOT}/include/libavcodec/avcodec.h") # 根项目必须先解压并校验仓库内的固定 FFmpeg 归档。
+    message(FATAL_ERROR "FSREMOTE_FFMPEG_ROOT is missing or incomplete: ${FSREMOTE_FFMPEG_ROOT}") # 阻止回退到开发机绝对路径或不稳定网络下载。
 endif()
+
+FetchContent_Declare(
+    ffmpeg # 将已验证的固定 FFmpeg 目录注册为现有目标继续使用的依赖名称。
+    SOURCE_DIR "${FSREMOTE_FFMPEG_ROOT}" # 直接消费构建目录内解压结果，不修改源码目录。
+)
 
 FetchContent_MakeAvailable(ffmpeg)
 

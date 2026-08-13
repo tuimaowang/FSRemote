@@ -25,6 +25,33 @@ option(FSREMOTE_BUILD_TESTS "Create FSRemote test targets for explicit developer
 option(FSREMOTE_BUILD_UU_STREAM_WEBRTC "Build the vendored UU native WebRTC streaming tools" ON)
 
 if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
+    include(cmake/FSRemoteArchiveDependency.cmake) # 引入仓库内固定依赖归档的哈希校验和构建目录解压函数。
+    set(FSREMOTE_WEBRTC_ARCHIVE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/packages/webrtc-native-sdk-329780be.tar.gz" CACHE FILEPATH "Bundled native WebRTC SDK archive") # 默认使用 Git LFS 上传的固定 WebRTC SDK，不依赖开发机源码树。
+    set(FSREMOTE_WEBRTC_ARCHIVE_SHA256 "6452d148a58f39c28dc2dec5a8b0b7f713d95029bd33e580c2b56d9b021d3512" CACHE STRING "Expected SHA-256 for the bundled native WebRTC SDK") # 固定当前已验证 WebRTC SDK 内容，防止归档损坏后继续链接。
+    if(NOT WEBRTC_ROOT) # 允许高级用户显式传入自己的原生 WebRTC SDK，同时为普通克隆提供零路径配置默认值。
+        fsremote_prepare_archive_dependency(
+            "${FSREMOTE_WEBRTC_ARCHIVE}" # 校验并解压仓库内的 WebRTC Git LFS 归档。
+            "${FSREMOTE_WEBRTC_ARCHIVE_SHA256}" # 使用固定哈希验证当前归档版本。
+            "${CMAKE_BINARY_DIR}/_deps/webrtc-native-sdk" # 将大型 SDK 仅解压到当前构建目录，保持源码树干净。
+            "src/api/peer_connection_interface.h" # 以核心 PeerConnection 头文件作为解压完整性标记。
+            _fsremote_bundled_webrtc_root # 接收 FindWebRTCNative.cmake 所需的 SDK 根目录。
+        )
+        set(WEBRTC_ROOT "${_fsremote_bundled_webrtc_root}" CACHE PATH "Path to a native WebRTC build/install root" FORCE) # 将已验证 SDK 根目录传递给现有原生 WebRTC 查找逻辑。
+    endif()
+
+    set(FSREMOTE_FFMPEG_ARCHIVE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/packages/ffmpeg-8.1-shared.tar.gz" CACHE FILEPATH "Bundled FFmpeg 8.1 shared SDK archive") # 默认使用项目已验证的 FFmpeg 头文件、导入库和运行 DLL。
+    set(FSREMOTE_FFMPEG_ARCHIVE_SHA256 "c4d7d123917c751950312a1e5e517dff19ad29671b77b0d25f431d97f0a38376" CACHE STRING "Expected SHA-256 for the bundled FFmpeg SDK") # 固定 FFmpeg 归档内容并检测 Git LFS 下载损坏。
+    if(NOT FSREMOTE_FFMPEG_ROOT) # 允许显式覆盖 FFmpeg SDK，同时让普通克隆无需配置外部路径。
+        fsremote_prepare_archive_dependency(
+            "${FSREMOTE_FFMPEG_ARCHIVE}" # 校验并解压仓库内的 FFmpeg Git LFS 归档。
+            "${FSREMOTE_FFMPEG_ARCHIVE_SHA256}" # 使用当前验证版本对应的固定哈希。
+            "${CMAKE_BINARY_DIR}/_deps/ffmpeg-8.1-shared" # 将 FFmpeg 解压到构建目录，避免污染源码树。
+            "include/libavcodec/avcodec.h" # 以核心编解码头文件作为解压完整性标记。
+            _fsremote_bundled_ffmpeg_root # 接收现有 FFmpeg CMake 模块使用的 SDK 根目录。
+        )
+        set(FSREMOTE_FFMPEG_ROOT "${_fsremote_bundled_ffmpeg_root}" CACHE PATH "FFmpeg SDK root containing include, lib, and bin" FORCE) # 将已验证目录提供给 FFmpeg 接口目标和运行时复制逻辑。
+    endif()
+
     add_subdirectory(third_party/uu_stream_webrtc)
     # =====wjy====
     target_sources(uu_stream_common PRIVATE
@@ -568,12 +595,26 @@ qt_add_executable(FSRemote WIN32
     # ===end====
     src/ui/D3D11FramePresenter.cpp
     src/ui/D3D11FramePresenter.h
+    src/ui/RemoteVideoRenderService.cpp # 注册统一远控视频渲染服务实现，确保当前本地开发源码进入正式构建。
+    src/ui/RemoteVideoRenderService.h # 注册统一渲染服务接口，供远控窗口共享渲染工作线程。
     src/ui/RemoteWindowCompositor.cpp
     src/ui/RemoteWindowCompositor.h
     src/stream/StreamRuntime.cpp
     src/stream/StreamRuntime.h
     src/stream/RemoteQualityPolicy.h
     src/stream/RemoteVideoPolicy.h # wjy: 主程序显式列出统一角色画质配置，Qt Creator重新加载后可见。
+    src/stream/RemoteVideoBaseline.h # 注册远控视频性能基线结构，供诊断和测试统一计算阈值。
+    src/stream/RemoteVideoD3D11Surface.cpp # 注册 D3D11 原生渲染表面实现，使统一渲染服务能够创建窗口表面。
+    src/stream/RemoteVideoD3D11Surface.h # 注册 D3D11 原生渲染适配器接口和表面工厂。
+    src/stream/RemoteVideoDiagnostics.cpp # 注册异步远控视频诊断实现，记录阶段样本和异常快照。
+    src/stream/RemoteVideoDiagnostics.h # 注册远控视频诊断事件、摘要和线程安全接口。
+    src/stream/RemoteVideoFrame.h # 注册原生纹理帧、代际和资源释放租约模型。
+    src/stream/RemoteVideoNativeAdapter.cpp # 注册原生纹理回调到统一帧模型的适配实现。
+    src/stream/RemoteVideoNativeAdapter.h # 注册原生纹理提交结果和统计接口。
+    src/stream/RemoteVideoRenderWorker.cpp # 注册单工作线程渲染调度与资源回收实现。
+    src/stream/RemoteVideoRenderWorker.h # 注册渲染表面抽象、通知和工作线程接口。
+    src/stream/RemoteVideoScheduler.cpp # 注册多窗口远控视频帧调度实现。
+    src/stream/RemoteVideoScheduler.h # 注册窗口角色、调度状态和决策接口。
     src/system/AppSettings.cpp
     src/system/AppSettings.h
     src/system/PowerManager.cpp
@@ -682,6 +723,18 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "$<TARGET_FILE:fsremote_stream>"
             "$<TARGET_FILE_DIR:FSRemote>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different # 将 WebRTC DLL 依赖的 FFmpeg 编解码运行库部署到主程序目录。
+            "${UU_STREAM_FFMPEG_BIN_DIR}/avcodec-62.dll" # 复制 FFmpeg 8.1 的核心编解码运行库。
+            "$<TARGET_FILE_DIR:FSRemote>/avcodec-62.dll" # 保证 Windows 加载 fsremote_stream.dll 时能在同目录解析依赖。
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different # 将 FFmpeg 公共工具运行库部署到主程序目录。
+            "${UU_STREAM_FFMPEG_BIN_DIR}/avutil-60.dll" # 复制像素格式、缓冲区和通用工具运行库。
+            "$<TARGET_FILE_DIR:FSRemote>/avutil-60.dll" # 使用主程序目录作为稳定的运行时搜索位置。
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different # 将 FFmpeg 音频重采样运行库部署到主程序目录。
+            "${UU_STREAM_FFMPEG_BIN_DIR}/swresample-6.dll" # 复制系统音频流处理需要的重采样运行库。
+            "$<TARGET_FILE_DIR:FSRemote>/swresample-6.dll" # 保证远控音频路径在新电脑上无需额外安装 FFmpeg。
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different # 将 FFmpeg 图像缩放运行库部署到主程序目录。
+            "${UU_STREAM_FFMPEG_BIN_DIR}/swscale-9.dll" # 复制视频像素格式转换和缩放运行库。
+            "$<TARGET_FILE_DIR:FSRemote>/swscale-9.dll" # 保证软件解码兼容路径可以从发布目录直接加载。
         DEPENDS fsremote_stream
         VERBATIM
     ) # wjy: 使用始终执行的旁车目标；即使主 EXE 无需重链接，更新后的 DLL 也会复制到正式发布根目录。
@@ -690,38 +743,28 @@ if(FSREMOTE_BUILD_UU_STREAM_WEBRTC)
 endif()
 
 # =====wjy====
-set(FSREMOTE_FAKER_INPUT_BRIDGE_EXE "" CACHE FILEPATH "Prebuilt FakerInputBridge.exe copied beside FSRemote.exe")
-if(NOT FSREMOTE_FAKER_INPUT_BRIDGE_EXE
-        AND EXISTS "C:/Users/test/Documents/FakerInputBridge/dist/FakerInputBridge.exe")
-    set(FSREMOTE_FAKER_INPUT_BRIDGE_EXE "C:/Users/test/Documents/FakerInputBridge/dist/FakerInputBridge.exe") # wjy: 当前独立 Bridge 项目保持在 FSRemote 仓库外，只消费其已验证发布成品。
-endif()
-if(FSREMOTE_FAKER_INPUT_BRIDGE_EXE AND EXISTS "${FSREMOTE_FAKER_INPUT_BRIDGE_EXE}")
-    add_custom_target(FSRemoteFakerInputBridgeCopy
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${FSREMOTE_FAKER_INPUT_BRIDGE_EXE}"
-            "$<TARGET_FILE_DIR:FSRemote>/FakerInputBridge.exe"
-        DEPENDS "${FSREMOTE_FAKER_INPUT_BRIDGE_EXE}"
-        VERBATIM
-    ) # wjy: 旁车复制目标不依赖主 EXE 是否重链接，每次构建都确认发布根目录中的 Bridge 为最新成品。
-    add_dependencies(FSRemote FSRemoteFakerInputBridgeCopy)
-else()
-    message(WARNING "FakerInputBridge.exe source is missing; set FSREMOTE_FAKER_INPUT_BRIDGE_EXE before publishing")
-endif()
+add_subdirectory(third_party/faker_input_bridge) # 从仓库内源码构建 FakerInputBridge，移除开发机绝对路径和预编译成品依赖。
+add_custom_target(FSRemoteFakerInputBridgeCopy
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different # 只在内容变化时更新主程序旁的 Bridge，减少无意义文件时间戳变化。
+        "$<TARGET_FILE:FakerInputBridge>" # 使用本次构建生成的 Bridge 可执行文件作为唯一来源。
+        "$<TARGET_FILE_DIR:FSRemote>/FakerInputBridge.exe" # 将 Bridge 部署到 FSRemote 运行时固定查找目录。
+    DEPENDS FakerInputBridge # 保证复制动作开始前 Bridge 已经完成编译和链接。
+    VERBATIM # 保持含空格路径在 Windows 命令行中的参数边界。
+) # 每次构建 FSRemote 都确认同目录中的 Bridge 与当前源码一致。
+add_dependencies(FSRemote FSRemoteFakerInputBridgeCopy) # 将 Bridge 构建和部署纳入主程序默认构建流程。
 
-set(FSREMOTE_FAKER_INPUT_MSI "" CACHE FILEPATH "FakerInput 0.1.1 x64 MSI copied beside FSRemote.exe")
-if(FSREMOTE_FAKER_INPUT_MSI AND EXISTS "${FSREMOTE_FAKER_INPUT_MSI}")
+set(FSREMOTE_FAKER_INPUT_MSI "${CMAKE_CURRENT_SOURCE_DIR}/third_party/faker_input_driver_kit/driver/FakerInput_Setup_0.1.1_x64.msi" CACHE FILEPATH "FakerInput 0.1.1 x64 MSI copied beside FSRemote.exe") # 默认使用仓库内 Git LFS 管理的驱动安装包。
+if(EXISTS "${FSREMOTE_FAKER_INPUT_MSI}") # 只有安装包实体已由 Git LFS 拉取时才创建发布复制目标。
     add_custom_target(FSRemoteFakerInputMsiCopy
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${FSREMOTE_FAKER_INPUT_MSI}"
-            "$<TARGET_FILE_DIR:FSRemote>/FakerInput_Setup_0.1.1_x64.msi"
-        DEPENDS "${FSREMOTE_FAKER_INPUT_MSI}"
-        VERBATIM
-    ) # wjy: 配置稳定源路径后，每次主目标构建都确认驱动安装包进入发布目录。
-    add_dependencies(FSRemote FSRemoteFakerInputMsiCopy)
-elseif(EXISTS "${CMAKE_BINARY_DIR}/FakerInput_Setup_0.1.1_x64.msi")
-    message(STATUS "Using FakerInput MSI already present in the build output directory") # wjy: 兼容用户已放入当前 build 根目录的安装包，避免同源同目标复制失败。
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different # 避免每次构建无条件覆盖相同 MSI。
+            "${FSREMOTE_FAKER_INPUT_MSI}" # 从仓库内固定驱动安装包读取发布源文件。
+            "$<TARGET_FILE_DIR:FSRemote>/FakerInput_Setup_0.1.1_x64.msi" # 按运行时代码约定部署到主程序目录。
+        DEPENDS "${FSREMOTE_FAKER_INPUT_MSI}" # 当 MSI 版本更新时强制重新执行复制目标。
+        VERBATIM # 保护包含空格的 Windows 路径参数。
+    ) # 将驱动安装包作为正式发布依赖纳入构建图。
+    add_dependencies(FSRemote FSRemoteFakerInputMsiCopy) # 主程序构建完成时保证驱动安装包已经存在于输出目录。
 else()
-    message(WARNING "FakerInput_Setup_0.1.1_x64.msi is missing; set FSREMOTE_FAKER_INPUT_MSI before publishing")
+    message(FATAL_ERROR "FakerInput MSI is missing: ${FSREMOTE_FAKER_INPUT_MSI}. Run 'git lfs pull' before configuring FSRemote.") # 缺少驱动时阻止产生功能不完整的发布目录。
 endif()
 
 set(FSREMOTE_FAKER_INPUT_PUBLISHER_CERT "${CMAKE_CURRENT_SOURCE_DIR}/resources/FakerInput_Ryodigi_Solutions_LLC.cer")

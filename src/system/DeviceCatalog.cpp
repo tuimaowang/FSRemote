@@ -171,6 +171,17 @@ bool DeviceCatalog::updateDevice(const QString& deviceId, DeviceRecord replaceme
     return true;
 }
 
+// 设置设备是否从所有控制端列表隐藏；设备不存在或状态未变化时返回 false，避免产生无意义同步提交。
+bool DeviceCatalog::setDeviceGloballyHidden(const QString& deviceId, bool hidden)
+{
+    const int index = deviceIndexForId(deviceId); // wjy: 通过稳定 UUID 定位设备，不能依赖同步后可能变化的数组下标。
+    if (index < 0 || m_devices.at(index).globallyHidden == hidden) { // wjy: 无效设备和重复状态都不修改目录，调用方据此判断是否需要保存。
+        return false;
+    }
+    m_devices[index].globallyHidden = hidden; // wjy: 设备实体继续保留在目录中，仅改变所有客户端共同消费的列表可见性字段。
+    return true;
+}
+
 int DeviceCatalog::addGroup(const QString& name, const QString& requestedId, bool expanded)
 {
     const QString normalizedName = name.trimmed();
@@ -305,6 +316,7 @@ QJsonObject DeviceCatalog::snapshot(bool includeLocalUiState) const
             {QStringLiteral("remark"), record.remark},
             {QStringLiteral("group"), record.group},
             {QStringLiteral("groupId"), record.groupId},
+            {QStringLiteral("globallyHidden"), record.globallyHidden}, // wjy: 全局隐藏状态进入本地和共享快照，所有客户端收到后采用同一列表过滤结果。
         });
     }
     QJsonObject raw{
@@ -379,6 +391,7 @@ bool DeviceCatalog::applySnapshot(const QJsonObject& source, bool preserveCurren
         record.remark = object.value(QStringLiteral("remark")).toString();
         record.group = object.value(QStringLiteral("group")).toString().trimmed();
         record.groupId = object.value(QStringLiteral("groupId")).toString();
+        record.globallyHidden = object.value(QStringLiteral("globallyHidden")).toBool(false); // wjy: 旧快照没有字段时默认显示，升级不会意外隐藏既有设备。
         devices.append(std::move(record));
     }
 

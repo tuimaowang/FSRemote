@@ -16,6 +16,7 @@ struct DeviceRecord {
     QString group; // wjy: 兼容旧界面和旧 JSON 的分组名称；跨同步和重命名关联始终以稳定 groupId 为准。
     QString id; // wjy: 设备稳定 UUID，异步结果、同步和跨窗口操作不能再依赖可能变化的数组下标。
     QString groupId; // wjy: 设备所属分组的稳定 UUID，空字符串表示设备位于“我的设备”根部。
+    bool globallyHidden = false; // wjy: 由设备本机设置并随共享目录同步；为 true 时所有控制端列表都隐藏该设备，但保留实体用于恢复显示。
 
     QString displayName() const; // wjy: 名称为空时统一回退 IP，避免各个 UI/控制器重复实现相同显示规则。
 };
@@ -53,6 +54,7 @@ public:
 
     bool addDevice(DeviceRecord device);
     bool updateDevice(const QString& deviceId, DeviceRecord replacement);
+    bool setDeviceGloballyHidden(const QString& deviceId, bool hidden); // wjy: 只修改指定稳定设备实体的全局可见性，调用方负责确认自己有权修改该设备。
     int addGroup(const QString& name, const QString& requestedId = {}, bool expanded = true);
     bool renameDevice(const QString& deviceId, const QString& newName);
     bool renameGroup(const QString& groupId, const QString& newName);

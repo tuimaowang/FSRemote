@@ -256,6 +256,7 @@ QJsonObject normalizeDeviceListSnapshot(const QJsonObject& snapshot)
         device.insert(QStringLiteral("remark"), source.value(QStringLiteral("remark")).toString());
         device.insert(QStringLiteral("groupId"), groupId);
         device.insert(QStringLiteral("group"), canonicalGroupName); // wjy: 保留 group 名只为兼容旧代码，真正关联以不可变 groupId 为准。
+        device.insert(QStringLiteral("globallyHidden"), source.value(QStringLiteral("globallyHidden")).toBool(false)); // wjy: 全局隐藏是设备共享字段，旧客户端数据缺失时按 false 兼容迁移。
         device.insert(QStringLiteral("sortOrder"), deviceOrder++);
         normalizedDevices.append(device);
     }
